@@ -16,7 +16,7 @@
 //
 // Frozen input contract (verbatim from resolver.js / uitree.js headers):
 //
-//   treeResult = { root: TNode, targetLabel, note }
+//   treeResult = { root: TNode, targetLabel, note, direction, stats }
 //   TNode = {
 //     label, kind: 'method'|'trigger'|'class'|'lwc'|'aura'|'flow'|
 //       'omniscript'|'vf' (A6/A7: metadata-caller nodes from resolver.js's
@@ -24,16 +24,27 @@
 //       Metadata record, same family, always terminal today) | 'anonymous'
 //       (v0.5 G4: anonymous-Apex-script (.apex) pseudo-type/method node --
 //       Apex-source family like 'method'/'trigger'/'class', NOT part of the
-//       metadata-caller family; always a pure root),
+//       metadata-caller family; always a pure root) | 'exception' (v0.7 A3:
+//       forward-traced throw target, always terminal) | 'unresolved' (v0.7
+//       A6: one aggregated, always-terminal, always-approximate leaf per
+//       method summarizing unresolved forward call sites),
 //     className, methodLower,
 //     path, line, entries: [string], isTest,
+//     package,  // string|null|undefined (v0.7 B3): the sfdx package label
+//               // this node's file lives under -- see shapeNodeForData's
+//               // targetPackage/packageBadge threading below, which turns
+//               // it into a '(label)' badge ONLY when it differs from the
+//               // traced target's own package (root.package).
 //     via: string|null,  // ...|'metadata'|'dml'|'dynamic'|'override' (v0.4
 //                         // adds the last three)|'publish'|'throws'|
 //                         // 'narrowed'|'async' (v0.5 G1/G2/G3/G5 add these
-//                         // four; only 'narrowed' is approximate) --
-//                         // rendered verbatim as edge labels/node badges, no
-//                         // code change needed here for a new via string to
-//                         // show up correctly)
+//                         // four; only 'narrowed' is approximate)|
+//                         // 'ambiguous' (v0.7 B2: duplicate-named-class
+//                         // fan-out that neither same-package nor default-
+//                         // package preference could resolve; approximate)
+//                         // -- rendered verbatim as edge labels/node badges,
+//                         // no code change needed here for a new via string
+//                         // to show up correctly)
 //     sites: [SiteView], children: [TNode],
 //     cyclic, truncated, approximate,
 //     caughtHere,  // boolean, v0.5 G2: an ancestor catch clause catches the
@@ -44,6 +55,20 @@
 //                  // CLIENT_JS_TEXT). Traversal continues past a caughtHere
 //                  // node, so it is purely an informational marker.
 //   }
+//
+// v0.7 (A3) direction: treeResult.direction is 'callers'|'callees'|absent.
+// resolver.js's buildCallerTree stamps 'callers' on EVERY TreeResult it
+// returns, unconditionally -- so 'callers' is treated exactly like an
+// absent field: both render byte-identically to before this round
+// (unmirrored layout, no direction header/meta text -- see layoutTree/
+// renderPathMapHtml below, both take the same non-mirrored branch and
+// produce a null directionLabel). 'callees' -- the one genuinely NEW
+// direction this round adds -- mirrors the layout (target LEFT, callees fan
+// out RIGHT -- see layoutTree) and shows an explicit 'What Does This Call?'
+// header/meta label. See uitree.js's matching directionHeaderLine for the
+// fuller interpretive-decision writeup (not duplicated here verbatim,
+// consistent with this file's existing pattern of small independent
+// re-implementations rather than a cross-file require).
 //   SiteView = {
 //     path, line, col, lineText, argsRendered: string|null, via,
 //     overloadSig: string|null,  // A4 field, v0.6 (H3): previously
@@ -143,9 +168,17 @@ const META_ACCENT_KINDS = new Set(['lwc', 'aura', 'flow', 'omniscript', 'vf', 'c
 // 'Anonymous Apex script' entries label per the G4 spec, so it would
 // otherwise collapse onto the generic 'entry' accent and lose its distinct
 // color.
+// v0.7 (A3): two more "the kind alone decides the accent" buckets, same
+// priority tier as trigger/anonymous, ahead of entry/test -- an exception-
+// class node or an aggregated unresolved-sites leaf could in principle
+// carry entries (e.g. an exception class that is ALSO an inner class with
+// its own annotation) and must not collapse onto the generic 'entry' accent
+// and lose its distinct color.
 function accentKind(node) {
   if (node.kind === 'trigger') return 'trigger';
   if (node.kind === 'anonymous') return 'anonymous';
+  if (node.kind === 'exception') return 'exception';
+  if (node.kind === 'unresolved') return 'unresolved';
   if (META_ACCENT_KINDS.has(node.kind)) return 'metadata';
   if (node.entries && node.entries.length) return 'entry';
   if (node.isTest) return 'test';
@@ -163,9 +196,24 @@ function accentKind(node) {
 // sweep), and a node's own row always lands inside its own subtree's
 // range — so two unrelated nodes that land in the same column are always
 // at least one full row apart. Depth (hops from the target) maps directly
-// to column, counted from the right: the target (depth 0) is the
-// rightmost column, and each hop further from it moves one column left.
-function layoutTree(root) {
+// to column. By default (the callers direction -- `direction` absent or
+// 'callers', see this file's header note on why those two are treated
+// identically) the target (depth 0) is the RIGHTMOST column, and each hop
+// further from it moves one column left, exactly as before this round.
+//
+// v0.7 (A3): when `direction === 'callees'` the column order MIRRORS -- the
+// target (depth 0) becomes the LEFTMOST column and each hop further (each
+// forward call) moves one column right, per the A3 spec ("target LEFT,
+// callees flowing RIGHT (mirror the column math)"). This is a pure column-
+// index flip (`rec.depth` instead of `maxDepth - rec.depth`); row placement
+// (the leaf-order dendrogram pass above) and every other geometry constant
+// (colWidth, width, height) are completely unaffected -- only which end of
+// the row a given depth lands on changes. The client-side edge-curve
+// direction (CLIENT_JS_TEXT's edgePath) reads DATA.layout.mirrored to draw
+// curves the same reading-direction way (parent-column -> child-column,
+// left to right) as the callers direction already always did.
+function layoutTree(root, direction) {
+  const mirrored = direction === 'callees';
   const nodes = [];
   const edges = [];
   let nextId = 0;
@@ -194,14 +242,15 @@ function layoutTree(root) {
   visit(root, null, 0);
 
   for (const rec of nodes) {
-    const col = maxDepth - rec.depth; // target (depth 0) -> rightmost column
+    // target (depth 0) -> rightmost column normally, leftmost when mirrored.
+    const col = mirrored ? rec.depth : maxDepth - rec.depth;
     rec.x = LAYOUT.marginX + col * LAYOUT.colWidth;
     rec.y = LAYOUT.marginY + rec.row * LAYOUT.rowHeight;
   }
 
   const width = LAYOUT.marginX * 2 + (maxDepth + 1) * LAYOUT.colWidth;
   const height = LAYOUT.marginY * 2 + Math.max(1, leafCounter) * LAYOUT.rowHeight;
-  return { nodes: nodes, edges: edges, width: width, height: height, maxDepth: maxDepth };
+  return { nodes: nodes, edges: edges, width: width, height: height, maxDepth: maxDepth, mirrored: mirrored };
 }
 
 // ---- TNode/SiteView -> plain JSON-safe shapes -----------------------------
@@ -228,8 +277,28 @@ function isRootNode(t) {
   return !hasChildren && !t.cyclic && !t.truncated && !t.seenElsewhere;
 }
 
-function shapeNodeForData(rec) {
+// v0.7 (B3): the node's package badge text, or null when none applies --
+// mirrors uitree.js's packageBadge exactly (see that file's comment for the
+// full rationale), kept as an independent small implementation here rather
+// than a cross-file require, same rationale as isRootNode above.
+function packageBadge(node, targetPackage) {
+  if (!node || !node.package) return null;
+  if (node.package === targetPackage) return null;
+  return '(' + node.package + ')';
+}
+
+// v0.7 (B3): `targetPackage` is an OPTIONAL second argument -- the traced
+// target's own `.package` (computed once in renderPathMapHtml from the tree
+// root and threaded through every node). Every EXISTING call site that
+// invokes `shapeNodeForData(rec)` with just one argument keeps behaving
+// exactly as before: `targetPackage` is undefined, so packageBadge() below
+// returns null for every node unless that node happens to carry a
+// `.package` of its own (no pre-v0.7 fixture does).
+function shapeNodeForData(rec, targetPackage) {
   const t = rec.tnode || {};
+  const badges = (t.entries || []).map(shortenEntry);
+  const pkgBadge = packageBadge(t, targetPackage);
+  if (pkgBadge) badges.push(pkgBadge);
   return {
     id: rec.id,
     parentId: rec.parentId,
@@ -238,7 +307,7 @@ function shapeNodeForData(rec) {
     label: t.label != null ? String(t.label) : '',
     kind: t.kind || 'class',
     accent: accentKind(t),
-    badges: (t.entries || []).map(shortenEntry),
+    badges: badges,
     isTest: !!t.isTest,
     approximate: !!t.approximate,
     cyclic: !!t.cyclic,
@@ -252,6 +321,11 @@ function shapeNodeForData(rec) {
     path: t.path || null,
     line: typeof t.line === 'number' ? t.line : null,
     className: t.className || '',
+    // v0.7 (B3): the raw package label (or null) -- not itself rendered as
+    // a badge client-side (the badge string, if any, already landed in
+    // `badges` above); exposed so dev tooling / future callers can inspect
+    // it without re-deriving from `entries`.
+    package: t.package || null,
     sites: (t.sites || []).map(shapeSiteForData),
   };
 }
@@ -320,6 +394,13 @@ const CSS_TEXT = `
     --pm-normal: var(--vscode-descriptionForeground, #9d9d9d);
     --pm-metadata: var(--vscode-charts-purple, #b180d7);
     --pm-anonymous: var(--vscode-charts-yellow, #cca700);
+    /* v0.7 (A3): no dedicated --vscode-charts-* slot is left unclaimed by
+       the buckets above, so these two reach for theme-semantic vars instead
+       of the charts palette -- errorForeground fits an exception-class node
+       directly, disabledForeground reads as "unknown/inert", matching an
+       aggregated unresolved-sites leaf. */
+    --pm-exception: var(--vscode-errorForeground, #f14c4c);
+    --pm-unresolved: var(--vscode-disabledForeground, #8a8a8a);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -339,6 +420,11 @@ const CSS_TEXT = `
   #pm-stats, #pm-hint { color: var(--pm-muted); font-size: 12px; }
   #pm-note { color: var(--pm-approx); font-size: 12px; }
   #pm-hint { margin-left: auto; }
+  /* v0.7 (A3): direction sign-post -- empty (no width impact beyond its own
+     zero content) whenever DATA.meta.directionLabel is null, i.e. for every
+     pre-v0.7-shaped/undirected TreeResult and the 'today' byte-identical
+     case; see directionHeaderLine's interpretive-decision comment. */
+  #pm-direction { font-weight: 600; font-size: 12px; color: var(--pm-link); }
 
   #pm-legend {
     position: fixed; top: 44px; right: 10px; z-index: 6; max-width: 340px; max-height: 70vh; overflow: auto;
@@ -359,6 +445,8 @@ const CSS_TEXT = `
   .swatch.normal { background: var(--pm-normal); }
   .swatch.metadata { background: var(--pm-metadata); }
   .swatch.anonymous { background: var(--pm-anonymous); }
+  .swatch.exception { background: var(--pm-exception); }
+  .swatch.unresolved { background: var(--pm-unresolved); }
 
   #pm-viewport { flex: 1 1 auto; position: relative; overflow: hidden; cursor: grab; }
   #pm-viewport.dragging { cursor: grabbing; }
@@ -378,6 +466,8 @@ const CSS_TEXT = `
   .node.kind-normal { border-left: 4px solid var(--pm-normal); }
   .node.kind-metadata { border-left: 4px solid var(--pm-metadata); }
   .node.kind-anonymous { border-left: 4px solid var(--pm-anonymous); }
+  .node.kind-exception { border-left: 4px solid var(--pm-exception); }
+  .node.kind-unresolved { border-left: 4px solid var(--pm-unresolved); }
   .node.is-test { opacity: .62; }
   .node.is-approx { border-style: dashed; border-color: var(--pm-approx); }
 
@@ -444,9 +534,17 @@ const CLIENT_JS_TEXT = `
   }
 
   var header = document.getElementById('pm-title');
+  var directionEl = document.getElementById('pm-direction');
   var stats = document.getElementById('pm-stats');
   var noteEl = document.getElementById('pm-note');
   header.textContent = DATA.meta.targetLabel || '(no target)';
+  // v0.7 (A3): direction sign-post -- left EMPTY (matching every pre-v0.7
+  // render byte-for-byte) whenever directionLabel is null, i.e. absent/
+  // undirected TreeResults; see directionHeaderLine's interpretive-decision
+  // comment for why that specific case must stay exactly "today".
+  if (DATA.meta.directionLabel) {
+    directionEl.textContent = DATA.meta.directionLabel;
+  }
   stats.textContent = DATA.meta.nodeCount + ' node' + (DATA.meta.nodeCount === 1 ? '' : 's') +
     ', ' + DATA.meta.edgeCount + ' edge' + (DATA.meta.edgeCount === 1 ? '' : 's');
   if (DATA.meta.note) {
@@ -541,11 +639,28 @@ const CLIENT_JS_TEXT = `
     nodesLayer.appendChild(buildNodeEl(n));
   });
 
+  // v0.7 (A3): 'to' is always the tree PARENT (edges are gathered child->
+  // parent, see layoutTree/shapeEdgeForData -- this doesn't change with
+  // direction) and 'from' is always the tree CHILD. In the default
+  // (non-mirrored) layout the parent sits at a LARGER x than the child (the
+  // target/depth-0 node is rightmost), so the curve is drawn child-right-
+  // edge -> parent-left-edge, i.e. left-to-right, converging into the
+  // target -- exactly the pre-v0.7 behavior, unchanged when MIRRORED is
+  // false (see the leftNode/rightNode selection below: false picks
+  // leftNode=from/rightNode=to, identical to the original from/to/x1/y1/x2/
+  // y2 assignment this replaced). When MIRRORED is true the parent instead
+  // sits at the SMALLER x (target/depth-0 is leftmost, see layoutTree), so
+  // leftNode/rightNode swap to keep the curve reading left-to-right
+  // (parent's right edge -> child's left edge) instead of drawing
+  // backwards.
+  var MIRRORED = !!(DATA.layout && DATA.layout.mirrored);
   function edgePath(from, to) {
-    var x1 = from.x + NW;
-    var y1 = from.y + NH / 2;
-    var x2 = to.x;
-    var y2 = to.y + NH / 2;
+    var leftNode = MIRRORED ? to : from;
+    var rightNode = MIRRORED ? from : to;
+    var x1 = leftNode.x + NW;
+    var y1 = leftNode.y + NH / 2;
+    var x2 = rightNode.x;
+    var y2 = rightNode.y + NH / 2;
     var midX = (x1 + x2) / 2;
     return 'M ' + x1 + ' ' + y1 + ' C ' + midX + ' ' + y1 + ', ' + midX + ' ' + y2 + ', ' + x2 + ' ' + y2;
   }
@@ -744,6 +859,8 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="swatch normal"></span><span><span class="k">normal</span>regular method or class</span></div>
     <div class="legend-row"><span class="swatch metadata"></span><span><span class="k">metadata</span>caller from LWC, Aura, Flow, OmniScript, VF, or Custom Metadata — not Apex source (a Flow node here may still have its own children, e.g. the DML sites on its object — a metadata node is not always a leaf)</span></div>
     <div class="legend-row"><span class="swatch anonymous"></span><span><span class="k">anonymous</span>anonymous Apex script (.apex) — real Apex source, but with no declared class/trigger of its own; always a pure root (nothing calls it)</span></div>
+    <div class="legend-row"><span class="swatch exception"></span><span><span class="k">exception</span>(v0.7) a thrown exception's class, reached by tracing forward (What Does This Call?) through a "throw" statement — always terminal</span></div>
+    <div class="legend-row"><span class="swatch unresolved"></span><span><span class="k">unresolved</span>(v0.7) one aggregated leaf per method, summarizing every forward call site that couldn't be resolved to an indexed target (dynamic/platform calls, e.g. HttpRequest/System.debug) — always terminal, approximate</span></div>
     <h4>Markers</h4>
     <div class="legend-row"><span class="k">~ prefix</span>approximate resolution (dashed border too) — via interface/unique-name/lexical/override/narrowed/dynamic fallback, so this edge may be wrong or one of several candidates</div>
     <div class="legend-row"><span class="k">&#x1F9EA;</span>test-only node (also dimmed)</div>
@@ -752,6 +869,11 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="k">&#x1F6E1;</span>caughtHere — an ancestor catch clause here catches the exception being traced (exact type, a USER exception ancestor, or bare Exception); paired with a "catches &lt;Exc&gt;" badge. Traversal still continues past this node — rethrow is unknowable</div>
     <div class="legend-row"><span class="k">&#x25C9;</span>root — no known caller in this trace: an entry point or unused/dead code. Never shown together with cyclic, truncated, or seenElsewhere (those all mean "there IS more above, it just isn't shown/expanded here")</div>
     <div class="legend-row"><span class="k">&#x21E2;</span>seenElsewhere — this method's caller subtree was already expanded once elsewhere in this same trace (per-run dedup); its own call sites are still shown here, only the deeper callers above it are collapsed</div>
+    <div class="legend-row"><span class="k">(pkgLabel)</span>(v0.7 B3) package badge — shown on a node when its file lives in a DIFFERENT sfdx package directory than the traced target's; the label is the package name from sfdx-project.json's packageDirectories, or the path segment itself when that directory declares no package name. A single call site can fan out to two children with two DIFFERENT badges (see the "ambiguous" via below)</div>
+    <div class="legend-row"><span class="k">N dup. names</span>(v0.7 B3) header note — "&lt;N&gt; duplicate class names across packages" appears above the map whenever this workspace has classes sharing the same qualified name across two or more sfdx packages; resolution always prefers the referring file's own package first, then the default package, before falling back to the ambiguous fan-out below</div>
+    <h4>Direction</h4>
+    <div class="legend-row"><span class="k">Who Calls This</span>(default, unlabeled above) the traced target sits on the RIGHT; its callers fan out to the LEFT, one hop per column, converging into the target</div>
+    <div class="legend-row"><span class="k">What This Calls</span>(v0.7 A3, forward tracing — shown above as "What Does This Call?") the traced target sits on the LEFT instead; its callees fan out to the RIGHT, one hop per column — the column order and every edge curve mirror the default layout so both directions still read left-to-right</div>
     <h4>Edge "via" labels</h4>
     <div class="legend-row"><span class="k">typed</span>resolved through the receiver's declared type</div>
     <div class="legend-row"><span class="k">static</span>Class.method() static call</div>
@@ -769,7 +891,23 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="k">throws</span>a throw statement (creator-type "throw new X(...)" or a resolved "throw e" rethrow) — shown as a root-level child when tracing the thrown exception type itself (not approximate)</div>
     <div class="legend-row"><span class="k">narrowed</span>instanceof-narrowing fallback — the receiver's declared type doesn't have the method, but an "x instanceof T" narrowing found in the same method does (approximate — branch polarity is not tracked, only that the narrowing exists in the method)</div>
     <div class="legend-row"><span class="k">async</span>System.enqueueJob / Database.executeBatch / System.schedule call whose argument is an inline "new KnownClass(...)" — edge added to that class's execute method, in addition to the ordinary "new" constructor edge (not approximate)</div>
+    <div class="legend-row"><span class="k">ambiguous</span>(v0.7 B2) a class name duplicated across sfdx packages that neither same-package nor default-package preference could resolve — every remaining candidate gets its own edge, each typically carrying a DIFFERENT package badge (approximate)</div>
 `;
+
+// v0.7 (A3): mirrors uitree.js's directionHeaderLine exactly -- see that
+// file's INTERPRETIVE DECISION comment for the full byte-identical-bar
+// writeup (not duplicated here verbatim, consistent with this file's
+// existing pattern of small independent re-implementations, same rationale
+// as isRootNode/packageBadge above). resolver.js's buildCallerTree stamps
+// `direction: 'callers'` on EVERY TreeResult unconditionally, so 'callers'
+// (like an absent field) stays the silent, byte-identical-to-today case;
+// only 'callees' (the genuinely new v0.7 capability) gets the explicit
+// 'What Does This Call?' sign-post, mirroring apexTrace.traceCallees's
+// command title verbatim (package.json, not owned by this file).
+function directionHeaderLine(direction) {
+  if (direction === 'callees') return 'What Does This Call?';
+  return null;
+}
 
 // v0.6 (H1/H4 forward-compat): additional header lines beyond treeResult.note
 // (which was already rendered before this round). Mirrors uitree.js's
@@ -784,11 +922,30 @@ const LEGEND_HTML = `
 // not a top-level TreeResult.unresolvedSites field -- read from stats to
 // match what resolver.js actually produces (uitree.js's shapeHeaderLines
 // mirrors this same fix).
+//
+// v0.7 (B3): duplicate-names line prepended ahead of capped/unresolved,
+// gated behind stats.duplicateNames > 0 -- does not fire for a
+// pre-v0.7-shaped TreeResult (no `stats.duplicateNames`), so fixture7's
+// existing exact-array assertion in test-pathmap.js is unaffected. (The
+// direction sign-post itself is NOT folded in here -- it gets its own
+// dedicated `data.meta.directionLabel` field / `#pm-direction` header
+// element instead, see renderPathMapHtml below, so it reads as a primary
+// mode indicator rather than getting lost among capped/unresolved
+// warnings.) The capped-line wording is direction-aware for the same
+// reason uitree.js's is (see shapeHeaderLines there): the SAME cap/DAG-
+// memoization machinery now runs in both directions, so "caller" would be
+// misleading for a callees-direction result.
 function headerExtraLinesForResult(treeResult) {
   const lines = [];
   const stats = treeResult && treeResult.stats;
+  if (stats && typeof stats.duplicateNames === 'number' && stats.duplicateNames > 0) {
+    lines.push(
+      `${stats.duplicateNames} duplicate class names across packages — resolution prefers the referring file's package`
+    );
+  }
   if (stats && stats.capped) {
-    lines.push('Result capped -- not every caller could be expanded.');
+    const cappedNoun = (treeResult && treeResult.direction) === 'callees' ? 'callee' : 'caller';
+    lines.push(`Result capped -- not every ${cappedNoun} could be expanded.`);
   }
   const unresolved = stats && stats.unresolvedSites;
   if (typeof unresolved === 'number' && unresolved > 0) {
@@ -805,11 +962,24 @@ function headerExtraLinesForResult(treeResult) {
 function renderPathMapHtml(treeResult, opts) {
   const options = opts || {};
   const root = treeResult && treeResult.root;
+  const direction = treeResult && treeResult.direction;
   const layout = root
-    ? layoutTree(root)
-    : { nodes: [], edges: [], width: LAYOUT.marginX * 2, height: LAYOUT.marginY * 2, maxDepth: 0 };
+    ? layoutTree(root, direction)
+    : {
+        nodes: [],
+        edges: [],
+        width: LAYOUT.marginX * 2,
+        height: LAYOUT.marginY * 2,
+        maxDepth: 0,
+        mirrored: direction === 'callees',
+      };
 
-  const nodesOut = layout.nodes.map(shapeNodeForData);
+  // v0.7 (B3): the traced target is `root` regardless of direction (see
+  // this file's header note -- buildCalleeTree's root is the traced method
+  // too, only its `children` mean something different), so `root.package`
+  // is unambiguously "the target's package" either way.
+  const targetPackage = (root && root.package) || null;
+  const nodesOut = layout.nodes.map((rec) => shapeNodeForData(rec, targetPackage));
   const edgesOut = layout.edges.map(shapeEdgeForData);
 
   const data = {
@@ -817,6 +987,13 @@ function renderPathMapHtml(treeResult, opts) {
       targetLabel: (treeResult && treeResult.targetLabel) || '',
       note: (treeResult && treeResult.note) || null,
       headerExtra: headerExtraLinesForResult(treeResult),
+      // v0.7 (A3): both fields are additive-only and null whenever
+      // `direction` is absent -- see directionHeaderLine's interpretive-
+      // decision comment for why that specific case must stay exactly
+      // "today" (this is the literal mechanism behind the pinned
+      // "callers-direction render is byte-identical to today" bar).
+      direction: direction || null,
+      directionLabel: directionHeaderLine(direction),
       nodeCount: nodesOut.length,
       edgeCount: edgesOut.length,
     },
@@ -825,6 +1002,10 @@ function renderPathMapHtml(treeResult, opts) {
       height: layout.height,
       nodeWidth: LAYOUT.nodeWidth,
       nodeHeight: LAYOUT.nodeHeight,
+      // v0.7 (A3): read by CLIENT_JS_TEXT's edgePath to flip which side of
+      // an edge is treated as visually-left vs visually-right; false for
+      // every direction except 'callees' (see layoutTree's own comment).
+      mirrored: !!layout.mirrored,
     },
     nodes: nodesOut,
     edges: edgesOut,
@@ -845,6 +1026,7 @@ function renderPathMapHtml(treeResult, opts) {
     '</head>\n' +
     '<body>\n' +
     '<header id="pm-header">\n' +
+    '  <div id="pm-direction"></div>\n' +
     '  <div id="pm-title"></div>\n' +
     '  <div id="pm-stats"></div>\n' +
     '  <div id="pm-note"></div>\n' +
@@ -875,5 +1057,7 @@ module.exports = {
   accentKind,
   layoutTree,
   isRootNode,
+  packageBadge,
+  directionHeaderLine,
   headerExtraLinesForResult,
 };

@@ -233,4 +233,223 @@ const { refineTargets } = require('./targets');
   assert.strictEqual(trig.methodLower, null, 'trigger collision must resolve to the class-level entry');
 }
 
+// ===========================================================================
+// v0.7 / B3: duplicate-name package-label suffixing.
+//
+// Fixtures below hand-build the shape resolver.js's suggestTargets() is
+// expected to produce ONCE it lands B2's duplicate-name buckets + packageOf
+// plumbing: an optional `package` field (string | null) alongside the
+// pre-existing { label, classLower, methodLower }. Package names mirror the
+// v0.7 adv-org corpus fixture (MANIFEST.md's "## v0.7 ground-truth edges"):
+// `force-app` (default package, label falls back to the path segment since
+// it declares no `package` field of its own), `nova-billing` (pkg-billing),
+// `nova-shared` (pkg-shared) -- and the corpus's own duplicate pair names,
+// `AcmeOrderUtil` (force-app + pkg-billing) and `NovaBillingUtil`
+// (pkg-billing + pkg-shared).
+// ===========================================================================
+
+// 14. Backward compatibility: an item with NO `package` property at all
+//     (today's shape, and every fixture above) produces an output item with
+//     no `package` key either -- exact 3-key shape, unaffected by the B3
+//     machinery being present in the module.
+{
+  const input = [{ label: 'AcmeDiscountUtil', classLower: 'acmediscountutil', methodLower: null }];
+  const out = refineTargets(input);
+  assert.deepStrictEqual(out, [{ label: 'AcmeDiscountUtil', classLower: 'acmediscountutil', methodLower: null }]);
+  assert.ok(!('package' in out[0]), 'no package key when the source item never had one');
+}
+
+// 15. A single-package class (every entry under one classLower carries the
+//     SAME package) is left alone: no suffix, even though `package` IS
+//     present and threaded through onto the output item ("ONLY for
+//     duplicated names").
+{
+  const input = [
+    { label: 'AcmeOrderService', classLower: 'acmeorderservice', methodLower: null, package: 'force-app' },
+    {
+      label: 'AcmeOrderService.processOrders',
+      classLower: 'acmeorderservice',
+      methodLower: 'processorders',
+      package: 'force-app',
+    },
+  ];
+  const out = refineTargets(input);
+  assert.strictEqual(out.length, 2);
+  assert.ok(
+    out.every((o) => o.label === 'AcmeOrderService' || o.label === 'AcmeOrderService.processOrders'),
+    'no non-duplicated class ever gets a package suffix'
+  );
+  assert.ok(
+    out.every((o) => o.package === 'force-app'),
+    'package field is still threaded through even when not duplicated'
+  );
+}
+
+// 16. Genuine duplicate: two DIFFERENT real classes share the same
+//     classLower/qualified name ('AcmeOrderUtil') across two packages.
+//     Their class-level entries would otherwise be an EXACT (classLower,
+//     label) collision -- rule 3's dedupe must not merge them, and both
+//     must come out suffixed with their own package.
+{
+  const input = [
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: 'force-app' },
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: 'nova-billing' },
+  ];
+  const out = refineTargets(input);
+  assert.strictEqual(out.length, 2, 'both duplicate-name candidates must survive, not collapse');
+  const labels = out.map((o) => o.label).sort();
+  assert.deepStrictEqual(labels, ['AcmeOrderUtil (force-app)', 'AcmeOrderUtil (nova-billing)']);
+  assert.ok(out.every((o) => o.classLower === 'acmeorderutil'));
+}
+
+// 17. Full duplicate-pair shape mirroring the adv-org corpus:
+//     force-app's AcmeOrderUtil declares normalize/markApproved/buildQuery,
+//     pkg-billing's (unrelated) AcmeOrderUtil declares
+//     reconcileBillingStatus/applyLateFee. The class-level rows collide and
+//     must be suffixed; the deliberate design choice (see targets.js's
+//     header comment) is that EVERY entry under the duplicated classLower
+//     gets suffixed too, even method-level rows whose own label never
+//     collided with anything (e.g. '.normalize' vs '.reconcileBillingStatus')
+//     -- because the underlying class identity is still ambiguous without
+//     package context, and it keeps the whole duplicated group visually
+//     consistent in the QuickPick.
+{
+  const input = [
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: 'force-app' },
+    { label: 'AcmeOrderUtil.normalize', classLower: 'acmeorderutil', methodLower: 'normalize', package: 'force-app' },
+    {
+      label: 'AcmeOrderUtil.markApproved',
+      classLower: 'acmeorderutil',
+      methodLower: 'markapproved',
+      package: 'force-app',
+    },
+    { label: 'AcmeOrderUtil.buildQuery', classLower: 'acmeorderutil', methodLower: 'buildquery', package: 'force-app' },
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: 'nova-billing' },
+    {
+      label: 'AcmeOrderUtil.reconcileBillingStatus',
+      classLower: 'acmeorderutil',
+      methodLower: 'reconcilebillingstatus',
+      package: 'nova-billing',
+    },
+    {
+      label: 'AcmeOrderUtil.applyLateFee',
+      classLower: 'acmeorderutil',
+      methodLower: 'applylatefee',
+      package: 'nova-billing',
+    },
+  ];
+  const out = refineTargets(input);
+  assert.strictEqual(out.length, 7, 'no entry lost -- every distinct (class,method,package) triple survives');
+  const labels = out.map((o) => o.label).sort();
+  assert.deepStrictEqual(labels, [
+    'AcmeOrderUtil (force-app)',
+    'AcmeOrderUtil (nova-billing)',
+    'AcmeOrderUtil.applyLateFee (nova-billing)',
+    'AcmeOrderUtil.buildQuery (force-app)',
+    'AcmeOrderUtil.markApproved (force-app)',
+    'AcmeOrderUtil.normalize (force-app)',
+    'AcmeOrderUtil.reconcileBillingStatus (nova-billing)',
+  ]);
+  assert.ok(out.every((o) => o.classLower === 'acmeorderutil'));
+  assert.deepStrictEqual(
+    out.map((o) => o.label).slice().sort(),
+    out.map((o) => o.label),
+    'output must still be fully label-sorted after suffixing'
+  );
+}
+
+// 18. Second corpus duplicate pair, 'NovaBillingUtil' (pkg-billing +
+//     pkg-shared) -- confirms the suffixing logic isn't hard-coded to one
+//     pair name, and that two INDEPENDENT duplicate groups in the same
+//     refineTargets() call are each suffixed correctly without cross-talk.
+{
+  const input = [
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: 'force-app' },
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: 'nova-billing' },
+    { label: 'NovaBillingUtil', classLower: 'novabillingutil', methodLower: null, package: 'nova-billing' },
+    { label: 'NovaBillingUtil', classLower: 'novabillingutil', methodLower: null, package: 'nova-shared' },
+    {
+      label: 'NovaBillingUtil.auditPricingSync',
+      classLower: 'novabillingutil',
+      methodLower: 'auditpricingsync',
+      package: 'nova-billing',
+    },
+    {
+      label: 'NovaBillingUtil.auditPricingSync',
+      classLower: 'novabillingutil',
+      methodLower: 'auditpricingsync',
+      package: 'nova-shared',
+    },
+  ];
+  const out = refineTargets(input);
+  const labels = out.map((o) => o.label).sort();
+  assert.deepStrictEqual(labels, [
+    'AcmeOrderUtil (force-app)',
+    'AcmeOrderUtil (nova-billing)',
+    'NovaBillingUtil (nova-billing)',
+    'NovaBillingUtil (nova-shared)',
+    'NovaBillingUtil.auditPricingSync (nova-billing)',
+    'NovaBillingUtil.auditPricingSync (nova-shared)',
+  ]);
+}
+
+// 19. Null/empty package, mixed with a real one, still distinguishes the
+//     group via a '(no package)' fallback suffix rather than crashing or
+//     silently merging the two.
+{
+  const input = [
+    { label: 'Orphan', classLower: 'orphan', methodLower: null, package: null },
+    { label: 'Orphan', classLower: 'orphan', methodLower: null, package: 'nova-shared' },
+  ];
+  const out = refineTargets(input);
+  const labels = out.map((o) => o.label).sort();
+  assert.deepStrictEqual(labels, ['Orphan (no package)', 'Orphan (nova-shared)'].sort());
+}
+
+// 20. Same-package trigger-collision dedupe (existing rule 3 behavior, test
+//     6 above) is unaffected by the package field being present: a
+//     class-level entry and its '(trigger)' pseudo-method sibling IN THE
+//     SAME PACKAGE still collapse to one, exactly as before.
+{
+  const input = [
+    { label: 'AcmeOrderTrigger', classLower: 'acmeordertrigger', methodLower: null, package: 'force-app' },
+    { label: 'AcmeOrderTrigger', classLower: 'acmeordertrigger', methodLower: '(trigger)', package: 'force-app' },
+  ];
+  const out = refineTargets(input);
+  assert.strictEqual(out.length, 1, 'same-package trigger collision must still collapse');
+  assert.strictEqual(out[0].label, 'AcmeOrderTrigger', 'a non-duplicated (single-package) name is never suffixed');
+  assert.strictEqual(out[0].package, 'force-app');
+}
+
+// 21. Idempotency: re-applying refineTargets() to its own package-suffixed
+//     output must not double-append the suffix (mirrors test 12's
+//     constructor-relabeling idempotency check).
+{
+  const input = [
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: 'force-app' },
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: 'nova-billing' },
+  ];
+  const once = refineTargets(input);
+  const twice = refineTargets(once);
+  assert.deepStrictEqual(twice, once, 'refineTargets must be idempotent when re-applied to its own suffixed output');
+  assert.ok(
+    !twice.some((o) => /\([^()]*\)\s*\([^()]*\)$/.test(o.label)),
+    'must never double-suffix a package label'
+  );
+}
+
+// 22. Defensive: a non-string `package` value (e.g. a stray number) is
+//     treated as null-ish (falls back to the 'no package' bucket) rather
+//     than throwing or producing a garbled label.
+{
+  const input = [
+    { label: 'Weird', classLower: 'weird', methodLower: null, package: 42 },
+    { label: 'Weird', classLower: 'weird', methodLower: null, package: 'nova-shared' },
+  ];
+  assert.doesNotThrow(() => refineTargets(input));
+  const out = refineTargets(input);
+  const labels = out.map((o) => o.label).sort();
+  assert.deepStrictEqual(labels, ['Weird (no package)', 'Weird (nova-shared)'].sort());
+}
+
 console.log('apex-trace targets.js self-check: all assertions passed');

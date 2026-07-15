@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0
+
+Both directions, and multi-package truth.
+
+- **Forward tracing** — new command **"What Does This Call?"** (plus a direction
+  toggle on the Callers view): trace what a method *sets off*, downstream. The
+  transaction story works forward too — an `update orders;` statement flows into the
+  object's triggers and record-triggered Flows; async scheduling flows into the job's
+  `execute`; `throw` statements end at the exception class; and every method shows an
+  honest aggregated "N unresolved sites" leaf instead of hiding what static analysis
+  can't follow. The Path Map mirrors accordingly (target left, callees flowing right).
+- **Tree orientation toggle** — prefer entry points at the top, flowing *down* into
+  your target in execution order? Toggle **entry-first** orientation on the Callers
+  view (the default stays the classic stack-trace style; your choice is remembered
+  per workspace).
+- **Multi-package awareness** — `sfdx-project.json` package directories are read;
+  duplicate class names across packages are no longer silently dropped: resolution
+  prefers the referring file's package, then the default package, and genuinely
+  ambiguous references fan out to all candidates marked `~ ambiguous`. Nodes from a
+  different package than your target carry a package badge, and the picker labels
+  duplicated names with their package.
+- Workspaces without `sfdx-project.json` behave exactly as before — verified
+  bit-identical, as is the existing callers-direction output.
+
 ## 0.6.0
 
 Hardening round, driven by two independent principal-level reviews.

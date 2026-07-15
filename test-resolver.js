@@ -7,7 +7,7 @@
 // must-cover behaviors from the task brief (see the section markers below).
 
 const assert = require('assert');
-const { buildSemanticIndex, buildCallerTree, suggestTargets, attachMetaCallers } = require('./resolver');
+const { buildSemanticIndex, buildCallerTree, buildCalleeTree, suggestTargets, attachMetaCallers } = require('./resolver');
 
 // ---- fixture builders (mirror the frozen contract's field names exactly) --
 
@@ -2872,5 +2872,604 @@ const indexH1 = buildSemanticIndex([mkFile(H1P), mkFile(H1Q), mkFile(H1R), mkFil
   assert.ok(treeWFan.stats.nodes < 5000, `H1 perf probe (functional): W=7/depth-12 fan-in must produce well under 5000 nodes via DAG memoization, got ${treeWFan.stats.nodes}`);
   assert.strictEqual(treeWFan.stats.capped, false, 'the W=7/depth-12 probe must not need the maxNodes cap at all -- memoization alone keeps it small');
 }
+
+// =========================================================================
+// v0.7 A1/A2: forward tracing (buildCalleeTree) -- "what does this call?"
+// =========================================================================
+// Every fixture below is NEW (a "W7" prefix keeps it out of every earlier
+// section's namespace); nothing above this line is touched, per the task's
+// "keep every existing assert unchanged" instruction.
+
+// ---- W7 fixture workspace: one caller method exercising every A1 forward
+// edge kind in a single body (call/dml/publish/async/throw/unresolved) -----
+
+const W7Target = ty('W7Target', 'W7Target', {
+  methods: [mth('doStatic', { line: 1, isStatic: true })],
+});
+
+const W7Job = ty('W7Job', 'W7Job', {
+  methods: [mth('execute', { line: 1 })],
+});
+
+// Per isExceptionTargetClass's fallback rule (no extends chain, name ends
+// 'Exception'), this is recognized as an exception target with no need for
+// a hand-built extends-'Exception' chain.
+const W7BoomException = ty('W7BoomException', 'W7BoomException', { methods: [] });
+
+const W7Notifiable = ty('W7Notifiable', 'W7Notifiable', {
+  isInterface: true,
+  methods: [mth('notify', { line: 1, params: [{ name: 'msg', type: 'String' }] })],
+});
+const W7EmailNotifier = ty('W7EmailNotifier', 'W7EmailNotifier', {
+  implementsTypes: ['W7Notifiable'],
+  methods: [mth('notify', { line: 5, params: [{ name: 'msg', type: 'String' }] })],
+});
+const W7SmsNotifier = ty('W7SmsNotifier', 'W7SmsNotifier', {
+  implementsTypes: ['W7Notifiable'],
+  methods: [mth('notify', { line: 5, params: [{ name: 'msg', type: 'String' }] })],
+});
+
+const W7AccountTriggerType = ty('W7AccountTrigger', 'W7AccountTrigger', {
+  methods: [mth('(trigger)', { line: 1 })],
+});
+const W7AccountTriggerFile = file(PT('W7AccountTrigger'), 'trigger', [W7AccountTriggerType], {
+  triggerInfo: { object: 'W7_Account__c', events: ['before insert', 'after insert'] },
+});
+
+const W7NoteTriggerType = ty('W7NoteTrigger', 'W7NoteTrigger', {
+  methods: [mth('(trigger)', { line: 1 })],
+});
+const W7NoteTriggerFile = file(PT('W7NoteTrigger'), 'trigger', [W7NoteTriggerType], {
+  triggerInfo: { object: 'W7_Note__e', events: ['after insert'] },
+});
+
+const W7Caller = ty('W7Caller', 'W7Caller', {
+  methods: [
+    mth('entry', {
+      line: 1,
+      locals: [
+        { name: 'acct', type: 'W7_Account__c', line: 1 },
+        { name: 'notifier', type: 'W7Notifiable', line: 1 },
+      ],
+      calls: [
+        cl('dot', 'doStatic', { receiver: 'W7Target', line: 2, lineText: 'W7Target.doStatic();' }),
+        cl('new', 'W7Target', { line: 3, lineText: 'new W7Target();' }),
+        cl('dot', 'publish', { receiver: 'EventBus', argTexts: ['new W7_Note__e()'], line: 4, lineText: 'EventBus.publish(new W7_Note__e());' }),
+        cl('dot', 'enqueueJob', { receiver: 'System', argTexts: ['new W7Job()'], line: 5, lineText: 'System.enqueueJob(new W7Job());' }),
+        // G5's own dual-fact shape: the SAME line's inline `new W7Job()`
+        // argument is ALSO parsed as its own ordinary rule-1 CallFacts --
+        // A1/A3's forward-collapse rule (isNewSuppressedFromForward) must
+        // suppress this half so async-hop-forward shows exactly ONE child
+        // (via=async), not two.
+        cl('new', 'W7Job', { line: 5, lineText: 'System.enqueueJob(new W7Job());' }),
+        cl('dot', 'notify', { receiver: 'notifier', argTexts: ['"hi"'], line: 6, lineText: 'notifier.notify("hi");' }),
+        cl('dot', 'zzzW7Unresolved', { receiver: 'mystery', line: 7, lineText: 'mystery.zzzW7Unresolved();' }),
+      ],
+      dml: [dmlFact('insert', 'acct', { line: 8, lineText: 'insert acct;' })],
+      throwsSites: [throwSite({ typeName: 'W7BoomException', line: 9, lineText: "throw new W7BoomException('boom');" })],
+    }),
+  ],
+});
+// G2's own dual-fact shape for the throw statement: same collapse rule.
+W7Caller.methods[0].calls.push(cl('new', 'W7BoomException', { line: 9, lineText: "throw new W7BoomException('boom');" }));
+
+const factsListW7 = [
+  W7AccountTriggerFile,
+  W7NoteTriggerFile,
+  mkFile(W7Target),
+  mkFile(W7Job),
+  mkFile(W7BoomException),
+  mkFile(W7Notifiable),
+  mkFile(W7EmailNotifier),
+  mkFile(W7SmsNotifier),
+  mkFile(W7Caller),
+];
+const indexW7 = buildSemanticIndex(factsListW7);
+const metaRefsW7 = [
+  {
+    kind: 'flow',
+    label: 'W7AccountFlow',
+    className: 'W7Target', // arbitrary -- forward DML->flow linkage never consults className/methodName, only flowObject (see resolver.js's own attachMetaCallers comment)
+    methodName: null,
+    flowObject: 'W7_Account__c',
+    flowRecordTriggerType: 'Create',
+    flowTriggerType: 'RecordAfterSave',
+    path: 'flows/W7AccountFlow.flow-meta.xml',
+    line: 1,
+    lineText: '<object>W7_Account__c</object>',
+  },
+  {
+    kind: 'flow',
+    label: 'W7NoteFlow',
+    className: 'W7Target',
+    methodName: null,
+    flowObject: 'W7_Note__e',
+    flowRecordTriggerType: null,
+    flowTriggerType: 'PlatformEvent',
+    path: 'flows/W7NoteFlow.flow-meta.xml',
+    line: 1,
+    lineText: '<object>W7_Note__e</object>',
+  },
+];
+attachMetaCallers(indexW7, metaRefsW7);
+
+// ---- A1/A2: forward semantics per edge kind --------------------------------
+{
+  const tree = buildCalleeTree(indexW7, { classLower: 'w7caller', methodLower: 'entry' });
+  assert.strictEqual(tree.direction, 'callees', 'buildCalleeTree TreeResult.direction must be "callees"');
+  const kids = tree.root.children;
+
+  const staticChild = findChild(kids, 'W7Target.doStatic');
+  assert.ok(staticChild, 'call/static: forward child for the static dispatch must exist');
+  assert.strictEqual(staticChild.via, 'static');
+  assert.strictEqual(staticChild.kind, 'method');
+  assert.strictEqual(staticChild.approximate, false);
+
+  const ctorChild = findChild(kids, 'W7Target.<init>');
+  assert.ok(ctorChild, "call/new: forward child for 'new W7Target()' must exist");
+  assert.strictEqual(ctorChild.via, 'new');
+
+  const trig = findChild(kids, 'W7AccountTrigger');
+  assert.ok(trig, 'dml->trigger: the insert DML site must forward to the matching trigger');
+  assert.strictEqual(trig.via, 'dml');
+  assert.strictEqual(trig.kind, 'trigger');
+  assert.strictEqual(trig.approximate, false, "via='dml' must not be approximate -- the trigger genuinely fires");
+
+  const flow = findChild(kids, 'W7AccountFlow');
+  assert.ok(flow, 'dml->flow: the SAME insert DML site must ALSO forward to the matching record-triggered flow');
+  assert.strictEqual(flow.via, 'dml');
+  assert.strictEqual(flow.kind, 'flow');
+  assert.strictEqual(flow.truncated, true, 'A2: a record-triggered flow node is TERMINAL in the forward direction');
+  assert.deepStrictEqual(flow.children, [], 'a terminal flow node must have no children');
+
+  const pubTrig = findChild(kids, 'W7NoteTrigger');
+  assert.ok(pubTrig, 'publish->trigger: EventBus.publish on a __e object must forward to its trigger');
+  assert.strictEqual(pubTrig.via, 'publish');
+  assert.strictEqual(pubTrig.kind, 'trigger');
+
+  const pubFlow = findChild(kids, 'W7NoteFlow');
+  assert.ok(pubFlow, 'publish->flow: the SAME publish site must ALSO forward to the matching platform-event flow');
+  assert.strictEqual(pubFlow.via, 'publish');
+  assert.strictEqual(pubFlow.kind, 'flow');
+  assert.strictEqual(pubFlow.truncated, true, 'A4: a platform-event flow node is TERMINAL in the forward direction');
+
+  const asyncChild = findChild(kids, 'W7Job.execute');
+  assert.ok(asyncChild, 'async: System.enqueueJob(new W7Job()) must forward to the job\'s execute() method');
+  assert.strictEqual(asyncChild.via, 'async');
+  assert.ok(!findChild(kids, 'W7Job.<init>'), 'G5 forward-collapse: the inline `new W7Job()` argument must NOT ALSO appear as a separate <init> child');
+
+  const excChild = findChild(kids, 'W7BoomException');
+  assert.ok(excChild, 'throw: the throw statement must forward to the exception class');
+  assert.strictEqual(excChild.via, 'throws');
+  assert.strictEqual(excChild.kind, 'exception');
+  assert.strictEqual(excChild.truncated, true, 'A3: an exception-class node is TERMINAL in the forward direction');
+  assert.strictEqual(excChild.approximate, false, "via='throws' must not be approximate -- not in APPROX_VIA, matches MANIFEST A3 (the exception-class node line carries no 'approximate' tag, unlike the interface/unresolved lines beside it)");
+  assert.deepStrictEqual(excChild.children, [], 'a terminal exception node must have no children');
+  assert.ok(!findChild(kids, 'W7BoomException.<init>'), 'G2 forward-collapse: the throw statement\'s own `new W7BoomException(...)` must NOT ALSO appear as a separate <init> child');
+
+  const ifaceChild = findChild(kids, 'W7Notifiable.notify');
+  assert.ok(ifaceChild, 'interface: a call through an interface-typed receiver forwards to the INTERFACE method itself');
+  assert.strictEqual(ifaceChild.via, 'interface');
+  assert.strictEqual(ifaceChild.approximate, true);
+  assert.ok(!findChild(kids, 'W7EmailNotifier.notify') && !findChild(kids, 'W7SmsNotifier.notify'), 'A5: the call SITE collapses onto the interface method node only -- implementer fan-out is the INTERFACE method\'s own forward children (see the next block), not this call site\'s');
+
+  const unresolved = kids.find((k) => k.kind === 'unresolved');
+  assert.ok(unresolved, 'unresolved-aggregate: the one genuinely-unresolved dot-call (mystery.zzzW7Unresolved()) must produce an aggregated leaf');
+  assert.strictEqual(unresolved.label, '1 unresolved site');
+  assert.strictEqual(unresolved.truncated, true, 'the unresolved-aggregate leaf is terminal');
+  assert.strictEqual(unresolved.approximate, true);
+  assert.deepStrictEqual(unresolved.children, []);
+
+  // A5 (continued): forward-tracing the INTERFACE method itself fans out to
+  // every implementer -- the relationship the call site above deliberately
+  // deferred.
+  const ifaceTree = buildCalleeTree(indexW7, { classLower: 'w7notifiable', methodLower: 'notify' });
+  const ifaceKids = ifaceTree.root.children;
+  assert.ok(findChild(ifaceKids, 'W7EmailNotifier.notify'), 'A5: AcmeNotifiable#notify\'s own forward children fan out to every implementer (W7EmailNotifier)');
+  assert.ok(findChild(ifaceKids, 'W7SmsNotifier.notify'), 'A5: ...and W7SmsNotifier');
+  for (const k of ifaceKids) {
+    assert.strictEqual(k.via, 'interface');
+    assert.strictEqual(k.approximate, true);
+  }
+}
+
+// ---- direction field --------------------------------------------------
+{
+  const calleeTree = buildCalleeTree(indexW7, { classLower: 'w7caller', methodLower: 'entry' });
+  assert.strictEqual(calleeTree.direction, 'callees');
+  const callerTree = buildCallerTree(indexW7, { classLower: 'w7target', methodLower: 'dostatic' });
+  assert.strictEqual(callerTree.direction, 'callers', 'buildCallerTree TreeResult.direction must be "callers"');
+  // not-found shells carry direction too (both are additive fields; see
+  // resolver.js's own comment on each not-found branch).
+  const missingCallee = buildCalleeTree(indexW7, { classLower: 'nope', methodLower: 'x' });
+  assert.strictEqual(missingCallee.direction, 'callees');
+  const missingCaller = buildCallerTree(indexW7, { classLower: 'nope', methodLower: 'x' });
+  assert.strictEqual(missingCaller.direction, 'callers');
+}
+
+// ---- forward cycles + seenElsewhere + cap (mirrors the existing H1 tests'
+// exact P/Q/R/S shape, edges reversed since callees pairs are OUTBOUND:
+// W7CycP calls BOTH W7CycQ and W7CycR directly; both Q and R call W7CycS;
+// S calls back to Q, which IS an ancestor on the P->Q->S->Q branch (cyclic)
+// but NOT on the P->R->S->Q branch's own ancestor path the first time S is
+// reached from Q -- S's SECOND occurrence (under R) is what exercises
+// seenElsewhere, exactly mirroring H1's own P/Q/R/S fixture one level
+// removed in the opposite direction) -----------------------------------
+{
+  const W7CycQ = ty('W7CycQ', 'W7CycQ', {
+    methods: [mth('m', { line: 1, calls: [cl('dot', 'm', { receiver: 'W7CycS', line: 1, lineText: 'W7CycS.m();' })] })],
+  });
+  const W7CycR = ty('W7CycR', 'W7CycR', {
+    methods: [mth('m', { line: 1, calls: [cl('dot', 'm', { receiver: 'W7CycS', line: 1, lineText: 'W7CycS.m();' })] })],
+  });
+  const W7CycS = ty('W7CycS', 'W7CycS', {
+    methods: [mth('m', { line: 1, calls: [cl('dot', 'm', { receiver: 'W7CycQ', line: 1, lineText: 'W7CycQ.m();' })] })],
+  });
+  const W7CycP = ty('W7CycP', 'W7CycP', {
+    methods: [
+      mth('m', {
+        line: 1,
+        calls: [
+          cl('dot', 'm', { receiver: 'W7CycQ', line: 1, lineText: 'W7CycQ.m();' }),
+          cl('dot', 'm', { receiver: 'W7CycR', line: 2, lineText: 'W7CycR.m();' }),
+        ],
+      }),
+    ],
+  });
+  const indexCyc = buildSemanticIndex([mkFile(W7CycP), mkFile(W7CycQ), mkFile(W7CycR), mkFile(W7CycS)]);
+  const tree = buildCalleeTree(indexCyc, { classLower: 'w7cycp', methodLower: 'm' });
+  const qNode = findChild(tree.root.children, 'W7CycQ.m');
+  const rNode = findChild(tree.root.children, 'W7CycR.m');
+  assert.ok(qNode && rNode, 'forward: both W7CycQ.m and W7CycR.m must be direct callees of W7CycP.m');
+  assert.strictEqual(qNode.seenElsewhere, false, 'forward: W7CycQ.m (first occurrence) must expand normally');
+
+  const sUnderQ = findChild(qNode.children, 'W7CycS.m');
+  assert.ok(sUnderQ, 'forward: W7CycS.m must appear as W7CycQ.m\'s callee');
+  assert.strictEqual(sUnderQ.seenElsewhere, false, "forward: W7CycS.m's FIRST occurrence (under W7CycQ) must expand normally");
+  assert.strictEqual(sUnderQ.children.length, 1, "forward: W7CycS.m's own subtree (its callee W7CycQ.m, cyclic) must still be built on its first, expanding occurrence");
+
+  const qUnderS = findChild(sUnderQ.children, 'W7CycQ.m');
+  assert.ok(qUnderS, 'forward cycle: W7CycQ must reappear one level under W7CycS (P -> Q -> S -> Q)');
+  assert.strictEqual(qUnderS.cyclic, true, 'forward: cyclic flag must be set when the identity is already on the ancestor path');
+  assert.deepStrictEqual(qUnderS.children, []);
+
+  const sUnderR = findChild(rNode.children, 'W7CycS.m');
+  assert.ok(sUnderR, 'forward: W7CycS.m must ALSO appear as W7CycR.m\'s callee (R -> S, a second edge to an already-expanded identity)');
+  assert.strictEqual(sUnderR.seenElsewhere, true, 'forward: a second occurrence of an already-expanded identity must be seenElsewhere, not re-walked');
+  assert.strictEqual(sUnderR.cyclic, false, 'seenElsewhere is not cyclic -- W7CycS is not W7CycR\'s own ancestor');
+  assert.deepStrictEqual(sUnderR.children, [], 'a seenElsewhere node\'s subtree must not be re-materialized');
+
+  // maxNodes cap, forward direction: a non-repeating fan-out chain (every
+  // identity distinct) so the cap itself is what stops expansion.
+  const capFactsFwd = [];
+  const namesFwd = [];
+  for (let i = 0; i < 30; i++) namesFwd.push(`W7Cap${i}`);
+  for (let i = 0; i < namesFwd.length; i++) {
+    const calls = i < namesFwd.length - 1 ? [cl('dot', 'm', { receiver: namesFwd[i + 1], line: 1, lineText: `${namesFwd[i + 1]}.m();` })] : [];
+    capFactsFwd.push(mkFile(ty(namesFwd[i], namesFwd[i], { methods: [mth('m', { line: 1, calls })] })));
+  }
+  const indexCapFwd = buildSemanticIndex(capFactsFwd);
+  const treeCappedFwd = buildCalleeTree(indexCapFwd, { classLower: namesFwd[0].toLowerCase(), methodLower: 'm' }, { maxDepth: 100, maxNodes: 10 });
+  assert.strictEqual(treeCappedFwd.stats.capped, true, 'forward: exceeding maxNodes must set stats.capped = true');
+  assert.strictEqual(treeCappedFwd.stats.nodes, 10, 'forward: node creation must stop AT maxNodes');
+  const treeUncappedFwd = buildCalleeTree(indexCapFwd, { classLower: namesFwd[0].toLowerCase(), methodLower: 'm' }, { maxDepth: 100, maxNodes: 2000 });
+  assert.strictEqual(treeUncappedFwd.stats.capped, false);
+  assert.strictEqual(treeUncappedFwd.stats.nodes, namesFwd.length, 'forward: the uncapped trace must show every one of the 30 distinct callees');
+}
+
+// =========================================================================
+// v0.7 B2: multi-package awareness (duplicate-name bucket resolution)
+// =========================================================================
+
+// Three packages: 'pkgA' (default), 'pkgB', 'pkgC'. 'W7Dup' is declared in
+// ALL THREE (the qualified-name collision fixture); 'W7OnlyB' exists only
+// in pkgB (an ordinary, non-duplicated name, used for the default-package-
+// fallback case: a pkgC caller referencing a name that exists in NEITHER
+// its own package NOR the default falls through to... nothing here, since
+// W7OnlyB isn't duplicated at all -- see the dedicated default-fallback
+// fixture below for the real B2 rule-2 case).
+const W7DupA = ty('W7Dup', 'W7Dup', { methods: [mth('identify', { line: 1 })] });
+const W7DupB = ty('W7Dup', 'W7Dup', { methods: [mth('identify', { line: 1 })] });
+const W7DupC = ty('W7Dup', 'W7Dup', { methods: [mth('identify', { line: 1 })] });
+
+const W7SamePkgCaller = ty('W7SamePkgCaller', 'W7SamePkgCaller', {
+  methods: [mth('go', { line: 1, calls: [cl('dot', 'identify', { receiver: 'W7Dup', line: 1, lineText: 'W7Dup.identify();' })] })],
+});
+const W7DefaultFallbackCaller = ty('W7DefaultFallbackCaller', 'W7DefaultFallbackCaller', {
+  methods: [mth('go', { line: 1, calls: [cl('dot', 'identify', { receiver: 'W7Dup', line: 1, lineText: 'W7Dup.identify();' })] })],
+});
+const W7AmbiguousCaller = ty('W7AmbiguousCaller', 'W7AmbiguousCaller', {
+  methods: [mth('go', { line: 1, calls: [cl('dot', 'identify', { receiver: 'W7Dup', line: 1, lineText: 'W7Dup.identify();' })] })],
+});
+
+// Files, mapped to packages purely by PATH PREFIX (mirrors how a real
+// extension.js would derive opts.packageOf from sfdx-project.json's
+// packageDirectories -- resolver.js itself never parses paths for this,
+// see buildSemanticIndex's own header note on the opts contract).
+const w7DupAFile = file('/ws/pkgA/classes/W7Dup.cls', 'class', [W7DupA]);
+const w7DupBFile = file('/ws/pkgB/classes/W7Dup.cls', 'class', [W7DupB]);
+const w7DupCFile = file('/ws/pkgC/classes/W7Dup.cls', 'class', [W7DupC]);
+// B1: same-package preference -- caller lives in pkgB, same as one candidate.
+const w7SamePkgCallerFile = file('/ws/pkgB/classes/W7SamePkgCaller.cls', 'class', [W7SamePkgCaller]);
+// B2: default-package fallback -- caller lives in pkgD, a FOURTH package
+// that declares no W7Dup of its own at all (rule 1 must fail cleanly);
+// pkgA is the default package, so resolution falls through to it. (pkgC
+// deliberately does NOT work for this fixture -- W7Dup is duplicated
+// across all of pkgA/B/C, so a pkgC caller would hit rule 1 against its
+// OWN pkgC candidate first; see MANIFEST's own real-corpus note that
+// default-fallback and ambiguity require a referrer OUTSIDE every
+// candidate package.)
+const w7DefaultFallbackCallerFile = file('/ws/pkgD/classes/W7DefaultFallbackCaller.cls', 'class', [W7DefaultFallbackCaller]);
+
+function w7PackageOf(fsPath) {
+  const m = /\/ws\/(pkg[ABCD])\//.exec(fsPath || '');
+  return m ? m[1] : null;
+}
+const W7_DEFAULT_PACKAGE = 'pkgA';
+
+// ---- B1/B2: same-package preference + default-package fallback ------------
+{
+  const facts = [w7DupAFile, w7DupBFile, w7DupCFile, w7SamePkgCallerFile, w7DefaultFallbackCallerFile];
+  const index = buildSemanticIndex(facts, { packageOf: w7PackageOf, defaultPackage: W7_DEFAULT_PACKAGE });
+
+  assert.strictEqual(index.stats.duplicateNames, 1, 'B2: exactly ONE duplicated qualified name (W7Dup, in 3 buckets) when packageOf is active');
+  assert.deepStrictEqual(index.duplicates, ['W7Dup', 'W7Dup'], 'duplicates keeps the pre-existing flat name list (2 losers of the 3-way collision)');
+
+  const bucket = index.classBuckets.get('w7dup');
+  assert.strictEqual(bucket.length, 3, 'classBuckets must expose all 3 same-name candidates');
+  const bPkgEntry = bucket.find((b) => b.package === 'pkgB');
+  const aPkgEntry = bucket.find((b) => b.package === 'pkgA');
+
+  const treeSamePkg = buildCallerTree(index, { classLower: bPkgEntry.classLower, methodLower: 'identify' });
+  const samePkgCaller = findChild(treeSamePkg.root.children, 'W7SamePkgCaller.go');
+  assert.ok(samePkgCaller, 'B1: pkgB\'s own W7Dup.identify must be called by W7SamePkgCaller (same-package preference)');
+  assert.strictEqual(samePkgCaller.via, 'static');
+  const treeOtherPkg = buildCallerTree(index, { classLower: aPkgEntry.classLower, methodLower: 'identify' });
+  assert.ok(!findChild(treeOtherPkg.root.children, 'W7SamePkgCaller.go'), 'B1: pkgA\'s (default-package) W7Dup.identify must NOT ALSO be called by W7SamePkgCaller -- same-package wins outright, no fan-out to the default package too');
+
+  const treeDefault = buildCallerTree(index, { classLower: aPkgEntry.classLower, methodLower: 'identify' });
+  const defaultCaller = findChild(treeDefault.root.children, 'W7DefaultFallbackCaller.go');
+  assert.ok(defaultCaller, 'B2 rule 2: pkgC (no W7Dup of its own) falls through to the DEFAULT package (pkgA)');
+  assert.strictEqual(defaultCaller.via, 'static');
+  const cPkgEntry = bucket.find((b) => b.package === 'pkgC');
+  const treeNonDefault = buildCallerTree(index, { classLower: cPkgEntry.classLower, methodLower: 'identify' });
+  assert.ok(!findChild(treeNonDefault.root.children, 'W7DefaultFallbackCaller.go'), 'B2 rule 2: the non-default pkgC candidate must NOT be chosen instead');
+}
+
+// ---- B3: ambiguous fan-out (neither same-package nor default-package
+// preference can disambiguate -- caller lives in a THIRD package declaring
+// neither candidate, and the default package ALSO isn't one of the two
+// candidates) ---------------------------------------------------------------
+{
+  // W7Dup2 duplicated ONLY across pkgB/pkgC (NOT pkgA, the default) --
+  // exactly the shape B2's own spec requires for genuine ambiguity to be
+  // reachable at all (see resolver.js's classBuckets header note / the
+  // real corpus's own B3 fixture design note in MANIFEST.md).
+  const W7Dup2B = ty('W7Dup2', 'W7Dup2', { methods: [mth('identify', { line: 1 })] });
+  const W7Dup2C = ty('W7Dup2', 'W7Dup2', { methods: [mth('identify', { line: 1 })] });
+  const W7AmbigCaller2 = ty('W7AmbigCaller2', 'W7AmbigCaller2', {
+    methods: [mth('go', { line: 1, calls: [cl('dot', 'identify', { receiver: 'W7Dup2', line: 1, lineText: 'W7Dup2.identify();' })] })],
+  });
+  const facts = [
+    file('/ws/pkgB/classes/W7Dup2.cls', 'class', [W7Dup2B]),
+    file('/ws/pkgC/classes/W7Dup2.cls', 'class', [W7Dup2C]),
+    file('/ws/pkgA/classes/W7AmbigCaller2.cls', 'class', [W7AmbigCaller2]),
+  ];
+  const index = buildSemanticIndex(facts, { packageOf: w7PackageOf, defaultPackage: W7_DEFAULT_PACKAGE });
+  const bucket = index.classBuckets.get('w7dup2');
+  assert.strictEqual(bucket.length, 2);
+
+  const treeB = buildCallerTree(index, { classLower: bucket.find((b) => b.package === 'pkgB').classLower, methodLower: 'identify' });
+  const callerInB = findChild(treeB.root.children, 'W7AmbigCaller2.go');
+  assert.ok(callerInB, 'B3: the ambiguous call site must produce an edge to the pkgB candidate');
+  assert.strictEqual(callerInB.via, 'ambiguous');
+  assert.strictEqual(callerInB.approximate, true, "B3: via='ambiguous' must join the approximate set");
+
+  const treeC = buildCallerTree(index, { classLower: bucket.find((b) => b.package === 'pkgC').classLower, methodLower: 'identify' });
+  const callerInC = findChild(treeC.root.children, 'W7AmbigCaller2.go');
+  assert.ok(callerInC, 'B3: ...AND to the pkgC candidate, from the SAME call site (fan-out, not a single pick)');
+  assert.strictEqual(callerInC.via, 'ambiguous');
+
+  // Forward direction sees the same fan-out from the caller's own side.
+  const calleeTree = buildCalleeTree(index, { classLower: 'w7ambigcaller2', methodLower: 'go' });
+  const targets = calleeTree.root.children.map((c) => c.label).sort();
+  assert.deepStrictEqual(targets, ['W7Dup2.identify', 'W7Dup2.identify'].sort(), 'B3 forward: the ambiguous call site forwards to BOTH candidates too');
+  for (const c of calleeTree.root.children) {
+    assert.strictEqual(c.via, 'ambiguous');
+    assert.strictEqual(c.approximate, true);
+  }
+}
+
+// ---- B5: packageless identity -- opts absent must reproduce today's
+// first-wins-drop behavior EXACTLY (no bucket surfacing, no via='ambiguous',
+// stats.duplicateNames stays 0) even though the SAME 3-way name collision
+// is present in the fixture ---------------------------------------------
+{
+  const facts = [w7DupAFile, w7DupBFile, w7DupCFile, w7SamePkgCallerFile, w7DefaultFallbackCallerFile];
+  const index = buildSemanticIndex(facts); // no opts at all -- the pre-v0.7 call shape
+
+  assert.strictEqual(index.stats.duplicateNames, 0, 'B5: stats.duplicateNames must be 0 (not merely absent) when opts.packageOf is inactive, even with real duplicate names present');
+  assert.deepStrictEqual(index.duplicates, ['W7Dup', 'W7Dup'], 'the pre-existing flat duplicates list is unaffected either way');
+
+  // First-parsed file (w7DupAFile, pkgA) wins the plain 'w7dup' slot --
+  // identical to the documented pre-v0.7 collision policy.
+  const tree = buildCallerTree(index, { classLower: 'w7dup', methodLower: 'identify' });
+  const callers = tree.root.children.map((c) => c.label).sort();
+  assert.deepStrictEqual(
+    callers,
+    ['W7DefaultFallbackCaller.go', 'W7SamePkgCaller.go'],
+    'B5: BOTH callers resolve to the single first-wins W7Dup slot (pkgA) -- no package-based split, exactly today\'s behavior'
+  );
+  for (const c of tree.root.children) {
+    assert.strictEqual(c.via, 'static', "B5: via stays 'static' -- 'ambiguous' must never appear when packageOf is inactive");
+  }
+}
+
+// =========================================================================
+// MUST-FIX #5 regression: packageless-identity must hold for a LIVE
+// packageOf function that merely returns null for every path -- not just
+// when opts.packageOf is omitted entirely. This is byte-for-byte what
+// extension.js's discoverPackageMap() produces whenever a workspace has no
+// discoverable sfdx-project.json (see extension.js's scanAndBuildIndex,
+// which always passes `{ packageOf }`, never omits the key). Before this
+// fix, buildSemanticIndex gated ALL of B2's behavior on mere function
+// PRESENCE (`opts && typeof opts.packageOf === 'function'`), so this exact
+// shape wrongly turned on bucket surfacing / stats.duplicateNames /
+// via='ambiguous' edges even though packageOf never told it anything real.
+// =========================================================================
+{
+  const facts = [w7DupAFile, w7DupBFile, w7DupCFile, w7SamePkgCallerFile, w7DefaultFallbackCallerFile];
+  const indexOmitted = buildSemanticIndex(facts); // opts fully omitted
+  const indexLiveNullPackageOf = buildSemanticIndex(facts, { packageOf: () => null }); // MUST-FIX #5 shape
+
+  assert.strictEqual(
+    indexLiveNullPackageOf.stats.duplicateNames,
+    indexOmitted.stats.duplicateNames,
+    'MUST-FIX #5: a live packageOf that always returns null must produce the SAME stats.duplicateNames as opts omitted entirely (both 0), not merely "opts.packageOf is a function"'
+  );
+  assert.strictEqual(indexLiveNullPackageOf.stats.duplicateNames, 0, 'MUST-FIX #5: duplicateNames must be 0, not surfaced, when package metadata is never actually discovered');
+
+  const treeOmitted = buildCallerTree(indexOmitted, { classLower: 'w7dup', methodLower: 'identify' });
+  const treeLiveNullPackageOf = buildCallerTree(indexLiveNullPackageOf, { classLower: 'w7dup', methodLower: 'identify' });
+  const viasOmitted = treeOmitted.root.children.map((c) => c.via).sort();
+  const viasLiveNullPackageOf = treeLiveNullPackageOf.root.children.map((c) => c.via).sort();
+  assert.deepStrictEqual(viasLiveNullPackageOf, viasOmitted, 'MUST-FIX #5: via values must be byte-identical between opts-omitted and a live packageOf returning null for everything');
+  for (const v of viasLiveNullPackageOf) {
+    assert.strictEqual(v, 'static', "MUST-FIX #5: via must stay 'static' -- 'ambiguous' must never appear when packageOf never actually resolves a real label");
+  }
+}
+
+// =========================================================================
+// MUST-FIX #2/#3 regression: a method's forward children (methodCallees)
+// must be in TRUE SOURCE-LINE order even when the underlying facts come
+// from THREE separate MethodFacts arrays (calls/dml/throwsSites) processed
+// as three separate loops in buildSemanticIndex's pass B. Before this fix,
+// mf.calls[] was always flushed to methodCallees before mf.dml[], which was
+// always flushed before mf.throwsSites[], regardless of which one actually
+// sits earlier in the source -- reproduces MANIFEST v0.7 chains #3 (DML
+// before a later call) and #5 (throw before a later call).
+// =========================================================================
+{
+  // Mirrors AcmeOrderUtil.markApproved (MANIFEST v0.7 chain #3): a DML
+  // statement at an EARLIER line than an ordinary call, using the exact
+  // same object/trigger-resolution pattern the pre-existing W7 fixture
+  // above already proves works (local var typed 'W7_Account__c', a trigger
+  // registered on the same object) -- reused here so the DML statement
+  // actually produces a real forward child, not merely a no-op.
+  const W7OrdTarget = ty('W7OrdTarget', 'W7OrdTarget', { methods: [mth('doStatic', { line: 1, isStatic: true })] });
+  const W7OrdBoom = ty('W7OrdBoom', 'W7OrdBoom', { methods: [] }); // recognized as an exception target by its name alone (isExceptionTargetClass fallback)
+  const W7OrdMix = ty('W7OrdMix', 'W7OrdMix', {
+    methods: [
+      mth('orderedMix', {
+        line: 1,
+        locals: [{ name: 'acct', type: 'W7_Account__c', line: 1 }],
+        // Source order (true line numbers): DML (L5), throw (L6), call (L7)
+        // -- pass B's own internal loop order is calls[]/dml[]/throwsSites[]
+        // (the OPPOSITE order), so this fixture only passes once the
+        // post-loop sort (MUST-FIX #2/#3) is actually applied.
+        calls: [cl('dot', 'doStatic', { receiver: 'W7OrdTarget', line: 7, lineText: 'W7OrdTarget.doStatic();' })],
+        dml: [dmlFact('insert', 'acct', { line: 5, lineText: 'insert acct;' })],
+        throwsSites: [throwSite({ typeName: 'W7OrdBoom', line: 6, lineText: "throw new W7OrdBoom('x');" })],
+      }),
+    ],
+  });
+  const W7OrdTriggerType = ty('W7OrdTrigger', 'W7OrdTrigger', { methods: [mth('(trigger)', { line: 1 })] });
+  const W7OrdTriggerFile = file(PT('W7OrdTrigger'), 'trigger', [W7OrdTriggerType], {
+    triggerInfo: { object: 'W7_Account__c', events: ['before insert'] },
+  });
+  const facts = [mkFile(W7OrdTarget), mkFile(W7OrdBoom), mkFile(W7OrdMix), W7OrdTriggerFile];
+  const index = buildSemanticIndex(facts);
+  const tree = buildCalleeTree(index, { classLower: 'w7ordmix', methodLower: 'orderedmix' });
+  const order = tree.root.children.map((c) => ({ label: c.label, via: c.via }));
+  assert.deepStrictEqual(
+    order.map((c) => c.via),
+    ['dml', 'throws', 'static'],
+    `MUST-FIX #2/#3: forward children must be in TRUE SOURCE-LINE order (dml L5, throws L6, call L7) regardless of the calls[]/dml[]/throwsSites[] loop order pass B walks them in -- got ${JSON.stringify(order)}`
+  );
+  assert.strictEqual(order[0].label, 'W7OrdTrigger', 'MUST-FIX #2: the DML (L5, earliest) must be first -- reproduces MANIFEST v0.7 chain #3 (AcmeOrderUtil.markApproved: dml L22 before static call L23)');
+  assert.strictEqual(order[1].label, 'W7OrdBoom', 'MUST-FIX #3: the throw (L6) must be second, before the later ordinary call -- reproduces MANIFEST v0.7 chain #5 (AcmeOrderValidator.validate: throws L9 before checkStock call L16)');
+  assert.strictEqual(order[2].label, 'W7OrdTarget.doStatic', 'the ordinary call (L7, latest) must come last');
+}
+
+// =========================================================================
+// MUST-FIX #4 regression: forward interface fan-out order must follow each
+// implementer's earliest known construction site in the codebase (e.g. a
+// dispatcher's own `List<Iface>{ new A(), new B(), new C() }` literal), NOT
+// raw interfaceImplementers scan/registration order -- reproduces MANIFEST
+// v0.7 chain #8 (AcmeNotifiable#notify's fan-out must be Email/Sms/Base
+// -- the dispatchToAll list-literal order -- not the alphabetical
+// Email/Base(Slack)/Sms scan order the file layout would otherwise produce).
+// =========================================================================
+{
+  const W7Iface = ty('W7NotifIface', 'W7NotifIface', { isInterface: true, methods: [mth('notify', { line: 1 })] });
+  // Deliberately registered in ALPHABETICAL order (Alpha, Bravo, Charlie)
+  // so scan-order alone would already produce the "correct-looking" answer
+  // if this regression test were weaker -- the dispatcher below constructs
+  // them in the REVERSE (Charlie, Bravo, Alpha) order, which is what must
+  // win.
+  const W7Alpha = ty('W7NotifAlpha', 'W7NotifAlpha', { implementsTypes: ['W7NotifIface'], methods: [mth('notify', { line: 1 })] });
+  const W7Bravo = ty('W7NotifBravo', 'W7NotifBravo', { implementsTypes: ['W7NotifIface'], methods: [mth('notify', { line: 1 })] });
+  const W7Charlie = ty('W7NotifCharlie', 'W7NotifCharlie', { implementsTypes: ['W7NotifIface'], methods: [mth('notify', { line: 1 })] });
+  const W7Dispatcher = ty('W7NotifDispatcher', 'W7NotifDispatcher', {
+    methods: [
+      mth('dispatchAll', {
+        line: 1,
+        calls: [
+          cl('new', 'W7NotifCharlie', { line: 10, lineText: 'new W7NotifCharlie()' }),
+          cl('new', 'W7NotifBravo', { line: 11, lineText: 'new W7NotifBravo()' }),
+          cl('new', 'W7NotifAlpha', { line: 12, lineText: 'new W7NotifAlpha()' }),
+        ],
+      }),
+    ],
+  });
+  const facts = [mkFile(W7Iface), mkFile(W7Alpha), mkFile(W7Bravo), mkFile(W7Charlie), mkFile(W7Dispatcher)];
+  const index = buildSemanticIndex(facts);
+  const ifaceTree = buildCalleeTree(index, { classLower: 'w7notififace', methodLower: 'notify' });
+  const order = ifaceTree.root.children.map((c) => c.label);
+  assert.deepStrictEqual(
+    order,
+    ['W7NotifCharlie.notify', 'W7NotifBravo.notify', 'W7NotifAlpha.notify'],
+    `MUST-FIX #4: interface fan-out order must follow construction-site order (Charlie/Bravo/Alpha per the dispatcher's own list), NOT alphabetical scan order (Alpha/Bravo/Charlie) -- got ${JSON.stringify(order)}`
+  );
+}
+
+// =========================================================================
+// MUST-FIX #1 regression: suggestTargets() must stamp each duplicate-name
+// candidate with ITS OWN distinct classLower (cm.classLower, the real
+// classes.get() key), not the shared lc(qualified) every candidate would
+// otherwise collapse onto -- and buildCallerTree/buildCalleeTree, driven
+// with EXACTLY the target object suggestTargets()'s own output produces
+// (mirroring the real QuickPick flow: buildSuggestPicks -> resolveTarget),
+// must reach the CORRECT candidate, not silently fall back to the
+// first-registered one.
+// =========================================================================
+{
+  const facts = [w7DupAFile, w7DupBFile, w7DupCFile, w7SamePkgCallerFile, w7DefaultFallbackCallerFile];
+  const index = buildSemanticIndex(facts, { packageOf: w7PackageOf, defaultPackage: W7_DEFAULT_PACKAGE });
+
+  const picks = suggestTargets(index).filter((p) => p.label === 'W7Dup' || p.label === 'W7Dup.identify');
+  const classLowers = new Set(picks.map((p) => p.classLower));
+  assert.strictEqual(classLowers.size, 3, `MUST-FIX #1: 3 duplicate W7Dup candidates must produce 3 DISTINCT classLower values, got ${JSON.stringify([...classLowers])}`);
+  for (const p of picks) {
+    assert.ok(Object.prototype.hasOwnProperty.call(p, 'package'), 'MUST-FIX #1: a suggestTargets() item for a duplicated name must carry a package field once package metadata is active');
+  }
+
+  // Drive buildCallerTree with the EXACT target shape a real QuickPick pick
+  // produces -- {classLower, methodLower} straight off the suggestTargets()
+  // item, no reaching into index.classBuckets.
+  const bPkgPick = picks.find((p) => p.methodLower === 'identify' && p.package === 'pkgB');
+  assert.ok(bPkgPick, 'MUST-FIX #1: the pkgB W7Dup.identify candidate must be suggestable');
+  const treeB = buildCallerTree(index, { classLower: bPkgPick.classLower, methodLower: bPkgPick.methodLower }, {});
+  assert.ok(findChild(treeB.root.children, 'W7SamePkgCaller.go'), 'MUST-FIX #1: buildCallerTree, driven by suggestTargets()\'s own classLower, must reach the pkgB candidate\'s real caller (same-package preference)');
+
+  // Forward direction: same guarantee via buildCalleeTree.
+  const calleeTreeB = buildCalleeTree(index, { classLower: bPkgPick.classLower, methodLower: bPkgPick.methodLower }, {});
+  assert.ok(calleeTreeB && calleeTreeB.root, 'MUST-FIX #1: buildCalleeTree must also resolve the suggestTargets()-derived duplicate classLower (not collapse to the primary candidate)');
+  assert.strictEqual(calleeTreeB.root.className, 'W7Dup', 'MUST-FIX #1: the resolved root must be a REAL W7Dup candidate, not a "target not found" shell');
+}
+
+// =========================================================================
+// v0.7: end of A1/A2/B2 additions.
+// =========================================================================
 
 console.log('test-resolver.js: all assertions passed.');

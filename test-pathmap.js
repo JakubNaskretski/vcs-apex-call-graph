@@ -16,7 +16,16 @@
 //      documented, harmless exception — see NOTE below) and carries the
 //      required strict CSP meta tag.
 const assert = require('assert');
-const { renderPathMapHtml, shortenEntry, accentKind, isRootNode, headerExtraLinesForResult } = require('./pathmap');
+const {
+  renderPathMapHtml,
+  shortenEntry,
+  accentKind,
+  layoutTree,
+  isRootNode,
+  packageBadge,
+  directionHeaderLine,
+  headerExtraLinesForResult,
+} = require('./pathmap');
 
 let passCount = 0;
 function check(condition, message) {
@@ -904,6 +913,285 @@ assert.strictEqual(isRootNode({ children: [], truncated: true }), false);
 assert.strictEqual(isRootNode({ children: [], seenElsewhere: true }), false);
 passCount += 6;
 
+// =========================================================================
+// Fixture 8 (v0.7): 'exception'/'unresolved' kinds, 'ambiguous' via fan-out
+// with two DIFFERENT-package children, and a plain cross-package badge --
+// one "kitchen sink" tree, same style as fixture5/fixture6's round-ups.
+// Loosely mirrors the MANIFEST's A3/A6/B3/B4 fixtures without being a
+// literal corpus subtree (real resolver.js output is resolver.js's/
+// test-resolver.js's concern).
+// =========================================================================
+const fixture8 = {
+  root: baseNode({
+    label: 'AcmeOrderBatchProcessor.finish',
+    className: 'AcmeOrderBatchProcessor',
+    methodLower: 'finish',
+    path: '/ws/force-app/main/default/classes/AcmeOrderBatchProcessor.cls',
+    line: 33,
+    package: 'force-app',
+    children: [
+      // A3: exception-class node -- terminal, via='throws', NOT approximate.
+      {
+        label: 'AcmeValidationException',
+        kind: 'exception',
+        className: 'AcmeValidationException',
+        methodLower: null,
+        path: '/ws/force-app/main/default/classes/AcmeValidationException.cls',
+        line: 1,
+        package: 'force-app',
+        entries: [],
+        isTest: false,
+        via: 'throws',
+        sites: [],
+        children: [],
+        cyclic: false,
+        truncated: false,
+        approximate: false,
+      },
+      // A6: aggregated unresolved-sites leaf -- terminal, approximate.
+      {
+        label: '5 unresolved sites',
+        kind: 'unresolved',
+        className: 'AcmeSmsNotifier',
+        methodLower: 'sendsms',
+        path: '/ws/force-app/main/default/classes/AcmeSmsNotifier.cls',
+        line: 18,
+        package: 'force-app',
+        entries: [],
+        isTest: false,
+        via: null,
+        sites: [],
+        children: [],
+        cyclic: false,
+        truncated: false,
+        approximate: true,
+      },
+      // B4 case 1: a plain cross-package child -- gets a badge.
+      {
+        label: 'NovaBillingService.recordBatchCompletion',
+        kind: 'method',
+        className: 'NovaBillingService',
+        methodLower: 'recordbatchcompletion',
+        path: '/ws/pkg-billing/main/default/classes/NovaBillingService.cls',
+        line: 20,
+        package: 'nova-billing',
+        entries: [],
+        isTest: false,
+        via: 'static',
+        sites: [],
+        children: [],
+        cyclic: false,
+        truncated: false,
+        approximate: false,
+      },
+      // B2/B3/B4 case 3: one call site fans out (via='ambiguous') to two
+      // DIFFERENT-package candidates -- each carries its OWN badge.
+      {
+        label: 'NovaBillingUtil.auditPricingSync',
+        kind: 'method',
+        className: 'NovaBillingUtil',
+        methodLower: 'auditpricingsync',
+        path: '/ws/pkg-billing/main/default/classes/NovaBillingUtil.cls',
+        line: 5,
+        package: 'nova-billing',
+        entries: [],
+        isTest: false,
+        via: 'ambiguous',
+        approximate: true,
+        sites: [],
+        children: [],
+        cyclic: false,
+        truncated: false,
+      },
+      {
+        label: 'NovaBillingUtil.auditPricingSync',
+        kind: 'method',
+        className: 'NovaBillingUtil',
+        methodLower: 'auditpricingsync',
+        path: '/ws/pkg-shared/main/default/classes/NovaBillingUtil.cls',
+        line: 5,
+        package: 'nova-shared',
+        entries: [],
+        isTest: false,
+        via: 'ambiguous',
+        approximate: true,
+        sites: [],
+        children: [],
+        cyclic: false,
+        truncated: false,
+      },
+    ],
+  }),
+  targetLabel: 'AcmeOrderBatchProcessor.finish',
+  note: null,
+  direction: 'callees',
+  stats: { duplicateNames: 2 },
+};
+
+const html8 = renderPathMapHtml(fixture8);
+
+check(html8.includes('"kind":"exception"'), "v0.7 A3: 'exception' node kind serialized");
+check(html8.includes('"accent":"exception"'), 'exception node gets its own accent bucket');
+check(html8.includes('"kind":"unresolved"'), "v0.7 A6: 'unresolved' node kind serialized");
+check(html8.includes('"accent":"unresolved"'), 'unresolved node gets its own accent bucket');
+check(countOccurrences(html8, '"via":"ambiguous"') >= 2, "v0.7 B2: 'ambiguous' via label present on both fan-out nodes");
+check(html8.includes('"badges":["(nova-billing)"]'), 'v0.7 B4: plain cross-package child carries the "(nova-billing)" badge');
+check(html8.includes('"badges":["(nova-billing)","(nova-billing)"]') === false, 'the plain cross-package child does not carry a duplicated badge');
+// the two ambiguous fan-out children each carry their OWN, DIFFERENT badge.
+check(html8.includes('"badges":["(nova-billing)"]') && html8.includes('"badges":["(nova-shared)"]'), 'v0.7 B4 case 3: the two ambiguous fan-out children carry two DIFFERENT package badges from each other');
+check(!html8.includes('"badges":["(force-app)"]'), 'the target itself (force-app) never carries its own package as a badge -- it cannot differ from itself');
+check(html8.includes('"package":"force-app"'), 'raw package field is serialized on the target node too (not just used to derive the badge)');
+
+// v0.7 (A3): direction header + meta.
+check(html8.includes('"direction":"callees"'), 'meta.direction serialized');
+check(html8.includes('"directionLabel":"What Does This Call?"'), 'meta.directionLabel carries the forward-tracing header text');
+check(html8.includes("if (DATA.meta.directionLabel)"), 'client script conditionally renders the direction label');
+check(html8.includes('id="pm-direction"'), 'dedicated #pm-direction header element is always present in the document shell');
+
+// v0.7 (B3): duplicate-names header note, exact MANIFEST-pinned wording.
+check(
+  html8.includes(
+    '"headerExtra":["2 duplicate class names across packages — resolution prefers the referring file\'s package"]'
+  ),
+  'duplicate-names line reaches headerExtra with the exact pinned wording, and (since capped/unresolvedSites are both absent from fixture8\'s stats) is the ONLY headerExtra entry'
+);
+
+// v0.7 (A3): mirrored layout -- direction:'callees' means the target
+// (depth 0) is the LEFTMOST node, i.e. has the SMALLEST x of any node.
+check(html8.includes('"mirrored":true'), 'layout.mirrored is true for a callees-direction render');
+{
+  const dataMatch8 = html8.match(/var DATA = ([\s\S]*?);\s*\(function/);
+  check(!!dataMatch8, 'DATA blob is extractable from the rendered document');
+  const data8 = JSON.parse(dataMatch8[1]);
+  const targetRec = data8.nodes.find((n) => n.parentId == null);
+  const minX = Math.min(...data8.nodes.map((n) => n.x));
+  check(targetRec.x === minX, "v0.7 A3: in a mirrored (callees) render, the traced target sits at the LEFTMOST column (target LEFT, flow RIGHT, per the A3 spec)");
+}
+
+// Legend: new v0.7 rows -- exception/unresolved swatches, ambiguous via,
+// package badge, and both direction labels ('who calls this' / 'what this
+// calls'), all present in every render (the legend is static/unconditional).
+check(html8.includes('<span class="swatch exception">'), "legend documents the 'exception' accent swatch");
+check(html8.includes('<span class="swatch unresolved">'), "legend documents the 'unresolved' accent swatch");
+check(html8.includes('<span class="k">ambiguous</span>'), "legend documents the 'ambiguous' via label");
+check(html8.includes('(pkgLabel)'), 'legend documents the package badge format');
+check(html8.toLowerCase().includes('who calls this'), "legend mentions 'Who Calls This' (the default/callers direction)");
+check(html8.toLowerCase().includes('what this calls'), "legend mentions 'What This Calls' (the forward/callees direction)");
+
+// =========================================================================
+// Fixture 9 (v0.7 A3): reuses fixture1's exact tree (deep trigger chain, no
+// packages) but tagged direction:'callees', purely to exercise the mirrored
+// layout end to end against a MULTI-hop (not just single-child) tree, and
+// direction:'callers' explicitly (for the byte-identical assertions below).
+// =========================================================================
+const fixture9Callees = { ...fixture1, direction: 'callees' };
+const fixture9Callers = { ...fixture1, direction: 'callers' };
+const html9 = renderPathMapHtml(fixture9Callees);
+
+check(html9.includes('"directionLabel":"What Does This Call?"'), 'fixture9 (callees): direction label present');
+{
+  const dataMatch9 = html9.match(/var DATA = ([\s\S]*?);\s*\(function/);
+  const data9 = JSON.parse(dataMatch9[1]);
+  const target9 = data9.nodes.find((n) => n.parentId == null);
+  // AccountTrigger is the deepest node in fixture1's chain (3 hops from the
+  // target) -- in a mirrored render it must sit STRICTLY to the RIGHT of
+  // the target (target leftmost, deepest caller rightmost).
+  const triggerNode = data9.nodes.find((n) => n.label === 'AccountTrigger');
+  check(triggerNode.x > target9.x, 'v0.7 A3: mirrored layout puts the deepest node to the RIGHT of the (now-leftmost) target');
+}
+check(html9.includes('"mirrored":true'), 'fixture9 layout.mirrored is true');
+
+// v0.7 (A3) byte-identical bar: an explicit direction:'callers' tag on a
+// PACKAGE-FREE fixture (fixture1, unmodified otherwise) must render a
+// document that is structurally identical to "today" (the same fixture
+// with NO direction field at all) in every OBSERVABLE way -- CONFIRMED
+// against the real resolver.js sibling implementation: buildCallerTree now
+// stamps `direction: 'callers'` on EVERY TreeResult it returns
+// unconditionally (see pathmap.js's own header-note on this), so 'callers'
+// must render with zero visible difference from the pre-v0.7, direction-
+// less shape -- not just "close enough". The ONE field allowed to differ at
+// all is the raw, non-visible `meta.direction` string itself (an internal
+// tag, never rendered as text); `meta.directionLabel` -- the actually-
+// user-visible field -- is null in BOTH cases. This is the concrete proof
+// behind the pinned "CALLERS-DIRECTION render is byte-identical to today"
+// bar, at this file's layer (mirrors test-uitree.js's analogous
+// shapeHeaderLines/shapeResult assertions).
+function extractData(html) {
+  const m = html.match(/var DATA = ([\s\S]*?);\s*\(function/);
+  assert(m, 'DATA blob found in the rendered document');
+  return JSON.parse(m[1]);
+}
+const dataTodayFixture1 = extractData(html1); // html1 = renderPathMapHtml(fixture1), no direction field at all
+const dataCallersExplicit = extractData(renderPathMapHtml(fixture9Callers));
+assert.deepStrictEqual(
+  dataCallersExplicit.nodes,
+  dataTodayFixture1.nodes,
+  'node array (x/y positions, badges, kind, accent, via, package, sites...) is byte-identical whether or not direction:"callers" is explicitly tagged, for a fixture with no package field'
+);
+assert.deepStrictEqual(dataCallersExplicit.edges, dataTodayFixture1.edges, 'edge array is byte-identical too');
+assert.deepStrictEqual(dataCallersExplicit.layout, dataTodayFixture1.layout, 'layout (dimensions AND mirrored flag) is fully byte-identical -- explicit "callers" takes the same non-mirrored branch as absent direction');
+// meta.direction is the ONE non-visible field allowed to differ (a raw
+// internal tag, 'callers' vs. null) -- every OTHER meta field, including
+// the actually-visible directionLabel, is identical.
+assert.deepStrictEqual(
+  { ...dataCallersExplicit.meta, direction: undefined },
+  { ...dataTodayFixture1.meta, direction: undefined },
+  'every meta field except the raw (non-visible) direction tag is byte-identical, including directionLabel -- both null'
+);
+assert.strictEqual(dataTodayFixture1.meta.direction, null, "'today' (no direction field) -> meta.direction is null");
+assert.strictEqual(dataCallersExplicit.meta.direction, 'callers', "explicit 'callers' -> meta.direction carries the raw tag (non-visible)");
+assert.strictEqual(dataTodayFixture1.meta.directionLabel, null, "'today' -> no direction label");
+assert.strictEqual(dataCallersExplicit.meta.directionLabel, null, "'callers' -- like every real buildCallerTree output -- ALSO gets no direction label: this is the whole point of the byte-identical bar");
+passCount += 8;
+
+// =========================================================================
+// layoutTree direct unit checks: mirroring is a pure column-index flip,
+// row placement/geometry constants untouched, and 'callers' explicit is a
+// complete no-op vs. direction absent.
+// =========================================================================
+const miniTree = {
+  label: 'Target',
+  children: [
+    { label: 'Child1', children: [] },
+    { label: 'Child2', children: [{ label: 'Grandchild', children: [] }] },
+  ],
+};
+const layoutAbsent = layoutTree(miniTree);
+const layoutCallersExplicit = layoutTree(miniTree, 'callers');
+const layoutCalleesMirrored = layoutTree(miniTree, 'callees');
+assert.deepStrictEqual(layoutCallersExplicit, layoutAbsent, "layoutTree(root, 'callers') is byte-identical to layoutTree(root) -- both take the non-mirrored branch");
+assert.notDeepStrictEqual(layoutCalleesMirrored, layoutAbsent, "layoutTree(root, 'callees') differs -- mirrored");
+assert.strictEqual(layoutAbsent.mirrored, false);
+assert.strictEqual(layoutCalleesMirrored.mirrored, true);
+const targetAbsent = layoutAbsent.nodes.find((n) => n.depth === 0);
+const targetMirrored = layoutCalleesMirrored.nodes.find((n) => n.depth === 0);
+const deepestAbsent = layoutAbsent.nodes.reduce((a, b) => (b.depth > a.depth ? b : a));
+const deepestMirroredNode = layoutCalleesMirrored.nodes.reduce((a, b) => (b.depth > a.depth ? b : a));
+assert(targetAbsent.x > deepestAbsent.x, 'default (unmirrored): target sits to the RIGHT of deeper nodes');
+assert(targetMirrored.x < deepestMirroredNode.x, 'mirrored: target sits to the LEFT of deeper nodes');
+// row placement (leaf-order dendrogram) is untouched by mirroring -- every
+// node keeps the exact same `row`/`y`, only `x` (column) changes.
+assert.deepStrictEqual(layoutCalleesMirrored.nodes.map((n) => n.y), layoutAbsent.nodes.map((n) => n.y), 'mirroring never touches row/y placement');
+assert.strictEqual(layoutCalleesMirrored.width, layoutAbsent.width, 'mirroring never touches the canvas width');
+assert.strictEqual(layoutCalleesMirrored.height, layoutAbsent.height, 'mirroring never touches the canvas height');
+passCount += 8;
+
+// =========================================================================
+// directionHeaderLine / packageBadge direct unit checks (pathmap.js's own
+// small re-implementations, mirroring uitree.js's).
+// =========================================================================
+assert.strictEqual(directionHeaderLine(undefined), null);
+assert.strictEqual(
+  directionHeaderLine('callers'),
+  null,
+  "'callers' -- the value EVERY real buildCallerTree TreeResult now carries -- renders with NO header line, same as absent"
+);
+assert.strictEqual(directionHeaderLine('callees'), 'What Does This Call?');
+assert.strictEqual(packageBadge({ package: 'force-app' }, 'force-app'), null, 'same package -> no badge');
+assert.strictEqual(packageBadge({ package: 'nova-billing' }, 'force-app'), '(nova-billing)');
+assert.strictEqual(packageBadge(null, 'force-app'), null);
+passCount += 6;
+
 // Same escaping property holds for every fixture, not just the one that
 // deliberately embeds the payload — belt-and-suspenders against a
 // regression that only breaks on some field/fixture combination.
@@ -915,6 +1203,8 @@ for (const [name, html] of [
   ['fixture5', html5],
   ['fixture6', html6],
   ['fixture7', html7],
+  ['fixture8', html8],
+  ['fixture9', html9],
 ]) {
   check(countOccurrences(html.toLowerCase(), '<script') === 1, name + ': exactly one <script> tag');
   check(countOccurrences(html.toLowerCase(), '</script>') === 1, name + ': exactly one </script> close tag');
@@ -941,6 +1231,8 @@ for (const [name, html] of [
   ['fixture5', html5],
   ['fixture6', html6],
   ['fixture7', html7],
+  ['fixture8', html8],
+  ['fixture9', html9],
 ]) {
   const withoutSvgNamespace = html.split('http://www.w3.org/2000/svg').join('');
   check(!/https?:\/\//i.test(withoutSvgNamespace), name + ': no http(s):// URL beyond the unfetched SVG namespace URI');
@@ -959,5 +1251,12 @@ for (const [name, html] of [
 // =========================================================================
 check(typeof renderPathMapHtml({ root: null, targetLabel: 'Missing.thing', note: 'target class not found in index' }) === 'string', 'missing-root TreeResult renders without throwing');
 check(typeof renderPathMapHtml({ root: baseNode({ label: 'Lonely.target' }), targetLabel: 'Lonely.target', note: null }) === 'string', 'childless root renders without throwing');
+// v0.7: a direction:'callees' TreeResult with a null root must not throw
+// either (mirrors the same degenerate-root guard, exercised in the new
+// direction).
+check(
+  typeof renderPathMapHtml({ root: null, targetLabel: 'Missing.thing', note: null, direction: 'callees' }) === 'string',
+  'v0.7: missing-root callees-direction TreeResult renders without throwing'
+);
 
 console.log('apex-trace pathmap self-check: ' + passCount + ' assertions passed');

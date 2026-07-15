@@ -160,7 +160,12 @@ const HTTP_ANNOTATIONS = new Set(['httpget', 'httppost', 'httpput', 'httpdelete'
 // event that got published genuinely does fire every trigger on its object;
 // a throw statement genuinely does throw; an async enqueue genuinely does
 // hand off to that job's execute().
-const APPROX_VIA = new Set(['interface', 'unique-name', 'lexical', 'override', 'dynamic', 'narrowed']);
+// v0.7/B3: 'ambiguous' (B2 duplicate-name fan-out, neither the same-package
+// nor default-package preference rule could disambiguate) joins the
+// approximate set -- by construction it's ALWAYS a multi-candidate fan-out
+// from one call site, exactly the same "genuinely can't tell which one"
+// reasoning as 'interface'/'narrowed'.
+const APPROX_VIA = new Set(['interface', 'unique-name', 'lexical', 'override', 'dynamic', 'narrowed', 'ambiguous']);
 
 // F1: statement-form and Database.xxx() method-form DML ops this resolver
 // understands, and the trigger event(s) each one activates. upsert maps to
@@ -413,10 +418,82 @@ function walkExtendsChain(indexLike, startLower, visitFn) {
 // buildSemanticIndex
 // =========================================================================
 
-function buildSemanticIndex(factsList) {
-  const classes = new Map(); // lowerQualified -> ClassMeta
+// =========================================================================
+// v0.7 A1/A2/B2: forward tracing + multi-package awareness
+// =========================================================================
+// buildSemanticIndex(factsList, opts) -- opts is NEW and entirely optional;
+// omitting it (or passing {}) reproduces v0.6 behavior byte-for-byte (see
+// the B5 "packageless-identity" guarantee threaded through every duplicate-
+// resolution branch below). Recognized opts fields (both additive, both
+// consumed ONLY by the B2 duplicate-bucket resolution path below -- nothing
+// else in this file reads them):
+//   - opts.packageOf(fsPath) -> label|null -- maps a FileFacts.path to its
+//     owning sfdx package's display label, or null when the path isn't
+//     covered by any known package directory. Supplied by extension.js's
+//     sfdx-project.json scan (out of this file's scope); resolver.js never
+//     parses sfdx-project.json itself and has no fs access.
+//   - opts.defaultPackage: string|null -- the label of the ONE package
+//     directory flagged `default: true` in sfdx-project.json, or null when
+//     unknown/absent. B2's resolution order needs this explicitly (rule 2,
+//     "candidate in the default package") -- packageOf() alone cannot
+//     distinguish "the default package" from "a package that happens to use
+//     its bare path segment as its label", so this is a SEPARATE opts field
+//     by design, not inferred from packageOf's return shape.
+// Both are ignored entirely unless opts.packageOf is an actual function --
+// that single check gates ALL of B2's new behavior (bucket surfacing,
+// stats.duplicateNames, via='ambiguous' edges): see the B5 spec text this
+// mirrors ("package-bucket surfacing is opt-in, gated entirely on package
+// metadata being discoverable, never on the mere existence of two files
+// sharing a name").
+function buildSemanticIndex(factsList, opts) {
+  const packageOf = opts && typeof opts.packageOf === 'function' ? opts.packageOf : null;
+  const defaultPackage = opts && opts.defaultPackage != null ? opts.defaultPackage : null;
+
+  const classes = new Map(); // lowerQualified -> ClassMeta (or a B2 synthetic dup-slot key -- see classBuckets)
   const methodCallers = new Map(); // 'lowerQualified#lowerMethod' -> CallSite[]
   const classCallers = new Map(); // lowerQualified -> CallSite[]
+  // A1: forward-direction counterpart of methodCallers/classCallers --
+  // 'lowerQualified#lowerMethodLabel' (the CALLING method's own identity,
+  // same callerKey format makeCallSite already uses) -> ForwardEdge[].
+  // Populated INLINE during the SAME pass-B resolution walk that populates
+  // methodCallers (see recordForwardEdge, called from writeMethodEdge/
+  // writeCtorEdge/handleThrowSite below) -- no second pass over factsList.
+  const methodCallees = new Map();
+  // A1/A6: per-callerKey count of call sites (from MethodFacts.calls only --
+  // see the pass-B loop below) that produced ZERO forward edges anywhere
+  // (every resolution rule declined, incl. the platform denylist) -- the
+  // raw material for buildCalleeTree's single aggregated "N unresolved
+  // sites" leaf per method (A2's unresolved-call spec).
+  const unresolvedForwardCounts = new Map();
+  // B2: qualifiedLower -> [{ classLower, package, cm }] -- EVERY type
+  // sharing that qualified name, across every file, package-tagged
+  // (package is null when packageOf is inactive or the file isn't covered
+  // by any known package directory). The FIRST entry pushed for a given
+  // qualifiedLower is always the one also registered in `classes` under the
+  // plain qualifiedLower key (identical to pre-v0.7 first-wins semantics);
+  // every SUBSEQUENT same-name type gets its own synthetic disambiguated
+  // key (see registerClassMeta below) registered ADDITIONALLY into
+  // `classes` so every existing classLower-keyed lookup in this file
+  // (resolveType's classes.has() checks, emitOwners/writeMethodEdge's
+  // classes.get(), the extends-chain/interface-closure passes that iterate
+  // classes.values(), etc.) keeps working completely unmodified against
+  // EITHER kind of key, with zero special-casing anywhere except the one
+  // new B2 resolution branch in resolveDotOther's rule 5 (below).
+  const classBuckets = new Map();
+  // MUST-FIX #4: classLower -> earliest {path, line} at which a `new
+  // ClassName(...)` construction of that class was encountered anywhere in
+  // pass B's sequential call-site walk. Populated by resolveCall's rule 1
+  // ('new') below. Used ONLY by calleeInterfaceFanoutPairs (forward
+  // interface fan-out ordering) to recover a deterministic, source-grounded
+  // order for an interface's implementers when tracing the interface
+  // method directly -- "the order these implementer types are typically
+  // constructed together" (e.g. a dispatcher's own `List<Iface>{ new A(),
+  // new B(), new C() }` literal) is a far more meaningful ordering than raw
+  // file-scan order, and MANIFEST v0.7 chain #8 pins exactly this ordering.
+  // An implementer with no known construction site anywhere falls back to
+  // its original interfaceImplementers position (see the sort in
+  // calleeInterfaceFanoutPairs).
+  const firstConstructedAt = new Map();
   // H7(b): lightweight wrapper so walkExtendsChain can share its one
   // implementation between this closure (live-building `classes`) and the
   // post-build `index` object query-time callers use -- same Map reference
@@ -438,80 +515,141 @@ function buildSemanticIndex(factsList) {
   // as `stats.unresolvedSites` and threaded through to every TreeResult
   // (H4's "N call sites workspace-wide could not be resolved" header).
   let unresolvedSitesCount = 0;
+  // MUST-FIX #5: whether opts.packageOf ever actually resolved a REAL
+  // (non-null) package label for at least one file, as opposed to merely
+  // being a function that was PASSED (and might return null for every
+  // path, exactly what extension.js's discoverPackageMap() produces for a
+  // workspace with zero discoverable sfdx-project.json files -- see
+  // extension.js's scanAndBuildIndex(), which always passes `{ packageOf }`
+  // and never omits the key). Set true the first time pass A's pkgLabel
+  // computation (below) yields non-null. This -- NOT merely `packageOf`
+  // being a function -- is the real B2 gate: every "gated entirely on
+  // opts.packageOf" check below (resolveDuplicateBucket's call site,
+  // stats.duplicateNames counting) must use THIS flag, matching this file's
+  // own header comment ("gated entirely on package metadata being
+  // discoverable ... never on the mere existence of two files sharing a
+  // name") and the B5 packageless-identity guarantee ("No sfdx-project.json
+  // anywhere -> packageOf returns null for everything and ALL behavior must
+  // be byte-identical to today").
+  let packageMetadataDiscovered = false;
 
   // Cross-class lookup tables, built alongside `classes` in pass A.
   const simpleNameIndex = new Map(); // lc(simpleName) -> lowerQualified[]
   const methodNameIndex = new Map(); // lc(methodName) -> Set<lowerQualified> (non-ctor only)
   const interfaceImplementers = new Map(); // lc(interfaceSimpleName) -> lowerQualified[]
 
+  // B2: builds one ClassMeta (identical shape/logic to the pre-v0.7 inline
+  // block this replaces) for ONE type -- factored out so pass A can call it
+  // for EVERY same-name type (not just the first-registered "winner"),
+  // which duplicate-bucket resolution and pass B's own-body call-walking
+  // both need a real ClassMeta for. Side-table registration (simpleNameIndex/
+  // methodNameIndex/interfaceImplementers) is NOT done here -- callers do
+  // that themselves, ONLY for the primary (first) registration of a given
+  // qualifiedLower, so every pre-v0.7 lookup path stays first-wins-only and
+  // therefore byte-identical whether or not opts.packageOf is active.
+  function buildClassMeta(tf, file, isTriggerFile, isAnonymousFile, pkgLabel) {
+    const classIsTest = (tf.annotations || []).map(annBare).includes('istest');
+    const methods = [];
+
+    // Constructors: merged into one synthetic '<init>' MethodMeta (decision #2).
+    const ctors = (tf.methods || []).filter((m) => m.isCtor);
+    if (ctors.length) {
+      const first = ctors[0];
+      methods.push({
+        name: '<init>',
+        params: (first.params || []).map((p) => ({ name: p.name, type: p.type })),
+        isStatic: false,
+        line: first.line || 0,
+        entries: [], // constructors are never entry points
+        isTest: methodIsTest(first, classIsTest),
+      });
+    }
+
+    // Regular methods (incl. synthetic '(init)'/'(get X)'/'(set X)' scopes
+    // and, for a trigger pseudo-type, its single '(trigger)' method).
+    for (const mf of tf.methods || []) {
+      if (mf.isCtor) continue;
+      const entries = computeAnnotationEntries(mf);
+      if (Array.isArray(mf.entries) && mf.entries.length) entries.push(...mf.entries); // G4: parser-supplied labels (e.g. anonymous-script) merge in, not derived here
+      if (isTriggerFile && mf.name === '(trigger)' && file.triggerInfo) {
+        entries.push(`trigger on ${file.triggerInfo.object} (${(file.triggerInfo.events || []).join(', ')})`);
+      }
+      const mm = {
+        name: mf.name,
+        params: (mf.params || []).map((p) => ({ name: p.name, type: p.type })),
+        isStatic: !!mf.isStatic,
+        line: mf.line || 0,
+        entries,
+        isTest: methodIsTest(mf, classIsTest),
+      };
+      methods.push(mm);
+    }
+
+    return {
+      name: tf.name,
+      qualified: tf.qualified,
+      path: file.path,
+      kind: isTriggerFile ? 'trigger' : isAnonymousFile ? 'anonymous' : 'class', // G4: anonymous scripts get their own TNode kind
+      // F1: needed to map a resolved DML target object back to the
+      // trigger(s) registered on it (event-mapping matrix).
+      triggerInfo: isTriggerFile ? (file.triggerInfo || null) : null,
+      isTest: classIsTest,
+      entries: [], // filled in pass C, after Batchable/Queueable/Schedulable attachment
+      extendsType: tf.extendsType || null,
+      implementsTypes: tf.implementsTypes || [],
+      // B2: package label for this type's OWN file, or null when
+      // opts.packageOf is inactive or doesn't cover this path. Purely
+      // informational except for the one new duplicate-bucket resolution
+      // branch below -- every pre-v0.7 code path ignores this field.
+      package: pkgLabel,
+      methods,
+      typeFacts: tf,
+    };
+  }
+
   // ---- pass A: register ClassMeta + MethodMeta for every parseable type --
   for (const file of factsList || []) {
     if (file.parseError) continue; // handled in the lexical fallback pass below
     const isTriggerFile = file.kind === 'trigger';
     const isAnonymousFile = file.kind === 'anonymous';
+    const pkgLabel = packageOf ? packageOf(file.path) || null : null;
+    if (pkgLabel != null) packageMetadataDiscovered = true; // MUST-FIX #5
     for (const tf of file.types || []) {
       const qualifiedLower = lc(tf.qualified);
-      if (classes.has(qualifiedLower)) {
+      const isDuplicateSlot = classes.has(qualifiedLower);
+      const cm = buildClassMeta(tf, file, isTriggerFile, isAnonymousFile, pkgLabel);
+
+      // B2: registration key. The FIRST type registered under a given
+      // qualifiedLower always keeps that plain key (identical to pre-v0.7
+      // first-wins semantics -- resolveType's classes.has(norm) exact-match
+      // check, and every other classLower-keyed lookup in this file, keeps
+      // resolving to exactly this ClassMeta exactly as before). Every
+      // SUBSEQUENT same-name type gets an additional, synthetic key so it
+      // still has a real, queryable identity of its own (pass B walks its
+      // calls under this key; buildCallerTree/buildCalleeTree can target it
+      // directly via index.classBuckets) -- but that key is never returned
+      // by resolveType's plain-name lookups, so ordinary (non-duplicate-
+      // aware) resolution never accidentally lands on it.
+      let key = qualifiedLower;
+      if (isDuplicateSlot) {
         duplicates.push(tf.qualified);
-        continue; // first-parsed file wins the slot (decision: duplicate collision policy)
+        const bucketLenSoFar = (classBuckets.get(qualifiedLower) || []).length;
+        key = `${qualifiedLower}~dup${bucketLenSoFar}~${lc(pkgLabel || file.path)}`;
       }
+      cm.classLower = key; // B2: this ClassMeta's OWN registration key -- see directSubclasses/ifaceParents below, which must self-reference by THIS (not always lc(cm.qualified), which only matches for non-duplicate primaries) so a duplicate-slot type's extends/interface identity is never misattributed to a same-named sibling.
+      classes.set(key, cm);
 
-      const classIsTest = (tf.annotations || []).map(annBare).includes('istest');
-      const methods = [];
+      if (!classBuckets.has(qualifiedLower)) classBuckets.set(qualifiedLower, []);
+      classBuckets.get(qualifiedLower).push({ classLower: key, package: pkgLabel, cm });
 
-      // Constructors: merged into one synthetic '<init>' MethodMeta (decision #2).
-      const ctors = (tf.methods || []).filter((m) => m.isCtor);
-      if (ctors.length) {
-        const first = ctors[0];
-        methods.push({
-          name: '<init>',
-          params: (first.params || []).map((p) => ({ name: p.name, type: p.type })),
-          isStatic: false,
-          line: first.line || 0,
-          entries: [], // constructors are never entry points
-          isTest: methodIsTest(first, classIsTest),
-        });
-      }
+      if (isDuplicateSlot) continue; // side tables below stay first-wins-only (see buildClassMeta's header note)
 
-      // Regular methods (incl. synthetic '(init)'/'(get X)'/'(set X)' scopes
-      // and, for a trigger pseudo-type, its single '(trigger)' method).
       for (const mf of tf.methods || []) {
         if (mf.isCtor) continue;
-        const entries = computeAnnotationEntries(mf);
-        if (Array.isArray(mf.entries) && mf.entries.length) entries.push(...mf.entries); // G4: parser-supplied labels (e.g. anonymous-script) merge in, not derived here
-        if (isTriggerFile && mf.name === '(trigger)' && file.triggerInfo) {
-          entries.push(`trigger on ${file.triggerInfo.object} (${(file.triggerInfo.events || []).join(', ')})`);
-        }
-        const mm = {
-          name: mf.name,
-          params: (mf.params || []).map((p) => ({ name: p.name, type: p.type })),
-          isStatic: !!mf.isStatic,
-          line: mf.line || 0,
-          entries,
-          isTest: methodIsTest(mf, classIsTest),
-        };
-        methods.push(mm);
         const nameLower = lc(mf.name);
         if (!methodNameIndex.has(nameLower)) methodNameIndex.set(nameLower, new Set());
         methodNameIndex.get(nameLower).add(qualifiedLower);
       }
-
-      const cm = {
-        name: tf.name,
-        qualified: tf.qualified,
-        path: file.path,
-        kind: isTriggerFile ? 'trigger' : isAnonymousFile ? 'anonymous' : 'class', // G4: anonymous scripts get their own TNode kind
-        // F1: needed to map a resolved DML target object back to the
-        // trigger(s) registered on it (event-mapping matrix).
-        triggerInfo: isTriggerFile ? (file.triggerInfo || null) : null,
-        isTest: classIsTest,
-        entries: [], // filled in pass C, after Batchable/Queueable/Schedulable attachment
-        extendsType: tf.extendsType || null,
-        implementsTypes: tf.implementsTypes || [],
-        methods,
-        typeFacts: tf,
-      };
-      classes.set(qualifiedLower, cm);
 
       const simpleLower = lc(tf.name);
       if (!simpleNameIndex.has(simpleLower)) simpleNameIndex.set(simpleLower, []);
@@ -551,6 +689,37 @@ function buildSemanticIndex(factsList) {
     return null;
   }
 
+  // =========================================================================
+  // B2: duplicate-name bucket resolution
+  // =========================================================================
+  // Only ever consulted from resolveDotOther's rule 5 (below) -- the ONE
+  // resolution path the B2/B3 ground truth actually exercises (a literal
+  // `ClassName.method()` static reference, the exact shape a qualified-name
+  // collision is about). `primaryQualifiedLower` is whatever resolveType()
+  // already returned (unchanged, first-wins) for the receiver text; this
+  // function ONLY runs a bucket lookup keyed on that same qualifiedLower --
+  // it never changes WHICH name resolveType found, only WHICH of that
+  // name's same-named candidates should get the edge. Returns
+  // { winners: classLower[], via: 'static'|'ambiguous' } -- 'winners' is
+  // always non-empty when called with a resolveType() hit. Resolution order
+  // (verbatim per the B2 spec):
+  //   1. a candidate in the SAME package as the referring file
+  //   2. else a candidate in the DEFAULT package
+  //   3. else EVERY remaining candidate, via='ambiguous' (approximate)
+  function resolveDuplicateBucket(primaryQualifiedLower, callerPackage) {
+    const bucket = classBuckets.get(primaryQualifiedLower);
+    if (!bucket || bucket.length <= 1) return { winners: [primaryQualifiedLower], via: 'static' };
+    if (callerPackage != null) {
+      const samePkg = bucket.filter((b) => b.package === callerPackage);
+      if (samePkg.length === 1) return { winners: [samePkg[0].classLower], via: 'static' };
+    }
+    if (defaultPackage != null) {
+      const defPkg = bucket.filter((b) => b.package === defaultPackage);
+      if (defPkg.length === 1) return { winners: [defPkg[0].classLower], via: 'static' };
+    }
+    return { winners: bucket.map((b) => b.classLower), via: 'ambiguous' };
+  }
+
   // F3: parent -> direct-subclass adjacency, built once now that every
   // class is registered and resolveType can resolve every extendsType
   // target. allDescendants() walks it transitively (DFS, cycle-guarded) so
@@ -572,7 +741,13 @@ function buildSemanticIndex(factsList) {
     subCm.extendsLower = parentLower || null;
     if (!parentLower) continue;
     if (!directSubclasses.has(parentLower)) directSubclasses.set(parentLower, []);
-    directSubclasses.get(parentLower).push(lc(subCm.qualified));
+    // B2 fix: self-reference by subCm's OWN registration key (subCm.classLower),
+    // not lc(subCm.qualified) -- identical for every non-duplicate class (the
+    // pre-v0.7/only case that existed before B2), but a duplicate-slot type's
+    // qualified name is shared with a same-named sibling, so lc(qualified)
+    // alone could misattribute a duplicate's subclass edge onto the wrong
+    // classLower entry.
+    directSubclasses.get(parentLower).push(subCm.classLower || lc(subCm.qualified));
   }
   function allDescendants(ancestorLower) {
     const out = [];
@@ -625,7 +800,7 @@ function buildSemanticIndex(factsList) {
         parentLowers.push(parentLower);
       }
     }
-    if (parentLowers.length) ifaceParents.set(lc(cmI.qualified), parentLowers);
+    if (parentLowers.length) ifaceParents.set(cmI.classLower || lc(cmI.qualified), parentLowers);
   }
   function ifaceAncestorsExclusive(ifaceQualifiedLower) {
     // BFS over ifaceParents from ifaceQualifiedLower UP through EVERY parent
@@ -657,7 +832,7 @@ function buildSemanticIndex(factsList) {
         const ancSimple = lc(ancCm.name);
         if (!interfaceImplementers.has(ancSimple)) interfaceImplementers.set(ancSimple, []);
         const list = interfaceImplementers.get(ancSimple);
-        const implLower = lc(cmI.qualified);
+        const implLower = cmI.classLower || lc(cmI.qualified);
         if (!list.includes(implLower)) list.push(implLower);
       }
     }
@@ -832,11 +1007,26 @@ function buildSemanticIndex(factsList) {
   // whether at least one edge was written (callers use this to decide
   // whether to fall through to rule 7 / the denylist). `methodFacts` is
   // optional and only used for A4's overload arg-type scoring.
-  function emitOwners(callerClassLower, callerMethodLabel, classLower, nameLower, call, via, walkSuper, callArity, methodFacts) {
+  //
+  // A1 `forwardOpt` (default true, per writeMethodEdge's own default):
+  // pass false from a FAN-OUT context (multiple approximate owners standing
+  // in for ONE call site's uncertain runtime target -- H2's interface-
+  // implementer loop in emitTypedOrInterfaceForClass) so that fan-out
+  // doesn't ALSO explode the calling method's own forward-edge list into
+  // one entry per possible implementer. The reverse direction is
+  // unaffected either way (methodCallers always gets every owner's edge,
+  // forwardOpt only gates the ADDITIONAL methodCallees write) -- see A2's
+  // ground truth (chain #7/#8): a call through an interface-typed receiver
+  // forward-resolves to the INTERFACE method's own node as its one and only
+  // forward child; the concrete implementers only appear one hop further,
+  // as that interface method's OWN forward children (a node-level special
+  // case in buildCalleeTree, not a per-call-site fan-out -- see
+  // calleeInterfaceFanoutPairs below).
+  function emitOwners(callerClassLower, callerMethodLabel, classLower, nameLower, call, via, walkSuper, callArity, methodFacts, forwardOpt) {
     const owners = findMethodOwners(classLower, nameLower, walkSuper, callArity, call, callerClassLower, methodFacts);
     for (const o of owners) {
       const overloadSig = computeOverloadSig(o, nameLower);
-      writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, via, o.method.name, overloadSig);
+      writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, via, o.method.name, overloadSig, forwardOpt);
     }
     return owners.length > 0;
   }
@@ -895,10 +1085,91 @@ function buildSemanticIndex(factsList) {
     };
   }
 
-  function writeMethodEdge(callerClassLower, callerMethodLabel, targetClassLower, nameLower, call, via, targetMethodName, overloadSig) {
+  // A1: 'name(TypeHead, ...)'-overload-aware param-name zip, the SAME
+  // param-vs-arg zipping logic shapeSites() uses at buildCallerTree render
+  // time (see its own comment for the full rationale) -- reimplemented here
+  // in miniature because forward edges compute argsRendered eagerly, at
+  // RECORD time inside this closure (ForwardEdge is a stored, not a
+  // derived-at-render-time, shape per the frozen A1 contract), against the
+  // LOCAL `classes` Map (identical Map reference `index.classes` will be
+  // once this build returns). Falls back to a plain joined-args string
+  // whenever the target isn't a known method (dml/publish/async/unresolved
+  // targets, or a target whose arity doesn't exactly match).
+  function renderArgsForTarget(targetClassLower, targetMethodLower, overloadSig, args) {
+    const joined = (args || []).length === 0 ? '' : args.join(', ');
+    const tcm = classes.get(targetClassLower);
+    if (!tcm || !targetMethodLower) return joined;
+    let paramSets;
+    if (targetMethodLower === '<init>') {
+      paramSets = (tcm.typeFacts.methods || []).filter((m) => m.isCtor).map((m) => m.params || []);
+    } else {
+      const candidates = tcm.methods.filter((m) => lc(m.name) === targetMethodLower);
+      if (overloadSig && candidates.length > 1) {
+        const match = candidates.find((m) => `${m.name}(${(m.params || []).map((p) => p.type || 'Object').join(', ')})` === overloadSig);
+        paramSets = match ? [match.params || []] : candidates.map((m) => m.params || []);
+      } else {
+        paramSets = candidates.map((m) => m.params || []);
+      }
+    }
+    const exact = paramSets.find((p) => p.length === (args || []).length);
+    if (!exact) return joined;
+    return exact.map((p, i) => `${p.name}: ${args[i]}`).join(', ');
+  }
+
+  // A1: pushes one ForwardEdge onto methodCallees[callerKey]. `targetKey` is
+  // either 'classLower#methodLower' (an ordinary method/trigger node) or a
+  // BARE 'classLower' (a class-level node -- used ONLY for G2/A3's
+  // exception-class terminal target, which has no method identity of its
+  // own) or null (a resolved-but-not-method target, e.g. a trigger fired by
+  // DML -- not used by this function directly; see the DML/publish
+  // tree-time handling in buildCalleeTree instead). `targetLabel` is the
+  // display text buildCalleeTree falls back to when targetKey doesn't
+  // resolve to a live node at tree-build time (defensive only -- every
+  // caller here passes a targetKey that resolves at record time).
+  function recordForwardEdge(callerClassLower, callerMethodLabel, edge) {
+    const callerKey = `${callerClassLower}#${lc(callerMethodLabel)}`;
+    if (!methodCallees.has(callerKey)) methodCallees.set(callerKey, []);
+    methodCallees.get(callerKey).push(edge);
+  }
+
+  // A1: via -> ForwardEdge.kind inference. 'dml'/'publish'/'async' vias are
+  // written exclusively by emitDmlTriggerEdges/handleEventBusPublish/
+  // handleAsyncHop (all of which route through writeMethodEdge, see below),
+  // so this single switch is the one place kind ever needs deciding for a
+  // methodCallers-shaped edge; 'throws' edges are recorded separately, by
+  // handleThrowSite directly (they never go through writeMethodEdge at all
+  // -- see its own header note).
+  function forwardKindForVia(via) {
+    if (via === 'dml') return 'dml';
+    if (via === 'publish') return 'publish';
+    if (via === 'async') return 'async';
+    return 'call';
+  }
+
+  function writeMethodEdge(callerClassLower, callerMethodLabel, targetClassLower, nameLower, call, via, targetMethodName, overloadSig, forward) {
     const key = `${targetClassLower}#${nameLower}`;
     if (!methodCallers.has(key)) methodCallers.set(key, []);
     methodCallers.get(key).push(makeCallSite(callerClassLower, callerMethodLabel, call, via, targetMethodName, overloadSig));
+    // A1: forward defaults to true -- every ordinary resolution rule (1-7,
+    // incl. DML-trigger/publish-trigger/async edges, which all fund through
+    // this same function) records itself as a forward edge too, UNLESS the
+    // caller explicitly opts out (fan-out contexts -- see emitOwners' own
+    // header note).
+    if (forward !== false) {
+      const args = call.argTexts || [];
+      recordForwardEdge(callerClassLower, callerMethodLabel, {
+        targetKey: key,
+        kind: forwardKindForVia(via),
+        via,
+        line: call.line,
+        col: call.col,
+        lineText: call.lineText,
+        args,
+        argsRendered: renderArgsForTarget(targetClassLower, nameLower, overloadSig, args),
+        overloadSig: overloadSig || null,
+        targetLabel: targetMethodName || nameLower,
+      });
+    }
   }
 
   // Rule 1 ('new') and rule 2 (this()/super() ctor chaining) both target a
@@ -907,13 +1178,58 @@ function buildSemanticIndex(factsList) {
   // is ALSO routed to classCallers here as a deliberate extension (decision
   // in header: "classCallers rollup scope") so class-level tracing doesn't
   // silently drop constructor-chaining callers.
-  function writeCtorEdge(callerClassLower, callerMethodLabel, targetClassLower, call, via) {
+  function writeCtorEdge(callerClassLower, callerMethodLabel, targetClassLower, call, via, forward) {
     const site = makeCallSite(callerClassLower, callerMethodLabel, call, via, '<init>');
     const key = `${targetClassLower}#<init>`;
     if (!methodCallers.has(key)) methodCallers.set(key, []);
     methodCallers.get(key).push(site);
     if (!classCallers.has(targetClassLower)) classCallers.set(targetClassLower, []);
     classCallers.get(targetClassLower).push(site);
+    // A1/A3/G5: forward defaults to true (a ctor edge is normally a single,
+    // definite target -- never a fan-out) -- rule 1's 'new' branch passes
+    // false when this exact 'new' expression's line is ALSO a throw site or
+    // a qualifying async-hop call (see isNewSuppressedFromForward).
+    if (forward !== false) {
+      const args = call.argTexts || [];
+      recordForwardEdge(callerClassLower, callerMethodLabel, {
+        targetKey: key,
+        kind: 'call',
+        via,
+        line: call.line,
+        col: call.col,
+        lineText: call.lineText,
+        args,
+        argsRendered: renderArgsForTarget(targetClassLower, '<init>', null, args),
+        overloadSig: null,
+        targetLabel: '<init>',
+      });
+    }
+  }
+
+  // A1/A2/A3/G5: see writeCtorEdge's call site (resolveCall's 'new' branch)
+  // for the full rationale -- reverse direction gets this SAME collapse for
+  // free (buildChildrenLevel groups by CALLER identity, so the 'new' edge
+  // and the throw/async edge for the same call site land on the SAME
+  // node); forward direction groups by TARGET identity instead (a
+  // structurally different key: '<init>' vs the exception class / the
+  // job's 'execute()'), so it needs this explicit line-based correlation
+  // to reach the same "one source line, one forward child" outcome.
+  function isNewSuppressedFromForward(mf, callLine) {
+    if (!mf) return false;
+    if ((mf.throwsSites || []).some((t) => t.line === callLine)) return true;
+    for (const c of mf.calls || []) {
+      if (c.kind !== 'dot' || c.line !== callLine) continue;
+      const receiverLower = lc(c.receiver);
+      const methodLower = lc(c.method);
+      if (
+        (receiverLower === 'system' && methodLower === 'enqueuejob') ||
+        (receiverLower === 'database' && methodLower === 'executebatch') ||
+        (receiverLower === 'system' && methodLower === 'schedule')
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // H4: returns whether an edge was written, so resolveDotOther's H4
@@ -971,7 +1287,14 @@ function buildSemanticIndex(factsList) {
         // chain finds the ancestor that actually supplies the method (e.g.
         // ConcreteGreeter implements Greeter but inherits greet() from
         // BaseGreeter -- the edge belongs on BaseGreeter#greet).
-        const implDirectHit = emitOwners(callerClassLower, callerMethodLabel, implLower, nameLower, call, 'interface', true, callArity, methodFacts);
+        // A1 forwardOpt=false: this is the H2 implementer FAN-OUT, not the
+        // primary interface edge (that's the `any = emitOwners(...)` call
+        // above, at the interface's own typeLower, which stays forward
+        // TRUE) -- see emitOwners' own header note for why forward tracing
+        // deliberately collapses interface dispatch onto the interface
+        // method's single node rather than exploding into N implementer
+        // children right at the call site.
+        const implDirectHit = emitOwners(callerClassLower, callerMethodLabel, implLower, nameLower, call, 'interface', true, callArity, methodFacts, false);
         if (implDirectHit) any = true;
         // H2 (interface x override composition): interface dispatch used to
         // fan out to direct implementers and walk UP their extends chains,
@@ -1037,7 +1360,15 @@ function buildSemanticIndex(factsList) {
       const owners = findMethodOwners(descLower, nameLower, false, callArity, call, callerClassLower, methodFacts);
       for (const o of owners) {
         const overloadSig = computeOverloadSig(o, nameLower);
-        writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, viaLabel, o.method.name, overloadSig);
+        // A1 forwardOpt=false: this whole function is ALWAYS an additive
+        // "might also be this subclass instance" fan-out over an already-
+        // recorded primary edge (F3's plain-typed override fan-out, or H2's
+        // interface x override composition above) -- never itself the
+        // primary resolution of a call site, so it never contributes its
+        // own forward edges (mirrors the interface-implementer fan-out's
+        // own forwardOpt=false, same reasoning: forward tracing shows the
+        // single most-direct target, not every possible-override variant).
+        writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, viaLabel, o.method.name, overloadSig, false);
         any = true;
       }
     }
@@ -1234,7 +1565,24 @@ function buildSemanticIndex(factsList) {
     if (!shadowedByVariable) {
       const classMatch = resolveType(receiverRaw, cm.qualified);
       if (classMatch) {
-        emitOwners(callerClassLower, callerMethodLabel, classMatch, nameLower, call, 'static', true, callArity, methodFacts);
+        // B2: classMatch is resolveType's ordinary first-wins pick -- when
+        // opts.packageOf never actually resolved a real package label for
+        // ANY file (MUST-FIX #5: packageMetadataDiscovered, not merely
+        // "packageOf is a function" -- a live packageOf that returns null
+        // for every path, exactly what extension.js passes for a workspace
+        // with no discoverable sfdx-project.json, must NOT enable this
+        // branch), or this name simply isn't duplicated,
+        // resolveDuplicateBucket is a same-value passthrough (winners:
+        // [classMatch], via:'static'), so this branch is byte-identical to
+        // pre-v0.7 behavior in both those cases (the B5 packageless-
+        // identity guarantee). Only a genuinely duplicated name with
+        // package metadata available changes anything here.
+        const bucketResult = packageMetadataDiscovered
+          ? resolveDuplicateBucket(classMatch, cm.package != null ? cm.package : null)
+          : { winners: [classMatch], via: 'static' };
+        for (const winnerClassLower of bucketResult.winners) {
+          emitOwners(callerClassLower, callerMethodLabel, winnerClassLower, nameLower, call, bucketResult.via, true, callArity, methodFacts);
+        }
         return;
       }
     }
@@ -1365,7 +1713,21 @@ function buildSemanticIndex(factsList) {
       // Rule 1.
       const targetClassLower = resolveType(call.method, cm.qualified);
       if (!targetClassLower) return; // not a known user class -> no edge
-      writeCtorEdge(callerClassLower, callerMethodLabel, targetClassLower, call, 'new');
+      // MUST-FIX #4: first-seen construction site for this class, keyed by
+      // its resolved classLower -- see firstConstructedAt's own header note.
+      if (!firstConstructedAt.has(targetClassLower)) {
+        firstConstructedAt.set(targetClassLower, { path: cm.path, line: call.line || 0 });
+      }
+      // A1/A2/A3: suppress the FORWARD half only (reverse methodCallers/
+      // classCallers edges are written unconditionally, below, unchanged)
+      // when this exact 'new' expression is the operand of either a throw
+      // statement (G2's 'throw new AcmeX(...)' dual-fact shape) or a
+      // qualifying async-hop call (G5's 'System.enqueueJob(new AcmeX(...))'
+      // shape) on the SAME line -- see isNewSuppressedFromForward's own
+      // header note for why forward direction needs this explicit check
+      // where reverse direction gets the equivalent collapse for free.
+      const forward = !isNewSuppressedFromForward(methodFacts, call.line);
+      writeCtorEdge(callerClassLower, callerMethodLabel, targetClassLower, call, 'new', forward);
       return;
     }
 
@@ -1666,6 +2028,32 @@ function buildSemanticIndex(factsList) {
     const site = makeThrowSite(callerClassLower, callerMethodLabel, throwSiteFact, 'throws');
     if (!throwers.has(excKey)) throwers.set(excKey, []);
     throwers.get(excKey).push(site);
+    // A3: forward-direction counterpart -- a throw site's own method gets a
+    // terminal forward child pointing at the exception CLASS (never a
+    // method -- targetKey is the bare classLower, no '#methodLower', which
+    // is how buildCalleeTree tells a class-level (kind='exception') forward
+    // target apart from an ordinary method target). Only recorded when the
+    // thrown type resolves to an INDEXED user class (resolvedLower) -- an
+    // unresolvable rethrow var already bailed out above (per G2 spec), and
+    // a resolved-but-external/platform exception type (bare normalized name
+    // fallback, excKey with no matching ClassMeta) has no real node to show
+    // as a forward target, so it's silently omitted here exactly the way an
+    // unindexed 'new' constructor target already is (rule 1's own header
+    // note: "not a known user class -> no edge").
+    if (resolvedLower) {
+      recordForwardEdge(callerClassLower, callerMethodLabel, {
+        targetKey: resolvedLower,
+        kind: 'throw',
+        via: 'throws',
+        line: throwSiteFact.line,
+        col: throwSiteFact.col || 0,
+        lineText: throwSiteFact.lineText,
+        args: [],
+        argsRendered: '',
+        overloadSig: null,
+        targetLabel: (classes.get(resolvedLower) || {}).name || typeNameRaw,
+      });
+    }
   }
 
   // =========================================================================
@@ -1747,26 +2135,96 @@ function buildSemanticIndex(factsList) {
     if (file.parseError) continue;
     for (const tf of file.types || []) {
       const qualifiedLower = lc(tf.qualified);
-      const cm = classes.get(qualifiedLower);
-      if (!cm || cm.path !== file.path) continue; // lost the duplicate-name race, ignored for resolution
+      // B2: resolve THIS exact (file, type) pair's own registration key via
+      // classBuckets, instead of unconditionally re-deriving qualifiedLower
+      // and skipping every type that "lost the race" (the pre-v0.7
+      // behavior). Every type pass A registered -- primary AND duplicate
+      // slots alike -- now gets its OWN calls walked under its OWN key, so
+      // a duplicate class's outbound calls are no longer silently dropped
+      // (they simply weren't reachable at all before B2 gave duplicates a
+      // real identity). Matched by file path, mirroring the exact
+      // disambiguation the old `cm.path !== file.path` check used.
+      const bucket = classBuckets.get(qualifiedLower) || [];
+      const entry = bucket.find((b) => b.cm.path === file.path);
+      if (!entry) continue; // defensive: should always be found (pass A registers every type)
+      const ownClassLower = entry.classLower;
+      const cm = entry.cm;
       for (const mf of tf.methods || []) {
         const callerMethodLabel = mf.isCtor ? '<init>' : mf.name;
+        // MUST-FIX #2/#3: this method's callerKey is constant across all
+        // three call/dml/throwsSites loops below -- hoisted so the
+        // post-loop source-line sort (see methodStartLen below) can find
+        // exactly the slice of methodCallees this ONE method contributed,
+        // regardless of which of the three loops wrote it.
+        const callerKeyStr = `${ownClassLower}#${lc(callerMethodLabel)}`;
+        const methodStartLen = (methodCallees.get(callerKeyStr) || []).length;
         for (const call of mf.calls || []) {
-          resolveCall(qualifiedLower, callerMethodLabel, mf, call);
+          const beforeLen = (methodCallees.get(callerKeyStr) || []).length;
+          resolveCall(ownClassLower, callerMethodLabel, mf, call);
           // F1/F4a/G1/G5: independent of ordinary dispatch above (see each
           // function's own header comment for why).
-          handleDatabaseMethodDml(qualifiedLower, callerMethodLabel, mf, call);
-          handleTypeForName(qualifiedLower, callerMethodLabel, call);
-          handleEventBusPublish(qualifiedLower, callerMethodLabel, mf, call);
-          handleAsyncHop(qualifiedLower, callerMethodLabel, call);
+          handleDatabaseMethodDml(ownClassLower, callerMethodLabel, mf, call);
+          handleTypeForName(ownClassLower, callerMethodLabel, call);
+          handleEventBusPublish(ownClassLower, callerMethodLabel, mf, call);
+          handleAsyncHop(ownClassLower, callerMethodLabel, call);
+          // A1/A6: this call site produced literally zero forward edges
+          // (of ANY kind -- call/dml/publish/async) from ANY of the five
+          // handlers above -- feeds buildCalleeTree's single aggregated
+          // "N unresolved sites" leaf per method. Only ORDINARY 'dot'/'bare'
+          // method-call attempts participate:
+          //   - 'prop' (A2 property get/set access, e.g. an SObject field
+          //     read/write like `ord.Acme_Status__c = 'Approved'`) is a
+          //     completely different relationship from "calling something"
+          //     -- resolvePropCall's own contract is silent-no-edge on a
+          //     plain FIELD match (not a dropped/unresolved call at all),
+          //     and even a genuinely unresolved receiver here was never a
+          //     method-invocation attempt in the first place. Confirmed
+          //     against the real corpus: AcmeOrderUtil.cls#markApproved's
+          //     three prop accesses (one set, two nested gets inside the
+          //     sendApprovalEmail call's own args) would otherwise inflate
+          //     its forward children with a bogus "3 unresolved sites" leaf
+          //     that MANIFEST's ground truth (chain #3, A1) does not have.
+          //   - 'new' is excluded for the SAME reason isNewSuppressedFromForward
+          //     exists one level up: an unresolved 'new' target (e.g.
+          //     `new Acme_Note__e(...)` -- a platform-event SObject, never
+          //     an indexed Apex class) is a constructor-style fact, not an
+          //     ordinary method-call attempt either, and MANIFEST's own A4
+          //     ground truth (chain #6, AcmeNoteEventPublisher#publishNote)
+          //     confirms this: exactly 2 children (trigger + flow), no
+          //     unresolved leaf, despite the un-indexable inline
+          //     `new Acme_Note__e(...)` argument sitting right there.
+          const afterLen = (methodCallees.get(callerKeyStr) || []).length;
+          if (afterLen === beforeLen && (call.kind === 'dot' || call.kind === 'bare')) {
+            unresolvedForwardCounts.set(callerKeyStr, (unresolvedForwardCounts.get(callerKeyStr) || 0) + 1);
+          }
         }
         // F1: statement-form DML.
         for (const dmlFact of mf.dml || []) {
-          handleDmlStatement(qualifiedLower, callerMethodLabel, mf, dmlFact);
+          handleDmlStatement(ownClassLower, callerMethodLabel, mf, dmlFact);
         }
         // G2: throw-statement sites.
         for (const throwSiteFact of mf.throwsSites || []) {
-          handleThrowSite(qualifiedLower, callerMethodLabel, mf, throwSiteFact, tf);
+          handleThrowSite(ownClassLower, callerMethodLabel, mf, throwSiteFact, tf);
+        }
+        // MUST-FIX #2/#3: mf.calls[], then mf.dml[], then mf.throwsSites[]
+        // are processed as three SEPARATE loops above (call-graph edges,
+        // DML/trigger fan-out, and exception fan-out are each their own
+        // MethodFacts array with no shared iteration order), so the forward
+        // edges just appended to methodCallees for THIS method are grouped
+        // by which loop wrote them, not by true source-line position --
+        // e.g. a method whose only DML statement sits before its only
+        // ordinary call (source order) would otherwise show the call first.
+        // Restore true source-line order (documented "ordered children
+        // (source-line order)" contract, MANIFEST v0.7 chains #3 and #5)
+        // by sorting just the slice this method contributed -- a stable
+        // sort, so call sites that share an exact line (rare, but not
+        // impossible for a one-line multi-call statement) keep their
+        // original relative (loop) order.
+        const methodEdges = methodCallees.get(callerKeyStr);
+        if (methodEdges && methodEdges.length > methodStartLen) {
+          const tail = methodEdges.slice(methodStartLen);
+          tail.sort((a, b) => (a.line || 0) - (b.line || 0) || (a.col || 0) - (b.col || 0));
+          methodEdges.splice(methodStartLen, tail.length, ...tail);
         }
       }
     }
@@ -1884,12 +2342,56 @@ function buildSemanticIndex(factsList) {
     }
   }
 
+  // B2: index.stats.duplicateNames -- count of DISTINCT qualified names with
+  // more than one registered candidate, but ONLY surfaced when package
+  // metadata was ACTUALLY discovered (MUST-FIX #5: packageMetadataDiscovered,
+  // not merely "opts.packageOf is a function" -- per B5's packageless-
+  // identity guarantee: "NEITHER index.stats.duplicateNames nor any
+  // via='ambiguous' edge is surfaced" when package metadata isn't
+  // discoverable, and a live packageOf returning null for every path counts
+  // as "not discoverable"). `duplicates` (the flat qualified-name list)
+  // stays populated unconditionally either way -- it already existed
+  // pre-v0.7 and its own meaning ("first-parsed file wins, this is who
+  // lost") is unaffected by whether packages are known.
+  let duplicateNamesCount = 0;
+  if (packageMetadataDiscovered) {
+    for (const bucket of classBuckets.values()) {
+      if (bucket.length > 1) duplicateNamesCount++;
+    }
+  }
+
   return {
     classes,
     methodCallers,
     classCallers,
+    // A1: forward-direction adjacency, keyed exactly like methodCallers'
+    // callerKey format (see makeCallSite) -- 'lowerQualified#lowerMethod' ->
+    // ForwardEdge[]. Consumed by buildCalleeTree (below).
+    methodCallees,
+    // A1/A6: callerKey -> count of MethodFacts.calls entries that produced
+    // zero forward edges -- buildCalleeTree folds this into one aggregated
+    // "N unresolved sites" leaf per method.
+    unresolvedForwardCounts,
     parseFallbacks,
     duplicates,
+    // B2: qualifiedLower -> [{classLower, package, cm}] -- every type
+    // sharing that qualified name (bucket length 1 for every non-duplicated
+    // name). Exposed so callers (tests, and eventually targets.js/UI code
+    // outside this file's ownership) can enumerate a duplicated name's
+    // individual package-tagged candidates and build a `target` object
+    // addressing ONE of them directly (its `classLower` is a real key into
+    // `classes`).
+    classBuckets,
+    // A5: exposed so buildCalleeTree's interface-fan-out special case
+    // (calleeInterfaceFanoutPairs, a top-level function outside this
+    // closure) can look up an interface's implementers by simple name --
+    // previously purely a buildSemanticIndex-internal lookup table, never
+    // needed post-build until forward tracing.
+    interfaceImplementers,
+    // MUST-FIX #4: exposed so calleeInterfaceFanoutPairs can order an
+    // interface's implementer fan-out by construction-site order instead of
+    // raw file-scan order -- see firstConstructedAt's own header note above.
+    firstConstructedAt,
     dmlSitesByObject,
     publishSitesByObject,
     throwers,
@@ -1899,7 +2401,14 @@ function buildSemanticIndex(factsList) {
     // through unchanged (see buildCallerTree's H4 stats passthrough) so the
     // UI can show one honest "N call sites workspace-wide could not be
     // resolved" header regardless of which target is being traced.
-    stats: { unresolvedSites: unresolvedSitesCount },
+    stats: { unresolvedSites: unresolvedSitesCount, duplicateNames: duplicateNamesCount },
+    // MUST-FIX #1/#5: exposed so post-build query-time code (suggestTargets,
+    // below) can apply the SAME real B2 gate this closure used internally
+    // -- true only once opts.packageOf actually resolved a non-null label
+    // for at least one file, never merely because opts.packageOf was
+    // passed as a function (see packageMetadataDiscovered's own header
+    // note above).
+    packageMetadataDiscovered,
   };
 }
 
@@ -1949,6 +2458,173 @@ function classLevelPairs(index, classLower, cm) {
     if (nl === '<init>' || seenNames.has(nl)) continue;
     seenNames.add(nl);
     for (const site of index.methodCallers.get(`${classLower}#${nl}`) || []) out.push({ site, targetMethodLower: nl });
+  }
+  return out;
+}
+
+// =========================================================================
+// A2: callee ("forward") direction pairs -- the SAME { site, targetMethodLower }
+// shape methodLevelPairs/classLevelPairs produce for callers, so the shared
+// walker (buildChildrenLevel/buildOneChildNode below) never has to know
+// which direction it's in beyond a couple of explicit `direction` checks.
+// Each ForwardEdge is ADAPTED into a CallSite-compatible `site` whose
+// callerClass/callerMethod fields deliberately name the EDGE'S TARGET (the
+// node this child represents), not a caller -- the shared walker only ever
+// reads those fields generically to decide "what identity does this child
+// represent", so re-purposing them this way lets grouping/cycle-detection/
+// dedup/label-building work completely unmodified for either direction.
+// =========================================================================
+
+function calleeItemFromEdge(index, edge) {
+  // A3: a class-level (no '#methodLower') target -- currently only the
+  // throw-forward exception-class node. Flagged via `kindOverride` so
+  // buildOneChildNode can short-circuit straight to a terminal 'exception'
+  // TNode without trying (and failing) the ordinary ccm.methods lookup.
+  if (edge.targetKey && edge.targetKey.indexOf('#') === -1) {
+    const tcm = index.classes.get(edge.targetKey);
+    return {
+      kindOverride: 'exception',
+      site: {
+        callerClass: tcm ? tcm.qualified : edge.targetLabel || edge.targetKey,
+        callerMethod: null,
+        callerKey: `${edge.targetKey}#(exception)`,
+        path: tcm ? tcm.path : '',
+        line: 0,
+        col: edge.col || 0,
+        lineText: edge.lineText,
+        args: edge.args || [],
+        argsRendered: edge.argsRendered || '',
+        via: edge.via,
+        overloadSig: null,
+      },
+      targetMethodLower: null,
+    };
+  }
+  let gClassLower = null;
+  let gMethodLower = null;
+  let resolvedCm = null;
+  let resolvedMm = null;
+  if (edge.targetKey) {
+    const hashIdx = edge.targetKey.indexOf('#');
+    gClassLower = edge.targetKey.slice(0, hashIdx);
+    gMethodLower = edge.targetKey.slice(hashIdx + 1);
+    resolvedCm = index.classes.get(gClassLower);
+    resolvedMm = resolvedCm ? resolvedCm.methods.find((m) => lc(m.name) === gMethodLower) : null;
+  }
+  const isTriggerTarget = !!(resolvedCm && resolvedCm.kind === 'trigger');
+  const displayMethodLabel = isTriggerTarget ? '(trigger)' : resolvedMm ? resolvedMm.name : gMethodLower || edge.targetLabel || '';
+  return {
+    site: {
+      callerClass: resolvedCm ? resolvedCm.qualified : edge.targetLabel || '(unresolved)',
+      callerMethod: displayMethodLabel,
+      callerKey: edge.targetKey || `(unresolved)#${edge.line}~${edge.col}`,
+      path: resolvedCm ? resolvedCm.path : '',
+      line: resolvedMm ? resolvedMm.line : 0,
+      col: edge.col || 0,
+      lineText: edge.lineText,
+      args: edge.args || [],
+      argsRendered: edge.argsRendered || '',
+      via: edge.via,
+      overloadSig: edge.overloadSig || null,
+    },
+    targetMethodLower: gMethodLower,
+  };
+}
+
+// A5: when classLower#methodLower identifies an INTERFACE method,
+// forward-tracing it does NOT read methodCallees (an interface method has
+// no body, so it never records any of its own outbound calls) -- instead it
+// fans out to every implementer's same-name method, via='interface',
+// mirroring the reverse direction's emitTypedOrInterfaceForClass fan-out
+// (incl. H2's "satisfies the interface via an INHERITED method" walk-up).
+// Returns null (not an interface, or no implementers) so the caller falls
+// back to the ordinary calleeMethodLevelPairs lookup.
+function calleeInterfaceFanoutPairs(index, classLower, methodLower) {
+  const cm = index.classes.get(classLower);
+  if (!cm || !cm.typeFacts || !cm.typeFacts.isInterface) return null;
+  const implementers = (index.interfaceImplementers && index.interfaceImplementers.get(lc(cm.name))) || [];
+  if (!implementers.length) return null;
+  const out = [];
+  implementers.forEach((implLower, scanIndex) => {
+    let cur = implLower;
+    const seen = new Set();
+    let ownerCm = null;
+    let ownerMm = null;
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      const ccm = index.classes.get(cur);
+      if (!ccm) break;
+      const mm = ccm.methods.find((m) => lc(m.name) === methodLower);
+      if (mm) {
+        ownerCm = ccm;
+        ownerMm = mm;
+        break;
+      }
+      cur = ccm.extendsLower || null;
+    }
+    if (!ownerCm || !ownerMm) return;
+    const ownerKey = ownerCm.classLower || lc(ownerCm.qualified);
+    out.push({
+      _implLower: implLower, // MUST-FIX #4: sort key input only -- stripped below
+      _scanIndex: scanIndex, // stable fallback when no construction site is known
+      site: {
+        callerClass: ownerCm.qualified,
+        callerMethod: ownerMm.name,
+        callerKey: `${ownerKey}#${methodLower}`,
+        path: ownerCm.path,
+        line: ownerMm.line,
+        col: 0,
+        lineText: '',
+        args: [],
+        argsRendered: '',
+        via: 'interface',
+        overloadSig: null,
+      },
+      targetMethodLower: methodLower,
+    });
+  });
+  if (!out.length) return null;
+  // MUST-FIX #4: order the fan-out by each implementer's earliest known
+  // `new ImplClass(...)` construction site in the codebase (file+line),
+  // NOT by raw interfaceImplementers scan order -- see firstConstructedAt's
+  // header note. An implementer with no known construction site anywhere
+  // sorts after every implementer that does have one, keeping its original
+  // relative scan order among its similarly-unconstructed peers.
+  out.sort((a, b) => {
+    const ca = index.firstConstructedAt && index.firstConstructedAt.get(a._implLower);
+    const cb = index.firstConstructedAt && index.firstConstructedAt.get(b._implLower);
+    if (ca && cb) {
+      if (ca.path !== cb.path) return ca.path < cb.path ? -1 : 1;
+      if (ca.line !== cb.line) return ca.line - cb.line;
+      return a._scanIndex - b._scanIndex;
+    }
+    if (ca && !cb) return -1;
+    if (!ca && cb) return 1;
+    return a._scanIndex - b._scanIndex;
+  });
+  return out.map(({ _implLower, _scanIndex, ...rest }) => rest);
+}
+
+function calleeMethodLevelPairs(index, classLower, methodLower) {
+  const ifacePairs = calleeInterfaceFanoutPairs(index, classLower, methodLower);
+  if (ifacePairs) return ifacePairs.map((it) => Object.assign({}, it, { _edgeItem: true }));
+  const edges = (index.methodCallees && index.methodCallees.get(`${classLower}#${methodLower}`)) || [];
+  return edges.map((edge) => Object.assign({}, calleeItemFromEdge(index, edge), { _edgeItem: true }));
+}
+
+// A2: class-level forward target (no specific method) -- union of every
+// declared method's own OWN outbound edges (mirrors classLevelPairs'
+// reverse-direction rollup shape), '<init>' included via a direct
+// methodCallees lookup (ctor bodies can make calls too, e.g. this()/super()
+// chaining aside -- an ordinary constructor body's OWN statements).
+function calleeClassLevelPairs(index, classLower, cm) {
+  const out = [];
+  const seenNames = new Set();
+  for (const m of cm.methods) {
+    const nl = lc(m.name);
+    if (seenNames.has(nl)) continue;
+    seenNames.add(nl);
+    out.push(...calleeMethodLevelPairs(index, classLower, nl));
   }
   return out;
 }
@@ -2006,6 +2682,26 @@ function shapeSites(index, items, targetClassLower) {
       overloadSig: site.overloadSig || null,
     };
   });
+}
+
+// A2: callee-direction SiteView construction. Unlike shapeSites (which
+// re-derives argsRendered against the METHOD BEING TRACED's own declared
+// params -- correct for callers, where the traced method is the one
+// RECEIVING the shown args), a callee child's argsRendered was already
+// computed at RECORD time (writeMethodEdge/writeCtorEdge's
+// renderArgsForTarget call, zipped against THAT CHILD's own declared
+// params -- the correct target for a forward call site's args) and carries
+// straight through from the adapted ForwardEdge (see calleeItemFromEdge).
+function shapeCalleeSites(items) {
+  return items.map(({ site }) => ({
+    path: site.path,
+    line: site.line,
+    col: site.col,
+    lineText: site.lineText,
+    argsRendered: site.argsRendered || '',
+    via: site.via,
+    overloadSig: site.overloadSig || null,
+  }));
 }
 
 function sortTNodes(a, b) {
@@ -2096,6 +2792,10 @@ function buildCallerTree(index, target, opts) {
       },
       targetLabel: rawLabel,
       note: 'target class not found in index',
+      // A2: direction is now present on EVERY TreeResult (both directions,
+      // incl. this not-found shell) -- purely additive, a brand-new field
+      // no pre-v0.7 caller could have been reading.
+      direction: 'callers',
       // H1/H4: stats still passed through even for a not-found target, so
       // callers can rely on TreeResult.stats always being present.
       stats: { nodes: 0, uniqueMethods: 0, capped: false, unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0 },
@@ -2147,6 +2847,16 @@ function buildCallerTree(index, target, opts) {
     entries: rootEntries, isTest: rootIsTest, via: null, sites: [], children: [],
     cyclic: false, truncated: false, approximate: false,
   };
+  // B3 (reconciliation): uitree.shapeResult derives targetPackage from
+  // treeResult.root.package REGARDLESS of direction ("the traced target IS
+  // treeResult.root ... in both directions", per uitree.js's own header
+  // note on shapeResult) -- buildCalleeTree already stamps this (see its
+  // own root construction below), so buildCallerTree must too, or every
+  // caller in the SAME package as the traced target would incorrectly grow
+  // a badge (targetPackage staying undefined never matches any node's real
+  // package, per packageBadge()'s `node.package === targetPackage` check).
+  // Caught live via dev/smoke.js's v0.7.0 PACKAGE MATRIX B4 case 2 output.
+  if (cm.package != null) root.package = cm.package;
 
   const ancestorPath = new Set(methodLower ? [`${classLower}#${methodLower}`] : []);
   const pairs = methodLower ? methodLevelPairs(index, classLower, methodLower) : classLevelPairs(index, classLower, cm);
@@ -2188,7 +2898,7 @@ function buildCallerTree(index, target, opts) {
   // DFS recursion -- specifically so a maxNodes cap (when it fires) stops
   // fairly across all branches rather than fully draining whichever branch
   // happened to be visited first.
-  const ctx = { maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set() };
+  const ctx = { maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set(), direction: 'callers' };
   const queue = [];
   root.children = buildChildrenLevel(index, allPairs, 1, ancestorPath, classLower, excCtx, ctx, queue);
   while (queue.length) {
@@ -2214,6 +2924,7 @@ function buildCallerTree(index, target, opts) {
     // metadata/flow) gets an honest info note instead of silently rendering
     // an empty tree.
     note: root.children.length === 0 ? ZERO_CALLER_NOTE : null,
+    direction: 'callers', // A2: additive, see the not-found branch's own note above.
     stats: {
       nodes: ctx.nodeCount,
       uniqueMethods: ctx.uniqueKeys.size,
@@ -2221,6 +2932,292 @@ function buildCallerTree(index, target, opts) {
       unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0,
     },
   };
+}
+
+// =========================================================================
+// A2: buildCalleeTree -- "what does this method call?"
+// =========================================================================
+// Shares buildChildrenLevel/buildOneChildNode (the v0.6 DAG-memoization +
+// fair maxNodes-cap walker) with buildCallerTree verbatim, parameterized by
+// ctx.direction === 'callees' -- see those two functions' own header notes
+// for exactly which branches differ. The pieces with NO callers-direction
+// equivalent at all (DML/publish -> flow fan-out, the unresolved-call
+// aggregate leaf) are bolted on afterward, once per node, the same way
+// buildCallerTree already bolts on buildMetaChildren's metadata callers
+// (new code, since there is nothing to fork there either -- forward tracing
+// invented these relationships).
+function buildCalleeTree(index, target, opts) {
+  const maxDepth = (opts && opts.maxDepth) || DEFAULT_MAX_DEPTH;
+  const maxNodes = (opts && opts.maxNodes) || DEFAULT_MAX_NODES;
+  const classLower = lc(target && target.classLower);
+  const cm = index.classes.get(classLower);
+
+  if (!cm) {
+    const rawLabel = target ? `${target.classLower || ''}${target.methodLower ? '.' + target.methodLower : ''}` : '';
+    return {
+      root: {
+        label: rawLabel, kind: 'class', className: (target && target.classLower) || '', path: '', line: 0,
+        methodLower: (target && target.methodLower) ? lc(target.methodLower) : null,
+        entries: [], isTest: false, via: null, sites: [], children: [],
+        cyclic: false, truncated: false, approximate: false,
+      },
+      targetLabel: rawLabel,
+      note: 'target class not found in index',
+      direction: 'callees',
+      stats: { nodes: 0, uniqueMethods: 0, capped: false, unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0 },
+    };
+  }
+
+  const isTrigger = cm.kind === 'trigger';
+  const isAnonymous = cm.kind === 'anonymous';
+  let methodLower = target && target.methodLower ? lc(target.methodLower) : null;
+  if (isTrigger) methodLower = '(trigger)';
+
+  // Root display shape is direction-agnostic -- identical logic to
+  // buildCallerTree's own root construction (deliberately duplicated
+  // rather than factored into a shared helper: the two functions' root
+  // blocks are already this file's most heavily fixture-pinned code, and a
+  // shared-helper refactor there risks the exact byte-identical-output
+  // regression bar this round is pinned against for zero benefit -- this
+  // block has no direction-specific branches to share in the first place).
+  let rootKind, rootLabel, rootLine, rootEntries, rootIsTest;
+  if (isTrigger) {
+    rootKind = 'trigger';
+    rootLabel = cm.name;
+    const mm = cm.methods.find((m) => lc(m.name) === '(trigger)');
+    rootLine = mm ? mm.line : 0;
+    rootEntries = mm ? mm.entries : [];
+    rootIsTest = false;
+  } else if (isAnonymous && methodLower === '(anonymous)') {
+    rootKind = 'anonymous';
+    const mm = cm.methods.find((m) => lc(m.name) === methodLower);
+    rootLabel = cm.name;
+    rootLine = mm ? mm.line : 0;
+    rootEntries = mm ? mm.entries : [];
+    rootIsTest = false;
+  } else if (methodLower) {
+    rootKind = 'method';
+    const mm = cm.methods.find((m) => lc(m.name) === methodLower);
+    const dispName = mm ? mm.name : methodLower;
+    rootLabel = `${cm.name}.${dispName}`;
+    rootLine = mm ? mm.line : 0;
+    rootEntries = mm ? mm.entries : [];
+    rootIsTest = mm ? mm.isTest : cm.isTest;
+  } else {
+    rootKind = 'class';
+    rootLabel = cm.name;
+    rootLine = 0;
+    rootEntries = cm.entries;
+    rootIsTest = cm.isTest;
+  }
+
+  const root = {
+    label: rootLabel, kind: rootKind, className: cm.qualified, path: cm.path, line: rootLine,
+    methodLower,
+    entries: rootEntries, isTest: rootIsTest, via: null, sites: [], children: [],
+    cyclic: false, truncated: false, approximate: false,
+  };
+  if (cm.package != null) root.package = cm.package; // B3
+
+  const ancestorPath = new Set(methodLower ? [`${classLower}#${methodLower}`] : []);
+  // A2/G4: a trigger body's own top-level local-variable declarations (e.g.
+  // `AcmeOrderTriggerHandler handler = new AcmeOrderTriggerHandler();`) are
+  // parsed under a SEPARATE synthetic '(init)' scope, distinct from
+  // '(trigger)' (the rest of the body) -- a pre-existing parser.js/
+  // resolver.js convention, unrelated to v0.7. Confirmed live against the
+  // real corpus's AcmeOrderTrigger.trigger (MANIFEST chain #12): forcing
+  // methodLower to '(trigger)' alone (as buildCallerTree also does for
+  // reverse-direction trigger targets) would silently miss the '(init)'-
+  // bucketed `new AcmeOrderTriggerHandler()` edge. Forward tracing "the
+  // trigger" is meant to show EVERYTHING the trigger file does, so a
+  // trigger target unions BOTH scopes' own outbound edges, '(init)' first
+  // (it always textually precedes the try/body per how triggers are
+  // written) to preserve overall source-order.
+  const pairs = isTrigger
+    ? calleeMethodLevelPairs(index, classLower, '(init)').concat(calleeMethodLevelPairs(index, classLower, '(trigger)'))
+    : methodLower
+      ? calleeMethodLevelPairs(index, classLower, methodLower)
+      : calleeClassLevelPairs(index, classLower, cm);
+
+  // H1 (shared): same ctx shape buildCallerTree uses, direction:'callees'
+  // is what buildChildrenLevel/buildOneChildNode key their few
+  // direction-specific branches off. dmlByCallerKey/publishByCallerKey are
+  // pre-indexed ONCE per buildCalleeTree call (not re-scanned per node) so
+  // the DML/publish -> flow fan-out below stays O(1) per node instead of
+  // O(objects) per node.
+  const ctx = {
+    maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set(),
+    direction: 'callees',
+    dmlByCallerKey: indexSitesByCallerKey(index.dmlSitesByObject),
+    publishByCallerKey: indexSitesByCallerKey(index.publishSitesByObject),
+  };
+  const queue = [];
+  root.children = buildChildrenLevel(index, pairs, 1, ancestorPath, classLower, null, ctx, queue);
+  if (isTrigger) {
+    appendCalleeExtras(index, root, classLower, '(init)', ctx);
+    appendCalleeExtras(index, root, classLower, '(trigger)', ctx);
+  } else {
+    appendCalleeExtras(index, root, classLower, methodLower, ctx);
+  }
+  while (queue.length) {
+    const task = queue.shift(); // FIFO -> breadth-first across the whole tree, same as buildCallerTree
+    task.node.children = buildChildrenLevel(index, task.pairs, task.depth, task.ancestorPath, task.targetClassLower, null, ctx, queue);
+    // A1: DML/publish flow-fanout + the unresolved-call aggregate leaf are
+    // computed PER NODE (unlike buildCallerTree's metaRefs folding, which
+    // is root-only by pre-existing design -- see buildCallerTree's own
+    // metaRefs comment) using THIS node's own identity, since forward
+    // tracing keeps walking arbitrarily deep and every method along the
+    // way can have its own DML/publish/unresolved-call facts.
+    appendCalleeExtras(index, task.node, task.targetClassLower, task.node.methodLower, ctx);
+  }
+
+  return {
+    root,
+    targetLabel: rootLabel,
+    note: root.children.length === 0 ? 'This method makes no traceable outbound calls.' : null,
+    direction: 'callees',
+    stats: {
+      nodes: ctx.nodeCount,
+      uniqueMethods: ctx.uniqueKeys.size,
+      capped: ctx.capped,
+      unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0,
+    },
+  };
+}
+
+// A1: objectLower -> [{callerClass, callerMethod, ...}] map (dmlSitesByObject/
+// publishSitesByObject) re-indexed by callerKey ('classLower#methodLower')
+// for O(1) per-node lookup in appendCalleeExtrasForMethod, instead of
+// re-scanning every object's site list for every node in the tree.
+function indexSitesByCallerKey(sitesByObject) {
+  const out = new Map();
+  if (!sitesByObject) return out;
+  for (const [objectLower, entries] of sitesByObject) {
+    for (const e of entries) {
+      const key = `${lc(e.callerClass)}#${lc(e.callerMethod)}`;
+      if (!out.has(key)) out.set(key, []);
+      out.get(key).push({ objectLower, entry: e });
+    }
+  }
+  return out;
+}
+
+// A1/A4: builds ONE terminal, non-expanding TNode for a flow reached via a
+// DML or EventBus.publish site -- mirrors buildFlowChildren's reverse-
+// direction node shape (kind:'flow') but for the OPPOSITE relationship
+// (this IS the flow being reached, not a caller list under it).
+function makeCalleeFlowNode(flow, via, siteEntry) {
+  return {
+    label: flow.label,
+    kind: 'flow',
+    className: '',
+    methodLower: null,
+    path: flow.path,
+    line: flow.line,
+    entries: [metaEntryLabel('flow')],
+    isTest: false,
+    via,
+    sites: [{
+      path: siteEntry.path,
+      line: siteEntry.line,
+      col: siteEntry.col,
+      lineText: siteEntry.lineText,
+      argsRendered: (siteEntry.args || []).join(', '),
+      via,
+      overloadSig: null,
+    }],
+    children: [],
+    cyclic: false,
+    truncated: true, // A2: "record-triggered flow node... terminal in this direction"
+    approximate: false,
+    seenElsewhere: false,
+  };
+}
+
+// class-level target (methodLower null) -- union of extras across every
+// declared method, mirroring calleeClassLevelPairs' own rollup shape.
+function appendCalleeExtras(index, node, classLower, methodLower, ctx) {
+  if (!methodLower) {
+    const cm = index.classes.get(classLower);
+    if (!cm) return;
+    const seen = new Set();
+    for (const m of cm.methods) {
+      const nl = lc(m.name);
+      if (seen.has(nl)) continue;
+      seen.add(nl);
+      appendCalleeExtrasForMethod(index, node, classLower, nl, ctx);
+    }
+    return;
+  }
+  appendCalleeExtrasForMethod(index, node, classLower, methodLower, ctx);
+}
+
+function appendCalleeExtrasForMethod(index, node, classLower, methodLower, ctx) {
+  const callerKey = `${classLower}#${methodLower}`;
+  const extras = [];
+
+  // A1: DML -> record-triggered flow fan-out (the '(trigger)' half of the
+  // same DML site already arrived as an ordinary methodCallees edge,
+  // through the shared walker above -- writeMethodEdge/emitDmlTriggerEdges
+  // records it with via='dml' pointing straight at the trigger's own
+  // classLower#(trigger) key. This only adds the FLOW half, which needs
+  // flow metadata that's only ever available via attachMetaCallers).
+  const myDmlSites = ctx.dmlByCallerKey.get(callerKey) || [];
+  for (const { objectLower, entry } of myDmlSites) {
+    const flowRefs = (index.flowRefsByObject && index.flowRefsByObject.get(objectLower)) || [];
+    for (const flow of flowRefs) {
+      if (!flow.flowRecordTriggerType) continue; // platform-event flow -- handled by the publish branch below
+      const matchOps = flowOpsForRecordTriggerType(flow.flowRecordTriggerType);
+      if (!matchOps.includes(entry.op)) continue;
+      extras.push(makeCalleeFlowNode(flow, 'dml', entry));
+    }
+  }
+
+  // A4: EventBus.publish -> platform-event-triggered flow fan-out. Mirrors
+  // the DML branch, but unconditional on op (a publish has none) and gated
+  // on flowTriggerType==='PlatformEvent' instead of flowRecordTriggerType
+  // (see metascan.js's own G1(b) note: the two fields are mutually
+  // exclusive on a given flow ref).
+  const myPublishSites = ctx.publishByCallerKey.get(callerKey) || [];
+  for (const { objectLower, entry } of myPublishSites) {
+    const flowRefs = (index.flowRefsByObject && index.flowRefsByObject.get(objectLower)) || [];
+    for (const flow of flowRefs) {
+      if (lc(flow.flowTriggerType) !== 'platformevent') continue;
+      extras.push(makeCalleeFlowNode(flow, 'publish', entry));
+    }
+  }
+
+  // A6: unresolved-call aggregation -- exactly ONE leaf per method,
+  // regardless of how many individual call sites contributed to the count.
+  const unresolvedCount = (index.unresolvedForwardCounts && index.unresolvedForwardCounts.get(callerKey)) || 0;
+  if (unresolvedCount > 0) {
+    extras.push({
+      label: `${unresolvedCount} unresolved site${unresolvedCount === 1 ? '' : 's'}`,
+      kind: 'unresolved',
+      className: '',
+      methodLower: null,
+      path: '',
+      line: 0,
+      entries: [],
+      isTest: false,
+      via: 'unresolved',
+      sites: [],
+      children: [],
+      cyclic: false,
+      truncated: true,
+      approximate: true,
+      seenElsewhere: false,
+    });
+  }
+
+  for (const extra of extras) {
+    if (ctx.nodeCount >= ctx.maxNodes) {
+      ctx.capped = true;
+      break;
+    }
+    ctx.nodeCount++;
+    node.children.push(extra);
+  }
 }
 
 // H1: counts every TNode in a (small, non-recursive-beyond-flow-children)
@@ -2438,6 +3435,41 @@ function attachMetaCallers(index, metaRefs) {
   }
   index.metaCallers = metaCallers;
   index.metaMethodCallers = metaMethodCallers;
+
+  // A1/A4: forward DML/publish -> flow linkage. A record-triggered (or
+  // platform-event-triggered) flow's own metaRef carries flowObject/
+  // flowRecordTriggerType/flowTriggerType regardless of WHICH apex action it
+  // calls (className/methodName above address a completely different
+  // relationship: "this flow invokes that apex method"). Forward tracing
+  // needs the OPPOSITE lookup from buildFlowChildren's reverse-direction one
+  // (object -> DML sites): given a DML/publish site's own resolved object,
+  // which flow(s) are triggered by it -- independent of whatever apex
+  // method(s) that flow happens to call elsewhere. This can only be built
+  // here (not inside buildSemanticIndex) because flow metadata never flows
+  // through that function at all -- it arrives exclusively via this
+  // attachMetaCallers call, same as metaCallers/metaMethodCallers above.
+  // Deduped by (kind, label, flowObject) since one flow's <actionCalls>
+  // block can produce several metaRefs sharing the same flow identity.
+  const flowRefsByObject = index.flowRefsByObject instanceof Map ? index.flowRefsByObject : new Map();
+  const seenFlowKeys = index._seenFlowKeys instanceof Set ? index._seenFlowKeys : new Set();
+  for (const ref of metaRefs || []) {
+    if (!ref || ref.kind !== 'flow' || !ref.flowObject) continue;
+    const objectLower = lc(ref.flowObject);
+    const dedupeKey = `${objectLower}::${lc(ref.label)}`;
+    if (seenFlowKeys.has(dedupeKey)) continue;
+    seenFlowKeys.add(dedupeKey);
+    if (!flowRefsByObject.has(objectLower)) flowRefsByObject.set(objectLower, []);
+    flowRefsByObject.get(objectLower).push({
+      label: ref.label,
+      path: ref.path || '',
+      line: ref.line || 0,
+      flowRecordTriggerType: ref.flowRecordTriggerType || null,
+      flowTriggerType: ref.flowTriggerType || null,
+    });
+  }
+  index.flowRefsByObject = flowRefsByObject;
+  index._seenFlowKeys = seenFlowKeys;
+
   return index;
 }
 
@@ -2466,6 +3498,12 @@ function findSoleInvocableMethod(index, classLower) {
 // still-queued task, since they all share the same ctx) and marks
 // ctx.capped = true -- the top-level TreeResult.stats.capped flag is what
 // makes this visible; nothing is silently dropped without it.
+// A2: `ctx.direction` ('callers'|'callees', default 'callers' when unset --
+// see buildCallerTree, which never sets it, vs buildCalleeTree, which
+// always does) is the ONE thing that makes this walker direction-agnostic
+// rather than forked: grouping/DAG-memoization/cap-enforcement below are
+// 100% shared code, unaware of direction beyond the couple of explicit
+// branches called out inline.
 function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower, excCtx, ctx, queue) {
   const groups = new Map();
   for (const item of pairs) {
@@ -2477,12 +3515,26 @@ function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower,
       isLexical = true;
       key = `LEX#${gClassLower}`;
     } else {
-      gClassLower = lc(site.callerClass);
+      // B2 fix: derive gClassLower/key from site.callerKey (the EXACT
+      // internal registration key every site shape already carries --
+      // makeCallSite, calleeItemFromEdge, and the pass-E lexical-fallback
+      // site all set it) instead of re-deriving it by lowercasing the
+      // DISPLAY qualified name (site.callerClass). Identical to the
+      // pre-v0.7 behavior for every non-duplicate class (lc(qualified)
+      // always equals the registration key there), but a B2 duplicate-slot
+      // identity's registration key is a SYNTHETIC string distinct from
+      // its shared display name -- re-deriving from the display name would
+      // collide two genuinely different classes/packages sharing one
+      // qualified name into a single grouped node (breaking B3's ambiguous
+      // fan-out, which needs them to stay two separate forward/reverse
+      // children).
+      const hashIdx = site.callerKey ? site.callerKey.indexOf('#') : -1;
+      gClassLower = hashIdx >= 0 ? site.callerKey.slice(0, hashIdx) : lc(site.callerClass);
       gMethodLabel = site.callerMethod;
       isLexical = false;
-      key = `${gClassLower}#${lc(gMethodLabel)}`;
+      key = site.callerKey || `${gClassLower}#${lc(gMethodLabel)}`;
     }
-    if (!groups.has(key)) groups.set(key, { gClassLower, gMethodLabel, isLexical, items: [] });
+    if (!groups.has(key)) groups.set(key, { gClassLower, gMethodLabel, isLexical, kindOverride: item.kindOverride || null, items: [] });
     groups.get(key).items.push(item);
   }
   const out = [];
@@ -2496,7 +3548,14 @@ function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower,
     out.push(built.node);
     if (built.expandTask) queue.push(built.expandTask);
   }
-  out.sort(sortTNodes);
+  // A2: callers-direction output is UNCHANGED (alphabetical, tests-last,
+  // exactly the pre-v0.7 sortTNodes call). Callees direction instead
+  // preserves SOURCE-LINE order -- forward tracing is telling "what happens
+  // first, second, third" in program order, not listing an arbitrary set of
+  // callers, and `groups` (a Map) already preserves `pairs`' own insertion
+  // order (== methodCallees' push order == call-site encounter order during
+  // pass B) for free, so simply skipping the sort here is enough.
+  if (ctx.direction !== 'callees') out.sort(sortTNodes);
   return out;
 }
 
@@ -2516,6 +3575,7 @@ function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower,
 // identity expanded (so any LATER occurrence hits case 3) and returns an
 // expandTask for the caller to enqueue.
 function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excCtx, ctx) {
+  const direction = ctx.direction === 'callees' ? 'callees' : 'callers';
   const approximate = g.items.length > 0 && g.items.every((it) => APPROX_VIA.has(it.site.via));
 
   if (g.isLexical) {
@@ -2527,6 +3587,34 @@ function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excC
         entries: [], isTest: false, via: 'lexical',
         sites: shapeSites(index, g.items, targetClassLower),
         children: [], cyclic: false, truncated: false, approximate: true, seenElsewhere: false,
+      },
+      expandTask: null,
+    };
+  }
+
+  // A3: class-level (no method) forward target -- currently only the
+  // throw-forward exception-class node (calleeItemFromEdge flags it via
+  // kindOverride). Always terminal per the A2 spec ("exception-class node
+  // ... TERMINAL") -- it does not expand into the exception class's own
+  // (nonexistent, for a plain exception subclass) outbound calls.
+  // Reconciled against MANIFEST.md's v0.7 A3 ground truth and the top-level
+  // contract's APPROX_VIA set (declared once, at this file's top): 'throws'
+  // is deliberately NOT a member -- a throw site genuinely does raise that
+  // exact exception type, the same "platform genuinely does this" reasoning
+  // already applied to via='dml'/'publish'/'async' elsewhere in this file.
+  // approximate is therefore computed from APPROX_VIA like every other node
+  // (currently always false, since 'throws' is the only via this branch
+  // ever sees), not hardcoded true -- terminality is carried by `truncated`
+  // alone, exactly like the sibling flow/unresolved terminal nodes above.
+  if (g.kindOverride === 'exception') {
+    const first = g.items[0].site;
+    return {
+      node: {
+        label: first.callerClass, kind: 'exception', className: first.callerClass, path: first.path, line: 0,
+        methodLower: null,
+        entries: [], isTest: false, via: first.via,
+        sites: direction === 'callees' ? shapeCalleeSites(g.items) : shapeSites(index, g.items, targetClassLower),
+        children: [], cyclic: false, truncated: true, approximate: APPROX_VIA.has(first.via), seenElsewhere: false,
       },
       expandTask: null,
     };
@@ -2544,7 +3632,7 @@ function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excC
         label: g.gMethodLabel, kind: 'method', className: g.gClassLower, path: '', line: 0,
         methodLower: methodLower2,
         entries: [], isTest: false, via: g.items[0].site.via,
-        sites: shapeSites(index, g.items, targetClassLower),
+        sites: direction === 'callees' ? shapeCalleeSites(g.items) : shapeSites(index, g.items, targetClassLower),
         children: [], cyclic: false, truncated: false, approximate, seenElsewhere: false,
       },
       expandTask: null,
@@ -2559,9 +3647,21 @@ function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excC
     label, kind: isTriggerCaller ? 'trigger' : 'method', className: ccm.qualified, path: ccm.path,
     methodLower: isTriggerCaller ? '(trigger)' : methodLower2,
     line: mm ? mm.line : 0, entries: mm ? mm.entries : [], isTest: mm ? mm.isTest : ccm.isTest,
-    via: g.items[0].site.via, sites: shapeSites(index, g.items, targetClassLower),
+    via: g.items[0].site.via,
+    // A2: callee-direction sites carry a PRE-COMPUTED argsRendered (zipped
+    // at RECORD time against THIS node's own declared params -- the
+    // correct target for a forward call site's args, unlike shapeSites'
+    // callers-direction zip against the method BEING TRACED). See
+    // shapeCalleeSites' own header note.
+    sites: direction === 'callees' ? shapeCalleeSites(g.items) : shapeSites(index, g.items, targetClassLower),
     children: [], cyclic: false, truncated: false, approximate, seenElsewhere: false,
   };
+  // B3: package badge -- only meaningful (and only ever populated) when
+  // opts.packageOf was active for this build; a plain string label or
+  // undefined otherwise (uitree/pathmap, out of this file's scope, decide
+  // when to actually render it -- e.g. only when it differs from the
+  // trace's own root package).
+  if (ccm.package != null) node.package = ccm.package;
 
   // G2: while tracing an exception's caller tree, every ANCESTOR node whose
   // OWN method declares a catch clause matching that exception (exact user
@@ -2621,7 +3721,9 @@ function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excC
   ctx.expandedKeys.add(cycleKey);
   const nextPath = new Set(ancestorPath);
   nextPath.add(cycleKey);
-  const nextPairs = methodLevelPairs(index, g.gClassLower, methodLower2);
+  const nextPairs = direction === 'callees'
+    ? calleeMethodLevelPairs(index, g.gClassLower, methodLower2)
+    : methodLevelPairs(index, g.gClassLower, methodLower2);
   return {
     node,
     expandTask: { node, pairs: nextPairs, depth: depth + 1, ancestorPath: nextPath, targetClassLower: g.gClassLower },
@@ -2634,8 +3736,29 @@ function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excC
 
 function suggestTargets(index) {
   const out = [];
+  // MUST-FIX #1: only stamp a `package` field when B2's real gate is active
+  // (package metadata was actually discovered somewhere -- see
+  // packageMetadataDiscovered's own header note in buildSemanticIndex).
+  // Matches targets.js's own contract: an item with NO `package` property
+  // at all is what keeps a packageless workspace's refineTargets() output
+  // byte-identical to pre-v0.7 (see targets.js's B3 addendum).
+  const stampPackage = !!index.packageMetadataDiscovered;
   for (const cm of index.classes.values()) {
-    out.push({ label: cm.name, classLower: lc(cm.qualified), methodLower: null });
+    // MUST-FIX #1: use THIS ClassMeta's own registration key (cm.classLower
+    // -- the real key it lives under in index.classes, which for a B2
+    // duplicate-slot candidate is a synthetic '~dupN~pkg' key, NOT the
+    // plain lc(cm.qualified) every same-named candidate shares) instead of
+    // re-deriving classLower from the qualified name. Before this fix every
+    // duplicate-name candidate's suggestTargets() item carried the SAME
+    // classLower (whichever one `index.classes.get(lc(qualified))` happens
+    // to resolve to -- always the first-registered/primary candidate), so
+    // buildCallerTree/buildCalleeTree could never actually reach any
+    // candidate but the primary one via the public suggestTargets() ->
+    // resolveTarget() flow real QuickPick usage goes through.
+    const classLower = cm.classLower || lc(cm.qualified);
+    const classItem = { label: cm.name, classLower, methodLower: null };
+    if (stampPackage) classItem.package = cm.package != null ? cm.package : null;
+    out.push(classItem);
     const seen = new Set();
     for (const m of cm.methods) {
       const nl = lc(m.name);
@@ -2646,7 +3769,9 @@ function suggestTargets(index) {
       // guaranteed to show zero callers.
       if (nl.startsWith('(get ') || nl.startsWith('(set ')) continue;
       const label = cm.kind === 'trigger' ? cm.name : `${cm.name}.${m.name}`;
-      out.push({ label, classLower: lc(cm.qualified), methodLower: nl });
+      const methodItem = { label, classLower, methodLower: nl };
+      if (stampPackage) methodItem.package = cm.package != null ? cm.package : null;
+      out.push(methodItem);
     }
   }
   out.sort((a, b) => a.label.localeCompare(b.label));
@@ -2656,6 +3781,7 @@ function suggestTargets(index) {
 module.exports = {
   buildSemanticIndex,
   buildCallerTree,
+  buildCalleeTree,
   suggestTargets,
   attachMetaCallers,
 };

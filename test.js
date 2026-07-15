@@ -591,6 +591,30 @@ addFile('classes/V06ZeroCallerTarget.cls', [
   '}',
 ].join('\n'));
 
+// =========================================================================
+// v0.7.0 A2 FORWARD-ASYNC fixture: System.enqueueJob(new X()) -> the job's
+// own execute() method, via='async', with the G5 forward-collapse rule
+// (the inline `new FwdAsyncJob()` constructor argument must NOT ALSO
+// surface as a separate '<init>' forward child) asserted end to end. Kept
+// as its own self-contained mini fixture set (FwdAsync* prefix, no overlap
+// with any other fixture in this file). Deliberately uses a denylisted
+// 'System.debug(...)' body (not an indexed call) so this fixture adds ZERO
+// new entries to the corpus-wide unresolvedSites count the H4 block above
+// already pins at 1.
+// =========================================================================
+addFile('classes/FwdAsyncOrchestrator.cls', [
+  'public class FwdAsyncOrchestrator {',
+  '  public void runMaintenance() {',
+  '    System.enqueueJob(new FwdAsyncJob());',
+  '  }',
+  '}',
+].join('\n'));
+addFile('classes/FwdAsyncJob.cls', [
+  'public class FwdAsyncJob implements Queueable {',
+  '  public void execute(QueueableContext qc) { System.debug(\'async\'); }',
+  '}',
+].join('\n'));
+
 // Sanity: no fixture should crash parseFile, and exactly the one deliberate
 // syntax error should carry parseError.
 for (const f of files) {
@@ -685,6 +709,13 @@ resolver.attachMetaCallers(index, pubStoryFlowMetaRefs);
 
 function callers(classLower, methodLower) {
   const tree = resolver.buildCallerTree(index, { classLower, methodLower }, {});
+  return tree;
+}
+
+// v0.7.0 A2: forward-direction counterpart to callers() -- same corpus/index,
+// same {}-opts convention, just buildCalleeTree instead of buildCallerTree.
+function callees(classLower, methodLower) {
+  const tree = resolver.buildCalleeTree(index, { classLower, methodLower }, {});
   return tree;
 }
 
@@ -1182,6 +1213,291 @@ function findChild(tree, label) {
     siteLabels.includes('L5: t.calc(5);\n-> calc(Integer) · i: 5'),
     'H3 e2e: the Integer-literal overload site is rendered the same way, with its own overloadSig/argsRendered'
   );
+}
+
+// =========================================================================
+// v0.7.0 integrator assertions -- Feature A (forward tracing) and Feature B
+// (multi-package awareness), end to end (real Apex source text ->
+// parser.parseFile -> resolver.buildSemanticIndex -> both
+// resolver.buildCallerTree/buildCalleeTree). Mirrors the MANIFEST.md v0.7
+// "Feature A -- Forward tracing ground truth" A1/A2/A3 chains and the
+// package matrix, as a synthetic parallel proof (test.js's own stated
+// purpose -- see this file's header note -- is proving the pipeline
+// end-to-end through its own self-contained fixtures, distinct from
+// dev/regress-callers-v07.js and the groundtruth harness, which exercise
+// the real adv-org corpus).
+// =========================================================================
+
+// --- FORWARD TRANSACTION STORY, asserted node by node: controller ->
+//     service -> DML -> {trigger, record-triggered flow}; trigger ->
+//     handler -> invocable. REUSES the pre-existing v0.4.0 TxStory*
+//     fixtures verbatim (no new files) -- the exact same corpus already
+//     proven correct in the REVERSE direction above (see the "v0.4.0
+//     TRANSACTION-STORY" assertions block), now traced FORWARD. -------------
+{
+  // Link 1 (controller -> service): 'TxStoryService svc = new
+  // TxStoryService(); svc.recalcStory(story);' is TWO ordinary forward call
+  // sites (unlike the async-collapse rule, a plain new+typed-call pair is
+  // NOT collapsed) -- the constructor and the typed dispatch each get their
+  // own child.
+  const controllerTree = callees('txstorycontroller', 'submitstory');
+  assert.strictEqual(controllerTree.direction, 'callees');
+  const svcCtor = controllerTree.root.children.find((c) => c.label === 'TxStoryService.<init>');
+  assert.ok(svcCtor, 'forward link 1a: TxStoryController.submitStory constructs TxStoryService');
+  assert.strictEqual(svcCtor.via, 'new');
+  const svcCall = controllerTree.root.children.find((c) => c.label === 'TxStoryService.recalcStory');
+  assert.ok(svcCall, 'forward link 1b: TxStoryController.submitStory calls svc.recalcStory(story)');
+  assert.strictEqual(svcCall.via, 'typed');
+  assert.strictEqual(controllerTree.root.children.length, 2, 'submitStory has exactly 2 forward call sites, no more');
+
+  // Link 2 (service -> DML fan-out): the SAME 'update story;' statement
+  // forwards to BOTH the matching trigger AND the matching record-triggered
+  // flow -- the A1 transaction-story shape.
+  const serviceTree = callees('txstoryservice', 'recalcstory');
+  const trigChild = serviceTree.root.children.find((c) => c.kind === 'trigger');
+  assert.ok(trigChild, 'forward link 2a: the update DML statement must forward to TxStoryTrigger');
+  assert.strictEqual(trigChild.label, 'TxStoryTrigger');
+  assert.strictEqual(trigChild.via, 'dml');
+  assert.strictEqual(trigChild.approximate, false, "via='dml' must not be approximate -- the trigger genuinely fires");
+
+  const flowChild = serviceTree.root.children.find((c) => c.kind === 'flow');
+  assert.ok(flowChild, 'forward link 2b: the SAME update DML statement must ALSO forward to TxStoryFollowUpFlow');
+  assert.strictEqual(flowChild.label, 'TxStoryFollowUpFlow');
+  assert.strictEqual(flowChild.via, 'dml');
+  assert.strictEqual(flowChild.truncated, true, 'A2: a record-triggered flow node is TERMINAL in the forward direction');
+  assert.deepStrictEqual(flowChild.children, [], 'a terminal flow node must have no children');
+
+  // Link 3 (trigger -> handler): unlike a flow node, a '(trigger)' node is
+  // NOT terminal forward -- tracing continues into its handler exactly like
+  // tracing forward from any other method (union of the '(init)' and
+  // '(trigger)' scopes, per buildCalleeTree's own trigger-target header
+  // note).
+  const trigTree = callees('txstorytrigger', null);
+  assert.strictEqual(trigTree.root.kind, 'trigger');
+  const handlerCtor = trigTree.root.children.find((c) => c.label === 'TxStoryTriggerHandler.<init>');
+  assert.ok(handlerCtor, 'forward link 3a: TxStoryTrigger constructs TxStoryTriggerHandler');
+  assert.strictEqual(handlerCtor.via, 'new');
+  const handlerCall = trigTree.root.children.find((c) => c.label === 'TxStoryTriggerHandler.handle');
+  assert.ok(handlerCall, 'forward link 3b: TxStoryTrigger calls .handle() on the freshly constructed handler');
+  assert.strictEqual(handlerCall.via, 'typed');
+
+  // Link 4 (handler -> invocable): ordinary static dispatch, resolves-today.
+  const handlerTree = callees('txstorytriggerhandler', 'handle');
+  const invocableChild = handlerTree.root.children.find((c) => c.label === 'TxStoryInvocable.execute');
+  assert.ok(invocableChild, 'forward link 4: TxStoryTriggerHandler.handle calls TxStoryInvocable.execute');
+  assert.strictEqual(invocableChild.via, 'static');
+  assert.strictEqual(handlerTree.root.children.length, 1, 'handle() has exactly 1 forward call site');
+}
+
+// --- FORWARD ASYNC CHAIN: System.enqueueJob(new FwdAsyncJob()) collapses
+//     to a single via='async' child at the job's own execute() method -- no
+//     separate '<init>' child for the inline constructor argument (G5
+//     forward-collapse). ------------------------------------------------
+{
+  const tree = callees('fwdasyncorchestrator', 'runmaintenance');
+  assert.strictEqual(tree.root.children.length, 1, 'runMaintenance() collapses to exactly ONE forward child, not two');
+  const asyncChild = tree.root.children[0];
+  assert.strictEqual(asyncChild.label, 'FwdAsyncJob.execute');
+  assert.strictEqual(asyncChild.via, 'async');
+  assert.ok(
+    !tree.root.children.some((c) => c.label === 'FwdAsyncJob.<init>'),
+    'G5 forward-collapse: the inline `new FwdAsyncJob()` argument must NOT ALSO appear as a separate <init> child'
+  );
+}
+
+// --- FORWARD THROW TERMINAL: reuses the pre-existing v0.5.0 ExcStory*
+//     fixtures (no new files) -- ExcStoryValidator.validate's guard-clause
+//     throw forwards to a terminal, non-approximate 'exception' node.
+//     Directly exercises this round's resolver.js reconciliation fix: the
+//     exception-class node's approximate flag is now computed from
+//     APPROX_VIA (via='throws' is NOT a member) instead of being hardcoded
+//     true -- see resolver.js's own A3 comment and MANIFEST.md's A3 ground
+//     truth, which tags this node terminal but never approximate. -------
+{
+  const tree = callees('excstoryvalidator', 'validate');
+  assert.strictEqual(tree.root.children.length, 1, "validate(Id)'s only statement is the guard-clause throw");
+  const excChild = tree.root.children[0];
+  assert.strictEqual(excChild.label, 'ExcStoryValidationException');
+  assert.strictEqual(excChild.kind, 'exception');
+  assert.strictEqual(excChild.via, 'throws');
+  assert.strictEqual(excChild.truncated, true, 'A3: an exception-class node is TERMINAL in the forward direction');
+  assert.strictEqual(excChild.approximate, false, "A3/reconciliation: via='throws' is not in APPROX_VIA -- an exception-class node must NOT be flagged approximate, matching MANIFEST.md's A3 ground truth");
+  assert.deepStrictEqual(excChild.children, [], 'a terminal exception node must have no children');
+  assert.ok(
+    !tree.root.children.some((c) => c.label === 'ExcStoryValidationException.<init>'),
+    "G2 forward-collapse: the throw statement's own `new ExcStoryValidationException(...)` must NOT ALSO appear as a separate <init> child"
+  );
+}
+
+// =========================================================================
+// v0.7.0 B PACKAGE MATRIX: multi-package awareness through the FULL
+// pipeline (real Apex source text -> parser.parseFile -> packageOf(fsPath)
+// -> resolver.buildSemanticIndex -> BOTH tree directions), as its own
+// self-contained mini-corpus (Pkg* prefix) indexed SEPARATELY from the main
+// `files`/`index` above -- packageOf's presence must never perturb any
+// pre-v0.7 assertion elsewhere in this file, notably the pre-existing
+// Dup1/Dup.cls vs Dup2/Dup.cls first-wins-drop fixture (still indexed with
+// no opts at all, still first-wins, completely untouched by this section).
+// =========================================================================
+
+const pkgFiles = [];
+function addPkgFile(relPath, text) {
+  pkgFiles.push(parser.parseFile({ path: `/ws/${relPath}`, text }));
+}
+
+// 'PkgDup' declared in 3 packages (alpha/beta/delta), deliberately
+// different bodies, same method name -- the duplicate-name fixture used for
+// same-package-preference and default-package-fallback below. pkg-alpha is
+// the DEFAULT package, and is deliberately ONE OF THE 3 CANDIDATES here --
+// see PkgDup2 below for why genuine ambiguity needs a DIFFERENT shape.
+addPkgFile('pkg-alpha/classes/PkgDup.cls', [
+  'public class PkgDup {',
+  '  public static void identify() { System.debug(\'alpha\'); }',
+  '}',
+].join('\n'));
+addPkgFile('pkg-beta/classes/PkgDup.cls', [
+  'public class PkgDup {',
+  '  public static void identify() { System.debug(\'beta\'); }',
+  '}',
+].join('\n'));
+addPkgFile('pkg-delta/classes/PkgDup.cls', [
+  'public class PkgDup {',
+  '  public static void identify() { System.debug(\'delta\'); }',
+  '}',
+].join('\n'));
+
+// Same-package preference: a pkg-alpha caller referencing PkgDup.identify().
+addPkgFile('pkg-alpha/classes/PkgAlphaCaller.cls', [
+  'public class PkgAlphaCaller {',
+  '  public void go() { PkgDup.identify(); }',
+  '}',
+].join('\n'));
+
+// Default-package fallback: pkg-gamma declares no PkgDup of its own, and is
+// not one of the 3 candidate packages -- falls through to the DEFAULT
+// package (pkg-alpha).
+addPkgFile('pkg-gamma/classes/PkgGammaCaller.cls', [
+  'public class PkgGammaCaller {',
+  '  public void go() { PkgDup.identify(); }',
+  '}',
+].join('\n'));
+
+// 'PkgDup2' declared ONLY in pkg-beta/pkg-delta -- NEITHER is the default
+// package (pkg-alpha), which is exactly the shape genuine ambiguity
+// requires (mirrors test-resolver.js's own B3 fixture design note: rule 2's
+// default-package fallback trivially "succeeds" whenever the default
+// happens to be one of the colliding candidates, as PkgDup above
+// demonstrates for pkg-gamma -- ambiguity is only reachable when the
+// default package is NOT among the candidates at all).
+addPkgFile('pkg-beta/classes/PkgDup2.cls', [
+  'public class PkgDup2 {',
+  '  public static void identify() { System.debug(\'beta2\'); }',
+  '}',
+].join('\n'));
+addPkgFile('pkg-delta/classes/PkgDup2.cls', [
+  'public class PkgDup2 {',
+  '  public static void identify() { System.debug(\'delta2\'); }',
+  '}',
+].join('\n'));
+
+// Genuinely ambiguous: pkg-epsilon is outside BOTH PkgDup2 candidate
+// packages (beta/delta) AND is not the default (alpha) -- rule 1
+// (same-package) and rule 2 (default-package) both fail, so resolution
+// fans out to ALL candidates, via='ambiguous'.
+addPkgFile('pkg-epsilon/classes/PkgEpsilonCaller.cls', [
+  'public class PkgEpsilonCaller {',
+  '  public void go() { PkgDup2.identify(); }',
+  '}',
+].join('\n'));
+
+// packageOf(fsPath) -- mirrors how the REAL extension.js derives this from
+// sfdx-project.json's packageDirectories (B1); resolver.js itself never
+// parses paths, see buildSemanticIndex's own opts contract.
+function pkgPackageOf(fsPath) {
+  const m = /\/ws\/(pkg-[a-z]+)\//.exec(fsPath || '');
+  return m ? m[1] : null;
+}
+const PKG_DEFAULT_PACKAGE = 'pkg-alpha';
+
+const pkgIndex = resolver.buildSemanticIndex(pkgFiles, { packageOf: pkgPackageOf, defaultPackage: PKG_DEFAULT_PACKAGE });
+
+{
+  assert.strictEqual(pkgIndex.stats.duplicateNames, 2, 'v0.7 e2e: PkgDup (3-way) and PkgDup2 (2-way) are the 2 duplicated qualified names, through the real parser pipeline');
+  const bucket = pkgIndex.classBuckets.get('pkgdup');
+  assert.strictEqual(bucket.length, 3, 'classBuckets exposes all 3 same-name PkgDup candidates');
+
+  const alphaEntry = bucket.find((b) => b.package === 'pkg-alpha');
+  const betaEntry = bucket.find((b) => b.package === 'pkg-beta');
+  const deltaEntry = bucket.find((b) => b.package === 'pkg-delta');
+  assert.ok(alphaEntry && betaEntry && deltaEntry, 'all 3 package candidates present in the PkgDup bucket');
+
+  // Same-package preference (reverse direction).
+  const treeAlpha = resolver.buildCallerTree(pkgIndex, { classLower: alphaEntry.classLower, methodLower: 'identify' }, {});
+  const alphaCaller = treeAlpha.root.children.find((c) => c.label === 'PkgAlphaCaller.go');
+  assert.ok(alphaCaller, 'B1 e2e: PkgAlphaCaller (in pkg-alpha) resolves to the pkg-alpha PkgDup candidate (same-package preference)');
+  assert.strictEqual(alphaCaller.via, 'static');
+
+  const treeBeta = resolver.buildCallerTree(pkgIndex, { classLower: betaEntry.classLower, methodLower: 'identify' }, {});
+  assert.ok(!treeBeta.root.children.some((c) => c.label === 'PkgAlphaCaller.go'), 'B1 e2e: same-package preference wins outright -- no ALSO fanning out to the pkg-beta candidate too');
+
+  // Default-package fallback (reverse direction): pkg-gamma has no PkgDup
+  // of its own -> falls through to the default package (pkg-alpha).
+  const gammaCaller = treeAlpha.root.children.find((c) => c.label === 'PkgGammaCaller.go');
+  assert.ok(gammaCaller, 'B2 rule 2 e2e: PkgGammaCaller (outside every candidate package) resolves to the DEFAULT package candidate (pkg-alpha)');
+  assert.strictEqual(gammaCaller.via, 'static');
+  assert.ok(!treeBeta.root.children.some((c) => c.label === 'PkgGammaCaller.go'), 'B2 rule 2 e2e: the non-default pkg-beta candidate must NOT be chosen instead');
+
+  // Genuinely ambiguous (both directions), on PkgDup2 (beta/delta only, no
+  // default-package candidate to fall back to): pkg-epsilon fans out to
+  // both candidates.
+  const bucket2 = pkgIndex.classBuckets.get('pkgdup2');
+  assert.strictEqual(bucket2.length, 2, 'classBuckets exposes both PkgDup2 candidates');
+  const beta2Entry = bucket2.find((b) => b.package === 'pkg-beta');
+  const delta2Entry = bucket2.find((b) => b.package === 'pkg-delta');
+  const treeBeta2 = resolver.buildCallerTree(pkgIndex, { classLower: beta2Entry.classLower, methodLower: 'identify' }, {});
+  const treeDelta2 = resolver.buildCallerTree(pkgIndex, { classLower: delta2Entry.classLower, methodLower: 'identify' }, {});
+  const epsilonInBeta2 = treeBeta2.root.children.find((c) => c.label === 'PkgEpsilonCaller.go');
+  const epsilonInDelta2 = treeDelta2.root.children.find((c) => c.label === 'PkgEpsilonCaller.go');
+  assert.ok(epsilonInBeta2 && epsilonInDelta2, 'B3 e2e: the ambiguous call site produces an edge to BOTH candidates, from the same call site');
+  for (const c of [epsilonInBeta2, epsilonInDelta2]) {
+    assert.strictEqual(c.via, 'ambiguous');
+    assert.strictEqual(c.approximate, true, "B3 e2e: via='ambiguous' must join the approximate set");
+  }
+
+  // Forward direction sees the same fan-out from the caller's own side, and
+  // each candidate node carries its own package label (B3 badge plumbing).
+  const calleeTreeEps = resolver.buildCalleeTree(pkgIndex, { classLower: 'pkgepsiloncaller', methodLower: 'go' }, {});
+  assert.strictEqual(calleeTreeEps.root.children.length, 2, 'B3 forward e2e: the ambiguous call site forwards to both candidates');
+  for (const c of calleeTreeEps.root.children) {
+    assert.strictEqual(c.label, 'PkgDup2.identify');
+    assert.strictEqual(c.via, 'ambiguous');
+    assert.strictEqual(c.approximate, true);
+  }
+  const badgePackages = calleeTreeEps.root.children.map((c) => c.package).sort();
+  assert.deepStrictEqual(badgePackages, ['pkg-beta', 'pkg-delta'], 'B3 e2e: each forward candidate node carries its own package label for the UI badge');
+
+  // Forward direction, same-package (non-ambiguous) call site for contrast
+  // -- resolves to exactly ONE candidate, no fan-out.
+  const calleeTreeAlphaCaller = resolver.buildCalleeTree(pkgIndex, { classLower: 'pkgalphacaller', methodLower: 'go' }, {});
+  assert.strictEqual(calleeTreeAlphaCaller.root.children.length, 1, 'B1 forward e2e: same-package call site resolves to exactly ONE candidate, no fan-out');
+  assert.strictEqual(calleeTreeAlphaCaller.root.children[0].via, 'static');
+  assert.strictEqual(calleeTreeAlphaCaller.root.children[0].package, 'pkg-alpha');
+
+  // B5 (through the real parser pipeline this time): a SEPARATE index over
+  // the SAME pkgFiles with NO opts at all must reproduce first-wins-drop
+  // behavior exactly, byte-identical to pre-v0.7.
+  const pkgIndexNoOpts = resolver.buildSemanticIndex(pkgFiles);
+  assert.strictEqual(pkgIndexNoOpts.stats.duplicateNames, 0, 'B5 e2e: stats.duplicateNames stays 0 when opts.packageOf is inactive, even with real duplicate names present, through the real parser pipeline');
+  const treeNoOpts = resolver.buildCallerTree(pkgIndexNoOpts, { classLower: 'pkgdup', methodLower: 'identify' }, {});
+  const noOptsCallers = treeNoOpts.root.children.map((c) => c.label).sort();
+  assert.deepStrictEqual(
+    noOptsCallers,
+    ['PkgAlphaCaller.go', 'PkgGammaCaller.go'],
+    'B5 e2e: BOTH callers resolve to the single first-wins PkgDup slot (pkg-alpha, first-parsed) -- no package-based split at all'
+  );
+  for (const c of treeNoOpts.root.children) {
+    assert.strictEqual(c.via, 'static', "B5 e2e: via stays 'static' -- 'ambiguous' must never appear when packageOf is inactive");
+  }
 }
 
 console.log('apex-trace end-to-end self-check: all assertions passed');

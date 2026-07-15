@@ -36,11 +36,48 @@ calls, chains deeper than 4 segments), instead of staying silent about it.
 ## Quickstart
 
 1. Put your cursor on a method or class name (or open nothing, for a QuickPick over
-   every class/method) and run **Apex Call Graph: Who Calls This?**.
-2. Results land in the **Apex Call Graph: Callers** view (Explorer sidebar) — click any
-   call site to jump straight to it.
+   every class/method) and run **Apex Call Graph: Who Calls This?** (callers) or
+   **Apex Call Graph: What Does This Call?** (callees).
+2. Results land in the **Apex Call Graph** view (Explorer sidebar) — click any call
+   site to jump straight to it. The view title's swap-arrow button re-runs the same
+   target in the other direction.
 3. Run **Apex Call Graph: Show Path Map** for the same trace as an interactive graph
    instead of a tree.
+
+## Both directions
+
+Every trace runs either direction: **Who Calls This?** walks callers upward to the
+entry points that can reach your target; **What Does This Call?** walks forward
+through everything your target sets off — DML statements fan out to every trigger
+*and* record-triggered Flow they fire, `EventBus.publish` fans out to platform-event
+triggers and Flows the same way, async scheduling (`enqueueJob`/`executeBatch`/
+`schedule`) lands on the job's `execute` method, and a `throw` lands on a terminal
+exception-class node. The transcript below is pasted **verbatim** from
+`node dev/smoke.js`, tracing forward from a publisher method:
+
+```
+=== AcmeNoteEventPublisher.publishNote -- A4 publish-forward: EventBus.publish -> trigger + PE flow ===
+What Does This Call?
+75 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).
+stats: nodes=5 unique=2 unresolved=75 capped=false direction=callees
+AcmeNoteEventPublisher.publishNote
+  AcmeNoteEventTrigger  [trigger on Acme_Note__e (after insert) · publish]
+      L6: EventBus.publish(new Acme_Note__e(Message__c = message));
+      -> new Acme_Note__e(Message__c = message)
+    AcmeNoteEventHandler.handle  [static]
+        L9: AcmeNoteEventHandler.handle(Trigger.new);
+        -> events: Trigger.new
+      ~1 unresolved site  [unresolved · ~ · … depth cap]
+  AcmeNoteEventFlow  [Flow apex action · publish · … depth cap]
+      L10: EventBus.publish(new Acme_Note__e(Message__c = message));
+      -> new Acme_Note__e(Message__c = message)
+```
+
+The SAME `EventBus.publish(...)` statement fans out to both the trigger and the Flow
+— a Flow node is always terminal going forward (its own internal actions aren't
+modeled as call-graph children), while a trigger node is not: tracing continues into
+its handler exactly like tracing forward from any other method. The Path Map mirrors
+for this direction too — the target sits on the LEFT, callees flow RIGHT.
 
 ## Reading the tree
 
@@ -108,6 +145,21 @@ nodes). Platform entries cover Email Services, install handlers, `Comparable`,
 - **Anonymous Apex** (`.apex` scripts) are scanned as root callers; `instanceof`-
   narrowed calls are kept and labeled `~ narrowed`.
 
+## Multi-package projects
+
+When your workspace has an `sfdx-project.json` with more than one `packageDirectory`,
+nodes from a different package than the one you're tracing carry a package badge
+(`(nova-billing)`, `(force-app)`, …) so you can see at a glance when a call crosses a
+package boundary. A class name declared in more than one package is no longer
+silently dropped: the header shows `N duplicate class names across packages —
+resolution prefers the referring file's package`, and each call site resolves in
+order — (1) the referring file's own package, (2) the package marked `default: true`,
+(3) if still ambiguous, an edge to **every** remaining candidate, marked `~ ambiguous`
+(each carrying its own package badge, since they're different classes that happen to
+share a name). QuickPick target labels get a package suffix too, but only for names
+that are actually duplicated. A workspace with no `sfdx-project.json` anywhere behaves
+exactly as before — no badges, no bucketing, first-registered class wins.
+
 ## Limits (known, by design)
 
 - Chains longer than 4 segments degrade to no edge (never a guessed one).
@@ -138,6 +190,8 @@ workspace-folder set; deleting them just forces a cold re-parse next run.
 | Command | Where |
 |---|---|
 | `Apex Call Graph: Who Calls This?` | Editor context menu (`.cls`/`.trigger`), command palette |
+| `Apex Call Graph: What Does This Call?` | Editor context menu (`.cls`/`.trigger`), command palette |
+| `Apex Call Graph: Switch Trace Direction` | View title button — re-runs the last target the other way |
 | `Apex Call Graph: Show Path Map` | Editor context menu, view title button, command palette |
 
 ## Reference: how edges are resolved
@@ -153,6 +207,14 @@ A real parse of every `.cls`/`.trigger`, then static resolution:
   marked approximate (`~`).
 - **unique-name** — unresolvable receiver, but exactly one class declares that method:
   edge kept, marked approximate.
+- **dml** / **publish** / **async** / **throws** — DML statements, `EventBus.publish`,
+  async scheduling, and `throw` sites each get their own resolution rule (see
+  "The transaction story" and "Exceptions, events, async" above); none of these four
+  are marked approximate — each reflects something the platform genuinely does, not a
+  guess.
+- **ambiguous** — a class name duplicated across sfdx packages that neither the
+  referring file's own package nor the default package could resolve: every remaining
+  candidate gets an edge, marked approximate (see "Multi-package projects" above).
 - **lexical** — files with syntax errors degrade to v1's name-mention scan.
 - Overloads are arity-matched; inner classes work as `Outer.Inner`; platform types
   (`System.debug`, `Database.insert`, …) are excluded unless you shadow them with a

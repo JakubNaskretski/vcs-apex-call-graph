@@ -8,16 +8,19 @@
 //
 // Usage: node dev/pathmap-preview.js [path-to-force-app-main-default]
 // Defaults to the adv-org advanced corpus (Apex + metadata: LWC/Aura/Flow/
-// OmniScript), targeting AcmeValidationException at the class level -- the
-// v0.5.0 "EXCEPTION STORY" target (see dev/smoke.js): tracing callers of the
-// exception class itself surfaces both G2 throw sites as root-level
-// via='throws' children, all four catch-depth scenarios (exact/supertype/
-// bare-Exception catches, each badged caughtHere with a "catches
-// AcmeValidationException" entry, plus one path that reaches an @isTest
-// entry fully uncaught), AND the v0.5.0 G5 async-hop ancestors that stack on
-// top of the exact-type catcher (AcmeOrderBatchProcessor.execute) -- so the
-// preview shows real throws/caughtHere/async accent variety together in one
-// map, not just the older dml/cyclic story.
+// OmniScript), targeting AcmeOrderUtil.markApproved in the FORWARD
+// (callees) direction -- v0.7.0's A1 forward transaction story (see
+// dev/smoke.js's own FORWARD STORY section): tracing what markApproved
+// calls surfaces the update DML statement fanning out to BOTH the matching
+// '(trigger)' node AND the matching record-triggered flow node (terminal),
+// with the @future email notifier as a sibling third child -- so the
+// preview shows the map mirrored (target on the LEFT, callees flowing
+// RIGHT) with a real trigger+flow+async fan-out, the richest single-node
+// forward shape in the corpus. (Prior versions of this preview targeted
+// AcmeValidationException in the reverse/callers direction -- the v0.5.0
+// "EXCEPTION STORY"; that render is still fully exercised by
+// test-pathmap.js's own self-check, this dev tool just previews the OTHER
+// direction now that both exist.)
 // metascan.js only runs when ROOT looks like an SFDX force-app default dir
 // (has lwc/aura/flows/omniscripts siblings) — an inz-org-style override
 // still works Apex-only, same as before.
@@ -43,7 +46,7 @@ const OUT_FILE = path.join(__dirname, 'pathmap-preview.html');
 const SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git']);
 const META_SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git', '__tests__']);
 
-const TARGET = { classLower: 'acmevalidationexception', methodLower: null };
+const TARGET = { classLower: 'acmeorderutil', methodLower: 'markapproved' };
 
 function walk(dir, out) {
   let entries;
@@ -187,8 +190,9 @@ function main() {
     process.exit(1);
   }
 
-  const tree = resolver.buildCallerTree(index, TARGET, { maxDepth: 8 });
-  console.log('Target: ' + tree.targetLabel + (tree.note ? '  (note: ' + tree.note + ')' : ''));
+  // v0.7.0: FORWARD (callees) direction -- see this file's own header note.
+  const tree = resolver.buildCalleeTree(index, TARGET, { maxDepth: 8 });
+  console.log('Target: ' + tree.targetLabel + ' (direction=' + tree.direction + ')' + (tree.note ? '  (note: ' + tree.note + ')' : ''));
   console.log('Tree node count: ' + countNodes(tree.root));
 
   const html = renderPathMapHtml(tree, { legendOpen: true });
@@ -198,11 +202,11 @@ function main() {
   console.log('Wrote ' + OUT_FILE + ' (' + stat.size + ' bytes).');
 
   if (stat.size < 2000) {
-    console.error('Output looks suspiciously small (<2000 bytes) for a real caller tree — check the target resolved.');
+    console.error('Output looks suspiciously small (<2000 bytes) for a real callee tree — check the target resolved.');
     process.exit(1);
   }
   if (countNodes(tree.root) <= 1) {
-    console.error('Caller tree has no callers beyond the target itself — check the target/corpus.');
+    console.error('Callee tree has no callees beyond the target itself — check the target/corpus.');
     process.exit(1);
   }
 

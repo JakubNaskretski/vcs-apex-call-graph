@@ -2,7 +2,7 @@
   "name": "apex-call-graph",
   "displayName": "Apex Call Graph",
   "description": "Trace who calls an Apex class or method — with the arguments at every call site — up to trigger/LWC/Flow/API entry points. Traces Flow, LWC, Aura and OmniScript callers too. Offline static analysis: real Apex parser, no org connection, no language server.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "Skrety",
   "license": "MIT",
   "engines": {
@@ -32,6 +32,24 @@
         "icon": "$(call-incoming)"
       },
       {
+        "command": "apexTrace.traceCallees",
+        "title": "What Does This Call?",
+        "category": "Apex Call Graph",
+        "icon": "$(call-outgoing)"
+      },
+      {
+        "command": "apexTrace.toggleDirection",
+        "title": "Switch Trace Direction",
+        "category": "Apex Call Graph",
+        "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "apexTrace.toggleOrientation",
+        "title": "Toggle orientation: target-first / entry-first",
+        "category": "Apex Call Graph",
+        "icon": "$(list-tree)"
+      },
+      {
         "command": "apexTrace.showPathMap",
         "title": "Show Path Map",
         "category": "Apex Call Graph",
@@ -46,8 +64,13 @@
           "when": "resourceExtname == .cls || resourceExtname == .trigger"
         },
         {
-          "command": "apexTrace.showPathMap",
+          "command": "apexTrace.traceCallees",
           "group": "apextrace@2",
+          "when": "resourceExtname == .cls || resourceExtname == .trigger"
+        },
+        {
+          "command": "apexTrace.showPathMap",
+          "group": "apextrace@3",
           "when": "resourceExtname == .cls || resourceExtname == .trigger"
         }
       ],
@@ -56,6 +79,16 @@
           "command": "apexTrace.showPathMap",
           "group": "navigation",
           "when": "view == apexTraceView"
+        },
+        {
+          "command": "apexTrace.toggleDirection",
+          "group": "navigation",
+          "when": "view == apexTraceView && apexTrace.hasResults"
+        },
+        {
+          "command": "apexTrace.toggleOrientation",
+          "group": "navigation",
+          "when": "view == apexTraceView && apexTrace.hasResults && apexTrace.direction == 'callers'"
         }
       ]
     },
@@ -71,7 +104,7 @@
     "viewsWelcome": [
       {
         "view": "apexTraceView",
-        "contents": "Trace who calls an Apex class or method.\n[Trace a Class or Method](command:apexTrace.traceCallers)\n[Open Path Map](command:apexTrace.showPathMap)"
+        "contents": "Trace who calls an Apex class or method, or what it calls out to.\n[Who Calls This?](command:apexTrace.traceCallers)\n[What Does This Call?](command:apexTrace.traceCallees)\n[Open Path Map](command:apexTrace.showPathMap)"
       }
     ]
   },

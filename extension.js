@@ -9,12 +9,22 @@
 // parser.js lands with that shape. resolver.js is required the same way.
 //
 //   parser.parseFile({ path, text }) -> FileFacts        // never throws
-//   resolver.buildSemanticIndex(factsList) -> Index
-//   resolver.buildCallerTree(index, { classLower, methodLower }, opts) -> TreeResult
+//   resolver.buildSemanticIndex(factsList[, opts]) -> Index
+//   resolver.buildCallerTree(index, { classLower, methodLower }, opts) -> TreeResult   // direction: 'callers'
+//   resolver.buildCalleeTree(index, { classLower, methodLower }, opts) -> TreeResult   // direction: 'callees' (v0.7 / A2)
 //   resolver.suggestTargets(index) -> [{ label, classLower, methodLower }]
 //   resolver.attachMetaCallers(index, metaRefs) -> Index (A6, mutates + returns)
 //   metascan.parseMetaFile({ path, text }) -> [MetaRef]   // never throws (A5)
 //   metascan.scanBundle(files) -> [MetaRef]                // Aura cross-file (A5)
+//
+// v0.7 / B1 additive contract: buildSemanticIndex's optional second `opts`
+// argument may carry `opts.packageOf(fsPath) -> label|null`, built fresh
+// every run from this workspace's sfdx-project.json file(s) -- see
+// discoverPackageMap()'s header comment below. A workspace with no
+// sfdx-project.json anywhere yields a packageOf that returns null for every
+// path, which resolver.js's B2 contract treats as "nothing to say" --
+// buildSemanticIndex's behavior in that case stays byte-identical to
+// pre-v0.7.
 //
 // uitree.js (pure, no vscode import) turns a TreeResult's TNode into plain
 // UiNode objects; this file's only jobs are: scan + cache + parse workspace
@@ -35,10 +45,18 @@ const resolver = require('./resolver');
 const metascan = require('./metascan');
 const cachestore = require('./cachestore');
 const targets = require('./targets');
-const { shapeResult, shapeHeaderLines } = require('./uitree');
+const { shapeResult, shapeHeaderLines, effectiveOrientation } = require('./uitree');
 const { renderPathMapHtml } = require('./pathmap');
 
 const MAX_DEPTH = 8;
+
+// v0.7.1: workspaceState key persisting the caller-tree ORIENTATION toggle
+// ('target-first' | 'entry-first') across sessions -- see uitree.js's
+// "v0.7.1 ORIENTATION" section for what the two values mean. Orientation is
+// a view-only preference (a pure uitree.js re-rooting of the already-
+// computed TreeResult), so it lives in workspaceState, not in the engine
+// cache, and never bumps ENGINE_CACHE_VERSION.
+const ORIENTATION_KEY = 'apexCallGraph.orientation';
 
 // F6: bump this whenever parser.js's FileFacts/MethodFacts/CallFacts shape
 // (or metascan.js's MetaRef shape) changes -- cachestore.js's deserialize()
@@ -483,6 +501,118 @@ function computeMetaRefs(files) {
   return refs;
 }
 
+// =========================================================================
+// B1 (v0.7): sfdx-project.json discovery -> packageOf(fsPath) -> label|null.
+//
+// Every sfdx-project.json found across the open workspace folder(s) is
+// parsed for its `packageDirectories` ({ path, package?, default? }), each
+// contributing one (absolute-prefix -> label) entry to a longest-prefix
+// map: `label` is the declared `package` name when present, else the
+// directory path's own last segment (per B1's contract) -- e.g. this
+// round's adv-org corpus declares `force-app` (no `package` field, label
+// falls back to `force-app`), `pkg-billing` (`package: "nova-billing"`),
+// `pkg-shared` (`package: "nova-shared"`).
+//
+// Re-discovered FRESH on every scanAndBuildIndex() call (see its call site
+// below) -- deliberately NOT cached across runs: sfdx-project.json files
+// are few and tiny, so re-reading them every trace is cheap, and doing so
+// means an edit to packageDirectories takes effect on the very next trace
+// with no reload/cache-invalidation bookkeeping needed. This is also why
+// B1 does NOT bump ENGINE_CACHE_VERSION -- packageOf is a pure opts-time
+// hook layered on top of the (unchanged) FileFacts/MetaRef cache shape, and
+// is never itself persisted.
+//
+// A workspace with no sfdx-project.json anywhere yields an empty prefix
+// list, so the returned packageOf() returns null for every path -- see the
+// module-header note on buildSemanticIndex's opts contract for why that
+// keeps a packageless workspace's output byte-identical to pre-v0.7.
+const SFDX_PROJECT_GLOB_EXCLUDE = '{**/node_modules/**,**/.sfdx/**,**/.sf/**,**/.git/**}';
+
+// OS-separator-agnostic path normalization so prefix comparison in
+// packageOf() below is a plain string operation regardless of platform --
+// darwin/linux fsPaths are already '/'-separated; a Windows workspace's
+// fsPaths use '\\', which this collapses to '/' the same way on both the
+// stored prefix and the path being looked up, and strips any trailing
+// separator so `X` and `X/` compare equal as prefixes.
+function normalizePathForPrefix(p) {
+  return String(p).replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+// Returns a packageOf(fsPath) function. Best-effort throughout: a missing
+// workspace, an unreadable or invalid-JSON sfdx-project.json, or a
+// malformed packageDirectories entry never throws -- each failure just
+// means that one project file (or that one directory entry) contributes
+// nothing to the map, same as if it didn't exist.
+async function discoverPackageMap() {
+  let uris = [];
+  try {
+    uris = await vscode.workspace.findFiles('**/sfdx-project.json', SFDX_PROJECT_GLOB_EXCLUDE);
+  } catch (e) {
+    return () => null;
+  }
+
+  const prefixes = []; // { prefix, label }[], sorted longest-prefix-first below
+  // MUST-FIX #6: label of the FIRST packageDirectories entry marked
+  // `default: true`, found across every discovered sfdx-project.json.
+  // resolver.js's resolveDuplicateBucket() rule 2 (B2's "candidate in the
+  // DEFAULT package" fallback) needs this label as opts.defaultPackage --
+  // this function used to parse .path and .package but never read .default
+  // at all, so that rule was permanently dead code in the shipped
+  // extension. See its attachment onto the returned packageOf function
+  // below for why this isn't a second return value.
+  let defaultPackage = null;
+
+  for (const uri of uris) {
+    let json;
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      json = JSON.parse(Buffer.from(bytes).toString('utf8'));
+    } catch (e) {
+      continue; // unreadable or invalid JSON -- skip this one project file, never fatal to the scan
+    }
+    const dirs = Array.isArray(json.packageDirectories) ? json.packageDirectories : [];
+    // Strip the trailing 'sfdx-project.json' filename (whichever separator
+    // precedes it) to get the project root, keeping its trailing separator
+    // so `projectRoot + relPath` concatenates cleanly below.
+    const projectRoot = uri.fsPath.replace(/[^\\/]*$/, '');
+
+    for (const dir of dirs) {
+      if (!dir || typeof dir.path !== 'string' || !dir.path.trim()) continue;
+      const relPath = dir.path.replace(/^[\\/]+/, '').replace(/[\\/]+$/, '');
+      if (!relPath) continue;
+      const label =
+        typeof dir.package === 'string' && dir.package.trim() ? dir.package.trim() : relPath.split(/[\\/]/).pop();
+      prefixes.push({ prefix: normalizePathForPrefix(projectRoot + relPath), label });
+      // MUST-FIX #6: first default:true entry wins (a malformed sfdx-project.json
+      // with 2+ default:true entries -- see dev/hostile-v070-sfdx-edgecases.js
+      // 7d -- must not throw; picking the first is a defensible, deterministic
+      // tie-break, same spirit as B2's own "first wins" duplicate handling).
+      if (defaultPackage == null && dir.default === true) defaultPackage = label;
+    }
+  }
+
+  // Longest prefix wins -- sort once, descending by prefix length, so
+  // packageOf() below just returns the first match.
+  prefixes.sort((a, b) => b.prefix.length - a.prefix.length);
+
+  const packageOf = function packageOf(fsPath) {
+    if (!fsPath || !prefixes.length) return null;
+    const norm = normalizePathForPrefix(fsPath);
+    for (const { prefix, label } of prefixes) {
+      if (norm === prefix || norm.startsWith(prefix + '/')) return label;
+    }
+    return null;
+  };
+  // MUST-FIX #6: attached to the returned function (not a second return
+  // value / wrapper object) so every existing caller that treats
+  // discoverPackageMap()'s result as a plain packageOf(fsPath) function --
+  // incl. dev/hostile-v070-sfdx-edgecases.js's PART 1 harness -- keeps
+  // working completely unchanged; scanAndBuildIndex (below) is the only
+  // reader of this property.
+  packageOf.defaultPackage = defaultPackage;
+  return packageOf;
+}
+
 function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -573,20 +703,37 @@ async function resolveCursorAmbiguity(index, enclosingCls, word, wordLower, encl
 // header comment for the full contract. This is just the wiring: refine,
 // then reshape into the { label, picked, target } shape showQuickPick/the
 // chosen.target.* read below expects.
+//
+// v0.7 / B3: targets.refineTargets() now ALSO suffixes a duplicated class
+// name's label with ' (pkgLabel)' and (only when the underlying
+// resolver.suggestTargets() item actually carried one) keeps a `package`
+// field on its output. When present, that field is carried through onto
+// `target` too -- so a QuickPick pick of e.g. "AcmeOrderUtil (nova-billing)"
+// resolves to a target resolver.js's buildCallerTree/buildCalleeTree can use
+// to pick the RIGHT one of the duplicated ClassMeta candidates, not just
+// whichever one happens to be bucketed first. In a packageless workspace
+// (or against a resolver.js that hasn't landed B2 yet), refineTargets()
+// never attaches `package` at all, so `target` keeps its pre-v0.7 two-field
+// shape exactly.
 function buildSuggestPicks(index) {
   const refined = targets.refineTargets(resolver.suggestTargets(index));
-  return refined.map((t) => ({
-    label: t.label,
-    picked: false,
-    target: { classLower: t.classLower, methodLower: t.methodLower },
-  }));
+  return refined.map((t) => {
+    const target = { classLower: t.classLower, methodLower: t.methodLower };
+    if (Object.prototype.hasOwnProperty.call(t, 'package')) target.package = t.package;
+    return { label: t.label, picked: false, target };
+  });
 }
 
 // Cursor resolution per contract: word == method of enclosing file's class
 // -> method target; word == known class -> class target; else QuickPick
 // over resolver.suggestTargets(index). H5(c) adds a cursor-ambiguity guard
 // (see resolveCursorAmbiguity above) ahead of the enclosing-class pick.
-async function resolveTarget(index) {
+//
+// v0.7 / A4: shared verbatim between both trace directions -- `direction`
+// only ever affects the QuickPick's placeholder wording below (the
+// enclosing-method/known-class fast paths above it stay direction-agnostic,
+// since "which class/method" is exactly the same question either way).
+async function resolveTarget(index, direction) {
   const editor = vscode.window.activeTextEditor;
   let word = null;
   let cursorLineText = null;
@@ -622,9 +769,13 @@ async function resolveTarget(index) {
     vscode.window.showWarningMessage('Apex Call Graph: no traceable classes or methods found.');
     return null;
   }
-  const chosen = await vscode.window.showQuickPick(picks, { placeHolder: 'Trace callers of which Apex method or class?' });
+  const placeHolder =
+    direction === 'callees' ? 'Trace what calls out from which Apex method or class?' : 'Trace callers of which Apex method or class?';
+  const chosen = await vscode.window.showQuickPick(picks, { placeHolder });
   if (!chosen) return null;
-  return { classLower: chosen.target.classLower, methodLower: chosen.target.methodLower || null };
+  const target = { classLower: chosen.target.classLower, methodLower: chosen.target.methodLower || null };
+  if (Object.prototype.hasOwnProperty.call(chosen.target, 'package')) target.package = chosen.target.package;
+  return target;
 }
 
 async function activate(context) {
@@ -654,6 +805,26 @@ async function activate(context) {
   // perf regression versus the old "reuse the stale cached TreeResult"
   // behavior it replaces.
   let lastTarget = null;
+  // v0.7 / A3: the direction the LAST successful trace ran in --
+  // 'callers' | 'callees'. Companion to lastTarget: the direction-toggle
+  // button (apexTrace.toggleDirection) re-runs lastTarget in whichever
+  // direction this ISN'T, so it must be updated in the same place
+  // lastTarget is (see traceTarget below).
+  let lastDirection = 'callers';
+  // v0.7.1: caller-tree orientation ('target-first' | 'entry-first'),
+  // hydrated from the last session's persisted choice. Anything other than
+  // the literal 'entry-first' (including undefined on first ever run)
+  // falls back to 'target-first', today's default.
+  let orientation = context.workspaceState.get(ORIENTATION_KEY) === 'entry-first' ? 'entry-first' : 'target-first';
+  // v0.7.1: the last rendered TreeResult + its scan counts + direction --
+  // kept ONLY so apexTrace.toggleOrientation can re-render the CURRENT
+  // result in the other orientation WITHOUT re-scanning (the toggle is a
+  // pure view transform of an already-computed tree, so what is on screen
+  // stays exactly as fresh -- or stale -- as it was the moment before the
+  // toggle; nothing about the underlying result changes). Deliberately NOT
+  // used by showPathMap: H6a's "always re-derive the map from a fresh
+  // scan" decision stands unchanged.
+  let lastRender = null; // { tree, scan, dir }
   let mapPanel = null; // singleton webview panel
 
   // Scans the workspace (Apex + metadata) and builds the semantic index --
@@ -695,7 +866,30 @@ async function activate(context) {
     // target QuickPick that follows.
     schedulePersistCaches(context);
 
-    const index = resolver.buildSemanticIndex(scan.factsList);
+    // B1: re-discover sfdx-project.json package directories fresh on every
+    // scan (see discoverPackageMap()'s header comment for why this is never
+    // cached) and hand resolver.js a packageOf(fsPath) lookup it can use
+    // for B2's same-package / default-package / ambiguous resolution order.
+    // Best-effort: package discovery is purely additive, so any failure
+    // here just falls back to a packageOf that returns null for everything
+    // (identical to a workspace with no sfdx-project.json at all) rather
+    // than blocking the trace.
+    let packageOf = () => null;
+    try {
+      packageOf = await discoverPackageMap();
+    } catch (e) {
+      packageOf = () => null;
+    }
+
+    // MUST-FIX #6: wire B2's default-package fallback through -- previously
+    // only `packageOf` was ever passed, so resolveDuplicateBucket()'s rule 2
+    // (resolver.js) was permanently dead code and every default-package
+    // resolution fell through to rule 3 ('ambiguous', approximate=true)
+    // even when exactly one candidate should win unambiguously via='static'.
+    const defaultPackage = typeof packageOf.defaultPackage !== 'undefined' && packageOf.defaultPackage != null
+      ? packageOf.defaultPackage
+      : null;
+    const index = resolver.buildSemanticIndex(scan.factsList, { packageOf, defaultPackage });
     resolver.attachMetaCallers(index, metaRefs);
     return { index, scan };
   }
@@ -706,24 +900,53 @@ async function activate(context) {
   // status-bar message, the live map-panel refresh) -- shared by
   // computeTrace (after interactive resolveTarget) and retraceLastTarget
   // (H6a, no interactive resolution).
-  function traceTarget(index, scan, target) {
-    const tree = resolver.buildCallerTree(index, target, { maxDepth: MAX_DEPTH });
-    if (!tree || !tree.root) {
-      vscode.window.showWarningMessage('Apex Call Graph: could not resolve that target.');
-      return null;
-    }
-
-    provider.setRoots(shapeResult(tree));
-    view.description = `${tree.targetLabel} (parsed ${scan.parsed}, cached ${scan.cached})`;
-    vscode.commands.executeCommand('setContext', 'apexTrace.hasResults', true);
+  //
+  // v0.7 / A3: `direction` ('callers' | 'callees', default 'callers') picks
+  // which resolver.js tree-builder runs; everything else here (tree-view
+  // wiring, header/note/duplicates messaging, map-panel refresh) is
+  // identical either way -- both TreeResults share the same TNode shape.
+  // v0.7.1: the pure RENDER step of a trace (tree roots + view description
+  // + header banner), split out of traceTarget so apexTrace.toggleOrientation
+  // can re-render the last result under the new orientation without
+  // re-scanning or re-resolving anything. Reads the `orientation` state
+  // above; uitree.js's effectiveOrientation() neutralizes 'entry-first' for
+  // callees-direction trees, so this stays a safe no-op transform there.
+  //
+  // The active orientation is stated by the header (an explicit
+  // 'Entry-first orientation: ...' line via shapeHeaderLines) and a
+  // ' — entry-first' suffix on view.description; the default target-first
+  // state deliberately renders BYTE-IDENTICALLY to pre-v0.7.1 (no suffix,
+  // no header line) -- absence of the marker means the default, and the
+  // toggle command's own toast announces every switch.
+  function renderTraceResult(tree, scan, dir) {
+    provider.setRoots(shapeResult(tree, orientation));
+    const directionLabel = dir === 'callees' ? 'callees of' : 'callers of';
+    const orientationSuffix = effectiveOrientation(tree, orientation) === 'entry-first' ? ' — entry-first' : '';
+    view.description = `${directionLabel} ${tree.targetLabel}${orientationSuffix} (parsed ${scan.parsed}, cached ${scan.cached})`;
 
     // H3/H1/H4: header lines (note today; capped/unresolvedSites once
     // resolver.js produces them) shown as a persistent banner above the
     // tree, in addition to (not instead of) the existing note toast below --
     // H8 already made the view always-visible/H4 calls for "an info row",
     // and view.message is the closest vscode TreeView API to that.
-    const headerLines = shapeHeaderLines(tree);
+    const headerLines = shapeHeaderLines(tree, orientation);
     view.message = headerLines.length ? headerLines.join('  •  ') : undefined;
+  }
+
+  function traceTarget(index, scan, target, direction) {
+    const dir = direction === 'callees' ? 'callees' : 'callers';
+    const tree =
+      dir === 'callees'
+        ? resolver.buildCalleeTree(index, target, { maxDepth: MAX_DEPTH })
+        : resolver.buildCallerTree(index, target, { maxDepth: MAX_DEPTH });
+    if (!tree || !tree.root) {
+      vscode.window.showWarningMessage('Apex Call Graph: could not resolve that target.');
+      return null;
+    }
+
+    renderTraceResult(tree, scan, dir);
+    vscode.commands.executeCommand('setContext', 'apexTrace.hasResults', true);
+    vscode.commands.executeCommand('setContext', 'apexTrace.direction', dir);
 
     if (tree.note) {
       vscode.window.showInformationMessage(`Apex Call Graph: ${tree.note}`);
@@ -739,27 +962,39 @@ async function activate(context) {
     }
 
     lastTarget = target;
+    lastDirection = dir;
+    // v0.7.1: everything toggleOrientation needs to re-render without a
+    // re-scan (the path map deliberately excluded -- see lastRender's decl).
+    lastRender = { tree, scan, dir };
     if (mapPanel) mapPanel.webview.html = renderPathMapHtml(tree);
     return tree;
   }
 
-  async function computeTrace() {
+  // v0.7 / A3: `direction` defaults to 'callers' (unchanged pre-v0.7
+  // behavior) when omitted -- the traceCallers/showPathMap call sites below
+  // rely on that default.
+  async function computeTrace(direction) {
     const built = await scanAndBuildIndex();
     if (!built) return null;
-    const target = await resolveTarget(built.index);
+    const target = await resolveTarget(built.index, direction);
     if (!target) return null;
-    return traceTarget(built.index, built.scan, target);
+    return traceTarget(built.index, built.scan, target, direction);
   }
 
   // H6a: re-runs scanAndParse + rebuilds the index/tree for the last
   // RESOLVED target (no QuickPick) -- called by showPathMap so the map is
   // never stale after an edit, instead of reusing whatever TreeResult
   // happened to be computed last.
-  async function retraceLastTarget() {
+  //
+  // v0.7 / A3: `direction` defaults to lastDirection (i.e. "re-run the same
+  // way it last ran") when omitted -- showPathMap's refresh wants that.
+  // apexTrace.toggleDirection instead passes the OPPOSITE of lastDirection
+  // explicitly.
+  async function retraceLastTarget(direction) {
     if (!lastTarget) return null;
     const built = await scanAndBuildIndex();
     if (!built) return null;
-    return traceTarget(built.index, built.scan, lastTarget);
+    return traceTarget(built.index, built.scan, lastTarget, direction || lastDirection);
   }
 
   function showPathMapPanel(tree) {
@@ -789,13 +1024,69 @@ async function activate(context) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('apexTrace.traceCallers', async () => {
-      const tree = await computeTrace();
+      const tree = await computeTrace('callers');
       if (tree) await vscode.commands.executeCommand('apexTraceView.focus');
+    }),
+    // v0.7 / A3: "What Does This Call?" -- forward tracing. Shares target
+    // resolution (resolveTarget/buildSuggestPicks) with the callers
+    // direction per A4; only the resolver call + tree.direction differ,
+    // both handled inside traceTarget/computeTrace above.
+    vscode.commands.registerCommand('apexTrace.traceCallees', async () => {
+      const tree = await computeTrace('callees');
+      if (tree) await vscode.commands.executeCommand('apexTraceView.focus');
+    }),
+    // v0.7 / A3: apexTraceView title-bar direction-toggle button -- re-runs
+    // the LAST resolved target in the OPPOSITE direction, no QuickPick.
+    // Mirrors retraceLastTarget's H6a "always re-derive from a fresh scan"
+    // behavior, so the toggled view is never stale after an edit either.
+    vscode.commands.registerCommand('apexTrace.toggleDirection', async () => {
+      if (!lastTarget) {
+        vscode.window.showWarningMessage(
+          'Apex Call Graph: trace a class or method first, then use the direction-toggle button.'
+        );
+        return;
+      }
+      const nextDirection = lastDirection === 'callees' ? 'callers' : 'callees';
+      const tree = await retraceLastTarget(nextDirection);
+      if (tree) await vscode.commands.executeCommand('apexTraceView.focus');
+    }),
+    // v0.7.1: apexTraceView title-bar ORIENTATION toggle -- flips the
+    // callers tree between 'target-first' (default: traced target at the
+    // top, callers expanding beneath, stack-trace style) and 'entry-first'
+    // (entry points at the top, execution order reading downward, target at
+    // each branch tip -- same reading direction as the Path Map), persists
+    // the choice, and re-renders the CURRENT result without re-scanning
+    // (pure uitree.js re-rooting of the already-computed TreeResult).
+    //
+    // Deliberately a no-op in the callees direction (and the title-bar
+    // button is hidden there via the package.json when-clause on
+    // apexTrace.direction): a callees tree ALREADY reads execution-forward
+    // -- its root is the traced target and expansion follows calls in the
+    // order they happen -- so re-rooting it would just re-create the
+    // backwards-reading problem this toggle exists to remove.
+    vscode.commands.registerCommand('apexTrace.toggleOrientation', async () => {
+      if (lastRender && lastRender.dir === 'callees') {
+        vscode.window.showInformationMessage(
+          'Apex Call Graph: orientation applies to the callers direction only — the callees tree already reads execution-forward.'
+        );
+        return;
+      }
+      orientation = orientation === 'entry-first' ? 'target-first' : 'entry-first';
+      await context.workspaceState.update(ORIENTATION_KEY, orientation);
+      if (lastRender) {
+        // Re-render only -- no scan, no index rebuild, no resolver call.
+        renderTraceResult(lastRender.tree, lastRender.scan, lastRender.dir);
+      }
+      vscode.window.showInformationMessage(
+        orientation === 'entry-first'
+          ? 'Apex Call Graph: entry-first orientation — entry points at the top, the traced target at each branch tip.'
+          : 'Apex Call Graph: target-first orientation — the traced target at the top, its callers expanding beneath.'
+      );
     }),
     vscode.commands.registerCommand('apexTrace.showPathMap', async () => {
       // H6a: prefer re-tracing the last KNOWN target over reusing a
       // possibly-stale cached TreeResult -- see retraceLastTarget's comment.
-      const tree = lastTarget ? await retraceLastTarget() : await computeTrace();
+      const tree = lastTarget ? await retraceLastTarget() : await computeTrace('callers');
       if (tree) showPathMapPanel(tree);
     })
   );

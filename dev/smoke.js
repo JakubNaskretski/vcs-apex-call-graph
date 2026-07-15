@@ -23,6 +23,7 @@ const parser = require('../parser');
 const resolver = require('../resolver');
 const metascan = require('../metascan');
 const uitree = require('../uitree');
+const targets = require('../targets');
 
 const ROOT = process.argv[2] || '/Users/agent/work/code/example-data/inz-org/force-app';
 const SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git']);
@@ -40,6 +41,46 @@ const ADV_ORG_SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git', '__te
 // workspace-wide, so this dev tool walks this sibling root separately
 // rather than teaching walkAdvOrg about a path outside ADV_ORG_ROOT.
 const ADV_ORG_SCRIPTS_ROOT = '/Users/agent/work/code/example-data/adv-org/scripts';
+
+// v0.7.0 (B1): the adv-org project root and its 2 NEW packageDirectories
+// (pkg-billing, pkg-shared) -- ADV_ORG_ROOT above only ever walked
+// force-app; the PACKAGE MATRIX section below needs all 3 package roots
+// indexed together, with a REAL packageOf(fsPath) derived from the REAL
+// sfdx-project.json (mirrors extension.js's discoverPackageMap algorithm --
+// same longest-prefix-wins map, same label fallback rule -- just without
+// the vscode.workspace plumbing, since this is a plain node dev tool).
+const ADV_ORG_PROJECT_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const ADV_ORG_PKG_ROOTS = [
+  path.join(ADV_ORG_PROJECT_ROOT, 'pkg-billing', 'main', 'default'),
+  path.join(ADV_ORG_PROJECT_ROOT, 'pkg-shared', 'main', 'default'),
+];
+
+function buildAdvOrgPackageOf() {
+  const sfdxProjectPath = path.join(ADV_ORG_PROJECT_ROOT, 'sfdx-project.json');
+  let json;
+  try {
+    json = JSON.parse(fs.readFileSync(sfdxProjectPath, 'utf8'));
+  } catch (e) {
+    return () => null;
+  }
+  const dirs = Array.isArray(json.packageDirectories) ? json.packageDirectories : [];
+  const prefixes = [];
+  for (const dir of dirs) {
+    if (!dir || typeof dir.path !== 'string' || !dir.path.trim()) continue;
+    const relPath = dir.path.replace(/^[\\/]+/, '').replace(/[\\/]+$/, '');
+    if (!relPath) continue;
+    const label = typeof dir.package === 'string' && dir.package.trim() ? dir.package.trim() : relPath.split(/[\\/]/).pop();
+    prefixes.push({ prefix: path.join(ADV_ORG_PROJECT_ROOT, relPath), label });
+  }
+  prefixes.sort((a, b) => b.prefix.length - a.prefix.length);
+  return function packageOf(fsPath) {
+    if (!fsPath || !prefixes.length) return null;
+    for (const { prefix, label } of prefixes) {
+      if (fsPath === prefix || fsPath.startsWith(prefix + path.sep)) return label;
+    }
+    return null;
+  };
+}
 
 function walk(dir, out) {
   let entries;
@@ -177,6 +218,20 @@ function printTree(title, index, target) {
   for (const line of uitree.shapeHeaderLines(tree)) console.log(line);
   const stats = tree.stats || {};
   console.log(`stats: nodes=${stats.nodes} unique=${stats.uniqueMethods} unresolved=${stats.unresolvedSites} capped=${stats.capped}`);
+  const lines = [];
+  for (const uiNode of uitree.shapeResult(tree)) renderUiNode(uiNode, 0, lines);
+  console.log(lines.join('\n'));
+  return tree;
+}
+
+// v0.7.0 (A2/B3): forward-direction counterpart to printTree -- same
+// header/stats/render shape, buildCalleeTree instead of buildCallerTree.
+function printCalleeTree(title, index, target) {
+  const tree = resolver.buildCalleeTree(index, target, { maxDepth: 8 });
+  console.log('\n=== ' + title + ' ===');
+  for (const line of uitree.shapeHeaderLines(tree)) console.log(line);
+  const stats = tree.stats || {};
+  console.log(`stats: nodes=${stats.nodes} unique=${stats.uniqueMethods} unresolved=${stats.unresolvedSites} capped=${stats.capped} direction=${tree.direction}`);
   const lines = [];
   for (const uiNode of uitree.shapeResult(tree)) renderUiNode(uiNode, 0, lines);
   console.log(lines.join('\n'));
@@ -437,6 +492,201 @@ function runAdvOrg() {
     index,
     { classLower: 'acmedirectpinghandler', methodLower: 'ping' }
   );
+
+  // ===================================================================
+  // v0.7.0 FORWARD STORY -- Feature A (forward tracing / buildCalleeTree)
+  // against the real adv-org corpus. See MANIFEST.md's "Feature A --
+  // Forward tracing ground truth" A1/A2/A3 chains for the full node-by-
+  // node ground truth each of these is checked against. Uses the SAME
+  // `index` as every printTree() call above (force-app + scripts only,
+  // no packageOf) -- Feature A is orthogonal to Feature B.
+  // ===================================================================
+  console.log('\n\n########################################################');
+  console.log('# v0.7.0 FORWARD STORY (Feature A -- buildCalleeTree)');
+  console.log('########################################################');
+
+  // --- A1: the full forward transaction story, 3 hops deep -- controller
+  // -> service -> util (markApproved), whose DML fans out to BOTH the
+  // matching trigger AND the matching record-triggered flow, with the
+  // @future email notifier as a sibling third child.
+  printCalleeTree(
+    'AcmeOrderApprovalController.approveOrder -- A1 forward transaction story, hop 1/3 (controller -> service)',
+    index,
+    { classLower: 'acmeorderapprovalcontroller', methodLower: 'approveorder' }
+  );
+  printCalleeTree(
+    'AcmeOrderService.approveOrder -- A1 forward transaction story, hop 2/3 (service -> util)',
+    index,
+    { classLower: 'acmeorderservice', methodLower: 'approveorder' }
+  );
+  printCalleeTree(
+    'AcmeOrderUtil.markApproved -- A1 forward transaction story, hop 3/3: DML fans out to trigger + flow, plus the @future sibling',
+    index,
+    { classLower: 'acmeorderutil', methodLower: 'markapproved' }
+  );
+
+  // --- A2: async-forward -- one orchestrator method reaching all 3 async
+  // entry points, each collapsing to a single via='async' child (no
+  // separate '<init>' child for the inline 'new AcmeXxx(...)' argument).
+  printCalleeTree(
+    'AcmeAsyncOrchestrator.runNightlyMaintenance -- A2 async-forward: 3 via=async children, G5 forward-collapse (no separate <init> children)',
+    index,
+    { classLower: 'acmeasyncorchestrator', methodLower: 'runnightlymaintenance' }
+  );
+
+  // --- A3: throw-forward -- a terminal, non-approximate 'exception' node
+  // (see this round's resolver.js reconciliation: via='throws' is not in
+  // APPROX_VIA, so this node's approximate flag is now computed, not
+  // hardcoded true), alongside an ordinary second child (delegation call).
+  printCalleeTree(
+    'AcmeOrderValidator.validate(Id,Integer) -- A3 throw-forward: terminal exception node (via=throws, NOT approximate) + ordinary delegation child',
+    index,
+    { classLower: 'acmeordervalidator', methodLower: 'validate' }
+  );
+
+  // --- A4: publish-forward -- EventBus.publish -> platform-event trigger +
+  // PE-triggered flow, mirroring A1's trigger+flow pairing for a publish
+  // site instead of a DML site.
+  printCalleeTree(
+    'AcmeNoteEventPublisher.publishNote -- A4 publish-forward: EventBus.publish -> trigger + PE flow',
+    index,
+    { classLower: 'acmenoteeventpublisher', methodLower: 'publishnote' }
+  );
+
+  // --- A5: interface-forward fan-out -- the call site collapses onto the
+  // INTERFACE method node; that node's OWN forward children fan out to
+  // every implementer.
+  printCalleeTree(
+    'AcmeNotificationDispatcher.dispatchToAll -- A5 interface-forward: the call site collapses onto AcmeNotifiable.notify',
+    index,
+    { classLower: 'acmenotificationdispatcher', methodLower: 'dispatchtoall' }
+  );
+  printCalleeTree(
+    'AcmeNotifiable.notify -- A5 interface-forward continued: fans out to all 3 implementers (including AcmeSlackNotifier, attributed through inherited AcmeBaseNotifier.notify)',
+    index,
+    { classLower: 'acmenotifiable', methodLower: 'notify' }
+  );
+
+  // --- A6: unresolved-leaf aggregation -- every platform dot-call in this
+  // method collapses into ONE 'N unresolved sites' leaf.
+  printCalleeTree(
+    'AcmeSmsNotifier.sendSms -- A6 unresolved-forward aggregation: 5 platform calls collapse into ONE leaf',
+    index,
+    { classLower: 'acmesmsnotifier', methodLower: 'sendsms' }
+  );
+
+  // --- bonus chain #12: a '(trigger)' node is NOT terminal forward --
+  // tracing continues into its handler exactly like any other method.
+  printCalleeTree(
+    'AcmeOrderTrigger (trigger-level) -- bonus chain #12: a (trigger) node is NOT terminal forward, unlike a flow node',
+    index,
+    { classLower: 'acmeordertrigger', methodLower: null }
+  );
+
+  // ===================================================================
+  // v0.7.0 PACKAGE MATRIX -- Feature B (multi-package awareness) against
+  // the real adv-org corpus, now including pkg-billing/pkg-shared and a
+  // REAL packageOf(fsPath) derived from sfdx-project.json. See MANIFEST
+  // .md's "Feature B -- Multi-package awareness ground truth (package
+  // matrix)" B1-B4 for the full ground truth. Built as its OWN index
+  // (force-app + pkg-billing + pkg-shared + scripts, WITH packageOf) --
+  // deliberately separate from the packageOf-less `index` used everywhere
+  // above, so this section can never perturb any pre-v0.7 printTree() call.
+  // ===================================================================
+  console.log('\n\n########################################################');
+  console.log('# v0.7.0 PACKAGE MATRIX (Feature B -- multi-package awareness)');
+  console.log('########################################################');
+
+  const pkgApexPaths = apexPaths.slice(); // force-app + scripts, already walked above
+  for (const pkgRoot of ADV_ORG_PKG_ROOTS) walkAdvOrg(pkgRoot, pkgApexPaths, []);
+  console.log(`Package-aware corpus: ${pkgApexPaths.length} .cls/.trigger/.apex file(s) (force-app + pkg-billing + pkg-shared + scripts).`);
+
+  const pkgFactsList = pkgApexPaths.map((p) => parser.parseFile({ path: p, text: fs.readFileSync(p, 'utf8') }));
+  const packageOf = buildAdvOrgPackageOf();
+  const pkgIndex = resolver.buildSemanticIndex(pkgFactsList, { packageOf, defaultPackage: 'force-app' });
+
+  console.log(`stats.duplicateNames: ${pkgIndex.stats.duplicateNames} (MANIFEST bar: 2 -- AcmeOrderUtil force-app+pkg-billing, NovaBillingUtil pkg-billing+pkg-shared)`);
+  console.log(`index.duplicates: ${pkgIndex.duplicates.join(', ')}`);
+
+  // MUST-FIX #1: reach every duplicate-class candidate through the REAL
+  // public QuickPick flow -- resolver.suggestTargets(index) ->
+  // targets.refineTargets(...) -- exactly what extension.js's
+  // buildSuggestPicks -> resolveTarget does, instead of reaching into the
+  // non-exported index.classBuckets map directly (the old approach here
+  // bypassed suggestTargets()/refineTargets() entirely and could never have
+  // caught suggestTargets() handing out the wrong classLower for a
+  // duplicate-name candidate -- see MUST-FIX #1's own header note in
+  // resolver.js's suggestTargets()).
+  const pkgPicks = targets.refineTargets(resolver.suggestTargets(pkgIndex));
+  const findPick = (labelRe, methodLower, pkgLabel) =>
+    pkgPicks.find((p) => p.methodLower === methodLower && p.package === pkgLabel && labelRe.test(p.label));
+  const forceAppOrderUtil = { classLower: (findPick(/^AcmeOrderUtil\b/, null, 'force-app') || {}).classLower };
+  const billingOrderUtil = { classLower: (findPick(/AcmeOrderUtil/i, 'reconcilebillingstatus', 'nova-billing') || {}).classLower };
+  const billingBillingUtil = { classLower: (findPick(/NovaBillingUtil/i, 'auditpricingsync', 'nova-billing') || {}).classLower };
+  const sharedBillingUtil = { classLower: (findPick(/NovaBillingUtil/i, 'auditpricingsync', 'nova-shared') || {}).classLower };
+  console.log(`suggestTargets/refineTargets duplicate picks resolved: AcmeOrderUtil(force-app)=${JSON.stringify(forceAppOrderUtil.classLower)}, AcmeOrderUtil(nova-billing)=${JSON.stringify(billingOrderUtil.classLower)}, NovaBillingUtil(nova-billing)=${JSON.stringify(billingBillingUtil.classLower)}, NovaBillingUtil(nova-shared)=${JSON.stringify(sharedBillingUtil.classLower)}`);
+
+  // --- B1: same-package preference (2 edges) --------------------------
+  printTree(
+    'AcmeOrderUtil.reconcileBillingStatus (pkg-billing candidate) -- B1 same-package preference: NovaPaymentProcessor (pkg-billing) resolves HERE, not to force-app',
+    pkgIndex,
+    { classLower: billingOrderUtil.classLower, methodLower: 'reconcilebillingstatus' }
+  );
+  printTree(
+    'AcmeOrderUtil.normalize (force-app candidate) -- B1 regression-safety half: the pre-existing v0.3 force-app->force-app edge keeps resolving via the SAME rule 1',
+    pkgIndex,
+    { classLower: forceAppOrderUtil.classLower, methodLower: 'normalize' }
+  );
+
+  // --- B2: default-package fallback (1 edge) ---------------------------
+  printTree(
+    'AcmeOrderUtil.buildQuery (force-app/default candidate) -- B2 default-package fallback: NovaSharedBillingBridge (pkg-shared, no AcmeOrderUtil of its own) falls through to the DEFAULT package',
+    pkgIndex,
+    { classLower: forceAppOrderUtil.classLower, methodLower: 'buildquery' }
+  );
+
+  // --- B3: ambiguous fan-out (1 call site -> 2 edges) -------------------
+  printTree(
+    'NovaBillingUtil.auditPricingSync (pkg-billing candidate) -- B3 ambiguous fan-out, edge 1/2: AcmeOrderRestResource.handleGet (force-app) fans out to BOTH candidates',
+    pkgIndex,
+    { classLower: billingBillingUtil.classLower, methodLower: 'auditpricingsync' }
+  );
+  printTree(
+    'NovaBillingUtil.auditPricingSync (pkg-shared candidate) -- B3 ambiguous fan-out, edge 2/2: the SAME call site, second candidate',
+    pkgIndex,
+    { classLower: sharedBillingUtil.classLower, methodLower: 'auditpricingsync' }
+  );
+
+  // --- B4: cross-package badges, forward direction ----------------------
+  // Case 1: AcmeOrderBatchProcessor.finish (force-app) -> NovaBillingService
+  // .recordBatchCompletion (nova-billing) -- badge on the child.
+  printCalleeTree(
+    'AcmeOrderBatchProcessor.finish -- B4 case 1: forward child NovaBillingService.recordBatchCompletion carries badge (nova-billing)',
+    pkgIndex,
+    { classLower: 'acmeorderbatchprocessor', methodLower: 'finish' }
+  );
+  // Case 4: NovaSharedBillingBridge.syncSharedQuery (nova-shared) ->
+  // AcmeOrderUtil.buildQuery (force-app, the DEFAULT package) -- badge
+  // applies uniformly, even against the default package.
+  printCalleeTree(
+    'NovaSharedBillingBridge.syncSharedQuery -- B4 case 4: forward child AcmeOrderUtil.buildQuery carries badge (force-app), badges apply even against the default package',
+    pkgIndex,
+    { classLower: 'novasharedbillingbridge', methodLower: 'syncsharedquery' }
+  );
+  // Case 2: AcmeOrderService.recalculatePricing (force-app) callers --
+  // the new v0.7 NovaBillingService.generateInvoice caller carries badge
+  // (nova-billing), while the pre-existing force-app caller carries none.
+  printTree(
+    'AcmeOrderService.recalculatePricing -- B4 case 2: caller NovaBillingService.generateInvoice carries badge (nova-billing); pre-existing force-app caller AcmeOrderRestResource.handleGet carries none',
+    pkgIndex,
+    { classLower: 'acmeorderservice', methodLower: 'recalculatepricing' }
+  );
+
+  // --- B5: packageless-identity note -- a SEPARATE index over the SAME
+  // pkgFactsList with NO opts at all must reproduce first-wins-drop
+  // behavior exactly (byte-identical to pre-v0.7).
+  const pkgIndexNoOpts = resolver.buildSemanticIndex(pkgFactsList);
+  console.log(`\nB5 packageless-identity check: stats.duplicateNames=${pkgIndexNoOpts.stats.duplicateNames} (bar: 0, no opts -> first-wins-drop, byte-identical to pre-v0.7)`);
 }
 
 main();
