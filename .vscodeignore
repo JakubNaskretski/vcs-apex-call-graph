@@ -9,3 +9,7 @@ node_modules/**/*.d.ts
 node_modules/**/*.d.cts
 node_modules/**/src/**
 node_modules/**/*.map
+*.local.md
+CLAUDE.md
+MEMORY.md
+CONTRACT.md
