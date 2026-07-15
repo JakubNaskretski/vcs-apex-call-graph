@@ -1,0 +1,14 @@
+node_modules/
+*.vsix
+samples/
+.DS_Store
+
+# internal working docs — never version these
+CLAUDE.md
+MEMORY.md
+CONTRACT.md
+*.local.md
+
+# dev: keep probe/verify scripts, ignore scratch fixtures + generated output
+dev/*
+!dev/*.js

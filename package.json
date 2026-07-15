@@ -1,0 +1,81 @@
+{
+  "name": "apex-call-graph",
+  "displayName": "Apex Call Graph",
+  "description": "Trace who calls an Apex class or method — with the arguments at every call site — up to trigger/LWC/Flow/API entry points. Traces Flow, LWC, Aura and OmniScript callers too. Offline static analysis: real Apex parser, no org connection, no language server.",
+  "version": "0.6.0",
+  "publisher": "Skrety",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "apex",
+    "salesforce",
+    "call hierarchy",
+    "callers",
+    "references"
+  ],
+  "main": "./extension.js",
+  "scripts": {
+    "build": "node --check extension.js && node --check apexindex.js",
+    "test": "node test.js"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "apexTrace.traceCallers",
+        "title": "Who Calls This?",
+        "category": "Apex Call Graph",
+        "icon": "$(call-incoming)"
+      },
+      {
+        "command": "apexTrace.showPathMap",
+        "title": "Show Path Map",
+        "category": "Apex Call Graph",
+        "icon": "$(map)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "apexTrace.traceCallers",
+          "group": "apextrace@1",
+          "when": "resourceExtname == .cls || resourceExtname == .trigger"
+        },
+        {
+          "command": "apexTrace.showPathMap",
+          "group": "apextrace@2",
+          "when": "resourceExtname == .cls || resourceExtname == .trigger"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "apexTrace.showPathMap",
+          "group": "navigation",
+          "when": "view == apexTraceView"
+        }
+      ]
+    },
+    "views": {
+      "explorer": [
+        {
+          "id": "apexTraceView",
+          "name": "Apex Call Graph: Callers",
+          "contextualTitle": "Apex Call Graph"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "apexTraceView",
+        "contents": "Trace who calls an Apex class or method.\n[Trace a Class or Method](command:apexTrace.traceCallers)\n[Open Path Map](command:apexTrace.showPathMap)"
+      }
+    ]
+  },
+  "dependencies": {
+    "@apexdevtools/apex-parser": "^5.1.0"
+  }
+}

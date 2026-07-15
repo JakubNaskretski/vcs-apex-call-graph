@@ -1,0 +1,11 @@
+.vscode/**
+.gitignore
+*.vsix
+test.js
+test-*.js
+dev/**
+**/.DS_Store
+node_modules/**/*.d.ts
+node_modules/**/*.d.cts
+node_modules/**/src/**
+node_modules/**/*.map
