@@ -30,7 +30,7 @@ assert.strictEqual(
 );
 assert.strictEqual(labelForNode({ label: 'OppService', approximate: false }), 'OppService');
 
-// --- badgesForNode: full combination, contract order (entries, test, via, ~, cycle, depth cap) ---
+// --- badgesForNode: full combination, contract order (entries, test, via, ~, cycle, capped) ---
 const fullNode = {
   entries: ['@AuraEnabled (LWC/Aura)'],
   isTest: true,
@@ -45,7 +45,7 @@ assert.deepStrictEqual(badgesForNode(fullNode), [
   'typed',
   '~',
   '↺ cycle',
-  '… depth cap',
+  '… capped',
 ]);
 
 // --- badgesForNode: individual flags in isolation ---
@@ -55,7 +55,11 @@ assert.deepStrictEqual(badgesForNode({ isTest: true }), ['test']);
 assert.deepStrictEqual(badgesForNode({ via: 'unique-name' }), ['unique-name']);
 assert.deepStrictEqual(badgesForNode({ approximate: true }), ['~']);
 assert.deepStrictEqual(badgesForNode({ cyclic: true }), ['↺ cycle']);
-assert.deepStrictEqual(badgesForNode({ truncated: true }), ['… depth cap']);
+// v0.7.1 (U2): '… capped' is now cause-agnostic -- it covers BOTH the
+// pre-existing per-branch depth cap and the new node-count (maxNodes) cap
+// (see uitree.js's badgesForNode/MARKER_GLOSSARY comments) -- one boolean,
+// one badge, regardless of which cap actually fired.
+assert.deepStrictEqual(badgesForNode({ truncated: true }), ['… capped']);
 
 // --- iconForNode: contract priority (trigger, test, entries, method, class) ---
 assert.strictEqual(iconForNode({ kind: 'trigger', isTest: false, entries: [] }), 'zap');
@@ -286,8 +290,8 @@ assert(shapedCyclic.description.includes('↺ cycle'));
 assert(!shapedCyclic.description.includes('◉ root'), 'a cyclic node never gets the root badge -- there IS more above it, just not shown');
 const truncatedNode = { ...tnode, truncated: true, children: [], sites: [] };
 const shapedTruncated = shapeNode(truncatedNode);
-assert(shapedTruncated.description.includes('… depth cap'));
-assert(!shapedTruncated.description.includes('◉ root'), 'a depth-capped node never gets the root badge -- more callers may exist above it');
+assert(shapedTruncated.description.includes('… capped'));
+assert(!shapedTruncated.description.includes('◉ root'), 'a capped node never gets the root badge -- more callers/callees may exist beyond it (U2 gauntlet Tier-3 #5)');
 
 // --- v0.6 (H1 forward-compat, H5 rendering): seenElsewhere badge + tooltip
 // glossary + root-badge exclusion. resolver.js does not produce this field
@@ -310,7 +314,7 @@ assert(shapeNode({ ...tnode, via: 'narrowed', children: [], sites: [] }).tooltip
 assert(shapeNode({ ...tnode, via: 'async', children: [], sites: [] }).tooltip.includes('async:'), "via 'async' gets a glossary explanation");
 assert(shapeNode({ ...tnode, approximate: true, children: [], sites: [] }).tooltip.includes('approximate resolution'), "'~' gets a glossary explanation");
 assert(shapeNode(cyclicNode).tooltip.includes('recurses back'), 'cycle gets a glossary explanation');
-assert(shapeNode(truncatedNode).tooltip.includes('depth cap reached'), 'depth cap gets a glossary explanation');
+assert(shapeNode(truncatedNode).tooltip.includes('capped'), 'capped gets a glossary explanation (cause-agnostic wording, U2)');
 assert(shapeNode({ ...tnode, caughtHere: true, children: [], sites: [] }).tooltip.includes('caughtHere'), 'caughtHere gets a glossary explanation');
 assert(shapeNode({ ...tnode, children: [], sites: [] }).tooltip.includes('root —'), "a bare childless node's tooltip explains the root badge too");
 
@@ -322,6 +326,232 @@ assert.strictEqual(isRootNode({ children: [], cyclic: true }), false, 'cyclic ex
 assert.strictEqual(isRootNode({ children: [], truncated: true }), false, 'truncated excludes root');
 assert.strictEqual(isRootNode({ children: [], seenElsewhere: true }), false, 'seenElsewhere excludes root');
 assert.strictEqual(isRootNode({}), true, 'no children field at all is treated as childless -> root');
+
+// =========================================================================
+// v0.7.1 (U2): root-badge gating against the maxNodes cap -- gauntlet
+// VALIDATION-REPORT.md Tier-3 #5 / ranked fix-backlog #2. resolver.js's R5
+// fix stamps truncated=true on the SPECIFIC node whose expansion the
+// node-count (maxNodes) budget cut off, mirroring the pre-existing
+// per-branch depth-cap pattern that isRootNode/badgesForNode already
+// handled correctly. This pins that the SAME UI-side gating (already
+// correct for the depth cap) also holds for the new cap cause, since both
+// causes share the one `truncated` boolean.
+//
+// Repro (dev/gauntlet/probe-fanin-scale.js SECTION 3, run-fanin-scale-
+// output.txt lines 29-35): VertexBoltHub.dispatch has 60+ real callers;
+// VertexBoltHubPremium.dispatch (the via='super' override sibling) alone
+// fans out to 63 further callers. Tracing either with maxNodes:20 sets
+// stats.capped=true but -- BEFORE R5 -- leaves every node's own `truncated`
+// flag false ("Nodes marked truncated in capped tree: 0" in the probe
+// output), so the node whose expansion was actually cut off renders
+// identically to a genuine zero-caller leaf and wrongly gets the '◉ root'
+// badge (the single strongest possible false signal a call-graph tool can
+// give). This fixture simulates R5's fix (truncated correctly stamped on
+// that one node) and pins that uitree.js does NOT then show it as a root.
+// =========================================================================
+const boltHubCappedNode = {
+  label: 'VertexBoltHubPremium.dispatch',
+  kind: 'method',
+  className: 'VertexBoltHubPremium',
+  path: '/ws/VertexBoltHubPremium.cls',
+  line: 4,
+  entries: [],
+  isTest: false,
+  via: 'super',
+  sites: [],
+  // R5: the maxNodes cap cut this node's expansion off -- it has 63 REAL
+  // further callers that simply were never materialized, not zero.
+  children: [],
+  cyclic: false,
+  truncated: true,
+  approximate: false,
+  seenElsewhere: false,
+};
+assert.strictEqual(
+  isRootNode(boltHubCappedNode),
+  false,
+  'U2 gauntlet Tier-3 #5: a maxNodes-capped node (63 real, unshown callers) is NOT a root'
+);
+const shapedBoltHubCapped = shapeNode(boltHubCappedNode);
+assert(
+  !shapedBoltHubCapped.description.includes('◉ root'),
+  'U2 gauntlet Tier-3 #5: VertexBoltHubPremium.dispatch must not render the false "◉ root" badge when its expansion was cap-cut'
+);
+assert(
+  shapedBoltHubCapped.description.includes('… capped'),
+  'U2: the capped node shows the generic "… capped" badge instead of the false root badge'
+);
+assert(
+  shapedBoltHubCapped.tooltip.includes('capped'),
+  'U2: the capped node gets a glossary explanation in its tooltip, not just a bare badge'
+);
+
+// =========================================================================
+// v0.7.1 (U1): pin -- callee-direction site rows must render the EDGE's
+// call-site line/col (the calling line), not the resolved target's
+// declaration line. Gauntlet VALIDATION-REPORT.md's "Callee-tree site-line
+// corruption" finding (ranked fix-backlog #1): resolver.js's
+// calleeItemFromEdge() (resolver.js, NOT owned by this file -- see the
+// note below) currently sets the returned site's `line` to
+// resolvedMm.line (the target method's OWN declaration line) instead of
+// edge.line (the real calling statement's line); `col` and `lineText` are
+// unaffected. That value flows straight through shapeCalleeSites() into
+// TNode.sites, which is exactly what siteLabel/shapeSite below render.
+//
+// OWNERSHIP NOTE (integrator): the computational bug lives entirely inside
+// resolver.js's calleeItemFromEdge (line ~2522: `line: resolvedMm ?
+// resolvedMm.line : 0` must become `line: edge.line || 0`) -- outside
+// uitree.js/pathmap.js, which is all this file (and this subagent) owns.
+// uitree.js's siteLabel/shapeSite were verified (by code reading) to
+// already render whatever `site.line`/`col`/`lineText` they are HANDED,
+// verbatim, with no independent re-derivation -- there is no second bug in
+// the UI layer. These fixtures use the exact correct values confirmed live
+// via `node dev/gauntlet/probe2.js` (VertexRepriceBatch.cls / Billing.cls /
+// VertexLedgerBridge.cls in example-data/gauntlet-org) and pin that the
+// rendering layer surfaces them correctly, so the fix is verified end-to-
+// end the moment resolver.js's owner lands the one-line fix -- no
+// uitree.js change is required or expected.
+// =========================================================================
+
+// Repro 1: VertexRepriceBatch.execute -> VertexPricingService.<init>
+// (`new VertexPricingService()` at VertexRepriceBatch.cls:8, col 31 --
+// confirmed via `node dev/gauntlet/probe2.js`'s raw ForwardEdge dump).
+// Today's bug renders this as "L0: ..." (VertexPricingService has no
+// explicit constructor, so resolvedMm is null -> resolvedMm.line falls
+// back to 0) instead of "L8: ...".
+const repriceBatchCtorSite = {
+  path: '/ws/gauntlet-org/force-app/main/default/classes/VertexRepriceBatch.cls',
+  line: 8,
+  col: 31,
+  lineText: 'VertexPricingService svc = new VertexPricingService();',
+  argsRendered: '',
+  via: 'new',
+  overloadSig: null,
+};
+assert.strictEqual(
+  siteLabel(repriceBatchCtorSite),
+  'L8: VertexPricingService svc = new VertexPricingService();',
+  'U1 gauntlet regression (VertexRepriceBatch.execute -> VertexPricingService.<init>): site label must show L8 (the real call-site line), not L0/L31 (the corrupted values)'
+);
+assert.deepStrictEqual(
+  shapeSite(repriceBatchCtorSite).jump,
+  { path: repriceBatchCtorSite.path, line: 8, col: 31 },
+  'U1: click-to-jump must land on the real call-site line (8), not the target constructor\'s declaration line'
+);
+
+// Repro 2: VertexLedgerBridge.postToLedger -> Billing.charge, two DISTINCT
+// call sites (VertexLedgerBridge.cls:3 `Billing.charge(...)` and
+// VertexLedgerBridge.cls:19 `zenq.Billing.charge(...)`) must render as two
+// DISTINCT site rows. Today's bug collapses BOTH onto "L2" (Billing.cls:2,
+// Billing.charge's own declaration line) since calleeItemFromEdge ignores
+// each edge's own line. (Note: R1's separate namespace-guard fix will
+// eventually remove the line-19 edge entirely, since `zenq.` is an unknown
+// namespace prefix -- that is out of scope here; this fixture only pins
+// that the RENDERING layer keeps genuinely different call sites distinct
+// by line number, independent of whichever edges resolver.js decides to
+// emit.)
+const billingChargeNode = {
+  label: 'Billing.charge',
+  kind: 'method',
+  className: 'Billing',
+  path: '/ws/gauntlet-org/force-app/main/default/classes/Billing.cls',
+  line: 2,
+  entries: [],
+  isTest: false,
+  via: 'static',
+  sites: [
+    {
+      path: '/ws/gauntlet-org/force-app/main/default/classes/VertexLedgerBridge.cls',
+      line: 3,
+      col: 4,
+      lineText: 'Billing.charge(order.TotalAmount__c);',
+      argsRendered: null,
+      via: 'static',
+      overloadSig: null,
+    },
+    {
+      path: '/ws/gauntlet-org/force-app/main/default/classes/VertexLedgerBridge.cls',
+      line: 19,
+      col: 4,
+      lineText: 'zenq.Billing.charge(order.TotalAmount__c);',
+      argsRendered: null,
+      via: 'static',
+      overloadSig: null,
+    },
+  ],
+  children: [],
+  cyclic: false,
+  truncated: false,
+  approximate: false,
+  seenElsewhere: false,
+};
+const shapedBillingCharge = shapeNode(billingChargeNode);
+assert.strictEqual(shapedBillingCharge.children.length, 2, 'U1 gauntlet regression: two distinct call sites render as two distinct site rows, not collapsed');
+assert.strictEqual(
+  shapedBillingCharge.children[0].label,
+  'L3: Billing.charge(order.TotalAmount__c);',
+  'U1: first site row shows its own real line (3), not Billing.charge\'s declaration line (2)'
+);
+assert.strictEqual(
+  shapedBillingCharge.children[1].label,
+  'L19: zenq.Billing.charge(order.TotalAmount__c);',
+  'U1: second site row shows its own real line (19), not the same collapsed line as the first'
+);
+assert.notStrictEqual(
+  shapedBillingCharge.children[0].label,
+  shapedBillingCharge.children[1].label,
+  'U1: the two site rows must never render identically ("both L2" was the exact reported symptom)'
+);
+
+// =========================================================================
+// v0.7.1 (U3): new markers rendered + glossaried.
+//
+// R8: resolver.js's fix for the gauntlet's "generic-typed DML loses trigger
+// linkage" gap (KappaUnitOfWork.commitWork() -- a `List<SObject> records;
+// insert records;` shape can't be narrowed to a concrete SObject type).
+// Fixture matches resolver.js's REAL buildCalleeTree implementation
+// verbatim (buildForwardExtras' unresolvedDmlForwardCounts branch, read
+// directly): kind:'unresolved' (reused), via:'dml-unresolved', label 'DML
+// on unresolved SObject type' (singular count), approximate + truncated.
+// =========================================================================
+const unresolvedDmlNode = {
+  label: 'DML on unresolved SObject type',
+  kind: 'unresolved',
+  className: '',
+  path: '',
+  line: 0,
+  entries: [],
+  isTest: false,
+  via: 'dml-unresolved',
+  sites: [],
+  children: [],
+  cyclic: false,
+  truncated: true,
+  approximate: true,
+  seenElsewhere: false,
+};
+assert.strictEqual(iconForNode(unresolvedDmlNode), 'question', "U3 (R8): the unresolved-DML marker gets the same icon as the generic 'unresolved' leaf");
+const shapedUnresolvedDml = shapeNode(unresolvedDmlNode);
+assert.strictEqual(shapedUnresolvedDml.label, '~DML on unresolved SObject type', 'approximate:true prefixes the ~ marker, per labelForNode');
+assert(shapedUnresolvedDml.description.includes('dml-unresolved'), 'U3 (R8): via badge renders verbatim');
+assert(
+  shapedUnresolvedDml.tooltip.includes('dml-unresolved:'),
+  'U3 (R8): the new dml-unresolved via gets its own glossary explanation, not just the bare badge'
+);
+assert(
+  shapedUnresolvedDml.tooltip.toLowerCase().includes('no trigger'),
+  'U3 (R8): the glossary explanation explicitly calls out "no trigger linkage", matching the fix spec'
+);
+// v0.7 (A6) gap closed alongside this: the pre-existing "N unresolved
+// sites" aggregate leaf carries via:'unresolved' but never had a matching
+// VIA_GLOSSARY entry (its tooltip silently dropped the via line). Purely
+// additive -- the label text was already self-explanatory, this just adds
+// the explanation line every other via value already gets.
+const unresolvedAggNode = { ...unresolvedDmlNode, label: '3 unresolved sites', via: 'unresolved' };
+assert(
+  shapeNode(unresolvedAggNode).tooltip.includes('unresolved:'),
+  "U3: the pre-existing 'unresolved' via (aggregated call-sites leaf) now gets a glossary explanation too"
+);
 
 // --- v0.6 (H1/H4 forward-compat): shapeHeaderLines ---
 assert.deepStrictEqual(shapeHeaderLines(null), [], 'null treeResult -> no header lines');
@@ -363,6 +593,42 @@ assert.deepStrictEqual(
     '1 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).',
   ],
   'all three header lines combine, note first, in a fixed order'
+);
+
+// v0.7.1 (U3, M2 coordination point): stats.metaUnresolved forward-compat --
+// metascan.js/resolver.js does not produce this field yet, but uitree.js's
+// rendering support is locked in ahead of that engine change (same
+// forward-compat rationale as seenElsewhere/duplicateNames above). Mirrors
+// the unresolvedSites tests immediately above, same exact-wording
+// requirement, same "nested under stats" shape, same graceful degrade when
+// absent/zero.
+assert.deepStrictEqual(
+  shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { nodes: 1, uniqueMethods: 1, capped: false, metaUnresolved: 2 } }),
+  ['2 metadata references could not be attached (ambiguous or unmatched namespace).'],
+  'U3 (M2): stats.metaUnresolved > 1 produces the exact required header wording, plural'
+);
+assert.deepStrictEqual(
+  shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { nodes: 1, uniqueMethods: 1, capped: false, metaUnresolved: 1 } }),
+  ['1 metadata reference could not be attached (ambiguous or unmatched namespace).'],
+  'U3 (M2): stats.metaUnresolved === 1 uses the singular form'
+);
+assert.deepStrictEqual(
+  shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { nodes: 1, uniqueMethods: 1, capped: false, metaUnresolved: 0 } }),
+  [],
+  'U3 (M2): stats.metaUnresolved === 0 produces no header line'
+);
+assert.deepStrictEqual(
+  shapeHeaderLines({
+    root: {},
+    targetLabel: 'x',
+    note: null,
+    stats: { nodes: 1, uniqueMethods: 1, capped: false, unresolvedSites: 3, metaUnresolved: 2 },
+  }),
+  [
+    '3 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).',
+    '2 metadata references could not be attached (ambiguous or unmatched namespace).',
+  ],
+  'U3 (M2): unresolvedSites and metaUnresolved lines combine, in a fixed order, when both fire'
 );
 
 // --- tests-last ordering preserved from resolver output (uitree must NOT re-sort) ---
@@ -773,10 +1039,10 @@ assert.strictEqual(
   'no targetPackage context (undefined) -> any package the node carries differs from it, badge shown'
 );
 
-// badge ordering: entries · shield · test · via · package · '~' · cycle · depth cap · seenElsewhere.
+// badge ordering: entries · shield · test · via · package · '~' · cycle · capped · seenElsewhere.
 assert.deepStrictEqual(
   badgesForNode({ entries: ['@AuraEnabled (LWC/Aura)'], isTest: true, via: 'static', approximate: true, cyclic: true, truncated: true }, '(nova-billing)'),
-  ['@AuraEnabled (LWC/Aura)', 'test', 'static', '(nova-billing)', '~', '↺ cycle', '… depth cap'],
+  ['@AuraEnabled (LWC/Aura)', 'test', 'static', '(nova-billing)', '~', '↺ cycle', '… capped'],
   'package badge sits right after via, ahead of the "~" approximate marker'
 );
 assert.deepStrictEqual(badgesForNode({ via: 'static' }), ['static'], 'badgesForNode(node) with no second argument is unaffected -- no package badge appears');
@@ -1196,7 +1462,7 @@ assert(!mSeenRootUi.description.includes('↪ seen elsewhere'), 'the target-firs
 assert(!mSeenRootUi.description.includes('◉ root'), 'a seenElsewhere boundary root is NOT a genuine entry -- no root badge');
 assert(mSeenRootUi.tooltip.includes('↪ continues above —'), 'entry-first seenElsewhere glossary line present');
 assert.strictEqual(mTruncRootUi.label, 'Deep.caller');
-assert(mTruncRootUi.description.split(' · ').includes('… depth cap'), 'the truncated marker survives re-rooting too');
+assert(mTruncRootUi.description.split(' · ').includes('… capped'), 'the truncated/capped marker survives re-rooting too');
 assert(!mTruncRootUi.description.includes('◉ root'));
 // Boundary roots still start a normal chain: their (former) edge data sits
 // on the node below, and the chain ends at the target.

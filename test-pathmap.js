@@ -914,6 +914,196 @@ assert.strictEqual(isRootNode({ children: [], seenElsewhere: true }), false);
 passCount += 6;
 
 // =========================================================================
+// v0.7.1 (U2): root-badge gating against the maxNodes cap -- mirrors
+// test-uitree.js's identical gauntlet VALIDATION-REPORT.md Tier-3 #5 /
+// ranked fix-backlog #2 pin (see that file for the full repro writeup:
+// dev/gauntlet/probe-fanin-scale.js SECTION 3 /
+// run-fanin-scale-output.txt lines 29-35, VertexBoltHub(Premium).dispatch
+// capped at maxNodes:20). isRootNode's "childless and unflagged" definition
+// already excludes truncated -- this proves that holds for pathmap.js too,
+// AND that the generic-cause 'capped' node still renders correctly
+// end-to-end through renderPathMapHtml's JSON blob (n.root, consumed by
+// CLIENT_JS_TEXT's badgeGlyphs to decide the '◉' root glyph), not just via
+// the standalone helper.
+// =========================================================================
+check(
+  isRootNode({ label: 'VertexBoltHubPremium.dispatch', children: [], truncated: true }) === false,
+  'U2 gauntlet Tier-3 #5: a maxNodes-capped node (real, unshown callers) is NOT a root'
+);
+const fixtureBoltHubCap = {
+  root: baseNode({
+    label: 'VertexBoltHub.dispatch',
+    className: 'VertexBoltHub',
+    methodLower: 'dispatch',
+    path: '/ws/VertexBoltHub.cls',
+    line: 4,
+    children: [
+      baseNode({
+        label: 'VertexBoltHubPremium.dispatch',
+        className: 'VertexBoltHubPremium',
+        methodLower: 'dispatch',
+        path: '/ws/VertexBoltHubPremium.cls',
+        line: 9,
+        via: 'super',
+        // R5: the maxNodes cap cut this node's expansion off -- it has 63
+        // REAL further callers that simply were never materialized, not
+        // zero (see run-fanin-scale-output.txt).
+        truncated: true,
+        sites: [],
+        children: [],
+      }),
+    ],
+  }),
+  targetLabel: 'VertexBoltHub.dispatch',
+  note: null,
+  stats: { nodes: 2, uniqueMethods: 2, capped: true, unresolvedSites: 0 },
+};
+const dataBoltHubCap = extractData(renderPathMapHtml(fixtureBoltHubCap));
+const cappedNode = dataBoltHubCap.nodes.find((n) => n.label === 'VertexBoltHubPremium.dispatch');
+check(!!cappedNode, 'U2: capped node present in rendered output');
+check(cappedNode.truncated === true, 'U2: truncated flag reaches the rendered JSON');
+check(
+  cappedNode.root === false,
+  'U2 gauntlet Tier-3 #5: the capped node must NOT be flagged root in the rendered document -- this is the exact false "◉ root" signal the finding reports'
+);
+
+// v0.7.1 (U3, R8): confirmed against resolver.js's real buildCalleeTree
+// implementation -- the generic-typed-DML marker reuses kind:'unresolved'
+// verbatim (via 'dml-unresolved' is what distinguishes it), so it already
+// gets the SAME swatch/accent as the existing 'unresolved' leaf with no
+// separate branch needed.
+check(
+  accentKind({ kind: 'unresolved', via: 'dml-unresolved', entries: [], isTest: false }) === 'unresolved',
+  "U3 (R8): the DML-unresolved marker (kind:'unresolved', via:'dml-unresolved') gets the 'unresolved' accent bucket"
+);
+
+// v0.7.1 (U2/U3): legend documents the new/updated markers -- checked
+// against html1, which (like every render) unconditionally embeds the
+// static LEGEND_HTML regardless of the fixture's own content.
+check(html1.includes('capped — trace depth cap OR the node-count'), 'U2: legend uses cause-agnostic "capped" wording, not "depth cap" alone');
+check(html1.includes('<span class="k">unresolved</span>'), "U3: legend documents the 'unresolved' via label");
+check(html1.includes('<span class="k">dml-unresolved</span>'), "U3 (R8): legend documents the 'dml-unresolved' via label");
+check(html1.toLowerCase().includes('dml on unresolved sobject type'), 'U3 (R8): legend mentions the exact "DML on unresolved SObject type" marker text');
+
+// End-to-end: the exact TNode shape resolver.js's buildForwardExtras
+// produces (read directly from resolver.js), rendered through the full
+// renderPathMapHtml pipeline.
+const fixtureDmlUnresolved = {
+  root: baseNode({
+    label: 'KappaUnitOfWork.commitWork',
+    className: 'KappaUnitOfWork',
+    methodLower: 'commitwork',
+    path: '/ws/KappaUnitOfWork.cls',
+    line: 15,
+    children: [
+      baseNode({
+        label: 'DML on unresolved SObject type',
+        className: '',
+        methodLower: null,
+        path: '',
+        line: 0,
+        kind: 'unresolved',
+        via: 'dml-unresolved',
+        approximate: true,
+        truncated: true,
+        sites: [],
+        children: [],
+      }),
+    ],
+  }),
+  targetLabel: 'KappaUnitOfWork.commitWork',
+  note: null,
+  direction: 'callees',
+};
+const dataDmlUnresolved = extractData(renderPathMapHtml(fixtureDmlUnresolved));
+const dmlUnresolvedNode = dataDmlUnresolved.nodes.find((n) => n.label === 'DML on unresolved SObject type');
+check(!!dmlUnresolvedNode, 'U3 (R8): DML-unresolved node present in rendered output');
+check(dmlUnresolvedNode.kind === 'unresolved', 'U3 (R8): kind reaches the rendered JSON as "unresolved"');
+check(dmlUnresolvedNode.via === 'dml-unresolved', 'U3 (R8): via reaches the rendered JSON as "dml-unresolved"');
+check(dmlUnresolvedNode.accent === 'unresolved', 'U3 (R8): the node gets the unresolved accent/swatch end to end');
+check(dmlUnresolvedNode.approximate === true, 'U3 (R8): approximate flag reaches the rendered JSON');
+
+// =========================================================================
+// v0.7.1 (U1): pin -- mirrors test-uitree.js's identical gauntlet
+// "Callee-tree site-line corruption" regression (see that file for the
+// full ownership-boundary writeup: the computational bug lives entirely in
+// resolver.js's calleeItemFromEdge, outside pathmap.js/uitree.js, which is
+// all this file/subagent owns). This confirms pathmap.js's
+// shapeNodeForData/shapeSiteForData ALSO already pass whatever
+// site.line/col/lineText they are handed straight through, verbatim, into
+// the rendered JSON blob's `sites` array -- no independent re-derivation,
+// no second bug in this file either. Uses the exact correct values
+// confirmed live via `node dev/gauntlet/probe2.js` and by reading
+// VertexLedgerBridge.cls/Billing.cls directly in example-data/gauntlet-org.
+// =========================================================================
+const fixtureU1 = {
+  root: baseNode({
+    label: 'Billing.charge',
+    className: 'Billing',
+    methodLower: 'charge',
+    path: '/ws/gauntlet-org/force-app/main/default/classes/Billing.cls',
+    line: 2,
+    via: 'static',
+    sites: [
+      {
+        path: '/ws/gauntlet-org/force-app/main/default/classes/VertexLedgerBridge.cls',
+        line: 3,
+        col: 4,
+        lineText: 'Billing.charge(order.TotalAmount__c);',
+        argsRendered: null,
+        via: 'static',
+      },
+      {
+        path: '/ws/gauntlet-org/force-app/main/default/classes/VertexLedgerBridge.cls',
+        line: 19,
+        col: 4,
+        lineText: 'zenq.Billing.charge(order.TotalAmount__c);',
+        argsRendered: null,
+        via: 'static',
+      },
+    ],
+    children: [],
+  }),
+  targetLabel: 'VertexLedgerBridge.postToLedger',
+  note: null,
+};
+const dataU1 = extractData(renderPathMapHtml(fixtureU1));
+const billingNodeU1 = dataU1.nodes.find((n) => n.label === 'Billing.charge');
+check(!!billingNodeU1, 'U1: Billing.charge node present in rendered output');
+check(billingNodeU1.sites.length === 2, 'U1: two distinct call sites both reach the rendered JSON');
+check(
+  billingNodeU1.sites[0].line === 3,
+  "U1 gauntlet regression: first site keeps its own real line (3), not Billing.charge's declaration line (2)"
+);
+check(
+  billingNodeU1.sites[1].line === 19,
+  'U1 gauntlet regression: second site keeps its own real line (19), not collapsed onto the first'
+);
+check(
+  billingNodeU1.sites[0].line !== billingNodeU1.sites[1].line,
+  'U1: the two site rows must never render with identical line numbers ("both L2" was the exact reported symptom)'
+);
+
+// v0.7.1 (U3, M2 coordination point): headerExtraLinesForResult's
+// stats.metaUnresolved forward-compat -- mirrors test-uitree.js's identical
+// shapeHeaderLines addition (metascan.js/resolver.js does not produce this
+// field yet; rendering support is locked in ahead of that engine change).
+check(
+  JSON.stringify(headerExtraLinesForResult({ root: {}, stats: { metaUnresolved: 2 } })) ===
+    JSON.stringify(['2 metadata references could not be attached (ambiguous or unmatched namespace).']),
+  'U3 (M2): stats.metaUnresolved > 1 produces the exact required header wording, plural'
+);
+check(
+  JSON.stringify(headerExtraLinesForResult({ root: {}, stats: { metaUnresolved: 1 } })) ===
+    JSON.stringify(['1 metadata reference could not be attached (ambiguous or unmatched namespace).']),
+  'U3 (M2): stats.metaUnresolved === 1 uses the singular form'
+);
+check(
+  JSON.stringify(headerExtraLinesForResult({ root: {}, stats: { metaUnresolved: 0 } })) === JSON.stringify([]),
+  'U3 (M2): stats.metaUnresolved === 0 produces no header line'
+);
+
+// =========================================================================
 // Fixture 8 (v0.7): 'exception'/'unresolved' kinds, 'ambiguous' via fan-out
 // with two DIFFERENT-package children, and a plain cross-package badge --
 // one "kitchen sink" tree, same style as fixture5/fixture6's round-ups.

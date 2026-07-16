@@ -203,6 +203,11 @@ function iconForNode(node) {
   // could in principle carry entries (e.g. an unresolved-sites leaf) and
   // must not fall back to the generic ICON_ENTRIES 'plug' glyph.
   if (node.kind === 'exception') return ICON_EXCEPTION;
+  // v0.7.1 (U3, R8): confirmed against resolver.js's real buildCalleeTree
+  // implementation (buildForwardExtras' unresolvedDmlForwardCounts branch)
+  // -- the generic-typed-DML marker reuses kind:'unresolved' verbatim (via
+  // 'dml-unresolved' is what distinguishes it; see the VIA_GLOSSARY entry
+  // below), so no separate kind/icon branch is needed here at all.
   if (node.kind === 'unresolved') return ICON_UNRESOLVED;
   if (META_ICON_BY_KIND[node.kind]) return META_ICON_BY_KIND[node.kind];
   if (node.isTest) return ICON_TEST;
@@ -217,7 +222,7 @@ function labelForNode(node) {
 }
 
 // Badge order per contract: entries · caughtHere (shield) · test · via ·
-// package (v0.7 B3) · '~' when approximate · '↺ cycle' · '… depth cap' ·
+// package (v0.7 B3) · '~' when approximate · '↺ cycle' · '… capped' ·
 // '↪ seen elsewhere'.
 // (The 'root' badge is NOT added here -- see isRootNode/shapeNode below: it
 // depends on the shaped `children` count, which this per-node-flags
@@ -252,7 +257,18 @@ function badgesForNode(node, pkgBadge, orientation) {
   if (pkgBadge) badges.push(pkgBadge);
   if (node.approximate) badges.push('~');
   if (node.cyclic) badges.push('↺ cycle');
-  if (node.truncated) badges.push('… depth cap');
+  // v0.7.1 (U2, gauntlet Tier-3 #5 / fix-backlog #2): resolver.js's
+  // `truncated` flag now fires for TWO distinct causes that share one
+  // boolean -- the pre-existing per-branch depth cap (maxDepth) AND the
+  // whole-tree maxNodes cap (R5's fix stamps `truncated=true` on the
+  // specific node whose expansion the node-count budget cut off, mirroring
+  // the depth-cap pattern). The old '… depth cap' wording was accurate only
+  // for the first cause and would misreport the second (a node cut off by
+  // the node-count budget has NOT necessarily hit any depth limit) -- '…
+  // capped' is deliberately cause-agnostic so it stays true either way. See
+  // isRootNode below: a truncated node is (and was already) excluded from
+  // the '◉ root' badge regardless of which cap fired.
+  if (node.truncated) badges.push('… capped');
   // v0.6 (H1 forward-compat, H5 rendering): resolver.js does not produce
   // TNode.seenElsewhere yet -- this is purely additive and a no-op today.
   // v0.7.1: in the entry-first orientation the SAME flag reads
@@ -373,13 +389,37 @@ const VIA_GLOSSARY = {
   // default-package preference could disambiguate, so every remaining
   // candidate gets its own edge.
   ambiguous: "a class name duplicated across sfdx packages that neither the referring file's own package nor the default package could resolve -- every remaining candidate gets an edge (approximate)",
+  // v0.7 (A6): pre-existing gap closed here -- the aggregated "N unresolved
+  // sites" leaf (kind:'unresolved') has carried via:'unresolved' since v0.7
+  // shipped, but this table never had a matching entry, so its tooltip
+  // silently dropped the via line. Purely additive: a node with this via
+  // already rendered correctly (the label text itself is self-explanatory
+  // plain English), it just gained an explanation line it was missing.
+  unresolved: 'aggregated leaf: one or more forward call sites in this method could not be resolved to an indexed target (dynamic/platform call, deep/unknown-type chain, etc.) — approximate',
+  // v0.7.1 (U3, R8): the gauntlet's "generic-typed DML loses trigger
+  // linkage" fix (KappaUnitOfWork.commitWork() -- `List<SObject> records;
+  // insert records;` can't be narrowed to a concrete SObject type, so no
+  // DML->trigger/flow edge can be emitted). Confirmed against resolver.js's
+  // real buildCalleeTree implementation (buildForwardExtras'
+  // unresolvedDmlForwardCounts branch): kind:'unresolved' (reused
+  // verbatim), via:'dml-unresolved' (this exact string -- deliberately its
+  // OWN via, not 'dml' above, since 'dml' promises a real trigger/flow
+  // match, which is exactly what this marker does NOT have; "no trigger
+  // linkage" is the whole point), label 'DML on unresolved SObject type'
+  // (or 'N DML sites on unresolved SObject type' when N > 1), always
+  // approximate + truncated (terminal).
+  'dml-unresolved': "DML on unresolved SObject type — the DML statement's target could not be narrowed to a concrete SObject (e.g. a generic List<SObject>/SObject-typed variable), so no trigger or flow linkage could be traced (approximate)",
 };
 
 const MARKER_GLOSSARY = {
   approximate: '~ — approximate resolution: this edge may be wrong or one of several candidates',
   caughtHere: '🛡 caughtHere — an ancestor catch clause here catches the exception being traced; traversal still continues past it (rethrow is unknowable)',
   cyclic: '↺ cycle — this call chain recurses back on itself here',
-  truncated: '… depth cap — trace depth cap reached; more callers may exist above this node',
+  // v0.7.1 (U2): cause-agnostic wording -- see the badgesForNode comment
+  // above for why this can no longer say "depth cap" specifically now that
+  // the node-count (maxNodes) cap stamps the same flag on the one node its
+  // own expansion was cut off at.
+  truncated: '… capped — trace depth cap or node-count cap reached; more callers/callees may exist beyond this node',
   seenElsewhere: '↪ seen elsewhere — this subtree was already expanded once elsewhere in this trace; its own call sites are still shown, only the deeper callers above it are collapsed',
   // v0.7.1: the entry-first re-wording of the same flag (see badgesForNode)
   // -- in that orientation the reference node is the START of its own
@@ -728,6 +768,17 @@ function shapeResult(treeResult, orientation) {
 //                                      resolver.js's real buildCallerTree
 //                                      return shape, NOT a top-level
 //                                      TreeResult.unresolvedSites field).
+//   - treeResult.stats.metaUnresolved (v0.7.1 U3/M2 coordination point:
+//                                      workspace-wide count of namespaced
+//                                      metadata refs -- LWC/Aura/Flow/etc.
+//                                      imports -- that attachMetaCallers()
+//                                      could not attach to exactly one local
+//                                      class and therefore dropped rather
+//                                      than mis-pointing at an unrelated
+//                                      same-name local class. Same
+//                                      nested-under-stats / not-yet-produced-
+//                                      by-every-TreeResult shape as
+//                                      unresolvedSites above.)
 //
 // v0.7 (A3) INTERPRETIVE DECISION on the pinned "callers-direction render is
 // byte-identical to today" bar: resolver.js's buildCallerTree now stamps
@@ -795,6 +846,23 @@ function shapeHeaderLines(treeResult, orientation) {
   const unresolved = stats && stats.unresolvedSites;
   if (typeof unresolved === 'number' && unresolved > 0) {
     lines.push(`${unresolved} call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).`);
+  }
+  // v0.7.1 (U3, M2 coordination point): anticipates metascan.js/resolver.js's
+  // planned attachMetaCallers() candidate-count gate -- a namespaced meta
+  // ref (LWC/Aura/Flow/etc. import naming a managed-package Apex method)
+  // that cannot be attached to exactly one local class under its own
+  // namespace is dropped rather than mis-pointed at an unrelated same-name
+  // local class, and counted in this stat instead. Mirrors the
+  // unresolvedSites line immediately above -- same "nested under stats"
+  // shape, same degrade-gracefully-when-absent behavior for every
+  // pre-v0.7.1 TreeResult. INTEGRATION NOTE: 'metaUnresolved' is the exact
+  // field name given in the fix spec; if the resolver/metascan owner lands
+  // it under a different name, update this key to match.
+  const metaUnresolved = stats && stats.metaUnresolved;
+  if (typeof metaUnresolved === 'number' && metaUnresolved > 0) {
+    lines.push(
+      `${metaUnresolved} metadata reference${metaUnresolved === 1 ? '' : 's'} could not be attached (ambiguous or unmatched namespace).`
+    );
   }
   return lines;
 }

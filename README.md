@@ -127,10 +127,14 @@ flagged as cycles.
 
 Also resolved: dispatch maps (`handlerMap.get(key).handle()` through collection
 generics), virtual override fan-out (`~ override`, including through a subclass that
-overrides a method inherited from an interface's direct implementer), `Type.forName('X')`
-literals (`~ dynamic`), and Custom Metadata records that name handler classes (`cmdt`
-nodes). Platform entries cover Email Services, install handlers, `Comparable`,
-`Finalizer`, and the full async surface.
+overrides a method inherited from an interface's direct implementer, AND a bare/`this`
+self-call made from within the declaring base class's own body — the trigger-handler
+"framework calls its own overridable hook" idiom), `Type.forName('X')` literals
+(`~ dynamic`), and Custom Metadata records that name handler classes (`cmdt` nodes).
+Platform entries cover Email Services, install handlers, `Comparable`, `Finalizer`, and
+the full async surface. LWC/Aura/Flow/OmniScript/Custom Metadata references that don't
+unambiguously match exactly one local class are dropped rather than mis-attached, and
+counted in a header line separate from the ordinary unresolved-call-site count.
 
 ## Exceptions, events, async
 
@@ -163,14 +167,30 @@ exactly as before — no badges, no bucketing, first-registered class wins.
 ## Limits (known, by design)
 
 - Chains longer than 4 segments degrade to no edge (never a guessed one).
-- `Type.forName` with a non-literal argument is not traced.
+- `Type.forName`/`Type.newInstance()` with a non-literal argument (including a
+  `Type`-typed local/field, however it's named — the check is by declared type, not
+  identifier text) is not traced: no constructor edge, and never a guessed one.
+- Namespace/managed-package references (`ns.Class.method()`, or an LWC/Aura/Flow
+  import of `@salesforce/apex/ns.Class.method`) are not resolved to any local class —
+  even when the bare, namespace-stripped tail happens to collide with a real local
+  class/method name — and are counted in the workspace-wide unresolved-sites tally
+  instead of being silently dropped. A namespace-qualified reference never falls back
+  to bare-tail matching, at any confidence level.
 - DML→trigger edges assume the trigger fires (validation rules and exceptions can
-  prevent it at runtime).
+  prevent it at runtime). A DML statement whose target can't be narrowed to a
+  concrete SObject type (e.g. a generic `List<SObject>`/`SObject`-typed variable
+  threaded through a `Map`) surfaces as an honest `DML on unresolved SObject type`
+  leaf instead of silently vanishing — no trigger/flow linkage is attempted for it.
 - A single trace caps at 2000 nodes; a trace that hits the cap is marked and stops
-  expanding fairly across branches rather than silently truncating one of them. Large
-  fan-in graphs are deduplicated first (a subtree is only ever expanded once per
-  trace, see `↪ seen elsewhere` above), so the cap is rarely the limiting factor in
-  practice.
+  expanding fairly across branches rather than silently truncating one of them —
+  the specific node whose own further expansion was cut carries the marker (never
+  the wrong node, and never mislabeled a root/dead-end). Large fan-in graphs are
+  deduplicated first (a subtree is only ever expanded once per trace, see
+  `↪ seen elsewhere` above), so the cap is rarely the limiting factor in practice.
+- Interface/DI-style dispatch (including a string-keyed service locator) fans out to
+  every implementer uniformly, approximate — narrowing to whichever one is actually
+  wired at runtime would require whole-program constant propagation, out of scope for
+  static analysis.
 - Static analysis shows *possible* paths; it cannot tell you which one ran. For that,
   capture a debug log of a real transaction.
 

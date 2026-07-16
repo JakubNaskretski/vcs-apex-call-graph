@@ -60,6 +60,35 @@
 //     flowObject/flowRecordTriggerType pair uses for DML children, just a
 //     different child-materialization rule on the resolver side.
 //
+// v0.7.1 (M1, gauntlet-round namespace fix) addition to the MetaRef 'lwc'
+// shape, purely additive (className/methodName keep their exact pre-existing
+// meaning -- still the bare last-two dot-segments of the specifier):
+//
+//   - kind:'lwc' refs gain an always-present field: { namespace: string|null }
+//     -- the dot-segment(s) BEFORE the trailing Class.method pair of a
+//     `@salesforce/apex/...` specifier, verbatim (not case-normalized).
+//     `@salesforce/apex/zenq.KappaGateway.dispatch` (3 segments) now yields
+//     { className:'KappaGateway', methodName:'dispatch', namespace:'zenq' }
+//     instead of silently discarding 'zenq' as v0.6 and earlier did. A bare
+//     2-segment specifier (`Class.method`, no namespace prefix) leaves
+//     namespace: null, exactly matching its pre-v0.7.1 output otherwise.
+//     4+-segment specifiers (e.g. `ns.Outer.Inner.method`) fold every leading
+//     segment before the trailing pair into one dot-joined namespace string
+//     (`'ns.Outer'`) -- best-effort, never throws, same tolerant posture as
+//     the rest of this file.
+//     metascan.js does NOT decide what a namespaced ref means for attach
+//     purposes -- this file has no knowledge of the local workspace's class
+//     index (see the header contract above: no dependency on parser.js or
+//     resolver.js) and never attaches anything itself. It only preserves the
+//     namespace signal faithfully so a downstream consumer -- resolver.js's
+//     attachMetaCallers(), out of scope here -- can gate on it per the M2
+//     fix: a non-null namespace means this ref names a method that belongs
+//     to a namespace the LOCAL (unmanaged, no-namespace) workspace does not
+//     own, so it must never be re-pointed at a local class purely because
+//     the bare tail segments happen to match (VALIDATION-REPORT.md Tier-1
+//     #1: `@salesforce/apex/zenq.KappaGateway.dispatch` previously collapsed
+//     onto local `KappaGateway.dispatch`, `via=metadata`, zero gating).
+//
 // Design notes:
 //
 // - `label` is always the file's stem (its Salesforce API name) — see
@@ -163,8 +192,11 @@ function makeRef(kind, label, className, methodName, text, lineStarts, idx) {
 // --- LWC -------------------------------------------------------------------
 // import x from '@salesforce/apex/Cls.method';  -- multi-line tolerant
 // (the `\s` between `from` and the quote already matches newlines), and
-// namespace-dotted specifiers (`@salesforce/apex/ns.Cls.method`) tolerated
-// by always taking the LAST TWO dot-separated segments as Class.method.
+// namespace-dotted specifiers (`@salesforce/apex/ns.Cls.method`) tolerated:
+// className/methodName are always the LAST TWO dot-separated segments, and
+// (v0.7.1, M1) any leading segment(s) before that pair are now retained
+// verbatim on the ref's `namespace` field instead of being discarded -- see
+// the v0.7.1 (M1) header note above for the full contract.
 // `import { refreshApex } from '@salesforce/apex';` (no trailing /Cls.method)
 // deliberately does not match — there's no method to attribute it to.
 const LWC_IMPORT_RE = /from\s+['"]@salesforce\/apex\/([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)['"]/g;
@@ -177,7 +209,13 @@ function extractLwc(path, text, lineStarts, out) {
     const segs = m[1].split('.');
     const methodName = segs[segs.length - 1];
     const className = segs[segs.length - 2];
-    out.push(makeRef('lwc', label, className, methodName, text, lineStarts, m.index));
+    // v0.7.1 (M1): segments before the Class.method pair are the namespace
+    // prefix -- null for a bare 2-segment specifier, dot-joined verbatim
+    // (case preserved) for 3+ segments. Never discarded.
+    const namespace = segs.length > 2 ? segs.slice(0, segs.length - 2).join('.') : null;
+    const ref = makeRef('lwc', label, className, methodName, text, lineStarts, m.index);
+    ref.namespace = namespace;
+    out.push(ref);
   }
 }
 

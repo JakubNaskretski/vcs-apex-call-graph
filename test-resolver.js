@@ -3048,10 +3048,22 @@ attachMetaCallers(indexW7, metaRefsW7);
   assert.ok(!findChild(kids, 'W7BoomException.<init>'), 'G2 forward-collapse: the throw statement\'s own `new W7BoomException(...)` must NOT ALSO appear as a separate <init> child');
 
   const ifaceChild = findChild(kids, 'W7Notifiable.notify');
-  assert.ok(ifaceChild, 'interface: a call through an interface-typed receiver forwards to the INTERFACE method itself');
+  assert.ok(ifaceChild, 'interface: a call through an interface-typed receiver forwards to the INTERFACE method itself, kept as one sibling (not a wrapper) -- v0.7.1/R7');
   assert.strictEqual(ifaceChild.via, 'interface');
   assert.strictEqual(ifaceChild.approximate, true);
-  assert.ok(!findChild(kids, 'W7EmailNotifier.notify') && !findChild(kids, 'W7SmsNotifier.notify'), 'A5: the call SITE collapses onto the interface method node only -- implementer fan-out is the INTERFACE method\'s own forward children (see the next block), not this call site\'s');
+  // v0.7.1/R7 (was A5 pre-fix, now UPDATED -- VALIDATION-REPORT.md fix
+  // backlog #9 / Callee-direction interface dispatch tree shape): the
+  // resolved implementer(s) must appear as DIRECT children of the calling
+  // method's call site, not buried two levels down under the interface
+  // node as a synthetic non-call-site wrapper. The interface node above is
+  // kept alongside as one additional sibling, not removed.
+  const emailImplDirect = findChild(kids, 'W7EmailNotifier.notify');
+  const smsImplDirect = findChild(kids, 'W7SmsNotifier.notify');
+  assert.ok(emailImplDirect && smsImplDirect, 'v0.7.1/R7: implementer(s) must be DIRECT children of the call site, not buried under the interface node');
+  assert.strictEqual(emailImplDirect.via, 'interface');
+  assert.strictEqual(emailImplDirect.approximate, true);
+  assert.strictEqual(smsImplDirect.via, 'interface');
+  assert.strictEqual(smsImplDirect.approximate, true);
 
   const unresolved = kids.find((k) => k.kind === 'unresolved');
   assert.ok(unresolved, 'unresolved-aggregate: the one genuinely-unresolved dot-call (mystery.zzzW7Unresolved()) must produce an aggregated leaf');
@@ -3471,5 +3483,299 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
 // =========================================================================
 // v0.7: end of A1/A2/B2 additions.
 // =========================================================================
+
+// =========================================================================
+// v0.7.1 GAUNTLET REGRESSION PINS -- each block below ports one confirmed
+// finding from /Users/agent/work/code/example-data/gauntlet-org/
+// VALIDATION-REPORT.md (R1-R8) into a self-contained assert, named after
+// the finding. R7's pin lives inline above (the W7 interface-dispatch
+// block, updated in place -- see its own "v0.7.1/R7" comments) since it
+// amends an existing assertion rather than adding a new one.
+// =========================================================================
+
+// ---- v0.7.1/R1: namespace-qualified receiver guard ------------------------
+// VALIDATION-REPORT.md Tier-1 #2: `zenq.Billing.charge()` (a reference into
+// a namespace that doesn't exist in the workspace) must NOT bare-tail-match
+// the unrelated LOCAL class whose simple name happens to equal the
+// receiver's last dotted segment. Pins dev/gauntlet/probe3.js +
+// run-namespace-probes.js PROBE 1 (VertexLedgerBridge.cls:19 shape).
+{
+  const G71Billing = ty('G71Billing', 'G71Billing', {
+    methods: [mth('charge', { line: 1, params: [{ name: 'amount', type: 'Decimal' }] })],
+  });
+  const G71LedgerBridge = ty('G71LedgerBridge', 'G71LedgerBridge', {
+    methods: [
+      mth('postToLedger', {
+        line: 1,
+        calls: [cl('dot', 'charge', { receiver: 'zenq.G71Billing', argTexts: ['amount'], line: 2, lineText: 'zenq.G71Billing.charge(amount);' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(G71Billing), mkFile(G71LedgerBridge)]);
+  const tree = buildCallerTree(index, { classLower: 'g71billing', methodLower: 'charge' });
+  assert.deepStrictEqual(tree.root.children, [], 'v0.7.1/R1: zenq.G71Billing.charge() must NOT resolve onto the unrelated local G71Billing.charge (namespace-prefix bare-tail collision)');
+  assert.strictEqual(tree.note, 'No callers found — this is likely an entry point or unused code.');
+  assert.strictEqual(index.stats.unresolvedSites, 1, 'v0.7.1/R1: the namespaced call must be counted as an honest unresolved site (both directions), not silently swallowed like a genuine platform-denylist exclusion');
+}
+
+// ---- v0.7.1/R1 re-hunt: known-class head does not imply known chain ------
+// Adversarial re-hunt finding (dev/gauntlet/repro-zenq-known-class-bare-tail.js
+// + run-namespace-probes-v2-rehunt.js PROBE A): isUnknownNamespacedReceiver
+// previously treated ANY dotted receiver as "in scope" the moment its HEAD
+// segment matched some known local class AT ALL (`classes.has(headLower)` /
+// `simpleNameIndex.has(headLower)`), without checking that the REMAINDER of
+// the chain actually resolves within that class's own inner-class hierarchy.
+// A genuine local top-level class literally named `zenq` (whose only inner
+// class is `Foo`, entirely unrelated to G71KappaGateway) must NOT cause
+// `zenq.G71KappaGateway.dispatch(...)` to be treated as in-scope just
+// because `zenq` itself is real -- it must still be excluded exactly as if
+// `zenq` were an unknown namespace token, and it must NOT resurrect the
+// false edge for the pre-existing zenq.G71Billing.charge() site either
+// (same fixture, two independent receivers sharing the `zenq` head).
+{
+  const G71ZenqFoo = ty('Foo', 'zenq.Foo', { methods: [mth('bar', { line: 1 })] });
+  const G71Zenq = ty('zenq', 'zenq', { methods: [] });
+  const G71ZenqFile = file(P('G71Zenq'), 'class', [G71Zenq, G71ZenqFoo]);
+
+  const G71RehuntKappaGateway = ty('G71RehuntKappaGateway', 'G71RehuntKappaGateway', {
+    methods: [mth('dispatch', { line: 1, params: [{ name: 'cmd', type: 'String' }] })],
+  });
+  const G71RehuntBilling = ty('G71RehuntBilling', 'G71RehuntBilling', {
+    methods: [mth('charge', { line: 1, params: [{ name: 'amount', type: 'Decimal' }] })],
+  });
+  const G71RehuntCaller = ty('G71RehuntCaller', 'G71RehuntCaller', {
+    methods: [
+      mth('run', {
+        line: 1,
+        calls: [
+          cl('dot', 'dispatch', { receiver: 'zenq.G71RehuntKappaGateway', argTexts: ['cmd'], line: 2, lineText: "zenq.G71RehuntKappaGateway.dispatch('cmd');" }),
+          cl('dot', 'charge', { receiver: 'zenq.G71RehuntBilling', argTexts: ['amount'], line: 3, lineText: 'zenq.G71RehuntBilling.charge(amount);' }),
+        ],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([G71ZenqFile, mkFile(G71RehuntKappaGateway), mkFile(G71RehuntBilling), mkFile(G71RehuntCaller)]);
+
+  const kgTree = buildCallerTree(index, { classLower: 'g71rehuntkappagateway', methodLower: 'dispatch' });
+  assert.deepStrictEqual(
+    kgTree.root.children,
+    [],
+    "v0.7.1/R1 re-hunt: zenq.G71RehuntKappaGateway.dispatch() must NOT resolve onto the unrelated local G71RehuntKappaGateway.dispatch merely because 'zenq' is itself a genuine local class -- the chain's remainder (G71RehuntKappaGateway) isn't a member of zenq's own hierarchy"
+  );
+
+  const billingTree = buildCallerTree(index, { classLower: 'g71rehuntbilling', methodLower: 'charge' });
+  assert.deepStrictEqual(
+    billingTree.root.children,
+    [],
+    "v0.7.1/R1 re-hunt: the presence of a genuine local 'zenq' class must not resurrect the original bare-tail false edge for zenq.G71RehuntBilling.charge() either"
+  );
+
+  assert.strictEqual(index.stats.unresolvedSites, 2, "v0.7.1/R1 re-hunt: both zenq.*-prefixed calls must be counted as honest unresolved sites, not silently misrouted");
+}
+
+// ---- v0.7.1/R1 re-hunt over-correction guard: genuine Outer.Inner must still edge --
+// The fix above must not blanket-block every 'zenq.X' chain -- only ones
+// where the remainder doesn't resolve within the head class's own
+// hierarchy. A genuine local 'zenq' class with a genuine inner class
+// 'G71RehuntBilling2' must still resolve via ordinary static dispatch.
+{
+  const G71ZenqInner = ty('G71RehuntBilling2', 'zenq.G71RehuntBilling2', {
+    methods: [mth('charge', { line: 1, params: [{ name: 'amount', type: 'Decimal' }] })],
+  });
+  const G71ZenqOuter = ty('zenq', 'zenq', { methods: [] });
+  const G71ZenqFile2 = file(P('G71Zenq2'), 'class', [G71ZenqOuter, G71ZenqInner]);
+  const G71RehuntCaller2 = ty('G71RehuntCaller2', 'G71RehuntCaller2', {
+    methods: [
+      mth('run', {
+        line: 1,
+        calls: [cl('dot', 'charge', { receiver: 'zenq.G71RehuntBilling2', argTexts: ['amount'], line: 2, lineText: 'zenq.G71RehuntBilling2.charge(amount);' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([G71ZenqFile2, mkFile(G71RehuntCaller2)]);
+  const tree = buildCallerTree(index, { classLower: 'zenq.g71rehuntbilling2', methodLower: 'charge' });
+  assert.ok(
+    findChild(tree.root.children, 'G71RehuntCaller2.run'),
+    "v0.7.1/R1 re-hunt over-correction check: zenq.G71RehuntBilling2.charge() -- a GENUINE Outer.Inner static call -- must still resolve; the guard must not blanket-exclude every dotted chain whose head is named 'zenq'"
+  );
+}
+
+// ---- v0.7.1/R2: Type-typed receiver denylist (by declared type) ----------
+// VALIDATION-REPORT.md Tier-2 #3: `Type implType = ...; implType.newInstance()`
+// must not fabricate an edge to an unrelated globally-unique `newInstance`
+// method via rule 7 -- the denylist decision must key on the receiver's
+// DECLARED TYPE ('Type'), not its identifier text ('implType'). Includes
+// the reported spurious SELF-referential cyclic edge (the call sits inside
+// the very method that would otherwise become its own "unique" target).
+// Pins dev/gauntlet/probe1.js (VertexGenericTriggerDispatcher.cls:8 /
+// VertexApplication.cls:8 shape).
+{
+  const G71Application = ty('G71Application', 'G71Application', {
+    methods: [
+      mth('newInstance', {
+        line: 1,
+        isStatic: true,
+        locals: [{ name: 'implType', type: 'Type', line: 1 }],
+        calls: [cl('dot', 'newInstance', { receiver: 'implType', line: 2, lineText: 'return implType.newInstance();' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(G71Application)]);
+  const tree = buildCallerTree(index, { classLower: 'g71application', methodLower: 'newinstance' });
+  assert.deepStrictEqual(
+    tree.root.children,
+    [],
+    "v0.7.1/R2: a Type-typed local's .newInstance() call must not fabricate a false edge -- incl. a spurious SELF-referential cyclic edge -- via rule 7's unique-name fallback (denylist must gate on declared TYPE, not identifier text)"
+  );
+}
+
+// ---- v0.7.1/R3: collection-accessor poisoning ------------------------------
+// VALIDATION-REPORT.md Tier-2 #4: a Map/List/Set builtin accessor call
+// (`.get`/`.put`/`.add`/...) on a collection-typed (or otherwise unresolved)
+// receiver must never reach rule 7's unique-name fallback, even when
+// exactly one unrelated method of that name happens to exist elsewhere in
+// the workspace. Pins the KappaUnitOfWork.cls:20/25 shape
+// (newRecordsByType.get(tkey) colliding onto KappaServiceLocator.get).
+{
+  const G71ServiceLocator = ty('G71ServiceLocator', 'G71ServiceLocator', {
+    methods: [mth('get', { line: 1, isStatic: true, params: [{ name: 'key', type: 'String' }] })],
+  });
+  const G71UnitOfWork = ty('G71UnitOfWork', 'G71UnitOfWork', {
+    fields: [{ name: 'byType', type: 'Map<Schema.SObjectType, List<SObject>>', isStatic: false }],
+    methods: [
+      mth('registerNew', {
+        line: 1,
+        params: [{ name: 'tkey', type: 'Schema.SObjectType' }],
+        calls: [cl('dot', 'get', { receiver: 'byType', argTexts: ['tkey'], line: 2, lineText: 'byType.get(tkey);' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(G71ServiceLocator), mkFile(G71UnitOfWork)]);
+  const tree = buildCallerTree(index, { classLower: 'g71servicelocator', methodLower: 'get' });
+  assert.deepStrictEqual(
+    tree.root.children,
+    [],
+    "v0.7.1/R3: a Map-typed receiver's .get(...) call must not fabricate an edge to an unrelated globally-unique .get() method elsewhere -- collection-accessor names must never reach rule 7"
+  );
+}
+
+// ---- v0.7.1/R4: template-method self-dispatch override fan-out -----------
+// VALIDATION-REPORT.md Tier-3 #6: a base class's bare/`this`-qualified
+// self-call to its own virtual hook method (the fflib/trigger-handler
+// template-method idiom) must ALSO fan out to a subclass override, exactly
+// as rule 6's typed dispatch already does -- otherwise a real, reachable
+// override method is falsely reported as having no callers. Pins
+// KappaTriggerHandler.cls / KappaOrderTriggerHandler.cls.
+{
+  const G71TriggerHandler = ty('G71TriggerHandler', 'G71TriggerHandler', {
+    methods: [
+      mth('run', { line: 1, calls: [cl('bare', 'beforeInsert', { line: 2, lineText: 'beforeInsert();' })] }),
+      mth('beforeInsert', { line: 3 }), // virtual no-op hook
+    ],
+  });
+  const G71OrderTriggerHandler = ty('G71OrderTriggerHandler', 'G71OrderTriggerHandler', {
+    extendsType: 'G71TriggerHandler',
+    methods: [mth('beforeInsert', { line: 1 })], // real override
+  });
+  const index = buildSemanticIndex([mkFile(G71TriggerHandler), mkFile(G71OrderTriggerHandler)]);
+  const tree = buildCallerTree(index, { classLower: 'g71ordertriggerhandler', methodLower: 'beforeinsert' });
+  const overrideCaller = findChild(tree.root.children, 'G71TriggerHandler.run');
+  assert.ok(overrideCaller, 'v0.7.1/R4: a base class\'s bare self-call to its own virtual hook method must fan out to a subclass override -- was "No callers found" pre-fix');
+  assert.strictEqual(overrideCaller.via, 'override');
+  assert.strictEqual(overrideCaller.approximate, true);
+}
+
+// ---- v0.7.1/R5: maxNodes cap honesty ---------------------------------------
+// VALIDATION-REPORT.md Tier-3 #5: the specific node whose expansion the
+// maxNodes cap cut off must be stamped truncated=true, mirroring the
+// existing depth-cap pattern -- otherwise a node with real further
+// callers/callees renders identically to a genuine zero-children leaf.
+// Pins the VertexBoltHub.dispatch (60 callers, maxNodes:20) shape at a
+// tractable scale (5 callers, maxNodes:3).
+{
+  const G71FanTarget = ty('G71FanTarget', 'G71FanTarget', { methods: [mth('hit', { line: 1 })] });
+  const fanFiles = [mkFile(G71FanTarget)];
+  for (let i = 1; i <= 5; i++) {
+    fanFiles.push(mkFile(ty(`G71FanCaller${i}`, `G71FanCaller${i}`, {
+      methods: [mth('go', { line: 1, calls: [cl('dot', 'hit', { receiver: 'G71FanTarget', line: 2, lineText: 'G71FanTarget.hit();' })] })],
+    })));
+  }
+  const index = buildSemanticIndex(fanFiles);
+  const tree = buildCallerTree(index, { classLower: 'g71fantarget', methodLower: 'hit' }, { maxNodes: 3 });
+  assert.strictEqual(tree.stats.capped, true, 'v0.7.1/R5: 5 real callers vs maxNodes:3 must trip the cap');
+  assert.strictEqual(
+    tree.root.truncated,
+    true,
+    'v0.7.1/R5: the SPECIFIC node whose children the cap cut off (root, here) must be stamped truncated=true -- was silently left unmarked pre-fix, indistinguishable from a genuine zero-caller leaf (the false "◉ root" signal)'
+  );
+  assert.ok(tree.root.children.length < 5, 'v0.7.1/R5: fewer than all 5 real callers were actually materialized -- the cap genuinely fired');
+
+  // Callee direction: same guarantee via buildCalleeTree (the report's own
+  // "reproduces identically in both buildCallerTree and buildCalleeTree").
+  // buildChildrenLevel/buildOneChildNode are direction-agnostic shared code,
+  // so a single-method, 5-callee fan-OUT fixture exercises the identical cap
+  // logic from the other direction.
+  const G71FanOutSource = ty('G71FanOutSource', 'G71FanOutSource', {
+    methods: [mth('runAll', {
+      line: 1,
+      calls: [1, 2, 3, 4, 5].map((i) => cl('dot', `stepFn${i}`, { receiver: 'G71FanOutSource', line: i + 1, lineText: `stepFn${i}();` })),
+    })].concat([1, 2, 3, 4, 5].map((i) => mth(`stepFn${i}`, { line: i + 1 }))),
+  });
+  const calleeIndex = buildSemanticIndex([mkFile(G71FanOutSource)]);
+  const calleeTree = buildCalleeTree(calleeIndex, { classLower: 'g71fanoutsource', methodLower: 'runall' }, { maxNodes: 3 });
+  assert.strictEqual(calleeTree.stats.capped, true, 'v0.7.1/R5 (callees): 5 real callees vs maxNodes:3 must trip the cap');
+  assert.strictEqual(
+    calleeTree.root.truncated,
+    true,
+    'v0.7.1/R5 (callees): the SPECIFIC node whose children the cap cut off (root, here) must be stamped truncated=true, same as the caller direction'
+  );
+}
+
+// ---- v0.7.1/R6: forward unresolved-count parity ----------------------------
+// VALIDATION-REPORT.md fix backlog #8: a denylisted-receiver call
+// (`Database.getQueryLocator(...)`) must be excluded from the FORWARD
+// unresolved-site count exactly like the backward-direction stat already
+// excludes it -- a deliberate, known exclusion, not a "dropped" site. Pins
+// VertexRepriceBatch.start() (SOQL-only, no Apex callee).
+{
+  const G71DenylistOnly = ty('G71DenylistOnly', 'G71DenylistOnly', {
+    methods: [
+      mth('start', {
+        line: 1,
+        calls: [cl('dot', 'getQueryLocator', { receiver: 'Database', argTexts: ['[SELECT Id FROM Account]'], line: 2, lineText: 'return Database.getQueryLocator([SELECT Id FROM Account]);' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(G71DenylistOnly)]);
+  const tree = buildCalleeTree(index, { classLower: 'g71denylistonly', methodLower: 'start' });
+  assert.deepStrictEqual(tree.root.children, [], 'v0.7.1/R6: a denylisted-receiver-only method must show ZERO unresolved forward sites, matching the backward-direction H4 exclusion');
+  assert.strictEqual(tree.note, 'This method makes no traceable outbound calls.');
+}
+
+// ---- v0.7.1/R8: generic-typed DML honest marker ----------------------------
+// VALIDATION-REPORT.md fix backlog #10: a DML statement whose target
+// reduces to the generic `SObject` placeholder (object identity erased
+// through a `List<SObject>`-typed collection) must surface an honest "DML
+// on unresolved SObject type" leaf instead of silently vanishing with zero
+// callee edges AND zero unresolved marker. Pins KappaUnitOfWork.commitWork().
+{
+  const G71GenericUow = ty('G71GenericUow', 'G71GenericUow', {
+    fields: [{ name: 'records', type: 'List<SObject>', isStatic: false }],
+    methods: [
+      mth('commitWork', {
+        line: 1,
+        dml: [dmlFact('insert', 'records', { line: 2, lineText: 'insert records;' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(G71GenericUow)]);
+  const tree = buildCalleeTree(index, { classLower: 'g71genericuow', methodLower: 'commitwork' });
+  const marker = findChild(tree.root.children, 'DML on unresolved SObject type');
+  assert.ok(marker, 'v0.7.1/R8: a generic List<SObject>-typed DML target must surface an honest "DML on unresolved SObject type" leaf instead of silently vanishing');
+  assert.strictEqual(marker.kind, 'unresolved');
+  assert.strictEqual(marker.via, 'dml-unresolved');
+  assert.strictEqual(marker.approximate, true);
+  assert.strictEqual(marker.truncated, true);
+}
 
 console.log('test-resolver.js: all assertions passed.');

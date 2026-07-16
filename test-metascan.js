@@ -1,7 +1,7 @@
 'use strict';
 // Self-check for metascan.js (amendment A5): node test-metascan.js
 //
-// Two halves:
+// Three parts:
 //   1. Inline-string fixtures for every source kind (lwc/aura/flow/
 //      omniscript/vf) plus edge cases (multi-line imports, namespace-dotted
 //      specifiers, __tests__ exclusion, non-apex Flow actions, the
@@ -10,6 +10,13 @@
 //      adv-org corpus, asserting the EXACT refs MANIFEST.md's "UI / metadata
 //      callers" ground-truth section promises -- this is the bar the task
 //      brief sets ("assert the exact refs the MANIFEST promises").
+//   3. v0.7.1 (M1) gauntlet-round regression: a real pass over the read-only
+//      /Users/agent/work/code/example-data/gauntlet-org corpus pinning
+//      VALIDATION-REPORT.md Tier-1 #1 -- `LWC_IMPORT_RE` must retain the
+//      namespace segment of `@salesforce/apex/ns.Class.method` specifiers
+//      instead of silently discarding it (the M2 fix that USES this field to
+//      gate attachMetaCallers() against a false attach onto a same-bare-name
+//      local class lives in resolver.js, out of scope for this file).
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
@@ -46,6 +53,7 @@ function refsOf(kind, refs) {
     refs[0].lineText,
     "import getRecentQuotes from '@salesforce/apex/AcmeQuoteAuraService.getRecentQuotes';"
   );
+  assert.strictEqual(refs[0].namespace, null, 'bare 2-segment specifier (Class.method) -- no namespace prefix');
 }
 
 // 2. Multi-line import (identifier and `from` on separate lines)
@@ -63,6 +71,7 @@ function refsOf(kind, refs) {
   assert.strictEqual(refs[0].className, 'AcmeQuoteAuraService');
   assert.strictEqual(refs[0].methodName, 'createQuote');
   assert.strictEqual(refs[0].line, 4, 'line should point at the `from \'...\'` line, not the `import` line');
+  assert.strictEqual(refs[0].namespace, null);
 }
 
 // 3. Two imports in one file (wire + imperative), both attributed correctly
@@ -81,16 +90,116 @@ function refsOf(kind, refs) {
     refs.map((r) => r.methodName).sort(),
     ['getInvoiceSummary', 'recalculateInvoice'].sort()
   );
-  for (const r of refs) assert.strictEqual(r.className, 'AcmeQuoteAuraService');
+  for (const r of refs) {
+    assert.strictEqual(r.className, 'AcmeQuoteAuraService');
+    assert.strictEqual(r.namespace, null);
+  }
 }
 
-// 4. Namespace-dotted specifier tolerated: last two segments are Class.method
+// 4. Namespace-dotted specifier (3 segments): className/methodName are still
+//    the last two segments (unchanged since v0.3), but (v0.7.1, M1) the
+//    leading segment is now RETAINED on `namespace` instead of discarded.
 {
   const text = "import doThing from '@salesforce/apex/acme_pkg.AcmeNamespacedService.doThing';";
   const refs = parseMetaFile({ path: 'lwc/acmeNsWidget/acmeNsWidget.js', text });
   assert.strictEqual(refs.length, 1);
   assert.strictEqual(refs[0].className, 'AcmeNamespacedService');
   assert.strictEqual(refs[0].methodName, 'doThing');
+  assert.strictEqual(refs[0].namespace, 'acme_pkg', 'M1: namespace segment must be captured, not discarded');
+}
+
+// 4a. Two-segment (bare, no namespace) vs three-segment (namespaced) import
+//     of THE SAME bare Class.method, side by side -- pins the exact signal
+//     M2's attachMetaCallers() gate (resolver.js, out of scope here) needs
+//     to tell "this is a genuine local reference" apart from "this merely
+//     SHARES a bare tail with a local class but is not one" (M2 spec: "a
+//     meta ref only attaches when it unambiguously matches exactly one local
+//     class under the ref's own namespace context"). This is the gauntlet
+//     Tier-1 #1 false-edge shape in miniature (see VALIDATION-REPORT.md):
+//     both refs resolve to identical className/methodName, so any consumer
+//     keying ONLY on `lc(className)` (the pre-fix behavior) cannot tell them
+//     apart -- `namespace` is the only field that can.
+{
+  const bareText = "import dispatch from '@salesforce/apex/KappaGateway.dispatch';";
+  const nsText = "import dispatch from '@salesforce/apex/zenq.KappaGateway.dispatch';";
+  const bareRefs = parseMetaFile({ path: 'lwc/kappaGatewayLocalPanel/kappaGatewayLocalPanel.js', text: bareText });
+  const nsRefs = parseMetaFile({ path: 'lwc/kappaGatewayPanel/kappaGatewayPanel.js', text: nsText });
+  assert.strictEqual(bareRefs.length, 1);
+  assert.strictEqual(nsRefs.length, 1);
+  // Same bare className/methodName in both -- the collision the bug exploited.
+  assert.strictEqual(bareRefs[0].className, nsRefs[0].className);
+  assert.strictEqual(bareRefs[0].methodName, nsRefs[0].methodName);
+  // But the namespace field distinguishes them: null means "no namespace
+  // prefix in source -- safe to consider for local attach"; a non-null
+  // namespace means "this ref names a method in a DIFFERENT namespace than
+  // the local no-namespace workspace, and must never be re-pointed at a
+  // local same-bare-name class purely on tail-segment equality" (M2).
+  assert.strictEqual(bareRefs[0].namespace, null, 'no-prefix specifier -- eligible for local attach');
+  assert.strictEqual(nsRefs[0].namespace, 'zenq', 'namespace-prefixed specifier -- must NOT local-attach (M2)');
+  assert.notStrictEqual(
+    bareRefs[0].namespace,
+    nsRefs[0].namespace,
+    'bare and namespaced refs to the same bare Class.method must be distinguishable'
+  );
+}
+
+// 4b. Different namespace tokens (second namespace, case-insensitive variant)
+//     -- namespace is preserved VERBATIM (not case-normalized; that is a
+//     resolver-level concern, matching how className/methodName are also
+//     preserved verbatim today).
+{
+  const kwxRefs = parseMetaFile({
+    path: 'lwc/boltRelayPanel/boltRelayPanel.js',
+    text: "import fire from '@salesforce/apex/kwx.BoltRelay.fire';",
+  });
+  assert.strictEqual(kwxRefs.length, 1);
+  assert.strictEqual(kwxRefs[0].className, 'BoltRelay');
+  assert.strictEqual(kwxRefs[0].methodName, 'fire');
+  assert.strictEqual(kwxRefs[0].namespace, 'kwx');
+
+  const caseRefs = parseMetaFile({
+    path: 'lwc/kappaGatewayCasePanel/kappaGatewayCasePanel.js',
+    text: "import dispatch from '@salesforce/apex/ZENQ.kappagateway.DISPATCH';",
+  });
+  assert.strictEqual(caseRefs.length, 1);
+  assert.strictEqual(caseRefs[0].className, 'kappagateway', 'className preserved verbatim, no case-folding');
+  assert.strictEqual(caseRefs[0].methodName, 'DISPATCH');
+  assert.strictEqual(caseRefs[0].namespace, 'ZENQ', 'namespace preserved verbatim, no case-folding');
+}
+
+// 4c. 4-segment specifier (namespace + inner-class-shaped tail): every
+//     leading segment before the trailing Class.method pair folds into one
+//     dot-joined namespace string -- tolerant, deterministic, never throws.
+{
+  const refs = parseMetaFile({
+    path: 'lwc/boltContainerPanel/boltContainerPanel.js',
+    text: "import fire from '@salesforce/apex/zenq.BoltContainer.Relay.fire';",
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'Relay');
+  assert.strictEqual(refs[0].methodName, 'fire');
+  assert.strictEqual(refs[0].namespace, 'zenq.BoltContainer');
+}
+
+// 4d. Multiple namespaced imports in one file, each with its own distinct
+//     namespace segment -- no cross-contamination between refs.
+{
+  const text = src([
+    "import dispatchZenq from '@salesforce/apex/zenq.KappaGateway.dispatch';",
+    "import fireKwx from '@salesforce/apex/kwx.BoltRelay.fire';",
+    "import bareLocal from '@salesforce/apex/KappaGateway.dispatch';",
+  ]);
+  const refs = parseMetaFile({ path: 'lwc/mixedNsPanel/mixedNsPanel.js', text });
+  assert.strictEqual(refs.length, 3);
+  const zenqRef = refs.find((r) => r.methodName === 'dispatch' && r.namespace === 'zenq');
+  const kwxRef = refs.find((r) => r.methodName === 'fire' && r.namespace === 'kwx');
+  const bareRef = refs.find((r) => r.methodName === 'dispatch' && r.namespace === null);
+  assert.ok(zenqRef, 'zenq.KappaGateway.dispatch ref must be found with namespace=zenq');
+  assert.ok(kwxRef, 'kwx.BoltRelay.fire ref must be found with namespace=kwx');
+  assert.ok(bareRef, 'bare KappaGateway.dispatch ref must be found with namespace=null');
+  assert.strictEqual(zenqRef.className, 'KappaGateway');
+  assert.strictEqual(kwxRef.className, 'BoltRelay');
+  assert.strictEqual(bareRef.className, 'KappaGateway');
 }
 
 // 5. __tests__ exclusion: a Jest spec importing the SAME specifier (to
@@ -108,6 +217,17 @@ function refsOf(kind, refs) {
     text,
   });
   assert.deepStrictEqual(refs, [], '__tests__ path must yield zero refs regardless of content');
+}
+
+// 5a. __tests__ exclusion also applies to a NAMESPACED specifier -- the
+//     namespace field is orthogonal to the __tests__ path exclusion.
+{
+  const text = "import dispatch from '@salesforce/apex/zenq.KappaGateway.dispatch';";
+  const refs = parseMetaFile({
+    path: 'lwc/kappaGatewayPanel/__tests__/kappaGatewayPanel.test.js',
+    text,
+  });
+  assert.deepStrictEqual(refs, [], '__tests__ path must yield zero refs even for a namespaced specifier');
 }
 
 // ===========================================================================
@@ -1265,3 +1385,57 @@ assert.ok(elapsedMs < 300, `metascan over the adv-org corpus must stay under 300
 console.log(
   `metascan.js real-corpus self-check: all assertions passed (adv-org metadata scan: ${elapsedMs}ms)`
 );
+
+// ===========================================================================
+// GAUNTLET-ORG REGRESSION PASS -- /Users/agent/work/code/example-data/
+// gauntlet-org (read-only). Pins VALIDATION-REPORT.md Tier-1 #1 / Ranked
+// backlog #4 as a named regression: parseMetaFile() on the real
+// kappaGatewayPanel LWC bundle must retain the 'zenq' namespace segment of
+// `@salesforce/apex/zenq.KappaGateway.dispatch` instead of silently
+// discarding it. This test only exercises metascan.js's OWN output (the
+// extraction half of M1/M2) -- it deliberately does NOT call
+// resolver.js's attachMetaCallers(), which implements the actual M2
+// candidate-count gate and is out of scope for this file/owner; that gate is
+// pinned as its own regression in test-resolver.js.
+// ===========================================================================
+
+const GAUNTLET_ROOT = '/Users/agent/work/code/example-data/gauntlet-org/force-app/main/default';
+
+function readGauntlet(relPath) {
+  const p = path.join(GAUNTLET_ROOT, relPath);
+  return { path: p, text: fs.readFileSync(p, 'utf8') };
+}
+
+if (!fs.existsSync(GAUNTLET_ROOT)) {
+  throw new Error(
+    'gauntlet-org corpus not found at ' + GAUNTLET_ROOT + ' -- test-metascan.js requires it (read-only).'
+  );
+}
+
+// GAUNTLET Tier-1 #1 (VALIDATION-REPORT.md): "attachMetaCallers() /
+// metascan.js: LWC -> namespaced-Apex import collapses onto an unrelated
+// local class, ZERO uniqueness gating". Repro: kappaGatewayPanel.js imports
+// `@salesforce/apex/zenq.KappaGateway.dispatch`; the corpus ALSO has an
+// unrelated local class classes/KappaGateway.cls with its own `dispatch`
+// method -- the exact same-bare-name collision the bug exploited. This test
+// pins that metascan.js's extraction now hands the resolver everything it
+// needs to decline that attach: a non-null `namespace` field.
+{
+  const refs = parseMetaFile(readGauntlet('lwc/kappaGatewayPanel/kappaGatewayPanel.js'));
+  assert.strictEqual(refs.length, 1, 'GAUNTLET Tier-1 #1: exactly one LWC import ref');
+  assert.strictEqual(refs[0].kind, 'lwc');
+  assert.strictEqual(refs[0].label, 'kappaGatewayPanel');
+  assert.strictEqual(refs[0].className, 'KappaGateway', 'bare className unchanged -- still last-but-one segment');
+  assert.strictEqual(refs[0].methodName, 'dispatch');
+  assert.strictEqual(
+    refs[0].namespace,
+    'zenq',
+    "GAUNTLET Tier-1 #1: 'zenq' namespace segment must be retained, not discarded (M1 fix)"
+  );
+  assert.ok(
+    /zenq\.KappaGateway\.dispatch/.test(refs[0].lineText),
+    'lineText must show the real namespaced specifier verbatim'
+  );
+}
+
+console.log('metascan.js gauntlet-org regression self-check: all assertions passed (M1: namespace retained)');

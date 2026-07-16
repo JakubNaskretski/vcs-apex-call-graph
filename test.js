@@ -615,6 +615,61 @@ addFile('classes/FwdAsyncJob.cls', [
   '}',
 ].join('\n'));
 
+// =========================================================================
+// v0.7.1/R1 e2e fixture: namespaced-reference honesty. `Ns071Caller.probe()`
+// calls `zenq.Ns071Target.run(...)` -- a dotted receiver whose head segment
+// ('zenq') is not a known local class/inner-class/variable, i.e. a reference
+// into a namespace/managed package this workspace never declared. Pre-R1,
+// resolveType()'s bare-last-segment fallback collapsed this straight onto
+// the unrelated LOCAL `Ns071Target.run` (VALIDATION-REPORT.md Tier-1 #2).
+// The honest contract this fixture pins: (a) ZERO edge to the local class
+// with the same bare tail, (b) the call site IS counted in the workspace-
+// wide unresolvedSites tally (an out-of-scope namespaced reference is a
+// real, countable gap -- not silently and invisibly dropped). This is the
+// ONE fixture in this file's main corpus that deliberately adds to the H4
+// unresolvedSites pin below (see that assertion's own updated count).
+// =========================================================================
+addFile('classes/Ns071Target.cls', [
+  'public class Ns071Target {',
+  '  public void run() { System.debug(\'local target\'); }',
+  '}',
+].join('\n'));
+addFile('classes/Ns071Caller.cls', [
+  'public class Ns071Caller {',
+  '  public void probe() {',
+  '    zenq.Ns071Target.run();',
+  '  }',
+  '}',
+].join('\n'));
+
+// =========================================================================
+// v0.7.1/R4 e2e fixture: template-method hook callers via override fan-out.
+// `Tpl071Base.run()` (the framework's own dispatch entry point) calls its
+// OWN virtual `hook()` via an implicit bare `this` self-call -- exactly the
+// fflib_SObjectDomain / hand-rolled TriggerHandler shape. `Tpl071Sub`
+// overrides `hook()` with the real logic. Pre-R4, bare/this self-calls from
+// within the DECLARING base class's own body never routed through the
+// override fan-out machinery (rule 6/typed-interface dispatch already had
+// it; self-calls didn't) -- buildCallerTree on Tpl071Sub.hook returned "No
+// callers found", even though it is reached at runtime via
+// Tpl071Base.run() -> this.hook(). The honest contract this fixture pins:
+// tracing the OVERRIDE's own callers must surface the BASE class's
+// self-dispatching method as a caller, via='override', approximate.
+// =========================================================================
+addFile('classes/Tpl071Base.cls', [
+  'public virtual class Tpl071Base {',
+  '  public virtual void run() {',
+  '    hook();',
+  '  }',
+  '  public virtual void hook() { }',
+  '}',
+].join('\n'));
+addFile('classes/Tpl071Sub.cls', [
+  'public class Tpl071Sub extends Tpl071Base {',
+  '  public override void hook() { System.debug(\'real logic\'); }',
+  '}',
+].join('\n'));
+
 // Sanity: no fixture should crash parseFile, and exactly the one deliberate
 // syntax error should carry parseError.
 for (const f of files) {
@@ -1191,9 +1246,42 @@ function findChild(tree, label) {
   // unresolvedSites stat is global to the index, not per-trace), which
   // surfaces here too as a second header line -- itself a real H4 behavior
   // worth pinning, not noise to suppress.
-  assert.strictEqual(tree.stats.unresolvedSites, 1, 'sanity: this corpus has exactly 1 real unresolved call site elsewhere (see resolver.js contract -- global to the index)');
+  // v0.7.1: was pinned at 1 pre-round; the new Ns071Caller.probe() fixture
+  // below (R1 e2e) deliberately adds exactly one more real unresolved site
+  // (the namespaced zenq.Ns071Target.run() reference) -- see that fixture's
+  // own header note for why this pin had to move, not stay suppressed.
+  assert.strictEqual(tree.stats.unresolvedSites, 2, 'sanity: this corpus has exactly 2 real unresolved call sites elsewhere (see resolver.js contract -- global to the index)');
   assert.strictEqual(headerLines.length, 2, 'note + the workspace-wide unresolved-sites line');
-  assert.strictEqual(headerLines[1], '1 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).');
+  assert.strictEqual(headerLines[1], '2 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).');
+}
+
+// --- v0.7.1/R1 e2e: namespaced-reference honesty -------------------------
+{
+  // No edge to the unrelated local class of the same bare tail: the
+  // namespace-qualified reference must never fabricate a caller.
+  const targetTree = callers('ns071target', 'run');
+  assert.deepStrictEqual(targetTree.root.children, [], 'R1 e2e: zenq.Ns071Target.run() must NOT collapse onto the local Ns071Target.run -- zero callers, not a fabricated static edge');
+  assert.strictEqual(
+    targetTree.note,
+    'No callers found — this is likely an entry point or unused code.',
+    'R1 e2e: the honest H4 note fires exactly as it would for a genuinely uncalled method -- the namespaced reference leaves no trace of a false edge'
+  );
+  // And it IS counted (a real, out-of-scope gap, not silently invisible):
+  // already pinned end-to-end via the H4 block's updated unresolvedSites=2
+  // assertion immediately above, which this fixture is the second
+  // contributor to.
+}
+
+// --- v0.7.1/R4 e2e: template-method hook callers via override fan-out ----
+{
+  const subTree = callers('tpl071sub', 'hook');
+  const baseCaller = findChild(subTree, 'Tpl071Base.run');
+  assert.ok(
+    baseCaller,
+    'R4 e2e: Tpl071Base.run() (a bare, implicit-this self-call to its own virtual hook()) must reach the SUBCLASS override Tpl071Sub.hook -- pre-R4 this returned "No callers found" despite being reached at runtime via run() -> hook()'
+  );
+  assert.strictEqual(baseCaller.via, 'override', "R4 e2e: the self-dispatch fan-out edge is via='override', mirroring the pre-existing typed/interface override fan-out convention");
+  assert.strictEqual(baseCaller.approximate, true, 'R4 e2e: override fan-out stays approximate, same as every other override-fanout edge in this engine');
 }
 
 // --- H3: inline overloadSig/argsRendered through the real uitree shaping

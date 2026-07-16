@@ -148,6 +148,22 @@ const PLATFORM_DENYLIST = new Set([
   'label', 'page', 'component', 'auth', 'cache', 'search', 'approval',
 ]);
 
+// v0.7.1/R3: common Map/List/Set builtin accessor method names. Gates rule
+// 7's unique-name fallback (resolveDotOther) — by the time that fallback is
+// even reached, EVERY prior resolution rule has already failed to identify
+// the receiver's class (it is, by construction, "collection-typed or
+// unresolved" — see VALIDATION-REPORT.md Tier-2 #4), so a call to one of
+// these extremely common, generic-sounding names must never be allowed to
+// collide with an unrelated, incidentally-unique real method of the same
+// name anywhere else in the workspace (`newRecordsByType.get(tkey)` falsely
+// resolving to `KappaServiceLocator.get`).
+const COLLECTION_ACCESSOR_NAMES = new Set([
+  'get', 'put', 'add', 'addall', 'remove', 'removeall', 'retainall',
+  'contains', 'containskey', 'containsall', 'containsvalue',
+  'values', 'keyset', 'entryset', 'size', 'isempty', 'clear', 'clone',
+  'deepclone', 'sort', 'iterator', 'set', 'putall', 'getall',
+]);
+
 const HTTP_ANNOTATIONS = new Set(['httpget', 'httppost', 'httpput', 'httpdelete', 'httppatch']);
 // v0.4: 'override' (F3 virtual override fan-out) and 'dynamic' (F4a
 // Type.forName) join the pre-existing approximate vias. 'dml' (F1) is
@@ -309,6 +325,15 @@ function lastSegmentLower(raw) {
 
 const SIMPLE_IDENT_RE = /^[A-Za-z_]\w*$/;
 
+// v0.7.1/R1: a PLAIN dotted identifier chain -- two or more bare
+// identifiers joined by dots, no parens/brackets/generics anywhere (e.g.
+// `zenq.Billing`, `Outer.Inner`, `someVar.field`). Deliberately narrower
+// than "receiver text contains a dot": cast expressions, chained method
+// calls, and subscripts all carry their own explicit shape and are resolved
+// by their own dedicated rules (resolveComplexReceiver/resolveChainedReceiver),
+// never by this guard.
+const PLAIN_DOTTED_CHAIN_RE = /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/;
+
 // 'should'-level bonus (see header decision list): cast-expression and
 // chained-new receivers get typed resolution via lightweight text patterns.
 // Tolerant of parser.js's getText()-without-whitespace concatenation
@@ -460,11 +485,34 @@ function buildSemanticIndex(factsList, opts) {
   // writeCtorEdge/handleThrowSite below) -- no second pass over factsList.
   const methodCallees = new Map();
   // A1/A6: per-callerKey count of call sites (from MethodFacts.calls only --
-  // see the pass-B loop below) that produced ZERO forward edges anywhere
-  // (every resolution rule declined, incl. the platform denylist) -- the
-  // raw material for buildCalleeTree's single aggregated "N unresolved
+  // see the pass-B loop below) that produced ZERO forward edges anywhere --
+  // the raw material for buildCalleeTree's single aggregated "N unresolved
   // sites" leaf per method (A2's unresolved-call spec).
+  // v0.7.1/R6: a denylisted-receiver call site (System/Database/etc., incl.
+  // the R2 declared-Type-typed variant) is EXCLUDED from this count, exactly
+  // like the backward-direction unresolvedSitesCount already excludes it
+  // (see resolveDotOther's own denylist-gate comment: "a deliberate, known
+  // exclusion ... not counted as an H4 'dropped' site") -- see
+  // lastReceiverDenylisted below, which the pass-B loop checks before
+  // incrementing this map.
   const unresolvedForwardCounts = new Map();
+  // v0.7.1/R8: per-callerKey count of DML statements/Database.xxx() calls
+  // whose target reduced to the literal generic `SObject` placeholder (a
+  // `List<SObject>`/`SObject` declared type that was never narrowed to a
+  // concrete object) -- surfaced as an honest "DML on unresolved SObject
+  // type" leaf instead of silently vanishing (VALIDATION-REPORT.md backlog
+  // #10). Deliberately separate from unresolvedForwardCounts: this is a
+  // DML-target-narrowing gap, not an ordinary unresolved method call.
+  const unresolvedDmlForwardCounts = new Map();
+  // v0.7.1/R6: set true by resolveDotOther (and its R2 declared-Type variant)
+  // for the SINGLE call currently being processed by the pass-B loop below,
+  // whenever that call site's receiver was excluded via the platform
+  // denylist. Reset to false before every resolveCall(...) dispatch in that
+  // loop -- resolveCall/resolveDotOther never recurse into themselves for a
+  // different call, so a plain closure-scoped flag (not a per-call Map) is
+  // sufficient and avoids threading an extra out-param through every
+  // resolution rule.
+  let lastReceiverDenylisted = false;
   // B2: qualifiedLower -> [{ classLower, package, cm }] -- EVERY type
   // sharing that qualified name, across every file, package-tagged
   // (package is null when packageOf is inactive or the file isn't covered
@@ -686,6 +734,33 @@ function buildSemanticIndex(factsList, opts) {
     const simple = lastSegmentLower(rawTypeName);
     const matches = simpleNameIndex.get(simple);
     if (matches && matches.length === 1) return matches[0];
+    return null;
+  }
+
+  // v0.7.1/R1 re-hunt: same first two tiers as resolveType (calling scope's
+  // own enclosing-class chain, then an exact dotted-qualified match) but
+  // DELIBERATELY OMITS resolveType's third tier -- the globally-unique
+  // bare-simple-name fallback. That fallback is exactly the mechanism the
+  // namespace false-edge bug exploits (a dotted chain whose TAIL happens to
+  // collide with an unrelated class's simple name, regardless of whether
+  // the chain's own HEAD/middle segments actually lead there). A caller
+  // that needs to know whether a dotted chain resolves as a REAL qualified
+  // path -- not merely "some class somewhere shares its bare tail name" --
+  // must use this instead of resolveType. Used exclusively by
+  // isUnknownNamespacedReceiver below.
+  function resolveTypeStrict(rawTypeName, currentQualifiedOriginalCase) {
+    const norm = normalizeTypeName(rawTypeName);
+    if (!norm) return null;
+    if (currentQualifiedOriginalCase) {
+      const curLower = lc(currentQualifiedOriginalCase);
+      const parts = curLower.split('.');
+      for (let i = parts.length; i >= 1; i--) {
+        const scope = parts.slice(0, i).join('.');
+        const candidate = `${scope}.${norm}`;
+        if (classes.has(candidate)) return candidate;
+      }
+    }
+    if (classes.has(norm)) return norm;
     return null;
   }
 
@@ -1027,6 +1102,37 @@ function buildSemanticIndex(factsList, opts) {
     for (const o of owners) {
       const overloadSig = computeOverloadSig(o, nameLower);
       writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, via, o.method.name, overloadSig, forwardOpt);
+    }
+    return owners.length > 0;
+  }
+
+  // v0.7.1/R4: identical to emitOwners, but ALSO fans out (approximate,
+  // via='override') to every subclass override of each resolved owner --
+  // mirrors F3's typed-dispatch override fan-out (emitTypedOrInterfaceForClass),
+  // gated the same way (only once the primary self-dispatch resolution
+  // actually found a declaring class to fan out FROM, one call per distinct
+  // owner classLower). Used ONLY by resolveCall's two bare/`this`-qualified
+  // self-dispatch rules (rule 3 and rule 4's `this` branch) -- a base
+  // class's own self-call to its own virtual/abstract hook method (the
+  // fflib/trigger-handler template-method idiom: `run() { beforeInsert();
+  // ... }`, overridden by a concrete subclass) previously never reached the
+  // subclass override at all, because F3's override fan-out was only wired
+  // into rule 6's TYPED dispatch path -- a real, reachable override method
+  // was reported as having "no callers found" (VALIDATION-REPORT.md Tier-3
+  // #6). Deliberately scoped to exactly these two self-dispatch call shapes
+  // (not a general emitOwners change) so this never fires for an ordinary
+  // typed/static/interface call, which already gets its own override
+  // fan-out via a different path.
+  function emitOwnersWithSelfOverrideFanout(callerClassLower, callerMethodLabel, classLower, nameLower, call, via, walkSuper, callArity, methodFacts) {
+    const owners = findMethodOwners(classLower, nameLower, walkSuper, callArity, call, callerClassLower, methodFacts);
+    const fannedOutFrom = new Set();
+    for (const o of owners) {
+      const overloadSig = computeOverloadSig(o, nameLower);
+      writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, via, o.method.name, overloadSig);
+      if (!fannedOutFrom.has(o.classLower)) {
+        fannedOutFrom.add(o.classLower);
+        emitOverrideFanout(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, callArity, methodFacts, 'override');
+      }
     }
     return owners.length > 0;
   }
@@ -1521,6 +1627,39 @@ function buildSemanticIndex(factsList, opts) {
     return false;
   }
 
+  // v0.7.1/R1: true when receiverRaw is a PLAIN dotted identifier chain
+  // that is NOT genuinely in scope -- see PLAIN_DOTTED_CHAIN_RE's own
+  // header note for exactly which receiver shapes this applies to.
+  // "Known"/in-scope means: the head is 'this'/'super', OR the head is a
+  // local variable/param/field in scope at this call site (covers a
+  // genuine `obj.field...` chain that merely doesn't happen to match any of
+  // resolveComplexReceiver's specific bonus shapes), OR -- v0.7.1 re-hunt
+  // fix -- the FULL dotted chain resolves to a real qualified local class
+  // via resolveTypeStrict (the calling scope's own enclosing-class chain,
+  // or an exact dotted-qualified match; deliberately NOT the bare-tail
+  // fallback). Merely having a head segment that happens to match SOME
+  // local class's name (top-level or inner, anywhere in the workspace) is
+  // NOT sufficient on its own: a genuine local class named `zenq` whose
+  // only inner class is `Foo` must not cause `zenq.KappaGateway` (or
+  // `zenq.deep.nested.KappaGateway`) to be treated as in-scope just because
+  // `zenq` itself is real -- the REMAINDER of the chain must also resolve
+  // within that class's own hierarchy. Everything else is an out-of-scope
+  // namespaced/managed reference (`zenq.Billing`, `kwx.KappaGateway`) that
+  // must never be allowed to alias onto a local class merely because its
+  // bare tail happens to collide.
+  function isUnknownNamespacedReceiver(receiverRaw, callerClassLower, methodFacts) {
+    const raw = String(receiverRaw || '').trim();
+    if (!PLAIN_DOTTED_CHAIN_RE.test(raw)) return false;
+    const head = raw.slice(0, raw.indexOf('.'));
+    const headLower = lc(head);
+    if (headLower === 'this' || headLower === 'super') return false;
+    if (findReceiverType(callerClassLower, methodFacts, head)) return false;
+    const cm = classes.get(callerClassLower);
+    const strictMatch = resolveTypeStrict(raw, cm ? cm.qualified : null);
+    if (strictMatch) return false;
+    return true;
+  }
+
   // Rules 5-7: a 'dot' call whose receiver is neither 'this' nor 'super'.
   function resolveDotOther(callerClassLower, callerMethodLabel, methodFacts, call) {
     const nameLower = lc(call.method);
@@ -1553,7 +1692,58 @@ function buildSemanticIndex(factsList, opts) {
         // when declared-type resolution already failed, per the G3 spec
         // ("never used when declared-type resolution succeeds").
         if (tryNarrowedReceiver(callerClassLower, callerMethodLabel, methodFacts, receiverRaw, nameLower, call, callArity)) return;
+        // v0.7.1/R2: gate the platform denylist on the receiver's DECLARED
+        // TYPE, not its identifier text. `Type handlerType = ...;
+        // handlerType.newInstance()` previously slipped past the
+        // text-based denylist gate below (headLower would be
+        // "handlertype", not "type") and reached rule 7's unique-name
+        // fallback, fabricating an edge to an unrelated globally-unique
+        // `newInstance` method elsewhere in the workspace (plus a spurious
+        // self-referential cyclic edge). A variable whose declared type is
+        // itself `System.Type` is exactly as out-of-scope as a bare
+        // `Type.forName(...)`-style reference -- treat it identically: no
+        // edge, not counted as an H4 dropped site, excluded from the R6
+        // forward-parity count (see VALIDATION-REPORT.md Tier-2 #3).
+        // Deliberately scoped to the single documented token ('type'), NOT
+        // the full PLATFORM_DENYLIST set -- Map/List/Set-typed receivers
+        // already have their own, more precise, method-name-gated handling
+        // (R3, below), and broadening this to every denylisted type name
+        // would also silently swallow (uncounted) any OTHER denylisted-type
+        // receiver's genuinely-unresolved call (e.g. a String/Object-typed
+        // local calling a non-unique method name that rule 7 correctly
+        // declines today) -- an undocumented removal the regression policy
+        // doesn't permit. Confirmed against the real corpus (test.js's H4
+        // sanity count) that the broader form over-removes.
+        if (lastSegmentLower(declaredType) === 'type') {
+          lastReceiverDenylisted = true;
+          return;
+        }
       }
+    }
+
+    // v0.7.1/R1: a DOTTED receiver whose head segment does not refer to a
+    // known local class/inner-class (simpleNameIndex), a known local
+    // variable/param/field (findReceiverType), or -- trivially -- a
+    // namespace-free single-token receiver, must never fall through to
+    // rule 5's bare-last-segment class match (nor rules 6/7). Without this
+    // guard, resolveType()'s "no exact dotted match -> retry on the bare
+    // last segment alone" fallback (and, failing that, rule 7's unique-name
+    // fallback) can fabricate a confident edge to an unrelated LOCAL class
+    // from a reference into a namespace/managed package that was never
+    // installed in this workspace (`zenq.Billing.charge()` colliding onto
+    // local `Billing.charge`, `kwx.KappaGateway.dispatch()` colliding onto
+    // local `KappaGateway.dispatch`) -- see VALIDATION-REPORT.md Tier-1 #2.
+    // Scoped to a PLAIN dotted identifier chain (no parens/brackets) so
+    // cast-expression/ternary/chained-call receivers (handled below by the
+    // rule-6-continued bonuses, which already require their own explicit
+    // shape match) are unaffected. Genuinely ambiguous local tails (2+
+    // candidates sharing the bare simple name) already produce no edge via
+    // the pre-existing N===1 gate inside resolveType/unresolvedFallback --
+    // this guard doesn't change that outcome, it just reaches "no edge" by
+    // a more honest path (never attempting the collision at all).
+    if (!shadowedByVariable && isUnknownNamespacedReceiver(receiverRaw, callerClassLower, methodFacts)) {
+      unresolvedSitesCount++;
+      return;
     }
 
     // Rule 5: receiver text case-insensitively names a known user class
@@ -1600,10 +1790,28 @@ function buildSemanticIndex(factsList, opts) {
     // deliberate, known exclusion (System/Database/etc.) -- not counted as
     // an H4 "dropped" site.
     const headLower = lastSegmentLower(receiverRaw);
-    if (PLATFORM_DENYLIST.has(headLower)) return;
+    if (PLATFORM_DENYLIST.has(headLower)) {
+      lastReceiverDenylisted = true; // v0.7.1/R6: forward-count parity, see the flag's own header note
+      return;
+    }
 
+    // v0.7.1/R3: a call whose method name is a common Map/List/Set builtin
+    // accessor (get/put/add/...) is NEVER routed through rule 7's
+    // unique-name fallback. By the time this line runs, rules 5/6 have
+    // already exhausted every way to resolve the receiver to a genuine user
+    // class -- the receiver is, by construction, either collection-typed
+    // (a Map<K,V>/List<T>/Set<T> declared type that resolveType() can't
+    // index) or simply of unknown type. Firing rule 7 anyway lets an
+    // extremely common, generic-sounding accessor name collide with an
+    // unrelated, incidentally-unique real method of the same name elsewhere
+    // in the workspace (`newRecordsByType.get(tkey)` -> `KappaServiceLocator.get`,
+    // including a spurious self-referential cyclic edge when the fallback's
+    // own sole candidate is the call's own enclosing method) -- see
+    // VALIDATION-REPORT.md Tier-2 #4.
     // Rule 7: unique-name fallback.
-    const resolved = unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower);
+    const resolved = COLLECTION_ACCESSOR_NAMES.has(nameLower)
+      ? false
+      : unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower);
     // H4: every prior rule (5, 6, and rule 7's own unique-name fallback)
     // has now failed -- this receiver never resolved to anything at all
     // ("unknown receiver"). Skip the count when resolveChainedReceiver
@@ -1752,9 +1960,13 @@ function buildSemanticIndex(factsList, opts) {
         return;
       }
       // Rule 3: own class, else walk extends chain (arity-aware — bug #1);
-      // else rule 7.
+      // else rule 7. v0.7.1/R4: emitOwnersWithSelfOverrideFanout (not plain
+      // emitOwners) -- a bare self-call is exactly the template-method
+      // self-dispatch shape (`run() { beforeInsert(); }`), so it must ALSO
+      // fan out to subclass overrides, same as rule 6's typed dispatch
+      // already does.
       const callArity3 = (call.argTexts || []).length;
-      if (emitOwners(callerClassLower, callerMethodLabel, callerClassLower, nameLower, call, 'this', true, callArity3, methodFacts)) return;
+      if (emitOwnersWithSelfOverrideFanout(callerClassLower, callerMethodLabel, callerClassLower, nameLower, call, 'this', true, callArity3, methodFacts)) return;
       unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower);
       return;
     }
@@ -1762,10 +1974,12 @@ function buildSemanticIndex(factsList, opts) {
     // call.kind === 'dot'
     const receiverLower = lc(call.receiver);
     if (receiverLower === 'this') {
-      // Rule 4 (this): identical semantics to rule 3.
+      // Rule 4 (this): identical semantics to rule 3 (incl. v0.7.1/R4's
+      // self-override fan-out -- see emitOwnersWithSelfOverrideFanout's own
+      // header note).
       const nameLower = lc(call.method);
       const callArity4t = (call.argTexts || []).length;
-      if (emitOwners(callerClassLower, callerMethodLabel, callerClassLower, nameLower, call, 'this', true, callArity4t, methodFacts)) return;
+      if (emitOwnersWithSelfOverrideFanout(callerClassLower, callerMethodLabel, callerClassLower, nameLower, call, 'this', true, callArity4t, methodFacts)) return;
       unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower);
       return;
     }
@@ -1849,6 +2063,25 @@ function buildSemanticIndex(factsList, opts) {
     }
   }
 
+  // v0.7.1/R8: `objectLower` reduced to the literal generic `SObject`
+  // placeholder (dmlObjectHead's own "strip List<>/Set<>/[] wrapper, keep
+  // the last dotted segment" logic applied to a declared type of
+  // `List<SObject>`/`SObject`/`SObject[]`, never narrowed to a concrete
+  // custom/standard object -- e.g. a fflib-style unit-of-work whose
+  // registered records are erased into `Map<Schema.SObjectType,
+  // List<SObject>>` before commitWork() DMLs them). A real object's bare
+  // API name can never legitimately BE the literal token "SObject" (custom
+  // objects always carry a `__c`/namespace suffix, standard objects have
+  // their own real names), so this check is unambiguous. Recorded so
+  // buildCalleeTree can surface an honest "DML on unresolved SObject type"
+  // leaf instead of silently dropping the DML site (no trigger linkage is
+  // attempted -- there is no real object identity to link against). See
+  // VALIDATION-REPORT.md fix backlog #10.
+  function recordUnresolvedDmlSite(callerClassLower, callerMethodLabel) {
+    const callerKey = `${callerClassLower}#${lc(callerMethodLabel)}`;
+    unresolvedDmlForwardCounts.set(callerKey, (unresolvedDmlForwardCounts.get(callerKey) || 0) + 1);
+  }
+
   // F1: statement-form DML (parser.js's MethodFacts.dml -- one entry per
   // insert/update/delete/undelete/upsert/merge STATEMENT).
   function handleDmlStatement(callerClassLower, callerMethodLabel, mf, dmlFact) {
@@ -1856,6 +2089,10 @@ function buildSemanticIndex(factsList, opts) {
     if (!DML_OPS.has(op)) return;
     const objectLower = resolveDmlTargetObject(dmlFact.targetText, callerClassLower, mf);
     if (!objectLower) return;
+    if (objectLower === 'sobject') { // v0.7.1/R8
+      recordUnresolvedDmlSite(callerClassLower, callerMethodLabel);
+      return;
+    }
     const callLike = { line: dmlFact.line, col: dmlFact.col, lineText: dmlFact.lineText, argTexts: [dmlFact.targetText] };
     emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, objectLower, callLike);
   }
@@ -1883,6 +2120,10 @@ function buildSemanticIndex(factsList, opts) {
     const targetText = (call.argTexts && call.argTexts[0]) || '';
     const objectLower = resolveDmlTargetObject(targetText, callerClassLower, mf);
     if (!objectLower) return;
+    if (objectLower === 'sobject') { // v0.7.1/R8, same reasoning as handleDmlStatement
+      recordUnresolvedDmlSite(callerClassLower, callerMethodLabel);
+      return;
+    }
     emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, objectLower, call);
   }
 
@@ -2160,6 +2401,7 @@ function buildSemanticIndex(factsList, opts) {
         const methodStartLen = (methodCallees.get(callerKeyStr) || []).length;
         for (const call of mf.calls || []) {
           const beforeLen = (methodCallees.get(callerKeyStr) || []).length;
+          lastReceiverDenylisted = false; // v0.7.1/R6: reset before every dispatch, see the flag's own header note
           resolveCall(ownClassLower, callerMethodLabel, mf, call);
           // F1/F4a/G1/G5: independent of ordinary dispatch above (see each
           // function's own header comment for why).
@@ -2194,7 +2436,11 @@ function buildSemanticIndex(factsList, opts) {
           //     unresolved leaf, despite the un-indexable inline
           //     `new Acme_Note__e(...)` argument sitting right there.
           const afterLen = (methodCallees.get(callerKeyStr) || []).length;
-          if (afterLen === beforeLen && (call.kind === 'dot' || call.kind === 'bare')) {
+          // v0.7.1/R6: denylisted-receiver calls (System/Database/etc., incl.
+          // the R2 declared-Type-typed variant) are EXCLUDED here, exactly
+          // like the backward-direction unresolvedSitesCount already
+          // excludes them -- see lastReceiverDenylisted's own header note.
+          if (afterLen === beforeLen && (call.kind === 'dot' || call.kind === 'bare') && !lastReceiverDenylisted) {
             unresolvedForwardCounts.set(callerKeyStr, (unresolvedForwardCounts.get(callerKeyStr) || 0) + 1);
           }
         }
@@ -2372,6 +2618,11 @@ function buildSemanticIndex(factsList, opts) {
     // zero forward edges -- buildCalleeTree folds this into one aggregated
     // "N unresolved sites" leaf per method.
     unresolvedForwardCounts,
+    // v0.7.1/R8: callerKey -> count of DML statements/Database.xxx() calls
+    // whose target reduced to the generic `SObject` placeholder --
+    // buildCalleeTree folds this into a SEPARATE "DML on unresolved SObject
+    // type" leaf per method (see recordUnresolvedDmlSite's own header note).
+    unresolvedDmlForwardCounts,
     parseFallbacks,
     duplicates,
     // B2: qualifiedLower -> [{classLower, package, cm}] -- every type
@@ -2519,7 +2770,15 @@ function calleeItemFromEdge(index, edge) {
       callerMethod: displayMethodLabel,
       callerKey: edge.targetKey || `(unresolved)#${edge.line}~${edge.col}`,
       path: resolvedCm ? resolvedCm.path : '',
-      line: resolvedMm ? resolvedMm.line : 0,
+      // v0.7.1/U1: the rendered call-site line must be the EDGE's own
+      // call-site line (the calling statement), not the resolved target
+      // method's own declaration line -- using resolvedMm.line here made
+      // every resolved callee-direction site row's line wrong (and collapsed
+      // genuinely distinct call sites at different lines onto one identical,
+      // incorrect line), breaking "click any call site to jump straight to
+      // it" for every resolved forward edge (VALIDATION-REPORT.md "Callee-
+      // tree site-line corruption").
+      line: edge.line || 0,
       col: edge.col || 0,
       lineText: edge.lineText,
       args: edge.args || [],
@@ -2609,7 +2868,39 @@ function calleeMethodLevelPairs(index, classLower, methodLower) {
   const ifacePairs = calleeInterfaceFanoutPairs(index, classLower, methodLower);
   if (ifacePairs) return ifacePairs.map((it) => Object.assign({}, it, { _edgeItem: true }));
   const edges = (index.methodCallees && index.methodCallees.get(`${classLower}#${methodLower}`)) || [];
-  return edges.map((edge) => Object.assign({}, calleeItemFromEdge(index, edge), { _edgeItem: true }));
+  const out = [];
+  for (const edge of edges) {
+    // v0.7.1/R7: a forward call resolved through an interface-typed
+    // receiver records its edge against the INTERFACE method's own
+    // targetKey (see emitOwners' own header note on why forward tracing
+    // collapses interface dispatch onto a single node at the call site).
+    // Expanding that single node one hop further used to bury the actually
+    // resolved implementer(s) two levels down, under a synthetic
+    // non-call-site wrapper -- VALIDATION-REPORT.md fix backlog #9 requires
+    // them to show up as DIRECT children of the calling method instead.
+    // Detected here (rather than changed at record time) so every existing
+    // ForwardEdge/methodCallees consumer is unaffected; only the CALLEE
+    // TREE'S rendering of this one edge shape changes. The interface
+    // method's own node is kept as one additional sibling (not a parent) --
+    // "may appear ... not as a wrapper level" -- so both "dispatched
+    // through this interface" and "here's who it actually reaches" survive.
+    if (edge.via === 'interface' && edge.targetKey && edge.targetKey.indexOf('#') !== -1) {
+      const hashIdx = edge.targetKey.indexOf('#');
+      const ifaceClassLower = edge.targetKey.slice(0, hashIdx);
+      const ifaceMethodLower = edge.targetKey.slice(hashIdx + 1);
+      const ifaceCm = index.classes.get(ifaceClassLower);
+      if (ifaceCm && ifaceCm.typeFacts && ifaceCm.typeFacts.isInterface) {
+        const implPairs = calleeInterfaceFanoutPairs(index, ifaceClassLower, ifaceMethodLower);
+        if (implPairs && implPairs.length) {
+          out.push(Object.assign({}, calleeItemFromEdge(index, edge), { _edgeItem: true }));
+          for (const ip of implPairs) out.push(Object.assign({}, ip, { _edgeItem: true }));
+          continue;
+        }
+      }
+    }
+    out.push(Object.assign({}, calleeItemFromEdge(index, edge), { _edgeItem: true }));
+  }
+  return out;
 }
 
 // A2: class-level forward target (no specific method) -- union of every
@@ -2798,7 +3089,7 @@ function buildCallerTree(index, target, opts) {
       direction: 'callers',
       // H1/H4: stats still passed through even for a not-found target, so
       // callers can rely on TreeResult.stats always being present.
-      stats: { nodes: 0, uniqueMethods: 0, capped: false, unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0 },
+      stats: { nodes: 0, uniqueMethods: 0, capped: false, unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0, metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0 },
     };
   }
 
@@ -2900,10 +3191,10 @@ function buildCallerTree(index, target, opts) {
   // happened to be visited first.
   const ctx = { maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set(), direction: 'callers' };
   const queue = [];
-  root.children = buildChildrenLevel(index, allPairs, 1, ancestorPath, classLower, excCtx, ctx, queue);
+  root.children = buildChildrenLevel(index, allPairs, 1, ancestorPath, classLower, excCtx, ctx, queue, root);
   while (queue.length) {
     const task = queue.shift(); // FIFO -> breadth-first across the whole tree
-    task.node.children = buildChildrenLevel(index, task.pairs, task.depth, task.ancestorPath, task.targetClassLower, excCtx, ctx, queue);
+    task.node.children = buildChildrenLevel(index, task.pairs, task.depth, task.ancestorPath, task.targetClassLower, excCtx, ctx, queue, task.node);
   }
 
   // A6: fold in metadata callers (LWC/Aura/Flow/OmniScript/VF) attached via
@@ -2915,6 +3206,7 @@ function buildCallerTree(index, target, opts) {
     root.children = root.children.concat(metaChildren).sort(sortTNodes);
   } else if (metaRefs.length) {
     ctx.capped = true;
+    root.truncated = true; // v0.7.1/R5: root is the specific node whose (metadata) children were cut
   }
 
   return {
@@ -2930,6 +3222,7 @@ function buildCallerTree(index, target, opts) {
       uniqueMethods: ctx.uniqueKeys.size,
       capped: ctx.capped,
       unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0,
+      metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
     },
   };
 }
@@ -2964,7 +3257,7 @@ function buildCalleeTree(index, target, opts) {
       targetLabel: rawLabel,
       note: 'target class not found in index',
       direction: 'callees',
-      stats: { nodes: 0, uniqueMethods: 0, capped: false, unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0 },
+      stats: { nodes: 0, uniqueMethods: 0, capped: false, unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0, metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0 },
     };
   }
 
@@ -3052,7 +3345,7 @@ function buildCalleeTree(index, target, opts) {
     publishByCallerKey: indexSitesByCallerKey(index.publishSitesByObject),
   };
   const queue = [];
-  root.children = buildChildrenLevel(index, pairs, 1, ancestorPath, classLower, null, ctx, queue);
+  root.children = buildChildrenLevel(index, pairs, 1, ancestorPath, classLower, null, ctx, queue, root);
   if (isTrigger) {
     appendCalleeExtras(index, root, classLower, '(init)', ctx);
     appendCalleeExtras(index, root, classLower, '(trigger)', ctx);
@@ -3061,7 +3354,7 @@ function buildCalleeTree(index, target, opts) {
   }
   while (queue.length) {
     const task = queue.shift(); // FIFO -> breadth-first across the whole tree, same as buildCallerTree
-    task.node.children = buildChildrenLevel(index, task.pairs, task.depth, task.ancestorPath, task.targetClassLower, null, ctx, queue);
+    task.node.children = buildChildrenLevel(index, task.pairs, task.depth, task.ancestorPath, task.targetClassLower, null, ctx, queue, task.node);
     // A1: DML/publish flow-fanout + the unresolved-call aggregate leaf are
     // computed PER NODE (unlike buildCallerTree's metaRefs folding, which
     // is root-only by pre-existing design -- see buildCallerTree's own
@@ -3081,6 +3374,7 @@ function buildCalleeTree(index, target, opts) {
       uniqueMethods: ctx.uniqueKeys.size,
       capped: ctx.capped,
       unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0,
+      metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
     },
   };
 }
@@ -3210,9 +3504,38 @@ function appendCalleeExtrasForMethod(index, node, classLower, methodLower, ctx) 
     });
   }
 
+  // v0.7.1/R8: generic-typed DML aggregation -- one honest leaf per method
+  // for every DML statement/Database.xxx() call whose target reduced to the
+  // literal `SObject` placeholder instead of a concrete object (see
+  // recordUnresolvedDmlSite's own header note). Deliberately a SEPARATE
+  // leaf from the "N unresolved sites" one above -- this is a DML-target-
+  // narrowing gap (no trigger linkage even attempted), not an ordinary
+  // unresolved method call.
+  const unresolvedDmlCount = (index.unresolvedDmlForwardCounts && index.unresolvedDmlForwardCounts.get(callerKey)) || 0;
+  if (unresolvedDmlCount > 0) {
+    extras.push({
+      label: unresolvedDmlCount === 1 ? 'DML on unresolved SObject type' : `${unresolvedDmlCount} DML sites on unresolved SObject type`,
+      kind: 'unresolved',
+      className: '',
+      methodLower: null,
+      path: '',
+      line: 0,
+      entries: [],
+      isTest: false,
+      via: 'dml-unresolved',
+      sites: [],
+      children: [],
+      cyclic: false,
+      truncated: true,
+      approximate: true,
+      seenElsewhere: false,
+    });
+  }
+
   for (const extra of extras) {
     if (ctx.nodeCount >= ctx.maxNodes) {
       ctx.capped = true;
+      node.truncated = true; // v0.7.1/R5: same node-specific truncation honesty as buildChildrenLevel's cap
       break;
     }
     ctx.nodeCount++;
@@ -3404,8 +3727,29 @@ function attachMetaCallers(index, metaRefs) {
   if (!index) return index;
   const metaCallers = index.metaCallers instanceof Map ? index.metaCallers : new Map();
   const metaMethodCallers = index.metaMethodCallers instanceof Map ? index.metaMethodCallers : new Map();
+  // v0.7.1/M2: candidate-count gating -- a meta ref only attaches when it
+  // unambiguously matches exactly one local class under the ref's OWN
+  // namespace context. This workspace's index never registers a local class
+  // under a namespace (index.classes/simpleNameIndex are entirely namespace-
+  // free -- see resolver.js's R1 guard, which establishes the same "local
+  // workspace has no namespace concept" fact for the static-call path), so a
+  // ref carrying a non-null `ref.namespace` (currently only kind:'lwc' refs,
+  // per metascan.js's M1 fix -- see LWC_IMPORT_RE's own header note) can, by
+  // construction, never have exactly-one local match under its own namespace:
+  // it is dropped here and counted in index.stats.metaUnresolved instead of
+  // being re-pointed at an unrelated same-name local class purely because the
+  // bare tail segments happen to collide (VALIDATION-REPORT.md Tier-1 #1:
+  // `@salesforce/apex/zenq.KappaGateway.dispatch` previously collapsed onto
+  // local `KappaGateway.dispatch`, `via=metadata`, zero gating). A ref with no
+  // namespace (namespace null/undefined -- every non-lwc ref kind, and any
+  // bare 2-segment LWC import) is unaffected: exactly the pre-v0.7.1 behavior.
+  let metaUnresolvedCount = 0;
   for (const ref of metaRefs || []) {
     if (!ref || !ref.className) continue;
+    if (ref.namespace) {
+      metaUnresolvedCount++;
+      continue;
+    }
     const classLower = lc(ref.className);
     if (!metaCallers.has(classLower)) metaCallers.set(classLower, []);
     metaCallers.get(classLower).push(ref);
@@ -3470,6 +3814,13 @@ function attachMetaCallers(index, metaRefs) {
   index.flowRefsByObject = flowRefsByObject;
   index._seenFlowKeys = seenFlowKeys;
 
+  // v0.7.1/M2: accumulate across repeat calls (this function is documented
+  // as safe to call multiple times / with refs from multiple scans, "later
+  // calls append, they don't replace") -- same additive posture as
+  // metaCallers/metaMethodCallers above, not a per-call overwrite.
+  index.stats = index.stats || {};
+  index.stats.metaUnresolved = (index.stats.metaUnresolved || 0) + metaUnresolvedCount;
+
   return index;
 }
 
@@ -3504,7 +3855,11 @@ function findSoleInvocableMethod(index, classLower) {
 // rather than forked: grouping/DAG-memoization/cap-enforcement below are
 // 100% shared code, unaware of direction beyond the couple of explicit
 // branches called out inline.
-function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower, excCtx, ctx, queue) {
+// v0.7.1/R5: `ownerNode` is the TNode whose children THIS call is building
+// (the tree root for the two top-level invocations, `task.node` for every
+// subsequent queue-driven expansion) -- see the maxNodes-cap `break` below
+// for why it's needed.
+function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower, excCtx, ctx, queue, ownerNode) {
   const groups = new Map();
   for (const item of pairs) {
     const site = item.site;
@@ -3541,6 +3896,16 @@ function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower,
   for (const g of groups.values()) {
     if (ctx.nodeCount >= ctx.maxNodes) {
       ctx.capped = true;
+      // v0.7.1/R5: stamp truncated=true on the SPECIFIC node whose
+      // expansion the cap cut off (mirrors the pre-existing depth-cap
+      // pattern a few lines down in buildOneChildNode, which already
+      // correctly marks the specific node it stops at). Without this, a
+      // node with real further callers/callees renders identically to a
+      // genuine zero-children leaf, and downstream root/leaf badge logic
+      // (uitree.js/pathmap.js's isRootNode()) mislabels it a terminal
+      // dead-end -- the single strongest possible false signal a
+      // call-graph tool can give. See VALIDATION-REPORT.md Tier-3 #5.
+      if (ownerNode) ownerNode.truncated = true;
       break;
     }
     const built = buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excCtx, ctx);

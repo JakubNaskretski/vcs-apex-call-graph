@@ -178,6 +178,10 @@ function accentKind(node) {
   if (node.kind === 'trigger') return 'trigger';
   if (node.kind === 'anonymous') return 'anonymous';
   if (node.kind === 'exception') return 'exception';
+  // v0.7.1 (U3, R8): confirmed against resolver.js's real buildCalleeTree
+  // implementation -- the generic-typed-DML marker reuses kind:'unresolved'
+  // verbatim (via 'dml-unresolved' is what distinguishes it; see
+  // LEGEND_HTML below), so no separate kind/accent branch is needed here.
   if (node.kind === 'unresolved') return 'unresolved';
   if (META_ACCENT_KINDS.has(node.kind)) return 'metadata';
   if (node.entries && node.entries.length) return 'entry';
@@ -592,7 +596,7 @@ const CLIENT_JS_TEXT = `
     // v0.6 (H3): 'root' glyph -- mirrors uitree.js's '◉ root' badge.
     if (n.root) out.push('\\u25C9'); // FISHEYE (U+25C9) -- root
     if (n.cyclic) out.push('\\u21BA'); // loop-arrow glyph
-    if (n.truncated) out.push('\\u2026'); // ellipsis (depth cap reached)
+    if (n.truncated) out.push('\\u2026'); // ellipsis (capped -- depth cap or node-count cap)
     // v0.6 (H1 forward-compat, H5 rendering): seenElsewhere glyph.
     if (n.seenElsewhere) out.push('\\u21E2'); // dashed rightwards arrow (U+21E2)
     return out;
@@ -860,12 +864,12 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="swatch metadata"></span><span><span class="k">metadata</span>caller from LWC, Aura, Flow, OmniScript, VF, or Custom Metadata — not Apex source (a Flow node here may still have its own children, e.g. the DML sites on its object — a metadata node is not always a leaf)</span></div>
     <div class="legend-row"><span class="swatch anonymous"></span><span><span class="k">anonymous</span>anonymous Apex script (.apex) — real Apex source, but with no declared class/trigger of its own; always a pure root (nothing calls it)</span></div>
     <div class="legend-row"><span class="swatch exception"></span><span><span class="k">exception</span>(v0.7) a thrown exception's class, reached by tracing forward (What Does This Call?) through a "throw" statement — always terminal</span></div>
-    <div class="legend-row"><span class="swatch unresolved"></span><span><span class="k">unresolved</span>(v0.7) one aggregated leaf per method, summarizing every forward call site that couldn't be resolved to an indexed target (dynamic/platform calls, e.g. HttpRequest/System.debug) — always terminal, approximate</span></div>
+    <div class="legend-row"><span class="swatch unresolved"></span><span><span class="k">unresolved</span>(v0.7) one aggregated leaf per method, summarizing every forward call site that couldn't be resolved to an indexed target (dynamic/platform calls, e.g. HttpRequest/System.debug) — always terminal, approximate. Also covers a DML statement whose target couldn't be narrowed to a concrete SObject type (e.g. a generic List&lt;SObject&gt;) — labeled "DML on unresolved SObject type", no trigger/flow linkage possible</span></div>
     <h4>Markers</h4>
     <div class="legend-row"><span class="k">~ prefix</span>approximate resolution (dashed border too) — via interface/unique-name/lexical/override/narrowed/dynamic fallback, so this edge may be wrong or one of several candidates</div>
     <div class="legend-row"><span class="k">&#x1F9EA;</span>test-only node (also dimmed)</div>
     <div class="legend-row"><span class="k">&#x21BA;</span>cyclic — this call chain recurses back on itself here</div>
-    <div class="legend-row"><span class="k">&#x2026;</span>truncated — trace depth cap reached, more callers may exist above this node</div>
+    <div class="legend-row"><span class="k">&#x2026;</span>capped — trace depth cap OR the node-count (maxNodes) cap reached, more callers/callees may exist beyond this node</div>
     <div class="legend-row"><span class="k">&#x1F6E1;</span>caughtHere — an ancestor catch clause here catches the exception being traced (exact type, a USER exception ancestor, or bare Exception); paired with a "catches &lt;Exc&gt;" badge. Traversal still continues past this node — rethrow is unknowable</div>
     <div class="legend-row"><span class="k">&#x25C9;</span>root — no known caller in this trace: an entry point or unused/dead code. Never shown together with cyclic, truncated, or seenElsewhere (those all mean "there IS more above, it just isn't shown/expanded here")</div>
     <div class="legend-row"><span class="k">&#x21E2;</span>seenElsewhere — this method's caller subtree was already expanded once elsewhere in this same trace (per-run dedup); its own call sites are still shown here, only the deeper callers above it are collapsed</div>
@@ -892,6 +896,8 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="k">narrowed</span>instanceof-narrowing fallback — the receiver's declared type doesn't have the method, but an "x instanceof T" narrowing found in the same method does (approximate — branch polarity is not tracked, only that the narrowing exists in the method)</div>
     <div class="legend-row"><span class="k">async</span>System.enqueueJob / Database.executeBatch / System.schedule call whose argument is an inline "new KnownClass(...)" — edge added to that class's execute method, in addition to the ordinary "new" constructor edge (not approximate)</div>
     <div class="legend-row"><span class="k">ambiguous</span>(v0.7 B2) a class name duplicated across sfdx packages that neither same-package nor default-package preference could resolve — every remaining candidate gets its own edge, each typically carrying a DIFFERENT package badge (approximate)</div>
+    <div class="legend-row"><span class="k">unresolved</span>(v0.7.1) marks the aggregated "N unresolved sites" leaf itself — one or more forward call sites in this method couldn't be resolved to an indexed target (approximate)</div>
+    <div class="legend-row"><span class="k">dml-unresolved</span>(v0.7.1) a DML statement whose target couldn't be narrowed to a concrete SObject (e.g. a generic List&lt;SObject&gt;/SObject-typed variable) — no trigger or flow linkage could be traced (approximate)</div>
 `;
 
 // v0.7 (A3): mirrors uitree.js's directionHeaderLine exactly -- see that
@@ -950,6 +956,18 @@ function headerExtraLinesForResult(treeResult) {
   const unresolved = stats && stats.unresolvedSites;
   if (typeof unresolved === 'number' && unresolved > 0) {
     lines.push(`${unresolved} call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).`);
+  }
+  // v0.7.1 (U3, M2 coordination point): mirrors uitree.js's matching
+  // shapeHeaderLines addition -- see that file's comment for the full
+  // rationale (attachMetaCallers() candidate-count gate dropping an
+  // ambiguous/unmatched-namespace metadata ref instead of mis-pointing it
+  // at an unrelated same-name local class). 'metaUnresolved' is the exact
+  // stat field name given in the fix spec.
+  const metaUnresolved = stats && stats.metaUnresolved;
+  if (typeof metaUnresolved === 'number' && metaUnresolved > 0) {
+    lines.push(
+      `${metaUnresolved} metadata reference${metaUnresolved === 1 ? '' : 's'} could not be attached (ambiguous or unmatched namespace).`
+    );
   }
   return lines;
 }

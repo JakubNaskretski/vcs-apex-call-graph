@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.1
+
+Precision patch, driven by an independent hard-mode validation corpus
+(enterprise naming, managed-package references, factory indirection, 60-way
+fan-in). Ten confirmed findings fixed, each pinned as a regression test:
+
+- **No more phantom edges from managed-package references**: `ns.Class.method()`
+  and namespaced LWC imports no longer attach to unrelated local classes that
+  happen to share the bare name — they are counted as unresolved instead of
+  fabricating a confident edge.
+- **Trigger-framework hooks stop reading as dead code**: template-method
+  self-dispatch (`this.beforeInsert()` in a virtual base) now fans out to
+  subclass overrides (`~ override`), so "Who calls this?" on your handler logic
+  answers truthfully.
+- **Unique-name fallback hardened**: `Type`-typed receivers and collection
+  accessors (`map.get(...)`, `list.add(...)`) can no longer poison it.
+- **Forward traces fixed**: call sites now jump to the actual calling line
+  (not the target's declaration), implementers appear as direct children under
+  interface dispatch, and generic-typed DML shows an honest "DML on unresolved
+  SObject type" marker instead of silently dropping.
+- **Cap honesty**: a node cut off by the node cap is marked truncated — never
+  painted as a false "root".
+- Existing behavior elsewhere is verified byte-identical against the published
+  0.7.0 artifact (site-level edge diff on 12 fixed targets).
+
 ## 0.7.0
 
 Both directions, and multi-package truth.
