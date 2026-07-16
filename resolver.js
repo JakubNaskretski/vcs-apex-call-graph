@@ -229,13 +229,74 @@ function flowOpsForRecordTriggerType(rtRaw) {
 // single record or a collection, and the object identity is the same either
 // way.
 function dmlObjectHead(rawType) {
+  const orig = dmlObjectHeadOriginal(rawType);
+  return orig ? lc(orig) : null;
+}
+
+// v0.8/N1(b)/N3: same wrapper-stripping as dmlObjectHead, but preserves the
+// object token's ORIGINAL case (dmlObjectHead's own lastSegmentLower() call
+// discards it). Needed so a managed-object external's `label`/`className`
+// (e.g. 'kwx__Ledger__c') renders with the exact source-text casing instead
+// of resolver.js's internal all-lowercase comparison keys -- see
+// resolveDmlTargetObject's own header note for how this feeds the N1(b)/N3
+// pipeline. `dmlObjectHead` above is now a thin lc() wrapper around this so
+// every pre-v0.8 caller's behavior (a lowercased objectLower string) is
+// completely unchanged.
+function dmlObjectHeadOriginal(rawType) {
   if (!rawType) return null;
   let s = String(rawType).trim();
   const listMatch = s.match(/^(?:List|Set)\s*<\s*([^<>]+)\s*>$/i);
   if (listMatch) s = listMatch[1];
   s = s.replace(/\[\]\s*$/, '').trim();
   if (!s) return null;
-  return lastSegmentLower(s);
+  return lastSegmentOriginal(s);
+}
+
+// v0.8/N1: 'ns__Rest' -> { ns, rest } (original case, unsplit further) on the
+// FIRST '__' occurrence only, or null when the token has no '__' at all (or
+// starts with one, or the ns-candidate segment isn't itself identifier-
+// shaped). Deliberately does not care whether `rest` looks like anything in
+// particular -- callers decide what shape of `rest` they're looking for
+// (an object ending in '__c' for a DML target per N1(b), a bare class name
+// NOT ending in '__c' for a metascan Flow/CMDT actionName/value per N1(c) --
+// see detectMetaRefNamespace's own header note on why that distinction
+// matters for not misreading an ordinary '..._Whatever__c' custom-object
+// token, e.g. this corpus's pre-existing 'Kappa_Order__c' CMDT value, as a
+// namespaced CLASS reference).
+function splitNamespacePrefix(token) {
+  const s = String(token == null ? '' : token);
+  const idx = s.indexOf('__');
+  if (idx <= 0) return null;
+  const ns = s.slice(0, idx);
+  const rest = s.slice(idx + 2);
+  if (!rest || !SIMPLE_IDENT_RE.test(ns)) return null;
+  return { ns, rest };
+}
+
+// v0.8/N5: index.stats.externalRefs/externalNamespaces are ALWAYS derived
+// fresh from the live `externals` Map's current contents (never a separately
+// tracked running counter) -- both buildSemanticIndex (Apex/DML sources) and
+// attachMetaCallers (metascan sources, possibly called several times over
+// the same index, per its own pre-existing "safe to call multiple times"
+// contract) mutate the SAME Map object in place, so recomputing here at
+// whichever point stats get read/refreshed can never drift out of sync with
+// what `externals`/suggestTargets/buildCallerTree's external-root branch
+// actually see. externalNamespaces is deduped by lowercase and sorted
+// case-insensitively for a deterministic header/list order.
+function computeExternalStats(externalsMap) {
+  let externalRefs = 0;
+  const seenNs = new Set();
+  const namespaces = [];
+  for (const ext of externalsMap ? externalsMap.values() : []) {
+    externalRefs += ext.refCount || 0;
+    const key = lc(ext.ns);
+    if (!seenNs.has(key)) {
+      seenNs.add(key);
+      namespaces.push(ext.ns);
+    }
+  }
+  namespaces.sort((a, b) => lc(a).localeCompare(lc(b)));
+  return { externalRefs, externalNamespaces: namespaces };
 }
 
 // F2: splits a generic argument list on top-level commas only (depth-aware,
@@ -321,6 +382,14 @@ function lastSegmentLower(raw) {
   const s = stripGenerics(raw);
   const segs = s.split('.');
   return lc(segs[segs.length - 1]);
+}
+
+// v0.8/N1(b)/N3: same as lastSegmentLower, case-preserving. See
+// dmlObjectHeadOriginal's own header note for why this exists.
+function lastSegmentOriginal(raw) {
+  const s = stripGenerics(raw);
+  const segs = s.split('.');
+  return segs[segs.length - 1];
 }
 
 const SIMPLE_IDENT_RE = /^[A-Za-z_]\w*$/;
@@ -473,6 +542,13 @@ function walkExtendsChain(indexLike, startLower, visitFn) {
 function buildSemanticIndex(factsList, opts) {
   const packageOf = opts && typeof opts.packageOf === 'function' ? opts.packageOf : null;
   const defaultPackage = opts && opts.defaultPackage != null ? opts.defaultPackage : null;
+  // v0.8/N3: opts.ownNamespace -- the workspace's OWN declared managed-
+  // package namespace (sfdx-project.json's 'namespace' property; reading
+  // that file is extension.js's concern, out of this module's scope, same
+  // division of labor as opts.packageOf above). Absent/empty -> no
+  // stripping anywhere (byte-identical to pre-v0.8 behavior), per N3's own
+  // text. Normalized once, lowercased, for every comparison below.
+  const ownNamespaceLower = opts && opts.ownNamespace ? lc(opts.ownNamespace) : null;
 
   const classes = new Map(); // lowerQualified -> ClassMeta (or a B2 synthetic dup-slot key -- see classBuckets)
   const methodCallers = new Map(); // 'lowerQualified#lowerMethod' -> CallSite[]
@@ -913,13 +989,35 @@ function buildSemanticIndex(factsList, opts) {
     }
   }
 
+  // v0.8/N3: strips a leading OWN-namespace 'ns__' prefix from an
+  // original-case object/token (e.g. trigger target object text, DML target
+  // text) before it becomes this engine's canonical (lowercased) object
+  // identity -- so `vtx__Config__c` and bare `Config__c` collapse onto the
+  // exact same local object identity, per N3's own text. No-op (returns the
+  // input unchanged) when opts.ownNamespace is absent/empty, or the token
+  // doesn't have the 'ns__' shape at all, or its ns segment isn't the OWN
+  // namespace (a genuinely managed 'ns__Object__c' token is left fully
+  // intact here -- N1(b)'s external-object detection, downstream in
+  // resolveDmlTargetObject, needs the UNSTRIPPED form to build its label).
+  function stripOwnNamespaceFromObject(originalCaseToken) {
+    if (!ownNamespaceLower) return originalCaseToken;
+    const split = splitNamespacePrefix(originalCaseToken);
+    if (split && lc(split.ns) === ownNamespaceLower) return split.rest;
+    return originalCaseToken;
+  }
+
   // F1: object (lowercased SObject API name) -> trigger ClassMeta[] declared
   // on it, built the same way -- every trigger's triggerInfo is already
   // attached to its ClassMeta by pass A above.
   const triggersByObject = new Map();
   for (const trigCm of classes.values()) {
     if (trigCm.kind !== 'trigger' || !trigCm.triggerInfo || !trigCm.triggerInfo.object) continue;
-    const objLower = lc(trigCm.triggerInfo.object);
+    // v0.8/N3: a trigger declared directly `on vtx__Foo__c` registers under
+    // the SAME stripped key ('foo__c') a DML on bare `Foo__c` resolves to --
+    // symmetric with resolveDmlTargetObject's own N3 stripping below, so
+    // event-matching stays keyed on one canonical local object identity
+    // regardless of which (prefixed or bare) spelling either side used.
+    const objLower = lc(stripOwnNamespaceFromObject(trigCm.triggerInfo.object));
     if (!triggersByObject.has(objLower)) triggersByObject.set(objLower, []);
     triggersByObject.get(objLower).push(trigCm);
   }
@@ -940,6 +1038,176 @@ function buildSemanticIndex(factsList, opts) {
   // CallSite[] of every 'throw' statement that raises it. Populated during
   // pass B from MethodFacts.throwsSites.
   const throwers = new Map();
+
+  // =========================================================================
+  // v0.8/N1/N2/N4: externals -- Map<'nslower.classlower', ExternalMeta>
+  // ExternalMeta = { ns, className, label, methods: Set<methodLower>, refCount }
+  // Built from THREE sources, all funneling through getOrCreateExternal
+  // below: (a) N2 step 3 -- a 3-segment Apex call expression (Head.Mid.
+  // method(...)) whose Head never resolves locally (tryAttachExternalTwoSegmentReceiver,
+  // called from resolveDotOther); (b) N1(b) -- a DML/publish target whose
+  // object text matches the managed-object shape 'ns__Object__c'
+  // (attachExternalDmlSite, called from resolveDmlTargetObject's 3 call
+  // sites); (c) N1(c) -- a metascan MetaRef carrying (or shown, via this
+  // module's own fold-detection, to imply) a namespace (attachMetaCallers,
+  // a separate top-level function -- see its own header note for why it
+  // reads/writes `externals`/`externalCallers` off the INDEX object rather
+  // than this closure). Key format is ALWAYS dot-joined + lowercased
+  // regardless of source ('zenq.billing', 'kwx.ledger__c') -- only the
+  // human-readable `label` differs by convention: dot-style ('zenq.Billing')
+  // for a namespaced Apex/metadata CLASS reference, underscore-style
+  // ('kwx__Ledger__c') for a namespaced DML/publish OBJECT reference --
+  // see getOrCreateExternal's own `style` parameter.
+  // =========================================================================
+  const externals = new Map();
+  // externalCallers: same key as `externals` -> CallSite[] of every LOCAL
+  // Apex/DML site that references it -- N4's "in the callers direction an
+  // external IS a valid trace target ... its callers are all local
+  // referencing sites" (buildExternalCallerTree, below, walks these exactly
+  // like methodCallers/classCallers feed an ordinary caller tree's level 1).
+  const externalCallers = new Map();
+  // externalForwardsByCallerKey: 'lowerQualified#lowerMethodLabel' (the
+  // SAME callerKey format methodCallees/dmlByCallerKey use) -> [{ key, ext,
+  // path, line, col, lineText, args }] -- the forward-direction (callees)
+  // counterpart of externalCallers, consumed by appendCalleeExtrasForMethod
+  // below to append one TERMINAL kind:'external' leaf per distinct external
+  // referenced FROM that specific caller method (N4: "external nodes are
+  // TERMINAL in the callee direction"). Deliberately a separate, simpler
+  // per-callerKey list rather than routed through methodCallees/ForwardEdge
+  // -- an external target is never a real `classLower#methodLower` key, and
+  // appendCalleeExtras's existing "extra terminal leaves per node" pattern
+  // (already used for DML/publish flow-fanout and the unresolved-call
+  // aggregate) is the natural, low-risk fit, requiring no changes to the
+  // ordinary forward-edge walk (calleeItemFromEdge/buildOneChildNode).
+  const externalForwardsByCallerKey = new Map();
+
+  // v0.8/N1/N4: creates (first-observation-wins label/case) or looks up the
+  // ExternalMeta for (nsRaw, classNameRaw), returning its Map key. `style`
+  // picks the label CONVENTION only, at first-creation time -- 'dot' for
+  // 'ns.Class' (a namespaced Apex/metadata CLASS/method reference), 'underscore'
+  // for 'ns__Object' (a namespaced DML/publish OBJECT reference) -- see this
+  // block's own header note above.
+  function getOrCreateExternal(nsRaw, classNameRaw, style) {
+    const key = `${lc(nsRaw)}.${lc(classNameRaw)}`;
+    if (!externals.has(key)) {
+      const label = style === 'underscore' ? `${nsRaw}__${classNameRaw}` : `${nsRaw}.${classNameRaw}`;
+      externals.set(key, { ns: nsRaw, className: classNameRaw, label, methods: new Set(), refCount: 0 });
+    }
+    return key;
+  }
+
+  // v0.8/N1(a)/N2: records ONE Apex call-expression site against the
+  // external (ns, className) pair -- via='external', NOT approximate (per
+  // N2's own text: "a genuine namespace match is exact, not a guess"), fed
+  // to BOTH externalCallers (reverse/caller-direction trace) and
+  // externalForwardsByCallerKey (forward/callee-direction terminal leaf).
+  function attachExternalApexSite(nsRaw, classNameRaw, methodLower, callerClassLower, callerMethodLabel, call) {
+    const key = getOrCreateExternal(nsRaw, classNameRaw, 'dot');
+    const ext = externals.get(key);
+    if (methodLower) ext.methods.add(methodLower);
+    ext.refCount++;
+    const site = makeCallSite(callerClassLower, callerMethodLabel, call, 'external', methodLower, null);
+    if (!externalCallers.has(key)) externalCallers.set(key, []);
+    externalCallers.get(key).push(site);
+    const ccm = classes.get(callerClassLower);
+    const callerKey = `${callerClassLower}#${lc(callerMethodLabel)}`;
+    if (!externalForwardsByCallerKey.has(callerKey)) externalForwardsByCallerKey.set(callerKey, []);
+    externalForwardsByCallerKey.get(callerKey).push({
+      key, ext, path: ccm ? ccm.path : '', line: call.line, col: call.col, lineText: call.lineText, args: call.argTexts || [],
+    });
+  }
+
+  // v0.8/N2 step 2 (extended): true when `midRaw` resolves as EITHER a
+  // nested/inner class OR a static field/property MEMBER of the GENUINE
+  // local top-level class named `headRaw` -- N2's own text lists "inner
+  // class, static member chain" as two forms of "Mid resolves on it", both
+  // of which must keep step 2's existing-rules outcome (never external),
+  // even when the pre-existing chained-receiver machinery doesn't itself go
+  // on to produce a resolved edge for the full chain. A genuinely LOCAL
+  // (if, today, still unresolved) reference must never be RECLASSIFIED as
+  // managed-package code merely because Head also happens to be
+  // identifier-shaped -- caught live against the real gauntlet-org corpus's
+  // `KappaApplication.Service.newInstance(...)` fflib-factory shape (a
+  // static FIELD access chain, deliberately a different, not-yet-covered
+  // receiver shape per that fixture's own header comment -- Corpus F,
+  // explicitly out of THIS round's scope per REGRESSION POLICY: it must
+  // stay exactly as unresolved in v0.8 as it already was in v0.7.1, not
+  // newly promoted to external).
+  function headClassHasMember(headRaw, midRaw) {
+    const headLower = lc(headRaw);
+    if (!classes.has(headLower)) return false;
+    const midLower = lc(midRaw);
+    if (classes.has(`${headLower}.${midLower}`)) return true; // inner/nested class
+    const found = walkExtendsChain(classesLike, headLower, (cm) => {
+      const tf = cm.typeFacts;
+      if ((tf.fields || []).some((f) => lc(f.name) === midLower)) return true;
+      if ((tf.properties || []).some((p) => lc(p.name) === midLower)) return true;
+      return undefined;
+    });
+    return found === true;
+  }
+
+  // v0.8/N2 step 3: only when receiverRaw is EXACTLY a 2-segment 'Head.Mid'
+  // dotted chain (the "3-segment call expression" N2 describes, receiver +
+  // method) does an unresolved namespace-shaped receiver become an external
+  // -- a longer chain, or a bare 1-segment receiver (N2's own "2-segment
+  // call NEVER creates an external" carve-out -- that shape never even
+  // reaches this function; see resolveDotOther's isSimple branch), is left
+  // exactly as before (an honest unresolved site). `head` must itself be a
+  // plausible namespace token (a plain identifier, not a PLATFORM_DENYLIST
+  // name), and Mid must NOT resolve as any kind of member (class or static
+  // field/property) of a genuine local Head class (headClassHasMember,
+  // above) -- called ONLY once isUnknownNamespacedReceiver has already
+  // confirmed this receiver never resolves locally via its own (class-only)
+  // strict-match check (rule-1/rule-2 of N2's precedence, both already
+  // handled upstream of this call).
+  function tryAttachExternalTwoSegmentReceiver(receiverRaw, methodLower, call, callerClassLower, callerMethodLabel) {
+    const raw = String(receiverRaw || '').trim();
+    const dotIdx = raw.indexOf('.');
+    if (dotIdx <= 0) return false;
+    const rest = raw.slice(dotIdx + 1);
+    if (rest.indexOf('.') !== -1) return false; // 3+ dots in the receiver -- out of N2's scoped shape, leave as unresolved
+    const head = raw.slice(0, dotIdx);
+    if (!SIMPLE_IDENT_RE.test(head) || !SIMPLE_IDENT_RE.test(rest)) return false;
+    if (PLATFORM_DENYLIST.has(lc(head))) return false;
+    if (headClassHasMember(head, rest)) return false;
+    attachExternalApexSite(head, rest, methodLower, callerClassLower, callerMethodLabel, call);
+    return true;
+  }
+
+  // v0.8/N1(b): records ONE DML/publish site against a managed-object
+  // external (ns, className) pair -- see resolveDmlTargetObject's own N1(b)
+  // note for how `nsRaw`/`classNameRaw` get derived. No forward-direction
+  // (`externalForwardsByCallerKey`) DML-specific method concept to zip args
+  // against, so `methods` is deliberately never populated here (stays the
+  // empty Set N1's own shape allows: "Set<methodLower observed>").
+  function attachExternalDmlSite(nsRaw, classNameRaw, callerClassLower, callerMethodLabel, callLike) {
+    const key = getOrCreateExternal(nsRaw, classNameRaw, 'underscore');
+    const ext = externals.get(key);
+    ext.refCount++;
+    const ccm = classes.get(callerClassLower);
+    if (!ccm) return;
+    const site = {
+      callerClass: ccm.qualified,
+      callerMethod: callerMethodLabel,
+      callerKey: `${callerClassLower}#${lc(callerMethodLabel)}`,
+      path: ccm.path,
+      line: callLike.line,
+      col: callLike.col,
+      lineText: callLike.lineText,
+      args: callLike.argTexts || [],
+      via: 'external',
+      targetMethod: null,
+      overloadSig: null,
+    };
+    if (!externalCallers.has(key)) externalCallers.set(key, []);
+    externalCallers.get(key).push(site);
+    const callerKey = `${callerClassLower}#${lc(callerMethodLabel)}`;
+    if (!externalForwardsByCallerKey.has(callerKey)) externalForwardsByCallerKey.set(callerKey, []);
+    externalForwardsByCallerKey.get(callerKey).push({
+      key, ext, path: ccm.path, line: callLike.line, col: callLike.col, lineText: callLike.lineText, args: callLike.argTexts || [],
+    });
+  }
 
   // BUG FIX (finding #1): the old findMethodOwner() stopped climbing the
   // extends chain at the FIRST class declaring ANY same-named method,
@@ -1660,8 +1928,40 @@ function buildSemanticIndex(factsList, opts) {
     return true;
   }
 
+  // v0.8/N3: strips a leading OWN-namespace segment off a dotted Apex
+  // receiver chain BEFORE any resolution rule (incl. isUnknownNamespacedReceiver
+  // above) ever sees it -- "stripped ... before any resolution is attempted",
+  // per N3's own text. `vtx.VertexPricingService.repriceOrder(...)` becomes
+  // an ordinary un-prefixed `VertexPricingService.repriceOrder(...)` local
+  // static call; a receiver whose head segment is NOT the own namespace (or
+  // there is no own namespace configured at all) is returned unchanged.
+  // Deliberately only strips ONE leading segment (the ns itself, not
+  // whatever follows) -- N3 only documents the namespace TOKEN being
+  // stripped, not any deeper chain-shape assumption.
+  function stripOwnNamespacePrefix(receiverRaw) {
+    if (!ownNamespaceLower) return receiverRaw;
+    const trimmed = String(receiverRaw == null ? '' : receiverRaw).trim();
+    if (!PLAIN_DOTTED_CHAIN_RE.test(trimmed)) return receiverRaw;
+    const dotIdx = trimmed.indexOf('.');
+    const head = trimmed.slice(0, dotIdx);
+    if (lc(head) !== ownNamespaceLower) return receiverRaw;
+    return trimmed.slice(dotIdx + 1);
+  }
+
   // Rules 5-7: a 'dot' call whose receiver is neither 'this' nor 'super'.
-  function resolveDotOther(callerClassLower, callerMethodLabel, methodFacts, call) {
+  function resolveDotOther(callerClassLower, callerMethodLabel, methodFacts, rawCall) {
+    // v0.8/N3: own-namespace stripping happens first, against a CLONE (the
+    // original CallFacts object is shared/reused elsewhere -- e.g. pass B's
+    // own forward-edge bookkeeping reads call.line/col/lineText/argTexts
+    // untouched -- so only `.receiver` is ever overridden, never mutated in
+    // place). Every downstream read in this function (incl. the
+    // resolveComplexReceiver call below, which reads call.receiver directly
+    // rather than the local `receiverRaw`) must see the SAME stripped value,
+    // hence threading the clone through as `call` rather than only
+    // shadowing a local variable.
+    const strippedReceiver = stripOwnNamespacePrefix(rawCall.receiver);
+    const strippedOwnNs = strippedReceiver !== rawCall.receiver;
+    const call = strippedOwnNs ? Object.assign({}, rawCall, { receiver: strippedReceiver }) : rawCall;
     const nameLower = lc(call.method);
     const cm = classes.get(callerClassLower);
     const receiverRaw = call.receiver;
@@ -1742,6 +2042,13 @@ function buildSemanticIndex(factsList, opts) {
     // this guard doesn't change that outcome, it just reaches "no edge" by
     // a more honest path (never attempting the collision at all).
     if (!shadowedByVariable && isUnknownNamespacedReceiver(receiverRaw, callerClassLower, methodFacts)) {
+      // v0.8/N2 step 3: exactly the "3-segment call expression Head.Mid.
+      // method(...)" shape (receiver has ONE dot -- Head.Mid) with a
+      // plausible, non-denylisted namespace-token Head promotes to an
+      // EXTERNAL edge instead of an anonymous unresolved count. A longer
+      // chain, or a Head that IS platform-denylisted, falls through to the
+      // exact pre-v0.8 "honest unresolved site" outcome unchanged.
+      if (tryAttachExternalTwoSegmentReceiver(receiverRaw, nameLower, call, callerClassLower, callerMethodLabel)) return;
       unresolvedSitesCount++;
       return;
     }
@@ -1808,8 +2115,28 @@ function buildSemanticIndex(factsList, opts) {
     // including a spurious self-referential cyclic edge when the fallback's
     // own sole candidate is the call's own enclosing method) -- see
     // VALIDATION-REPORT.md Tier-2 #4.
+    // v0.8/N3 fix (defect #1, ghost-remainder rule-7 fabrication):
+    // stripOwnNamespacePrefix can turn a dotted, namespace-shaped receiver
+    // ('ownx.GhostClass') into a BARE simple identifier ('GhostClass')
+    // BEFORE this function ever ran isUnknownNamespacedReceiver above --
+    // and that guard only ever gates dotted chains (PLAIN_DOTTED_CHAIN_RE),
+    // so a stripped-down bare remainder sails straight past it. Rule 5
+    // (just above) already tried and failed to match the bare remainder to
+    // a real local class, and it isn't a shadowing variable either (the
+    // `!shadowedByVariable` block above already excluded that) -- so this
+    // is exactly a stale/typo'd/nonexistent own-namespace reference, the
+    // same class of receiver isUnknownNamespacedReceiver exists to
+    // quarantine for still-dotted remainders. Without this gate, N3 would
+    // silently downgrade such a reference from "safely quarantined" to
+    // "exposed to rule 7", fabricating a confident but false local edge to
+    // any unrelated class that happens to declare a globally-unique method
+    // of the same name (dev/gauntlet/repro-n3-ghost-remainder-rule7.js).
+    // Deliberately only suppresses rule 7's OWN fallback attempt here --
+    // the denylist gate above (e.g. a stripped 'ownx.System' remainder)
+    // still runs first and is unaffected, exactly like the pre-existing
+    // COLLECTION_ACCESSOR_NAMES suppression this mirrors.
     // Rule 7: unique-name fallback.
-    const resolved = COLLECTION_ACCESSOR_NAMES.has(nameLower)
+    const resolved = COLLECTION_ACCESSOR_NAMES.has(nameLower) || (strippedOwnNs && isSimple)
       ? false
       : unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower);
     // H4: every prior rule (5, 6, and rule 7's own unique-name fallback)
@@ -2007,6 +2334,20 @@ function buildSemanticIndex(factsList, opts) {
   // 'new List<Type>(...)' / 'new Type(...)' expression -- best-effort text
   // extraction, same spirit as castOrNewChainType. Returns null (no edge,
   // not a guess) when neither shape yields a type.
+  // v0.8/N1(b)/N3: return shape widened from a plain lowercased string to
+  // { lower, original, external } -- `lower` is EXACTLY what every pre-v0.8
+  // caller already used (unchanged meaning: the canonical, lowercased object
+  // identity used for trigger-matching/dmlSitesByObject/etc.), `original`
+  // is its case-preserved form (only consumed by this function's own N1(b)
+  // branch below today), and `external` is `{ ns, className }` when (and
+  // only when) this object's text matches the FULL managed-object shape
+  // 'ns__Object__c' per N1(b) and ns is NOT the workspace's own namespace --
+  // null otherwise. N3's own-namespace stripping happens INLINE here (not as
+  // a separate post-processing step) so `lower`/`original` themselves become
+  // the STRIPPED identity for an own-namespace token -- the ONE canonical
+  // object key every downstream consumer (trigger matching, dmlSitesByObject,
+  // flow DML fan-out) sees, so `vtx__Config__c` and bare `Config__c` are
+  // provably the same object, not merely two objects that happen to agree.
   function resolveDmlTargetObject(targetText, callerClassLower, methodFacts) {
     const raw = String(targetText || '').trim();
     if (!raw) return null;
@@ -2023,7 +2364,27 @@ function buildSemanticIndex(factsList, opts) {
       }
     }
     if (!typeRaw) return null;
-    return dmlObjectHead(typeRaw);
+    let original = dmlObjectHeadOriginal(typeRaw);
+    if (!original) return null;
+    let external = null;
+    const split = splitNamespacePrefix(original);
+    if (split) {
+      if (ownNamespaceLower && lc(split.ns) === ownNamespaceLower) {
+        original = split.rest; // N3: own-namespace object token strips to its local identity
+      } else if (/__c$/i.test(split.rest)) {
+        // N1(b): the FULL 'ns__Object__c' managed-object shape (an ordinary
+        // local custom object like 'Vertex_Order__c' has only ONE '__',
+        // between its name and the trailing 'c' -- splitNamespacePrefix's
+        // `rest` for that shape is just 'c', which never itself ends in
+        // '__c', so this branch is unreachable for a plain local object;
+        // see splitNamespacePrefix's own header note). The FULL, unstripped
+        // token stays the trigger-matching identity (N4: event matching is
+        // untouched by an object "looking" namespaced) -- only `external`
+        // gains a value, nothing about `original`/`lower` changes here.
+        external = { ns: split.ns, className: split.rest };
+      }
+    }
+    return { lower: lc(original), original, external };
   }
 
   // F1(b): records every valid DML site regardless of trigger match, for
@@ -2087,14 +2448,19 @@ function buildSemanticIndex(factsList, opts) {
   function handleDmlStatement(callerClassLower, callerMethodLabel, mf, dmlFact) {
     const op = lc(dmlFact && dmlFact.op);
     if (!DML_OPS.has(op)) return;
-    const objectLower = resolveDmlTargetObject(dmlFact.targetText, callerClassLower, mf);
-    if (!objectLower) return;
-    if (objectLower === 'sobject') { // v0.7.1/R8
+    const resolved = resolveDmlTargetObject(dmlFact.targetText, callerClassLower, mf);
+    if (!resolved) return;
+    if (resolved.lower === 'sobject') { // v0.7.1/R8
       recordUnresolvedDmlSite(callerClassLower, callerMethodLabel);
       return;
     }
     const callLike = { line: dmlFact.line, col: dmlFact.col, lineText: dmlFact.lineText, argTexts: [dmlFact.targetText] };
-    emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, objectLower, callLike);
+    emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, resolved.lower, callLike);
+    // v0.8/N1(b): additive -- an object matching the managed-object shape
+    // ALSO gains an external node, regardless of whether it matched a
+    // trigger above (N4: the two mechanisms are independent, see
+    // resolveDmlTargetObject's own N1(b) note).
+    if (resolved.external) attachExternalDmlSite(resolved.external.ns, resolved.external.className, callerClassLower, callerMethodLabel, callLike);
   }
 
   // F1: Database.insert()/.update()/etc. METHOD-form DML (incl.
@@ -2118,13 +2484,14 @@ function buildSemanticIndex(factsList, opts) {
     const op = lc(call.method);
     if (!DML_OPS.has(op)) return;
     const targetText = (call.argTexts && call.argTexts[0]) || '';
-    const objectLower = resolveDmlTargetObject(targetText, callerClassLower, mf);
-    if (!objectLower) return;
-    if (objectLower === 'sobject') { // v0.7.1/R8, same reasoning as handleDmlStatement
+    const resolved = resolveDmlTargetObject(targetText, callerClassLower, mf);
+    if (!resolved) return;
+    if (resolved.lower === 'sobject') { // v0.7.1/R8, same reasoning as handleDmlStatement
       recordUnresolvedDmlSite(callerClassLower, callerMethodLabel);
       return;
     }
-    emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, objectLower, call);
+    emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, resolved.lower, call);
+    if (resolved.external) attachExternalDmlSite(resolved.external.ns, resolved.external.className, callerClassLower, callerMethodLabel, call);
   }
 
   // F4a: Type.forName('LiteralClassName') -- single string-literal arg only;
@@ -2200,14 +2567,22 @@ function buildSemanticIndex(factsList, opts) {
     if (lc(call.method) !== 'publish') return;
     const args = call.argTexts || [];
     if (!args.length) return;
-    const objectLower = resolveDmlTargetObject(args[0], callerClassLower, mf);
-    if (!objectLower) return;
+    const resolved = resolveDmlTargetObject(args[0], callerClassLower, mf);
+    if (!resolved) return;
+    const objectLower = resolved.lower;
     if (!objectLower.endsWith('__e')) return; // only platform events qualify
     recordPublishSite(objectLower, callerClassLower, callerMethodLabel, call);
     const triggers = triggersByObject.get(objectLower) || [];
     for (const t of triggers) {
       writeMethodEdge(callerClassLower, callerMethodLabel, lc(t.qualified), '(trigger)', call, 'publish', '(trigger)', null);
     }
+    // v0.8/N1(b): "DML/publish targets" both funnel through
+    // resolveDmlTargetObject's own N1(b) detection -- in practice this stays
+    // inert for a genuine platform event (its object always ends '__e', and
+    // N1(b)'s managed-object shape requires the token to end '__c'), but the
+    // check is included here for the same reason it's unconditional in the
+    // two DML call sites above: no special-casing needed either way.
+    if (resolved.external) attachExternalDmlSite(resolved.external.ns, resolved.external.className, callerClassLower, callerMethodLabel, call);
   }
 
   // =========================================================================
@@ -2646,13 +3021,40 @@ function buildSemanticIndex(factsList, opts) {
     dmlSitesByObject,
     publishSitesByObject,
     throwers,
+    // v0.8/N1/N4: externals/externalCallers/externalForwardsByCallerKey --
+    // see this closure's own "v0.8/N1/N2/N4: externals" header block above
+    // for the full contract. Exposed so buildCallerTree's external-root
+    // branch, buildCalleeTree's appendCalleeExtrasForMethod call, and
+    // suggestTargets (below, all top-level functions outside this closure)
+    // can reach them, and so attachMetaCallers (a SEPARATE top-level
+    // function, called after this closure has already returned) can mutate
+    // the SAME Map objects in place when it attaches N1(c) metascan-sourced
+    // externals.
+    externals,
+    externalCallers,
+    externalForwardsByCallerKey,
+    // v0.8/N1(c): attachMetaCallers reads this to decide whether a metascan
+    // ref's detected namespace token is the workspace's OWN namespace
+    // (resolves locally, per N3) or a genuinely external one. null/absent
+    // when opts.ownNamespace was absent/empty.
+    ownNamespace: ownNamespaceLower,
     // H4: workspace-wide count of call sites this build positively
     // identified as dropped (see unresolvedSitesCount's own header comment
     // for the three counted categories). Every TreeResult carries this
     // through unchanged (see buildCallerTree's H4 stats passthrough) so the
     // UI can show one honest "N call sites workspace-wide could not be
     // resolved" header regardless of which target is being traced.
-    stats: { unresolvedSites: unresolvedSitesCount, duplicateNames: duplicateNamesCount },
+    // v0.8/N5: externalRefs/externalNamespaces gained here, computed fresh
+    // from `externals`' current contents (see computeExternalStats's own
+    // header note on why this is derived rather than a tracked counter) --
+    // attachMetaCallers recomputes/overwrites both after it mutates
+    // `externals` further, so this initial value is only ever "final" for a
+    // build with no metascan refs attached afterward.
+    stats: {
+      unresolvedSites: unresolvedSitesCount,
+      duplicateNames: duplicateNamesCount,
+      ...computeExternalStats(externals),
+    },
     // MUST-FIX #1/#5: exposed so post-build query-time code (suggestTargets,
     // below) can apply the SAME real B2 gate this closure used internally
     // -- true only once opts.packageOf actually resolved a non-null label
@@ -3073,6 +3475,17 @@ function buildCallerTree(index, target, opts) {
   const cm = index.classes.get(classLower);
 
   if (!cm) {
+    // v0.8/N4: an EXTERNAL node IS a valid trace target in the callers
+    // direction ("its callers are all local referencing sites — full normal
+    // caller tree above them") -- checked only once the ordinary
+    // index.classes lookup has already failed, so this can never shadow a
+    // real local class (external keys are only ever created for a receiver/
+    // DML-object/metascan-ref shape that has ALREADY failed local
+    // resolution -- see tryAttachExternalTwoSegmentReceiver's own header
+    // note -- so no key collision is structurally possible).
+    const ext = index.externals instanceof Map ? index.externals.get(classLower) : null;
+    if (ext) return buildExternalCallerTree(index, classLower, ext, opts);
+
     const rawLabel = target ? `${target.classLower || ''}${target.methodLower ? '.' + target.methodLower : ''}` : '';
     return {
       root: {
@@ -3089,7 +3502,13 @@ function buildCallerTree(index, target, opts) {
       direction: 'callers',
       // H1/H4: stats still passed through even for a not-found target, so
       // callers can rely on TreeResult.stats always being present.
-      stats: { nodes: 0, uniqueMethods: 0, capped: false, unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0, metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0 },
+      stats: {
+        nodes: 0, uniqueMethods: 0, capped: false,
+        unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0,
+        metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
+        externalRefs: (index.stats && index.stats.externalRefs) || 0,
+        externalNamespaces: (index.stats && index.stats.externalNamespaces) || [],
+      },
     };
   }
 
@@ -3223,6 +3642,68 @@ function buildCallerTree(index, target, opts) {
       capped: ctx.capped,
       unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0,
       metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
+      externalRefs: (index.stats && index.stats.externalRefs) || 0,
+      externalNamespaces: (index.stats && index.stats.externalNamespaces) || [],
+    },
+  };
+}
+
+// v0.8/N4: caller-direction trace ROOTED AT an external node. Reuses the
+// exact SAME level-1/recursive machinery an ordinary class/method root uses
+// (buildChildrenLevel walking externalCallers' site list at level 1, then
+// methodLevelPairs -- via each site's own callerKey -- for every level
+// above that) so "full normal caller tree above them" falls out for free,
+// with zero duplicated tree-walking logic. `key` is the external's own Map
+// key ('nslower.classlower'); `ext` is its ExternalMeta.
+function buildExternalCallerTree(index, key, ext, opts) {
+  const maxDepth = (opts && opts.maxDepth) || DEFAULT_MAX_DEPTH;
+  const maxNodes = (opts && opts.maxNodes) || DEFAULT_MAX_NODES;
+  const root = {
+    label: ext.label, kind: 'external', className: ext.label, path: '', line: 0,
+    methodLower: null,
+    ns: ext.ns, // v0.8/N4: read directly by uitree.js's externalNamespace()/managedBadge()
+    entries: [], isTest: false, via: null, sites: [], children: [],
+    cyclic: false, truncated: false, approximate: false,
+  };
+
+  const apexSites = (index.externalCallers instanceof Map ? index.externalCallers.get(key) : null) || [];
+  const pairs = apexSites.map((site) => ({ site, targetMethodLower: null }));
+
+  const ctx = { maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set(), direction: 'callers' };
+  const queue = [];
+  root.children = buildChildrenLevel(index, pairs, 1, new Set(), key, null, ctx, queue, root);
+  while (queue.length) {
+    const task = queue.shift();
+    task.node.children = buildChildrenLevel(index, task.pairs, task.depth, task.ancestorPath, task.targetClassLower, null, ctx, queue, task.node);
+  }
+
+  // N1(c): metascan-sourced callers (LWC import/Flow actionName/CMDT value
+  // referencing this SAME external) render exactly like buildCallerTree's
+  // own root-level metaRefs fold-in -- TERMINAL children alongside the Apex
+  // ones (an LWC/Flow/CMDT reference has no callers of its own to walk).
+  const metaRefs = (index.externalMetaRefs instanceof Map ? index.externalMetaRefs.get(key) : null) || [];
+  if (metaRefs.length && ctx.nodeCount < ctx.maxNodes) {
+    const metaChildren = buildMetaChildren(index, metaRefs);
+    ctx.nodeCount += countTNodes(metaChildren);
+    root.children = root.children.concat(metaChildren).sort(sortTNodes);
+  } else if (metaRefs.length) {
+    ctx.capped = true;
+    root.truncated = true;
+  }
+
+  return {
+    root,
+    targetLabel: ext.label,
+    note: root.children.length === 0 ? ZERO_CALLER_NOTE : null,
+    direction: 'callers',
+    stats: {
+      nodes: ctx.nodeCount,
+      uniqueMethods: ctx.uniqueKeys.size,
+      capped: ctx.capped,
+      unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0,
+      metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
+      externalRefs: (index.stats && index.stats.externalRefs) || 0,
+      externalNamespaces: (index.stats && index.stats.externalNamespaces) || [],
     },
   };
 }
@@ -3257,7 +3738,19 @@ function buildCalleeTree(index, target, opts) {
       targetLabel: rawLabel,
       note: 'target class not found in index',
       direction: 'callees',
-      stats: { nodes: 0, uniqueMethods: 0, capped: false, unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0, metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0 },
+      // v0.8/N4: an external node is TERMINAL in the callees direction --
+      // "no source to recurse into" -- so this not-found shell (external
+      // keys are never in index.classes) is exactly the right, unmodified
+      // outcome for tracing "what does this external call"; no special
+      // branch needed here the way buildCallerTree's not-found path needed
+      // one for the OPPOSITE (callers) direction.
+      stats: {
+        nodes: 0, uniqueMethods: 0, capped: false,
+        unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0,
+        metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
+        externalRefs: (index.stats && index.stats.externalRefs) || 0,
+        externalNamespaces: (index.stats && index.stats.externalNamespaces) || [],
+      },
     };
   }
 
@@ -3375,6 +3868,8 @@ function buildCalleeTree(index, target, opts) {
       capped: ctx.capped,
       unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0,
       metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
+      externalRefs: (index.stats && index.stats.externalRefs) || 0,
+      externalNamespaces: (index.stats && index.stats.externalNamespaces) || [],
     },
   };
 }
@@ -3478,6 +3973,51 @@ function appendCalleeExtrasForMethod(index, node, classLower, methodLower, ctx) 
     for (const flow of flowRefs) {
       if (lc(flow.flowTriggerType) !== 'platformevent') continue;
       extras.push(makeCalleeFlowNode(flow, 'publish', entry));
+    }
+  }
+
+  // v0.8/N4: external nodes are TERMINAL in the callees direction -- one
+  // leaf per DISTINCT external referenced from THIS specific caller method
+  // (grouped by external key, mirroring how the callers direction groups
+  // multiple sites onto one external node -- see externalForwardsByCallerKey's
+  // own header note in buildSemanticIndex for why this is a simple per-
+  // callerKey extras list rather than routed through methodCallees/
+  // calleeItemFromEdge).
+  const myExternalSites = (index.externalForwardsByCallerKey && index.externalForwardsByCallerKey.get(callerKey)) || [];
+  if (myExternalSites.length) {
+    const extGroups = new Map();
+    for (const es of myExternalSites) {
+      if (!extGroups.has(es.key)) extGroups.set(es.key, []);
+      extGroups.get(es.key).push(es);
+    }
+    for (const group of extGroups.values()) {
+      const first = group[0];
+      extras.push({
+        label: first.ext.label,
+        kind: 'external',
+        className: first.ext.label,
+        methodLower: null,
+        path: '',
+        line: 0,
+        ns: first.ext.ns,
+        entries: [],
+        isTest: false,
+        via: 'external',
+        sites: group.map((g) => ({
+          path: g.path || '',
+          line: g.line || 0,
+          col: g.col || 0,
+          lineText: g.lineText || '',
+          argsRendered: (g.args || []).join(', '),
+          via: 'external',
+          overloadSig: null,
+        })),
+        children: [],
+        cyclic: false,
+        truncated: true, // permanently terminal -- no source to recurse into (N4), same convention buildOneChildNode's 'exception' branch uses
+        approximate: false, // N2: a genuine namespace match is exact, not a guess
+        seenElsewhere: false,
+      });
     }
   }
 
@@ -3718,6 +4258,52 @@ function buildFlowChildren(index, objectLower, via, matchOps) {
   return out;
 }
 
+// v0.8/N1(c): given a metascan MetaRef and the (lowercased) own-namespace
+// token, detects whether this ref names a namespace -- normally via the
+// EXPLICIT `namespace` field metascan.js now populates for ALL ref kinds
+// (LWC, Flow, CMDT, os-meta; the same-round metascan update superseded the
+// older LWC-only split), with the shape-inference branches below kept as a
+// defensive fallback for refs from any older/partial extraction -- and,
+// if so, whether that namespace IS the workspace's own (isOwn:true, per N3:
+// resolves locally, stripped) or a genuinely foreign managed package
+// (isOwn:false: external, per N1(c)). Returns null when the ref carries no
+// namespace signal at all -- callers' pre-v0.8 default local-attach path is
+// then completely unchanged, byte-for-byte.
+function detectMetaRefNamespace(ref, ownNamespaceLower) {
+  if (ref.namespace) {
+    const isOwn = !!ownNamespaceLower && lc(ref.namespace) === ownNamespaceLower;
+    return { ns: ref.namespace, className: ref.className, methodName: ref.methodName || null, isOwn };
+  }
+  // Pattern A ("dotted fold-in"): a 3-dot-segment actionName (e.g. a Flow's
+  // 'zenq.KappaGateway.dispatch') that metascan.js's naive last-two-segments
+  // split folds into { className:'zenq', methodName:'KappaGateway.dispatch' }
+  // -- the methodName's OWN embedded dot is the tell that this className is
+  // really a namespace prefix, not the actual class.
+  if (ref.methodName && ref.methodName.indexOf('.') !== -1 && SIMPLE_IDENT_RE.test(ref.className || '')) {
+    const dotIdx = ref.methodName.indexOf('.');
+    const candClass = ref.methodName.slice(0, dotIdx);
+    const candMethod = ref.methodName.slice(dotIdx + 1);
+    if (SIMPLE_IDENT_RE.test(candClass) && candMethod) {
+      const isOwn = !!ownNamespaceLower && lc(ref.className) === ownNamespaceLower;
+      return { ns: ref.className, className: candClass, methodName: candMethod, isOwn };
+    }
+  }
+  // Pattern B ("double-underscore fold-in"): a bare 'ns__ClassName' actionName/
+  // CMDT value (no dot at all -- an Invocable-style bare class reference).
+  // Excludes anything ending in '__c' -- the ordinary custom-OBJECT-API-name
+  // shape (e.g. this corpus's pre-existing 'Kappa_Order__c' CMDT value,
+  // which is NOT a class reference at all and must keep its exact pre-v0.8
+  // fate: an inert local attach under a classLower nothing ever traces).
+  if (!ref.methodName && ref.className && !/__c$/i.test(ref.className)) {
+    const split = splitNamespacePrefix(ref.className);
+    if (split) {
+      const isOwn = !!ownNamespaceLower && lc(split.ns) === ownNamespaceLower;
+      return { ns: split.ns, className: split.rest, methodName: null, isOwn };
+    }
+  }
+  return null;
+}
+
 // A6: attaches metascan.js's MetaRef[] output onto an existing index,
 // mutating it with metaCallers (by class) and metaMethodCallers (by
 // 'classLower#methodLower'). Pure and order-independent: safe to call
@@ -3727,37 +4313,65 @@ function attachMetaCallers(index, metaRefs) {
   if (!index) return index;
   const metaCallers = index.metaCallers instanceof Map ? index.metaCallers : new Map();
   const metaMethodCallers = index.metaMethodCallers instanceof Map ? index.metaMethodCallers : new Map();
-  // v0.7.1/M2: candidate-count gating -- a meta ref only attaches when it
-  // unambiguously matches exactly one local class under the ref's OWN
-  // namespace context. This workspace's index never registers a local class
-  // under a namespace (index.classes/simpleNameIndex are entirely namespace-
-  // free -- see resolver.js's R1 guard, which establishes the same "local
-  // workspace has no namespace concept" fact for the static-call path), so a
-  // ref carrying a non-null `ref.namespace` (currently only kind:'lwc' refs,
-  // per metascan.js's M1 fix -- see LWC_IMPORT_RE's own header note) can, by
-  // construction, never have exactly-one local match under its own namespace:
-  // it is dropped here and counted in index.stats.metaUnresolved instead of
-  // being re-pointed at an unrelated same-name local class purely because the
-  // bare tail segments happen to collide (VALIDATION-REPORT.md Tier-1 #1:
-  // `@salesforce/apex/zenq.KappaGateway.dispatch` previously collapsed onto
-  // local `KappaGateway.dispatch`, `via=metadata`, zero gating). A ref with no
-  // namespace (namespace null/undefined -- every non-lwc ref kind, and any
-  // bare 2-segment LWC import) is unaffected: exactly the pre-v0.7.1 behavior.
+  // v0.8/N1/N4: same Map objects buildSemanticIndex's closure builds (see
+  // its own "v0.8/N1/N2/N4: externals" header block) -- lazily created here
+  // too (defensive fallback, mirroring metaCallers/metaMethodCallers just
+  // above) for an index this function is ever handed that wasn't produced
+  // by buildSemanticIndex.
+  const externals = index.externals instanceof Map ? index.externals : new Map();
+  const externalMetaRefs = index.externalMetaRefs instanceof Map ? index.externalMetaRefs : new Map();
+  const ownNamespaceLower = index.ownNamespace || null;
+  // v0.7.1/M2 -> v0.8/N1(c)/N5: a ref carrying (or shown, via
+  // detectMetaRefNamespace's own fold-detection, to imply) a namespace no
+  // longer becomes an uncounted "metaUnresolved" drop -- it either resolves
+  // LOCALLY (own namespace, N3) or attaches to an EXTERNAL node (N1(c)).
+  // metaUnresolvedCount therefore stays permanently 0 for every namespace-
+  // shaped ref today; the counter/stats field itself is kept for API
+  // stability (uitree.js/pathmap.js already read index.stats.metaUnresolved)
+  // and in case a genuinely ambiguous/unattachable shape is added later.
   let metaUnresolvedCount = 0;
   for (const ref of metaRefs || []) {
     if (!ref || !ref.className) continue;
-    if (ref.namespace) {
-      metaUnresolvedCount++;
+    const detected = detectMetaRefNamespace(ref, ownNamespaceLower);
+    if (detected && !detected.isOwn) {
+      // v0.8/N1(c): external attach -- routes to the SAME external node an
+      // Apex dotted-receiver (N2) or a same-(ns,class) ref from a DIFFERENT
+      // metadata surface would (A5/B5's cross-surface consistency
+      // requirement: one external node, multiple referencing sites, never
+      // duplicated per surface). TERMINAL under the caller in this
+      // direction -- an LWC/Flow/CMDT/etc reference has no callers of its
+      // OWN to walk further; buildExternalCallerTree renders it via
+      // buildMetaChildren exactly like any other metadata-caller node.
+      const key = `${lc(detected.ns)}.${lc(detected.className)}`;
+      let ext = externals.get(key);
+      if (!ext) {
+        ext = { ns: detected.ns, className: detected.className, label: `${detected.ns}.${detected.className}`, methods: new Set(), refCount: 0 };
+        externals.set(key, ext);
+      }
+      if (detected.methodName) ext.methods.add(lc(detected.methodName));
+      ext.refCount++;
+      const attachedRef = (ref.className === detected.className && ref.methodName === detected.methodName)
+        ? ref
+        : Object.assign({}, ref, { className: detected.className, methodName: detected.methodName });
+      if (!externalMetaRefs.has(key)) externalMetaRefs.set(key, []);
+      externalMetaRefs.get(key).push(attachedRef);
       continue;
     }
-    const classLower = lc(ref.className);
+    // v0.8/N3: an own-namespace ref is rewritten to its STRIPPED identity
+    // before falling into the exact pre-v0.8 local-attach logic below (a
+    // ref with no detected namespace signal at all -- `detected === null`
+    // -- passes `ref` straight through, unchanged).
+    const effectiveRef = detected && detected.isOwn
+      ? Object.assign({}, ref, { className: detected.className, methodName: detected.methodName })
+      : ref;
+    const classLower = lc(effectiveRef.className);
     if (!metaCallers.has(classLower)) metaCallers.set(classLower, []);
-    metaCallers.get(classLower).push(ref);
-    if (ref.methodName) {
-      const key = `${classLower}#${lc(ref.methodName)}`;
+    metaCallers.get(classLower).push(effectiveRef);
+    if (effectiveRef.methodName) {
+      const key = `${classLower}#${lc(effectiveRef.methodName)}`;
       if (!metaMethodCallers.has(key)) metaMethodCallers.set(key, []);
-      metaMethodCallers.get(key).push(ref);
-    } else if (ref.kind === 'flow') {
+      metaMethodCallers.get(key).push(effectiveRef);
+    } else if (effectiveRef.kind === 'flow') {
       // Cross-reference: a Flow actionCalls block with a BARE actionName
       // (class only, e.g. <actionName>AcmeDiscountApprovalInvocable</actionName>)
       // implicitly targets that class's @InvocableMethod entry point --
@@ -3773,12 +4387,14 @@ function attachMetaCallers(index, metaRefs) {
       if (invocableMethodName) {
         const key = `${classLower}#${lc(invocableMethodName)}`;
         if (!metaMethodCallers.has(key)) metaMethodCallers.set(key, []);
-        metaMethodCallers.get(key).push(ref);
+        metaMethodCallers.get(key).push(effectiveRef);
       }
     }
   }
   index.metaCallers = metaCallers;
   index.metaMethodCallers = metaMethodCallers;
+  index.externals = externals;
+  index.externalMetaRefs = externalMetaRefs;
 
   // A1/A4: forward DML/publish -> flow linkage. A record-triggered (or
   // platform-event-triggered) flow's own metaRef carries flowObject/
@@ -3820,6 +4436,12 @@ function attachMetaCallers(index, metaRefs) {
   // metaCallers/metaMethodCallers above, not a per-call overwrite.
   index.stats = index.stats || {};
   index.stats.metaUnresolved = (index.stats.metaUnresolved || 0) + metaUnresolvedCount;
+  // v0.8/N5: externalRefs/externalNamespaces are RECOMPUTED (not
+  // accumulated) from `externals`' current, now-possibly-larger contents --
+  // see computeExternalStats's own header note on why a derived value here
+  // can never drift, regardless of how many times this function is called
+  // or in what order relative to buildSemanticIndex's own initial stats.
+  Object.assign(index.stats, computeExternalStats(externals));
 
   return index;
 }
@@ -4138,6 +4760,20 @@ function suggestTargets(index) {
       if (stampPackage) methodItem.package = cm.package != null ? cm.package : null;
       out.push(methodItem);
     }
+  }
+  // v0.8/N4: externals ARE valid trace targets in the callers direction --
+  // every ExternalMeta in the index (by construction, only ever created
+  // once at least one local site references it -- see getOrCreateExternal's
+  // own callers, all of which increment refCount in the same breath) gets
+  // ONE class-level-shaped item, `kind:'external'`, bare `label` (targets.js's
+  // refineTargets(), out of this file's ownership, is the one that appends
+  // the ' (managed)' suffix -- see its own N4/N6 header note; resolver.js
+  // hands it the raw '<ns>.<Class>' label unmodified, matching the same
+  // "each layer owns its own transform" division targets.js's constructor-
+  // relabel/B3 package-suffix passes already use). No `package` field --
+  // externals have no local file/sfdx-package identity.
+  for (const [key, ext] of index.externals instanceof Map ? index.externals : []) {
+    out.push({ label: ext.label, classLower: key, methodLower: null, kind: 'external' });
   }
   out.sort((a, b) => a.label.localeCompare(b.label));
   return out;

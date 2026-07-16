@@ -7,20 +7,25 @@
 // vscode dependency).
 //
 // Usage: node dev/pathmap-preview.js [path-to-force-app-main-default]
-// Defaults to the adv-org advanced corpus (Apex + metadata: LWC/Aura/Flow/
-// OmniScript), targeting AcmeOrderUtil.markApproved in the FORWARD
-// (callees) direction -- v0.7.0's A1 forward transaction story (see
-// dev/smoke.js's own FORWARD STORY section): tracing what markApproved
-// calls surfaces the update DML statement fanning out to BOTH the matching
-// '(trigger)' node AND the matching record-triggered flow node (terminal),
-// with the @future email notifier as a sibling third child -- so the
-// preview shows the map mirrored (target on the LEFT, callees flowing
-// RIGHT) with a real trigger+flow+async fan-out, the richest single-node
-// forward shape in the corpus. (Prior versions of this preview targeted
-// AcmeValidationException in the reverse/callers direction -- the v0.5.0
-// "EXCEPTION STORY"; that render is still fully exercised by
-// test-pathmap.js's own self-check, this dev tool just previews the OTHER
-// direction now that both exist.)
+// v0.8.0: defaults to the gauntlet-org corpus, targeting
+// VertexLedgerBridge.postToLedger in the FORWARD (callees) direction --
+// GROUND-TRUTH.md's v0.8-A1 story: the local Billing.charge edge stays
+// exactly as it was pre-v0.8, PLUS two brand-new EXTERNAL (managed-package)
+// terminal leaves appear as siblings -- zenq.Billing (method call) and
+// kwx__Ledger__c (DML object) -- so this is the richest single-node forward
+// shape demonstrating kind='external' rendering (N6: distinct accent,
+// 'managed: <ns>' badge, glossary entry) in the map. opts.ownNamespace is
+// wired from gauntlet-org's own sfdx-project.json (namespace 'vtx'),
+// mirroring extension.js's real discoverPackageMap plumbing, so this preview
+// also proves N3 stripping doesn't accidentally touch this trace (none of
+// its 3 callee children carry ns='vtx').
+// (Prior versions of this preview targeted, in order: AcmeValidationException
+// in the reverse/callers direction -- the v0.5.0 "EXCEPTION STORY" -- then
+// AcmeOrderUtil.markApproved forward on adv-org for v0.7.0's trigger+flow+
+// async fan-out story. Both renders are still fully exercised by
+// test-pathmap.js's own self-check, which is the actual required-green gate
+// for pathmap.js -- this dev tool just previews whichever single shape is
+// most illustrative for the CURRENT round, and is free to move.)
 // metascan.js only runs when ROOT looks like an SFDX force-app default dir
 // (has lwc/aura/flows/omniscripts siblings) — an inz-org-style override
 // still works Apex-only, same as before.
@@ -35,18 +40,30 @@ const resolver = require('../resolver');
 const metascan = require('../metascan');
 const { renderPathMapHtml } = require('../pathmap');
 
-const ROOT = process.argv[2] || '/Users/agent/work/code/example-data/adv-org/force-app/main/default';
+const ROOT = process.argv[2] || '/Users/agent/work/code/example-data/gauntlet-org/force-app/main/default';
 // v0.5.0 (G4): scripts/*.apex lives outside force-app entirely -- same
 // sibling-root shape dev/smoke.js's ADV_ORG_SCRIPTS_ROOT uses. Only
 // consulted when ROOT is left at its adv-org default (an inz-org-style
 // override has no such sibling, same guard smoke.js doesn't need since it
-// hardcodes the adv-org path for this corpus).
+// hardcodes the adv-org path for this corpus). gauntlet-org's own
+// force-app/ has no sibling scripts/ dir, so this is simply a silent no-op
+// (readdirSync throw -> caught below) for the new v0.8.0 default.
 const SCRIPTS_ROOT = path.join(path.dirname(path.dirname(path.dirname(ROOT))), 'scripts');
+// v0.8.0: sfdx-project.json's own `namespace` property, read exactly like
+// extension.js's real discoverPackageMap -> opts.ownNamespace plumbing (N3).
+// Absent/unreadable sfdx-project.json (e.g. an inz-org-style ROOT override
+// with no project file at all) -> null, current pre-v0.8 behavior.
+const PROJECT_ROOT = path.dirname(path.dirname(path.dirname(ROOT)));
+let ownNamespace = null;
+try {
+  const sfdxProject = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'sfdx-project.json'), 'utf8'));
+  ownNamespace = typeof sfdxProject.namespace === 'string' && sfdxProject.namespace.trim() ? sfdxProject.namespace.trim() : null;
+} catch (e) { /* no sfdx-project.json / unreadable / no namespace property -> null */ }
 const OUT_FILE = path.join(__dirname, 'pathmap-preview.html');
 const SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git']);
 const META_SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git', '__tests__']);
 
-const TARGET = { classLower: 'acmeorderutil', methodLower: 'markapproved' };
+const TARGET = { classLower: 'vertexledgerbridge', methodLower: 'posttoledger' };
 
 function walk(dir, out) {
   let entries;
@@ -83,6 +100,7 @@ function walkMeta(dir, out) {
       /\.(cmp|app)$/i.test(e.name) ||
       /\.flow-meta\.xml$/i.test(e.name) ||
       /\.os-meta\.xml$/i.test(e.name) ||
+      /\.md-meta\.xml$/i.test(e.name) ||
       /\.json$/i.test(e.name) ||
       /\.(page|component)$/i.test(e.name)
     ) {
@@ -167,8 +185,9 @@ function main() {
   }
   console.log('Found ' + filePaths.length + ' .cls/.trigger/.apex file(s) (' + anonScriptCount + ' anonymous script(s)).');
 
+  console.log('ownNamespace (from sfdx-project.json): ' + JSON.stringify(ownNamespace));
   const factsList = filePaths.map((p) => parser.parseFile({ path: p, text: fs.readFileSync(p, 'utf8') }));
-  const index = resolver.buildSemanticIndex(factsList);
+  const index = resolver.buildSemanticIndex(factsList, { ownNamespace });
 
   const errCount = factsList.filter((f) => f.parseError).length;
   console.log('Parse errors: ' + errCount + '/' + factsList.length);
@@ -180,8 +199,14 @@ function main() {
   walkMeta(ROOT, metaPaths);
   const metaFiles = metaPaths.map((p) => ({ path: p, text: fs.readFileSync(p, 'utf8') }));
   const metaRefs = computeMetaRefs(metaFiles);
-  resolver.attachMetaCallers(index, metaRefs);
+  // v0.8.0 (N3): mirrors extension.js's real call order -- strip the
+  // workspace's own namespace off metaRefs BEFORE attachMetaCallers.
+  const strippedMetaRefs = ownNamespace && typeof metascan.stripOwnNamespace === 'function'
+    ? metascan.stripOwnNamespace(metaRefs, ownNamespace)
+    : metaRefs;
+  resolver.attachMetaCallers(index, strippedMetaRefs);
   console.log('Found ' + metaPaths.length + ' metadata file(s), ' + metaRefs.length + ' meta ref(s) attached.');
+  console.log('index.stats: ' + JSON.stringify(index.stats));
 
   if (!index.classes.has(TARGET.classLower)) {
     console.error(

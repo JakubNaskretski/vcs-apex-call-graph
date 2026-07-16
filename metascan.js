@@ -13,6 +13,8 @@
 //
 //   scanBundle(files) -> [MetaRef]      // files: [{path, text}]
 //
+//   stripOwnNamespace(refs, ownNamespace) -> [MetaRef]   // v0.8, N3 -- see below
+//
 // v0.4 (F1b/F4b) additions to the MetaRef shape, both purely additive (every
 // pre-existing field/kind keeps its exact v0.3 meaning):
 //
@@ -88,6 +90,67 @@
 //     the bare tail segments happen to match (VALIDATION-REPORT.md Tier-1
 //     #1: `@salesforce/apex/zenq.KappaGateway.dispatch` previously collapsed
 //     onto local `KappaGateway.dispatch`, `via=metadata`, zero gating).
+//
+// v0.8 (N1(c)/N3, namespace/managed-package modeling) additions -- this
+// file's half of the contract only; resolver.js owns attachMetaCallers()
+// routing namespaced refs to external nodes, out of scope here. metascan
+// still has zero knowledge of/dependency on the local workspace's class
+// index -- it only extracts and faithfully preserves the namespace signal,
+// exactly the posture M1 already established for 'lwc' refs.
+//
+//   - kind:'flow' refs gain the same always-present `namespace: string|null`
+//     field 'lwc' refs got in M1, extracted from the <actionName> text two
+//     ways depending on its shape (see splitDottedNamespace/
+//     splitBareNamespace below): a dotted `ns.Class.method` (3+ dot
+//     segments) folds every segment before the trailing Class.method PAIR
+//     into `namespace`, exactly like an LWC specifier; a bare, dot-free
+//     `ns__Class` (managed-object/Invocable-action-name style,
+//     double-underscore separator) splits into `namespace`+`className` with
+//     `methodName` staying null, same shape a local bare actionName already
+//     produced. A bare 1-segment actionName with no `__` (an ordinary local
+//     Invocable class name) and a plain 2-segment `Class.method` (no
+//     namespace prefix at all) are BYTE-IDENTICAL to pre-v0.8 output --
+//     namespace: null in both cases.
+//   - kind:'cmdt' refs gain the same `namespace: string|null` field,
+//     extracted from the identifier-shaped <value> text via the SAME
+//     `ns__Class` double-underscore split Flow's bare form uses (a CMDT
+//     <value> is always a single token -- the pre-existing identifier-shape
+//     gate (APEX_IDENTIFIER_RE) already rejects anything containing a dot,
+//     so the dotted-specifier shape never applies here). `className` becomes
+//     the split local class name (post-namespace-prefix); a value with no
+//     `__` at all is untouched (namespace: null, className verbatim).
+//   - kind:'omniscript' refs from the *.os-meta.xml `<remoteClass>` surface
+//     gain the same `namespace: string|null` field, trying BOTH shapes (a
+//     `<remoteClass>` value contains only a class, never a method -- that
+//     always comes from the paired `<remoteMethod>` element -- so the dotted
+//     form here folds every segment before the trailing SINGLE class segment
+//     into `namespace`, not the trailing pair): `ns.Class` dotted first, then
+//     the `ns__Class` double-underscore form if there's no dot. Deliberately
+//     NOT extended to the OmniScript/IP DataPack *.json `remoteClass` surface
+//     in this amendment (out of stated scope for N1(c) here; flagged as a
+//     follow-up rather than a silent inconsistency) -- extractOmniscriptJson()
+//     is unchanged, byte-identical to pre-v0.8.
+//   - New exported pure function `stripOwnNamespace(refs, ownNamespace)`
+//     (N3's metascan-side stripping hook): given an array of MetaRef (as
+//     returned by parseMetaFile()/scanBundle()) and the workspace's own
+//     declared namespace (the `namespace` property of sfdx-project.json --
+//     absent/empty string means "no stripping", matching N3's documented
+//     no-op for a packageless/unnamespaced workspace), returns a NEW array
+//     where every ref whose `.namespace` case-insensitively equals
+//     `ownNamespace` has `.namespace` reset to `null` (case-insensitive
+//     because every other identifier lookup in this engine family is -- see
+//     A2's `ZENQ.kappagateway.DISPATCH` case-varied probe). `className`/
+//     `methodName` need no further adjustment: this file's own extraction
+//     already separates the namespace prefix from the local class/method
+//     text for every kind that carries a `namespace` field, so once
+//     `namespace` is nulled the ref reads exactly like an ordinary local
+//     reference always would have. Refs with no `namespace` field at all
+//     (aura/vf, or a ref this amendment doesn't touch) pass through
+//     unchanged (same object, not even copied). This function does NOT run
+//     automatically inside parseMetaFile()/scanBundle() -- like `packageOf`,
+//     it is opts-time plumbing the extension is expected to call explicitly
+//     (see the caller's own `opts.ownNamespace`, out of scope here) AFTER
+//     scanning and BEFORE handing refs to resolver.js's attachMetaCallers().
 //
 // Design notes:
 //
@@ -187,6 +250,52 @@ function makeRef(kind, label, className, methodName, text, lineStarts, idx) {
     line: lineForIndex(lineStarts, idx),
     lineText: lineTextForIndex(text, lineStarts, idx),
   };
+}
+
+// --- namespace-splitting helpers (v0.8, N1(c)/N3) ---------------------------
+// Two distinct "this token names something living in a managed namespace"
+// shapes recur across the LWC/Flow/CMDT/OmniScript metadata surfaces:
+//
+//   1. DOTTED — 'ns.Class' / 'ns.Class.method' / 'ns.Outer.Inner.method':
+//      the trailing `tailCount` dot-segment(s) are the "local" part (2 for a
+//      Class.method pair -- LWC specifiers, Flow actionNames; 1 for a
+//      class-only value -- an os-meta remoteClass, which never embeds a
+//      method segment). Every segment before that tail folds into one
+//      dot-joined `namespace` string, verbatim (case preserved -- this
+//      engine never case-normalizes the namespace field, only its lookup
+//      keys). A string with <= tailCount segments has nothing left to fold,
+//      so `namespace` is null (this is the pre-v0.8, pre-M1-even behavior
+//      for a bare 2-segment LWC specifier / Class.method Flow action).
+//   2. DOUBLE-UNDERSCORE — 'ns__Class': the managed-object/API-name-style
+//      convention (no dots at all -- a bare Flow Invocable actionName or a
+//      CMDT <value>). Namespace tokens are constrained to letters+digits
+//      only (a real Salesforce namespace prefix may never itself contain an
+//      underscore), so splitting on the first '__' can never false-positive
+//      on an ordinary custom-object/field-style API name like
+//      'Kappa_Order__c': its internal word-separator underscore stops the
+//      letters-only namespace group short of ever reaching the '__' pair,
+//      so the whole pattern simply fails to match rather than picking a
+//      wrong split point. A token with no '__' anywhere (an ordinary local
+//      identifier) is untouched.
+//
+// Neither helper throws; both degrade to "no namespace" on anything that
+// doesn't fit.
+
+function splitDottedNamespace(dotted, tailCount) {
+  const segs = String(dotted).split('.');
+  if (segs.length <= tailCount) return { namespace: null, tail: segs };
+  return { namespace: segs.slice(0, segs.length - tailCount).join('.'), tail: segs.slice(segs.length - tailCount) };
+}
+
+// Namespace group deliberately excludes '_' -- see the design note above for
+// why that's what keeps this from misfiring on 'Word_Word__c'-style object/
+// field API names.
+const NS_DOUBLE_UNDERSCORE_RE = /^([A-Za-z][A-Za-z0-9]*)__(\w+)$/;
+
+function splitBareNamespace(token) {
+  const m = NS_DOUBLE_UNDERSCORE_RE.exec(String(token));
+  if (!m) return { namespace: null, className: token };
+  return { namespace: m[1], className: m[2] };
 }
 
 // --- LWC -------------------------------------------------------------------
@@ -306,12 +415,33 @@ function extractFlow(path, text, lineStarts, out) {
     const nameMatch = ACTION_NAME_RE.exec(block);
     if (!nameMatch) continue;
     const dotted = nameMatch[1].trim();
-    const segs = dotted.split('.');
-    const className = segs[0];
-    const methodName = segs.length > 1 ? segs.slice(1).join('.') : null;
+    // v0.8 (N1(c)): a dotted actionName ('Class.method', or namespaced
+    // 'ns.Class.method'/'ns.Outer.Inner.method') keeps its pre-existing
+    // 2-segment meaning (className/methodName = the trailing pair) and
+    // additionally folds any segment(s) before that pair into `namespace`,
+    // same convention M1 already gave LWC specifiers. A bare, dot-free
+    // actionName (single segment -- an @InvocableMethod-style action named
+    // by class alone) is checked for the managed-object-style 'ns__Class'
+    // double-underscore convention instead; an ordinary local bare
+    // actionName (no '__') is untouched.
+    let className;
+    let methodName;
+    let namespace;
+    if (dotted.indexOf('.') !== -1) {
+      const split = splitDottedNamespace(dotted, 2);
+      namespace = split.namespace;
+      className = split.tail[0];
+      methodName = split.tail.length > 1 ? split.tail.slice(1).join('.') : null;
+    } else {
+      const split = splitBareNamespace(dotted);
+      namespace = split.namespace;
+      className = split.className;
+      methodName = null;
+    }
     const blockStart = bm.index + ACTION_CALLS_OPEN_TAG.length;
     const idx = blockStart + nameMatch.index;
     const ref = makeRef('flow', label, className, methodName, text, lineStarts, idx);
+    ref.namespace = namespace;
     ref.flowObject = start.flowObject;
     ref.flowRecordTriggerType = start.flowRecordTriggerType;
     ref.flowTriggerType = start.flowTriggerType;
@@ -339,14 +469,30 @@ function extractOmniscriptXml(path, text, lineStarts, out) {
   REMOTE_CLASS_XML_RE.lastIndex = 0;
   let cm;
   while ((cm = REMOTE_CLASS_XML_RE.exec(text))) {
-    const className = cm[1].trim();
+    const rawClassName = cm[1].trim();
     const afterIdx = cm.index + cm[0].length;
     REMOTE_METHOD_XML_RE.lastIndex = afterIdx;
     const mm = REMOTE_METHOD_XML_RE.exec(text);
     if (!mm) continue;
     const methodName = mm[1].trim();
     const idx = mm.index;
-    out.push(makeRef('omniscript', label, className, methodName, text, lineStarts, idx));
+    // v0.8 (N1(c)): a namespaced <remoteClass> value carries its namespace
+    // either dotted ('ns.Class', the same convention a namespaced Apex
+    // class is referenced by everywhere else in this file -- LWC/Flow
+    // above) or as the managed-object-style 'ns__Class' double-underscore
+    // form (Flow's/CMDT's bare-identifier convention above). An ordinary
+    // unqualified <remoteClass> (no dot, no '__') matches neither and is
+    // byte-identical to pre-v0.8 output: namespace null, className verbatim.
+    let split;
+    if (rawClassName.indexOf('.') !== -1) {
+      const dotted = splitDottedNamespace(rawClassName, 1);
+      split = { namespace: dotted.namespace, className: dotted.tail[0] };
+    } else {
+      split = splitBareNamespace(rawClassName);
+    }
+    const ref = makeRef('omniscript', label, split.className, methodName, text, lineStarts, idx);
+    ref.namespace = split.namespace;
+    out.push(ref);
   }
 }
 
@@ -451,7 +597,13 @@ function extractCmdt(path, text, lineStarts, out) {
     const fieldName = fieldMatch ? fieldMatch[1].trim() : null;
     const blockStart = bm.index + CMDT_VALUES_OPEN_TAG.length;
     const idx = blockStart + valueMatch.index;
-    const ref = makeRef('cmdt', label, rawValue, null, text, lineStarts, idx);
+    // v0.8 (N1(c)): APEX_IDENTIFIER_RE already rejects anything containing a
+    // dot, so a CMDT <value> only ever needs the managed-object-style
+    // 'ns__Class' double-underscore split -- an ordinary local value (no
+    // '__') is untouched (namespace: null, className verbatim).
+    const split = splitBareNamespace(rawValue);
+    const ref = makeRef('cmdt', label, split.className, null, text, lineStarts, idx);
+    ref.namespace = split.namespace;
     ref.fieldName = fieldName;
     out.push(ref);
   }
@@ -608,4 +760,50 @@ function scanBundle(files) {
   return out;
 }
 
-module.exports = { parseMetaFile, scanBundle };
+/**
+ * stripOwnNamespace(refs, ownNamespace) -> [MetaRef]
+ *
+ * N3's metascan-side own-namespace stripping hook. Pure and side-effect-free:
+ * never mutates `refs` or any ref inside it, always returns a fresh array
+ * (or the exact input, untouched, on the no-op paths below).
+ *
+ * `ownNamespace` is the workspace's own declared namespace -- the `namespace`
+ * property of sfdx-project.json, exactly as the extension is expected to
+ * read and plumb it through (mirroring how `packageOf` is built fresh from
+ * sfdx-project.json and handed to resolver.js as opts). An absent/empty/
+ * non-string `ownNamespace` means "no stripping" (N3: "Absent/empty
+ * namespace property -> no stripping, current behavior") -- `refs` is
+ * returned completely unchanged (the exact same array reference).
+ *
+ * For every ref whose `.namespace` field case-insensitively equals
+ * `ownNamespace` (case-insensitive: Apex/Salesforce identifiers are, same as
+ * every other lookup in this engine family), returns a NEW ref object with
+ * `.namespace` reset to `null` -- this file's own extraction already split
+ * the namespace prefix out of `className`/`methodName` for every kind that
+ * carries a `namespace` field, so nulling it is the entire fix: the ref now
+ * reads exactly like an always-local reference would have. Every other ref
+ * (non-matching namespace, or no `namespace` field at all -- aura/vf, or any
+ * kind this amendment doesn't touch) passes through as the SAME object
+ * (never copied), so callers that rely on reference identity for refs this
+ * function doesn't touch are unaffected.
+ *
+ * This does not run automatically inside parseMetaFile()/scanBundle() (that
+ * would require plumbing sfdx-project.json awareness into a file with zero
+ * fs/vscode dependencies, breaking this module's frozen contract) -- the
+ * caller (extension.js, out of scope here, via its own opts.ownNamespace) is
+ * expected to call this explicitly, once, over the full ref list, AFTER
+ * scanning and BEFORE handing refs to resolver.js's attachMetaCallers().
+ */
+function stripOwnNamespace(refs, ownNamespace) {
+  if (!Array.isArray(refs)) return refs;
+  const own = typeof ownNamespace === 'string' ? ownNamespace.trim() : '';
+  if (!own) return refs;
+  const ownLower = own.toLowerCase();
+  return refs.map((ref) => {
+    if (!ref || typeof ref.namespace !== 'string' || ref.namespace === '') return ref;
+    if (ref.namespace.toLowerCase() !== ownLower) return ref;
+    return Object.assign({}, ref, { namespace: null });
+  });
+}
+
+module.exports = { parseMetaFile, scanBundle, stripOwnNamespace };

@@ -107,12 +107,48 @@
 //   already does. It is idempotent: re-applying refineTargets() to its own
 //   suffixed output never double-appends the same suffix (mirroring
 //   ctorLabel's ALREADY_RELABELED_RE guard above).
+//
+// v0.8 / N4/N6 contract addition (additive, forward-compat -- resolver.js
+// does not produce external-target items yet, a different phase's job; see
+// the CONTRACT AMENDMENTS' own N1/N2/N4 text): each input item MAY now also
+// carry an optional `kind` field -- mirroring TNode.kind's new 'external'
+// value (v0.8 N1) -- once resolver.js's suggestTargets() lands its N4
+// addition ("suggestTargets includes externals that have >=1 local ref").
+// This file reacts to it exactly the way it already reacts to the optional
+// `package` field (B3, above): an item with NO `kind` property at all
+// (today's shape, and every pre-v0.8 fixture in test-targets.js) is
+// COMPLETELY untouched -- no code path here even looks at `item.kind`
+// unless it's present, so a resolver.js that hasn't landed the N4 change
+// yet keeps this file byte-identical to pre-v0.8 output.
+//
+//   When an item's `kind === 'external'`, its (post steps 1-3) label gets a
+//   ' (managed)' suffix appended -- per N4's CONTRACT AMENDMENT text
+//   ("suggestTargets includes externals ... labeled 'zenq.Billing
+//   (managed)')") and N6's own text ("QuickPick '(managed)' suffix
+//   entries") -- idempotent (mirrors ctorLabel's ALREADY_RELABELED_RE
+//   guard), applied in the SAME per-item pass as rule 2's constructor
+//   relabel, so it participates correctly in rule 3's dedupe key and rule
+//   4's final re-sort exactly like every other label transform here.
+//   `kind` itself is carried through onto the output item (mirroring how
+//   `package` is carried through) whenever the source item had one, so a
+//   downstream caller (extension.js's buildSuggestPicks, wiring left for
+//   that file's own owner to land -- see targets.js's established
+//   INTEGRATION NOTE convention above) can distinguish an external pick
+//   from a local one without re-deriving it from the suffixed label text.
+//
+//   External items never carry a `package` field in N4's design (they are
+//   not local files living under an sfdx package directory), so this never
+//   interacts with rule 3's B3 duplicate-package suffixing pass -- the two
+//   suffixes are independent and never compound in practice.
 
 const CTOR_METHOD = '<init>';
 const FIELD_INIT_METHOD = '(init)';
 const CTOR_SUFFIX_RE = /\.?<init>\s*$/;
 const ALREADY_RELABELED_RE = / \(constructor\)$/;
 const LEFTOVER_CTOR_TOKEN_RE = /<init>/;
+// v0.8 (N4/N6): exact suffix text per N4/N6's CONTRACT AMENDMENT text.
+const MANAGED_SUFFIX = ' (managed)';
+const ALREADY_MANAGED_RE = / \(managed\)$/;
 
 function isPlainTargetItem(item) {
   return (
@@ -136,6 +172,15 @@ function ctorLabel(rawLabel) {
   return stripped + ' (constructor)';
 }
 
+// v0.8 (N4/N6): 'zenq.Billing' -> 'zenq.Billing (managed)'. Idempotent
+// (calling it again on an already-suffixed string is a no-op), same
+// convention as ctorLabel above.
+function managedLabel(rawLabel) {
+  const s = typeof rawLabel === 'string' ? rawLabel : '';
+  if (ALREADY_MANAGED_RE.test(s)) return s;
+  return s + MANAGED_SUFFIX;
+}
+
 function refineTargets(list) {
   if (!Array.isArray(list)) return [];
 
@@ -151,7 +196,18 @@ function refineTargets(list) {
     if (methodLower === FIELD_INIT_METHOD) continue;
 
     // Rule 2: relabel the merged-constructor synthetic method.
-    const label = methodLower === CTOR_METHOD ? ctorLabel(item.label) : item.label;
+    let label = methodLower === CTOR_METHOD ? ctorLabel(item.label) : item.label;
+
+    // v0.8 (N4/N6): a suggestTargets entry for an external (managed-package)
+    // target gets a ' (managed)' suffix -- see the header comment above for
+    // the full contract. Applied right after rule 2's constructor relabel,
+    // BEFORE the dedupe key below is built, so it participates correctly in
+    // rule 3's dedupe/rule 4's sort exactly like the constructor relabel
+    // does. `item.kind` is read directly (not defaulted) -- absent on every
+    // pre-v0.8 item, which is what keeps this a complete no-op until
+    // resolver.js's owner actually starts stamping kind:'external' on
+    // suggestTargets() output.
+    if (item.kind === 'external') label = managedLabel(label);
 
     // v0.7 / B3: only items whose SOURCE actually carried a 'package'
     // property participate in package-aware dedupe/suffixing below --
@@ -174,6 +230,12 @@ function refineTargets(list) {
 
     const outItem = { label, classLower: item.classLower, methodLower };
     if (hasPkg) outItem.package = pkg;
+    // v0.8 (N4/N6): carry `kind` through onto the output item, same
+    // "only when the source actually had it" convention as `package`
+    // above -- see the header comment's INTEGRATION NOTE for why this file
+    // stops at carrying the field through rather than wiring it into
+    // extension.js's `target` object itself.
+    if (typeof item.kind === 'string' && item.kind) outItem.kind = item.kind;
     out.push(outItem);
   }
 

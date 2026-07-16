@@ -19,6 +19,8 @@ const {
   shapeHeaderLines,
   effectiveOrientation,
   rerootEntryFirst,
+  externalNamespace,
+  managedBadge,
 } = require('./uitree');
 
 // --- labelForNode: approximate '~' prefix ---
@@ -1529,6 +1531,155 @@ assert.deepStrictEqual(
     '1 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).',
   ],
   'entry-first header line slots between the note and the stats lines'
+);
+
+// =========================================================================
+// v0.8 (N1/N4/N6, forward-compat): kind:'external' rendering.
+// resolver.js does not produce this kind yet (a different phase's job, see
+// the CONTRACT AMENDMENTS' own N1/N2/N4/N5 text) -- exactly the same
+// forward-compat status seenElsewhere/duplicateNames/metaUnresolved had
+// when their rendering support first landed here, so every fixture below is
+// hand-built against the documented shape rather than produced by a real
+// resolver.js run.
+// =========================================================================
+
+// --- iconForNode: kind:'external' gets its own icon, ahead of isTest/entries ---
+assert.strictEqual(iconForNode({ kind: 'external', isTest: false, entries: [] }), 'package');
+assert.strictEqual(
+  iconForNode({ kind: 'external', isTest: true, entries: ['managed'] }),
+  'package',
+  'external wins over isTest/entries, same tier as exception/unresolved'
+);
+
+// --- externalNamespace: reads node.ns first, falls back to deriving from label ---
+assert.strictEqual(externalNamespace({ kind: 'external', ns: 'zenq', label: 'zenq.Billing' }), 'zenq');
+assert.strictEqual(
+  externalNamespace({ kind: 'external', label: 'zenq.Billing' }),
+  'zenq',
+  'no explicit ns -> derived from the dotted label (ns.Class shape)'
+);
+assert.strictEqual(
+  externalNamespace({ kind: 'external', label: 'kwx__Ledger__c' }),
+  'kwx',
+  'no explicit ns -> derived from a dunder-namespaced object label'
+);
+assert.strictEqual(externalNamespace({ kind: 'method', ns: 'zenq', label: 'zenq.Billing' }), null, 'non-external kind never yields a namespace, even with an ns field present');
+assert.strictEqual(externalNamespace({ kind: 'external', label: 'NoNamespaceHere' }), null, 'external node with an undecorated label has no derivable namespace');
+assert.strictEqual(externalNamespace(null), null, 'defensive: null node -> null');
+assert.strictEqual(externalNamespace({ kind: 'external', ns: '', label: 'zenq.Billing' }), 'zenq', 'empty-string ns falls back to label derivation rather than short-circuiting to null');
+
+// --- managedBadge: exact 'managed: <ns>' wording per N4 ---
+assert.strictEqual(managedBadge({ kind: 'external', ns: 'zenq', label: 'zenq.Billing' }), 'managed: zenq');
+assert.strictEqual(managedBadge({ kind: 'external', label: 'kwx__Ledger__c' }), 'managed: kwx');
+assert.strictEqual(managedBadge({ kind: 'method', label: 'Foo.bar' }), null, 'no badge for a non-external node');
+assert.strictEqual(managedBadge({ kind: 'external', label: 'NoNamespaceHere' }), null, 'no badge when no namespace is derivable');
+
+// --- badgesForNode: managed badge slots right after via, ahead of pkgBadge/~/cycle/capped ---
+assert.deepStrictEqual(
+  badgesForNode({ kind: 'external', ns: 'zenq', label: 'zenq.Billing', via: 'external', entries: [], isTest: false }),
+  ['external', 'managed: zenq'],
+  'managed badge follows the via badge'
+);
+assert.deepStrictEqual(
+  badgesForNode({ kind: 'external', ns: 'kwx', label: 'kwx__Ledger__c', via: 'external', caughtHere: false, isTest: true, cyclic: true, truncated: true }, '(nova-billing)'),
+  ['test', 'external', 'managed: kwx', '(nova-billing)', '↺ cycle', '… capped'],
+  'managed badge sits between via and the (unrelated, coincidental) package badge, full combination'
+);
+assert.deepStrictEqual(
+  badgesForNode({ kind: 'method', via: 'typed', entries: [] }),
+  ['typed'],
+  'regression: an ordinary non-external node never gains a managed badge'
+);
+
+// --- tooltip / glossary (via shapeNode, same pattern as every other via
+// glossary assertion above): via:'external' surfaces the exact N4 wording ---
+assert(
+  shapeNode({ kind: 'external', ns: 'zenq', label: 'zenq.Billing', via: 'external', path: null, children: [], sites: [] }).tooltip.includes(
+    'external: managed package code — source not analyzable'
+  ),
+  'the external via glossary line uses the exact N4-specified tooltip text'
+);
+
+// =========================================================================
+// v0.8 (N5, forward-compat): shapeHeaderLines' combined
+// 'N unresolved · M managed-package refs (ns1, ns2)' line.
+// =========================================================================
+
+// externalRefs > 0, no namespaces list -> still renders (defensive, no crash).
+assert.deepStrictEqual(
+  shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { unresolvedSites: 3, externalRefs: 2 } }),
+  ['3 unresolved · 2 managed-package refs.'],
+  'externalRefs > 0 with no externalNamespaces list still renders (no namespace parenthetical)'
+);
+
+// The exact CONTRACT-quoted example: 'N unresolved · M managed-package refs (zenq, kwx)'.
+assert.deepStrictEqual(
+  shapeHeaderLines({
+    root: {},
+    targetLabel: 'x',
+    note: null,
+    stats: { unresolvedSites: 4, externalRefs: 7, externalNamespaces: ['zenq', 'kwx'] },
+  }),
+  ['4 unresolved · 7 managed-package refs (zenq, kwx).'],
+  'N5: exact CONTRACT-pinned combined wording'
+);
+
+// Singular 'ref' wording for externalRefs === 1.
+assert.deepStrictEqual(
+  shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { unresolvedSites: 0, externalRefs: 1, externalNamespaces: ['zenq'] } }),
+  ['0 unresolved · 1 managed-package ref (zenq).'],
+  'singular "ref" for externalRefs === 1, and unresolvedSites:0 still renders "0 unresolved"'
+);
+
+// unresolvedSites absent entirely (not just 0) alongside externalRefs -> defensive '0 unresolved'.
+assert.deepStrictEqual(
+  shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { externalRefs: 3, externalNamespaces: ['kwx'] } }),
+  ['0 unresolved · 3 managed-package refs (kwx).'],
+  'missing unresolvedSites alongside a real externalRefs count still renders cleanly'
+);
+
+// REGRESSION: externalRefs absent (every pre-v0.8 fixture, and the whole
+// adv-org corpus per the v0.8 REGRESSION POLICY) -> the OLD unresolvedSites
+// line, byte-identical to pre-v0.8, exactly like the pre-existing assertion
+// higher up in this file pins.
+assert.deepStrictEqual(
+  shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { nodes: 1, uniqueMethods: 1, capped: false, unresolvedSites: 3 } }),
+  ['3 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).'],
+  'REGRESSION: externalRefs absent -> unresolvedSites keeps its exact pre-v0.8 wording'
+);
+// REGRESSION: externalRefs explicitly 0 -> same untouched old wording, not
+// the new combined line (a workspace that HAS namespace support wired up
+// but genuinely has zero managed-package refs must render identically to a
+// workspace with no namespace support at all).
+assert.deepStrictEqual(
+  shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { unresolvedSites: 5, externalRefs: 0, externalNamespaces: [] } }),
+  ['5 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).'],
+  'REGRESSION: externalRefs === 0 -> old unresolvedSites wording, not the new combined line'
+);
+// Neither unresolvedSites nor externalRefs fire -> no line at all.
+assert.deepStrictEqual(
+  shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { unresolvedSites: 0, externalRefs: 0 } }),
+  [],
+  'both zero -> no header line, exactly like the pre-v0.8 zero case'
+);
+
+// Combines correctly with duplicateNames/capped/metaUnresolved, in the
+// established fixed ordering (duplicateNames, capped, unresolved-line,
+// metaUnresolved).
+assert.deepStrictEqual(
+  shapeHeaderLines({
+    root: {},
+    targetLabel: 'x',
+    note: null,
+    stats: { duplicateNames: 1, capped: true, unresolvedSites: 2, externalRefs: 3, externalNamespaces: ['zenq'], metaUnresolved: 1 },
+  }),
+  [
+    "1 duplicate class names across packages — resolution prefers the referring file's package",
+    'Result capped -- not every caller could be expanded.',
+    '2 unresolved · 3 managed-package refs (zenq).',
+    '1 metadata reference could not be attached (ambiguous or unmatched namespace).',
+  ],
+  'N5 combined line slots into the existing fixed header-line ordering without disturbing the other stat lines'
 );
 
 console.log('apex-trace uitree self-check: all assertions passed');

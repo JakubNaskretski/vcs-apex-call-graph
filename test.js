@@ -1246,19 +1246,35 @@ function findChild(tree, label) {
   // unresolvedSites stat is global to the index, not per-trace), which
   // surfaces here too as a second header line -- itself a real H4 behavior
   // worth pinning, not noise to suppress.
-  // v0.7.1: was pinned at 1 pre-round; the new Ns071Caller.probe() fixture
-  // below (R1 e2e) deliberately adds exactly one more real unresolved site
-  // (the namespaced zenq.Ns071Target.run() reference) -- see that fixture's
-  // own header note for why this pin had to move, not stay suppressed.
-  assert.strictEqual(tree.stats.unresolvedSites, 2, 'sanity: this corpus has exactly 2 real unresolved call sites elsewhere (see resolver.js contract -- global to the index)');
-  assert.strictEqual(headerLines.length, 2, 'note + the workspace-wide unresolved-sites line');
-  assert.strictEqual(headerLines[1], '2 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).');
+  // v0.7.1: was pinned at 1 pre-round; the Ns071Caller.probe() fixture below
+  // (R1 e2e) used to add exactly one more real unresolved site (the
+  // namespaced zenq.Ns071Target.run() reference), pinning this at 2.
+  // v0.8/N1(a)/N2: that reference is now a 3-segment dotted call whose Head
+  // ('zenq') is not a local var/class -- it is promoted to an EXTERNAL node
+  // (zenq.Ns071Target, method run) per REGRESSION POLICY category (a)
+  // ("references previously counted unresolved/metaUnresolved that match N1
+  // shapes become external edges/nodes"). It is therefore REMOVED from the
+  // unresolved tally (N5) and this pin moves back down to 1 (the original,
+  // pre-R1 contributor -- see that fixture's own comment above, still
+  // unaffected by v0.8 since it is a denylisted System.debug(...) body, not
+  // a namespaced call). The reference is NOT silently dropped, though: it
+  // now surfaces via the NEW externalRefs/externalNamespaces half of this
+  // same header line (N5) instead of the plain unresolved-count sentence.
+  assert.strictEqual(tree.stats.unresolvedSites, 1, 'sanity: this corpus has exactly 1 real unresolved call site elsewhere (see resolver.js contract -- global to the index); zenq.Ns071Target.run() moved to externalRefs under v0.8');
+  assert.strictEqual(tree.stats.externalRefs, 1, 'v0.8/N5: zenq.Ns071Target.run() is the corpus\'s one managed-package (external) reference');
+  assert.deepStrictEqual(tree.stats.externalNamespaces, ['zenq'], 'v0.8/N5: externalNamespaces lists the one namespace this corpus references');
+  assert.strictEqual(headerLines.length, 2, 'note + the workspace-wide unresolved/managed-package line');
+  assert.strictEqual(headerLines[1], '1 unresolved · 1 managed-package ref (zenq).', 'v0.8/N5: header now shows BOTH counts on one line once externalRefs > 0, per uitree.js shapeHeaderLines');
 }
 
-// --- v0.7.1/R1 e2e: namespaced-reference honesty -------------------------
+// --- v0.7.1/R1 e2e (superseded by v0.8/N1/N2, see below): namespaced-----
+// reference honesty -- still true, for a different reason ------------------
 {
   // No edge to the unrelated local class of the same bare tail: the
-  // namespace-qualified reference must never fabricate a caller.
+  // namespace-qualified reference must never fabricate a caller. Pre-v0.8
+  // this was "unresolved, but counted"; post-v0.8 it is "external, and
+  // counted differently" (see the H4 block immediately above) -- the "zero
+  // false edge onto the local class" guarantee itself is unchanged.
   const targetTree = callers('ns071target', 'run');
   assert.deepStrictEqual(targetTree.root.children, [], 'R1 e2e: zenq.Ns071Target.run() must NOT collapse onto the local Ns071Target.run -- zero callers, not a fabricated static edge');
   assert.strictEqual(
@@ -1266,10 +1282,16 @@ function findChild(tree, label) {
     'No callers found — this is likely an entry point or unused code.',
     'R1 e2e: the honest H4 note fires exactly as it would for a genuinely uncalled method -- the namespaced reference leaves no trace of a false edge'
   );
-  // And it IS counted (a real, out-of-scope gap, not silently invisible):
-  // already pinned end-to-end via the H4 block's updated unresolvedSites=2
-  // assertion immediately above, which this fixture is the second
-  // contributor to.
+  // v0.8/N1(a)/N4: the reference now has a POSITIVE landing spot -- the
+  // external node 'zenq.Ns071Target' -- tracing THAT as a caller-direction
+  // target must surface Ns071Caller.probe as a local referencing site.
+  const externalTree = callers('zenq.ns071target', null);
+  assert.strictEqual(externalTree.root.kind, 'external', 'v0.8/N4: tracing the external node itself yields a root of kind=external');
+  assert.strictEqual(externalTree.root.label, 'zenq.Ns071Target', 'v0.8/N4: external root label is the ns.className pair');
+  const nsCaller = findChild(externalTree, 'Ns071Caller.probe');
+  assert.ok(nsCaller, 'v0.8/N4: the external node\'s caller tree includes the local Ns071Caller.probe referencing site');
+  assert.strictEqual(nsCaller.via, 'external', "v0.8/N2 step 3: the edge into the external node is labeled via='external'");
+  assert.strictEqual(nsCaller.approximate, false, 'v0.8/N2: an external edge is NOT approximate -- it is a confident (namespace-precedence) resolution, not a guess');
 }
 
 // --- v0.7.1/R4 e2e: template-method hook callers via override fan-out ----
@@ -1586,6 +1608,104 @@ const pkgIndex = resolver.buildSemanticIndex(pkgFiles, { packageOf: pkgPackageOf
   for (const c of treeNoOpts.root.children) {
     assert.strictEqual(c.via, 'static', "B5 e2e: via stays 'static' -- 'ambiguous' must never appear when packageOf is inactive");
   }
+}
+
+// =========================================================================
+// v0.8/N1/N2/N4 e2e: external-node story, forward direction. A local
+// service calls into a managed namespace (zenq.Billing.charge) -- the
+// callee-direction trace must show a TERMINAL external leaf (kind
+// 'external'), and (mirroring the H4/R1 block far above, which already
+// pins the REVERSE direction via the Ns071 fixtures) tracing that SAME
+// external node as a caller-direction root target must list the local
+// caller. Built as its OWN isolated fixture set/index (like pkgFiles/
+// pkgIndex above) so it cannot perturb the main corpus's pinned
+// unresolvedSites/externalRefs counts.
+// =========================================================================
+const v08Files = [];
+function addV08File(relPath, text) {
+  const p = '/v08ws/' + relPath;
+  v08Files.push(parser.parseFile({ path: p, text }));
+}
+addV08File('classes/V08BillingCaller.cls', [
+  'public class V08BillingCaller {',
+  '  public void runBilling(Decimal amount) {',
+  '    zenq.Billing.charge(amount);',
+  '  }',
+  '}',
+].join('\n'));
+const v08Index = resolver.buildSemanticIndex(v08Files);
+
+{
+  // Forward (callee) direction: local service -> zenq.Billing.charge
+  // external TERMINAL leaf. (parser.js's own dot-chain shape emits a SECOND,
+  // unrelated 'prop'-kind pseudo-call for the same source line -- e.g. a
+  // property-style get on 'zenq' -- which resolver.js aggregates into the
+  // ordinary "N unresolved sites" leaf; this is pre-existing chained-
+  // expression behavior confirmed live against the real gauntlet-org corpus
+  // (VertexLedgerBridge.postToLedger's own callee tree shows the same
+  // pattern), unrelated to v0.8, so this e2e only pins the EXTERNAL child.)
+  const calleeTree = resolver.buildCalleeTree(v08Index, { classLower: 'v08billingcaller', methodLower: 'runbilling' }, {});
+  const extChild = calleeTree.root.children.find((c) => c.kind === 'external');
+  assert.ok(extChild, 'v0.8/N4 e2e: V08BillingCaller.runBilling has a forward external-node child');
+  assert.strictEqual(extChild.kind, 'external', 'v0.8/N4: the forward child is kind=external');
+  assert.strictEqual(extChild.label, 'zenq.Billing', 'v0.8/N1(a): external node label is the ns.className pair');
+  assert.strictEqual(extChild.via, 'external', "v0.8/N2 step 3: edge into the external is via='external'");
+  assert.strictEqual(extChild.approximate, false, 'v0.8/N2: external edges are confident, not approximate');
+  assert.deepStrictEqual(extChild.children, [], 'v0.8/N4: an external node is TERMINAL in the callees direction -- no source to recurse into');
+
+  // Reverse (caller) direction, rooted directly AT the external node:
+  // tracing 'zenq.billing' as a target must return the local referencing
+  // site as a normal caller-tree node above it.
+  const externalCallerTree = resolver.buildCallerTree(v08Index, { classLower: 'zenq.billing', methodLower: null }, {});
+  assert.strictEqual(externalCallerTree.root.kind, 'external', 'v0.8/N4 e2e: tracing the external node as a target yields kind=external at the root');
+  assert.strictEqual(externalCallerTree.root.label, 'zenq.Billing');
+  assert.strictEqual(externalCallerTree.root.children.length, 1, 'v0.8/N4 e2e: exactly one local referencing site (caller) above the external root');
+  assert.strictEqual(externalCallerTree.root.children[0].label, 'V08BillingCaller.runBilling', "v0.8/N4 e2e: 'its callers are all local referencing sites -- full normal caller tree above them'");
+}
+
+// =========================================================================
+// v0.8/N3 e2e: own-namespace local resolution. A workspace whose OWN
+// declared namespace (opts.ownNamespace, mirroring sfdx-project.json's
+// `namespace` property via extension.js) matches the prefix of a dotted
+// receiver/DML-object token must resolve LOCALLY (prefix stripped before
+// resolution), never create an external node for its own namespace. Own
+// isolated fixture set/index, deliberately reusing the SAME v08Files
+// source text with a DIFFERENT opts.ownNamespace -- pins that ownNamespace
+// is a pure per-buildSemanticIndex-call opt, not global state.
+// =========================================================================
+{
+  const v08NsFiles = [];
+  const addNsFile = (relPath, text) => v08NsFiles.push(parser.parseFile({ path: '/v08nsws/' + relPath, text }));
+  addNsFile('classes/AcmeOwnNsTarget.cls', [
+    'public class AcmeOwnNsTarget {',
+    '  public static void doWork() { System.debug(\'own-ns local target\'); }',
+    '}',
+  ].join('\n'));
+  addNsFile('classes/AcmeOwnNsCaller.cls', [
+    'public class AcmeOwnNsCaller {',
+    '  public void call() {',
+    '    acme.AcmeOwnNsTarget.doWork();',
+    '  }',
+    '}',
+  ].join('\n'));
+
+  const ownNsIndex = resolver.buildSemanticIndex(v08NsFiles, { ownNamespace: 'acme' });
+  assert.strictEqual(ownNsIndex.stats.externalRefs, 0, 'v0.8/N3 e2e: the own-namespace-prefixed reference resolves locally -- zero external refs, not one');
+  assert.deepStrictEqual(ownNsIndex.stats.externalNamespaces, [], 'v0.8/N3 e2e: the workspace\'s own namespace never appears as an external namespace');
+
+  const ownNsTree = resolver.buildCallerTree(ownNsIndex, { classLower: 'acmeownnstarget', methodLower: 'dowork' }, {});
+  assert.strictEqual(ownNsTree.root.children.length, 1, 'v0.8/N3 e2e: acme.AcmeOwnNsTarget.doWork() resolves as ONE local caller edge, not zero (and not an external)');
+  assert.strictEqual(ownNsTree.root.children[0].label, 'AcmeOwnNsCaller.call');
+  assert.strictEqual(ownNsTree.root.children[0].via, 'static', 'v0.8/N3: post-strip, this is an ordinary local static call -- via stays \'static\', never \'external\'');
+
+  // Negative control: building the IDENTICAL source WITHOUT opts.ownNamespace
+  // must treat 'acme' as a foreign namespace token instead -- external node,
+  // not a local edge. Proves the v0.8/N3 fixture above is actually exercising
+  // the stripping path, not some unrelated always-resolves-locally rule.
+  const noOwnNsIndex = resolver.buildSemanticIndex(v08NsFiles);
+  const noOwnNsTree = resolver.buildCallerTree(noOwnNsIndex, { classLower: 'acmeownnstarget', methodLower: 'dowork' }, {});
+  assert.deepStrictEqual(noOwnNsTree.root.children, [], 'v0.8/N3 negative control: WITHOUT opts.ownNamespace, acme.AcmeOwnNsTarget.doWork() must NOT resolve locally');
+  assert.ok(noOwnNsIndex.externals instanceof Map && noOwnNsIndex.externals.has('acme.acmeownnstarget'), 'v0.8/N3 negative control: without ownNamespace, the SAME reference becomes an external node instead');
 }
 
 console.log('apex-trace end-to-end self-check: all assertions passed');

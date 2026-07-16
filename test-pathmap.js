@@ -23,6 +23,8 @@ const {
   layoutTree,
   isRootNode,
   packageBadge,
+  externalNamespace,
+  managedBadge,
   directionHeaderLine,
   headerExtraLinesForResult,
 } = require('./pathmap');
@@ -1447,6 +1449,90 @@ check(typeof renderPathMapHtml({ root: baseNode({ label: 'Lonely.target' }), tar
 check(
   typeof renderPathMapHtml({ root: null, targetLabel: 'Missing.thing', note: null, direction: 'callees' }) === 'string',
   'v0.7: missing-root callees-direction TreeResult renders without throwing'
+);
+
+// =========================================================================
+// v0.8 (N1/N4/N6, forward-compat): kind:'external' rendering. Mirrors
+// test-uitree.js's matching N6 section -- resolver.js does not produce this
+// kind yet (a different phase's job), so every fixture below is hand-built
+// against the documented shape.
+// =========================================================================
+
+// --- accentKind: 'external' gets its own bucket, ahead of entry/test ---
+check(accentKind({ kind: 'external', entries: [], isTest: false }) === 'external', "kind:'external' gets the 'external' accent");
+check(
+  accentKind({ kind: 'external', entries: ['managed'], isTest: true }) === 'external',
+  'external wins over entries/isTest, same tier as exception/unresolved'
+);
+
+// --- externalNamespace / managedBadge: mirror uitree.js's helpers exactly ---
+check(externalNamespace({ kind: 'external', ns: 'zenq', label: 'zenq.Billing' }) === 'zenq', 'ns field read directly when present');
+check(externalNamespace({ kind: 'external', label: 'zenq.Billing' }) === 'zenq', 'namespace derived from a dotted label when ns is absent');
+check(externalNamespace({ kind: 'external', label: 'kwx__Ledger__c' }) === 'kwx', 'namespace derived from a dunder-namespaced object label');
+check(externalNamespace({ kind: 'method', ns: 'zenq', label: 'zenq.Billing' }) === null, 'non-external kind never yields a namespace');
+check(externalNamespace({ kind: 'external', label: 'Plain' }) === null, 'no derivable namespace -> null');
+check(managedBadge({ kind: 'external', ns: 'zenq', label: 'zenq.Billing' }) === 'managed: zenq', "exact 'managed: <ns>' wording");
+check(managedBadge({ kind: 'method', label: 'Foo.bar' }) === null, 'no badge for a non-external node');
+
+// --- end-to-end via renderPathMapHtml: external node serializes with the
+//     'external' kind/accent, a 'managed: <ns>' badge, and the legend/CSS
+//     document the new bucket unconditionally. ---
+const externalChild = baseNode({
+  label: 'zenq.Billing',
+  kind: 'external',
+  ns: 'zenq',
+  via: 'external',
+  entries: [],
+  children: [],
+  sites: [],
+});
+const externalTarget = baseNode({ label: 'OppService.applyDiscount', children: [externalChild] });
+const htmlExternal = renderPathMapHtml({ root: externalTarget, targetLabel: 'OppService.applyDiscount', note: null });
+check(htmlExternal.includes('"kind":"external"'), "v0.8: 'external' node kind serialized");
+check(htmlExternal.includes('"accent":"external"'), 'external node gets its own accent bucket');
+check(htmlExternal.includes('"via":"external"'), "v0.8: 'external' via label present");
+check(htmlExternal.includes('"badges":["managed: zenq"]'), "v0.8 N4: exact 'managed: zenq' badge serialized");
+check(htmlExternal.includes('"ns":"zenq"'), 'raw ns field is serialized on the external node too (not just used to derive the badge)');
+check(htmlExternal.includes('<span class="swatch external">'), "legend documents the 'external' accent swatch");
+check(htmlExternal.includes('managed: ns'), 'legend documents the managed-package badge format');
+check(htmlExternal.includes('.node.kind-external'), 'stylesheet defines the external node accent border rule');
+check(htmlExternal.includes('.swatch.external'), 'stylesheet defines the external swatch rule');
+
+// A local (non-external) node in the SAME render never picks up a managed badge.
+{
+  const dataMatch = htmlExternal.match(/var DATA = ([\s\S]*?);\s*\(function/);
+  const dataExternal = JSON.parse(dataMatch[1]);
+  const targetRec = dataExternal.nodes.find((n) => n.label === 'OppService.applyDiscount');
+  check(targetRec.badges.length === 0, 'regression: the local target node itself never gains a managed badge from a sibling external node');
+  check(targetRec.ns === null, 'regression: a non-external node serializes ns:null, not the external child\'s namespace');
+}
+
+// =========================================================================
+// v0.8 (N5, forward-compat): headerExtraLinesForResult's combined
+// 'N unresolved · M managed-package refs (ns1, ns2)' line -- mirrors
+// test-uitree.js's matching N5 section exactly.
+// =========================================================================
+assert.deepStrictEqual(
+  headerExtraLinesForResult({ root: {}, stats: { unresolvedSites: 4, externalRefs: 7, externalNamespaces: ['zenq', 'kwx'] } }),
+  ['4 unresolved · 7 managed-package refs (zenq, kwx).'],
+  'N5: exact CONTRACT-pinned combined wording'
+);
+assert.deepStrictEqual(
+  headerExtraLinesForResult({ root: {}, stats: { unresolvedSites: 0, externalRefs: 1, externalNamespaces: ['zenq'] } }),
+  ['0 unresolved · 1 managed-package ref (zenq).'],
+  'singular "ref" wording for externalRefs === 1'
+);
+// REGRESSION: externalRefs absent (the whole adv-org corpus) -> the exact
+// pre-v0.8 unresolvedSites wording, byte-identical.
+assert.deepStrictEqual(
+  headerExtraLinesForResult({ root: {}, stats: { unresolvedSites: 5 } }),
+  ['5 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).'],
+  'REGRESSION: externalRefs absent -> unresolvedSites keeps its exact pre-v0.8 wording'
+);
+assert.deepStrictEqual(
+  headerExtraLinesForResult({ root: {}, stats: { unresolvedSites: 5, externalRefs: 0 } }),
+  ['5 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).'],
+  'REGRESSION: externalRefs === 0 -> old wording, not the new combined line'
 );
 
 console.log('apex-trace pathmap self-check: ' + passCount + ' assertions passed');

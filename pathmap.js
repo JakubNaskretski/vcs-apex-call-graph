@@ -27,7 +27,15 @@
 //       metadata-caller family; always a pure root) | 'exception' (v0.7 A3:
 //       forward-traced throw target, always terminal) | 'unresolved' (v0.7
 //       A6: one aggregated, always-terminal, always-approximate leaf per
-//       method summarizing unresolved forward call sites),
+//       method summarizing unresolved forward call sites) | 'external'
+//       (v0.8 N1/N4/N6, forward-compat -- resolver.js does not produce this
+//       kind yet, same status as the seenElsewhere field below: a reference
+//       into managed-package code this workspace has no source for.
+//       Terminal in the callees direction; in callers direction its
+//       children are the ordinary local caller subtree of every site that
+//       references it -- no special-casing needed here either way, see
+//       accentKind/shapeNodeForData below for its accent + 'managed: <ns>'
+//       badge),
 //     className, methodLower,
 //     path, line, entries: [string], isTest,
 //     package,  // string|null|undefined (v0.7 B3): the sfdx package label
@@ -35,13 +43,21 @@
 //               // targetPackage/packageBadge threading below, which turns
 //               // it into a '(label)' badge ONLY when it differs from the
 //               // traced target's own package (root.package).
+//     ns,       // string|undefined (v0.8 N1/N4, forward-compat): ONLY
+//               // meaningful on a kind:'external' node -- its managed-
+//               // package namespace, mirrored into the 'managed: <ns>'
+//               // badge (see managedBadge/shapeNodeForData below).
 //     via: string|null,  // ...|'metadata'|'dml'|'dynamic'|'override' (v0.4
 //                         // adds the last three)|'publish'|'throws'|
 //                         // 'narrowed'|'async' (v0.5 G1/G2/G3/G5 add these
 //                         // four; only 'narrowed' is approximate)|
 //                         // 'ambiguous' (v0.7 B2: duplicate-named-class
 //                         // fan-out that neither same-package nor default-
-//                         // package preference could resolve; approximate)
+//                         // package preference could resolve; approximate)|
+//                         // 'external' (v0.8 N1/N2/N4, forward-compat: a
+//                         // reference into managed-package code -- NOT
+//                         // approximate, see uitree.js's matching TNode.via
+//                         // doc for the rationale)
 //                         // -- rendered verbatim as edge labels/node badges,
 //                         // no code change needed here for a new via string
 //                         // to show up correctly)
@@ -174,6 +190,12 @@ const META_ACCENT_KINDS = new Set(['lwc', 'aura', 'flow', 'omniscript', 'vf', 'c
 // carry entries (e.g. an exception class that is ALSO an inner class with
 // its own annotation) and must not collapse onto the generic 'entry' accent
 // and lose its distinct color.
+// v0.8 (N6, forward-compat): a 7th bucket, 'external', for TNode.kind===
+// 'external' -- see the module header's TNode.kind doc above. Same "the
+// kind alone decides the accent" tier as trigger/anonymous/exception/
+// unresolved, ahead of entry/test, for the identical reason: an external
+// node could in principle carry entries and must not collapse onto the
+// generic 'entry' accent and lose its distinct color.
 function accentKind(node) {
   if (node.kind === 'trigger') return 'trigger';
   if (node.kind === 'anonymous') return 'anonymous';
@@ -183,10 +205,34 @@ function accentKind(node) {
   // verbatim (via 'dml-unresolved' is what distinguishes it; see
   // LEGEND_HTML below), so no separate kind/accent branch is needed here.
   if (node.kind === 'unresolved') return 'unresolved';
+  if (node.kind === 'external') return 'external';
   if (META_ACCENT_KINDS.has(node.kind)) return 'metadata';
   if (node.entries && node.entries.length) return 'entry';
   if (node.isTest) return 'test';
   return 'normal';
+}
+
+// v0.8 (N4/N6, forward-compat): mirrors uitree.js's externalNamespace/
+// managedBadge exactly -- kept as independent small implementations here
+// rather than a cross-file require, same rationale as isRootNode/
+// packageBadge above (this file stays a standalone, dev-tool-friendly
+// module). See uitree.js's matching comment for the full label-derivation
+// rationale (a TNode arriving with kind:'external' but no explicit `ns`
+// field still renders a correct badge, derived from its own label).
+function externalNamespace(node) {
+  if (!node || node.kind !== 'external') return null;
+  if (typeof node.ns === 'string' && node.ns) return node.ns;
+  const label = typeof node.label === 'string' ? node.label : '';
+  const dotIdx = label.indexOf('.');
+  if (dotIdx > 0) return label.slice(0, dotIdx);
+  const dunderIdx = label.indexOf('__');
+  if (dunderIdx > 0) return label.slice(0, dunderIdx);
+  return null;
+}
+
+function managedBadge(node) {
+  const ns = externalNamespace(node);
+  return ns ? `managed: ${ns}` : null;
 }
 
 // ---- layout: simple leaf-order dendrogram ---------------------------------
@@ -301,6 +347,14 @@ function packageBadge(node, targetPackage) {
 function shapeNodeForData(rec, targetPackage) {
   const t = rec.tnode || {};
   const badges = (t.entries || []).map(shortenEntry);
+  // v0.8 (N4/N6, forward-compat): the 'managed: <ns>' badge for an external
+  // node -- a node-level fact about THIS node (which managed package it
+  // belongs to), so it joins `badges` the same way entries/pkgBadge do,
+  // rather than riding on the edge-level `via` field a couple lines below
+  // (edges get their own label from `t.via`, see CLIENT_JS_TEXT's edge
+  // rendering -- this badge is about the node, not the edge into it).
+  const managed = managedBadge(t);
+  if (managed) badges.push(managed);
   const pkgBadge = packageBadge(t, targetPackage);
   if (pkgBadge) badges.push(pkgBadge);
   return {
@@ -330,6 +384,11 @@ function shapeNodeForData(rec, targetPackage) {
     // `badges` above); exposed so dev tooling / future callers can inspect
     // it without re-deriving from `entries`.
     package: t.package || null,
+    // v0.8 (N4/N6, forward-compat): the resolved external namespace (or
+    // null) -- same "raw value exposed alongside its derived badge" pattern
+    // as `package` immediately above; the badge string itself, if any,
+    // already landed in `badges` above.
+    ns: externalNamespace(t),
     sites: (t.sites || []).map(shapeSiteForData),
   };
 }
@@ -405,6 +464,12 @@ const CSS_TEXT = `
        aggregated unresolved-sites leaf. */
     --pm-exception: var(--vscode-errorForeground, #f14c4c);
     --pm-unresolved: var(--vscode-disabledForeground, #8a8a8a);
+    /* v0.8 (N6, forward-compat): an 8th accent bucket for kind:'external'
+       (managed-package reference) nodes. charts-cyan is the one
+       --vscode-charts-* slot none of the buckets above claims yet, and its
+       cool, "not one of ours" tone fits a node whose source lives outside
+       this workspace. */
+    --pm-external: var(--vscode-charts-cyan, #29b6f6);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -451,6 +516,7 @@ const CSS_TEXT = `
   .swatch.anonymous { background: var(--pm-anonymous); }
   .swatch.exception { background: var(--pm-exception); }
   .swatch.unresolved { background: var(--pm-unresolved); }
+  .swatch.external { background: var(--pm-external); }
 
   #pm-viewport { flex: 1 1 auto; position: relative; overflow: hidden; cursor: grab; }
   #pm-viewport.dragging { cursor: grabbing; }
@@ -472,6 +538,7 @@ const CSS_TEXT = `
   .node.kind-anonymous { border-left: 4px solid var(--pm-anonymous); }
   .node.kind-exception { border-left: 4px solid var(--pm-exception); }
   .node.kind-unresolved { border-left: 4px solid var(--pm-unresolved); }
+  .node.kind-external { border-left: 4px solid var(--pm-external); }
   .node.is-test { opacity: .62; }
   .node.is-approx { border-style: dashed; border-color: var(--pm-approx); }
 
@@ -865,6 +932,7 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="swatch anonymous"></span><span><span class="k">anonymous</span>anonymous Apex script (.apex) — real Apex source, but with no declared class/trigger of its own; always a pure root (nothing calls it)</span></div>
     <div class="legend-row"><span class="swatch exception"></span><span><span class="k">exception</span>(v0.7) a thrown exception's class, reached by tracing forward (What Does This Call?) through a "throw" statement — always terminal</span></div>
     <div class="legend-row"><span class="swatch unresolved"></span><span><span class="k">unresolved</span>(v0.7) one aggregated leaf per method, summarizing every forward call site that couldn't be resolved to an indexed target (dynamic/platform calls, e.g. HttpRequest/System.debug) — always terminal, approximate. Also covers a DML statement whose target couldn't be narrowed to a concrete SObject type (e.g. a generic List&lt;SObject&gt;) — labeled "DML on unresolved SObject type", no trigger/flow linkage possible</span></div>
+    <div class="legend-row"><span class="swatch external"></span><span><span class="k">external</span>(v0.8) a reference into managed-package code this workspace has no source for — terminal when tracing What Does This Call?; a valid trace target with its own local-caller subtree when tracing Who Calls This</span></div>
     <h4>Markers</h4>
     <div class="legend-row"><span class="k">~ prefix</span>approximate resolution (dashed border too) — via interface/unique-name/lexical/override/narrowed/dynamic fallback, so this edge may be wrong or one of several candidates</div>
     <div class="legend-row"><span class="k">&#x1F9EA;</span>test-only node (also dimmed)</div>
@@ -874,6 +942,7 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="k">&#x25C9;</span>root — no known caller in this trace: an entry point or unused/dead code. Never shown together with cyclic, truncated, or seenElsewhere (those all mean "there IS more above, it just isn't shown/expanded here")</div>
     <div class="legend-row"><span class="k">&#x21E2;</span>seenElsewhere — this method's caller subtree was already expanded once elsewhere in this same trace (per-run dedup); its own call sites are still shown here, only the deeper callers above it are collapsed</div>
     <div class="legend-row"><span class="k">(pkgLabel)</span>(v0.7 B3) package badge — shown on a node when its file lives in a DIFFERENT sfdx package directory than the traced target's; the label is the package name from sfdx-project.json's packageDirectories, or the path segment itself when that directory declares no package name. A single call site can fan out to two children with two DIFFERENT badges (see the "ambiguous" via below)</div>
+    <div class="legend-row"><span class="k">managed: ns</span>(v0.8 N4) managed-package badge — shown on an "external" node, naming the managed-package namespace it belongs to (e.g. "managed: zenq")</div>
     <div class="legend-row"><span class="k">N dup. names</span>(v0.7 B3) header note — "&lt;N&gt; duplicate class names across packages" appears above the map whenever this workspace has classes sharing the same qualified name across two or more sfdx packages; resolution always prefers the referring file's own package first, then the default package, before falling back to the ambiguous fan-out below</div>
     <h4>Direction</h4>
     <div class="legend-row"><span class="k">Who Calls This</span>(default, unlabeled above) the traced target sits on the RIGHT; its callers fan out to the LEFT, one hop per column, converging into the target</div>
@@ -898,6 +967,7 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="k">ambiguous</span>(v0.7 B2) a class name duplicated across sfdx packages that neither same-package nor default-package preference could resolve — every remaining candidate gets its own edge, each typically carrying a DIFFERENT package badge (approximate)</div>
     <div class="legend-row"><span class="k">unresolved</span>(v0.7.1) marks the aggregated "N unresolved sites" leaf itself — one or more forward call sites in this method couldn't be resolved to an indexed target (approximate)</div>
     <div class="legend-row"><span class="k">dml-unresolved</span>(v0.7.1) a DML statement whose target couldn't be narrowed to a concrete SObject (e.g. a generic List&lt;SObject&gt;/SObject-typed variable) — no trigger or flow linkage could be traced (approximate)</div>
+    <div class="legend-row"><span class="k">external</span>(v0.8 N1/N2/N4) a reference into managed-package code (a namespaced method/class call, or a DML target naming a managed object) — NOT approximate, a genuine namespace match (see the "external" accent above)</div>
 `;
 
 // v0.7 (A3): mirrors uitree.js's directionHeaderLine exactly -- see that
@@ -954,7 +1024,19 @@ function headerExtraLinesForResult(treeResult) {
     lines.push(`Result capped -- not every ${cappedNoun} could be expanded.`);
   }
   const unresolved = stats && stats.unresolvedSites;
-  if (typeof unresolved === 'number' && unresolved > 0) {
+  // v0.8 (N5, forward-compat): mirrors uitree.js's matching shapeHeaderLines
+  // addition exactly -- see that file's comment for the full rationale and
+  // the byte-identical-when-absent gate this depends on (adv-org, with zero
+  // namespaced refs, always has externalRefs absent/0, so it always takes
+  // the untouched `else` branch below).
+  const externalRefs = stats && stats.externalRefs;
+  const externalNamespaces = stats && Array.isArray(stats.externalNamespaces) ? stats.externalNamespaces : [];
+  if (typeof externalRefs === 'number' && externalRefs > 0) {
+    const unresolvedPart = typeof unresolved === 'number' ? unresolved : 0;
+    const refWord = externalRefs === 1 ? 'ref' : 'refs';
+    const nsPart = externalNamespaces.length ? ` (${externalNamespaces.join(', ')})` : '';
+    lines.push(`${unresolvedPart} unresolved · ${externalRefs} managed-package ${refWord}${nsPart}.`);
+  } else if (typeof unresolved === 'number' && unresolved > 0) {
     lines.push(`${unresolved} call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).`);
   }
   // v0.7.1 (U3, M2 coordination point): mirrors uitree.js's matching
@@ -1076,6 +1158,10 @@ module.exports = {
   layoutTree,
   isRootNode,
   packageBadge,
+  // v0.8 (N4/N6): external-node badge helpers, exported so test-pathmap.js
+  // can unit-test them directly, same rationale as packageBadge/isRootNode.
+  externalNamespace,
+  managedBadge,
   directionHeaderLine,
   headerExtraLinesForResult,
 };

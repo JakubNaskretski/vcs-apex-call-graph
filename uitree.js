@@ -27,7 +27,25 @@
 //                   // terminal) | 'unresolved' (v0.7 A6: one aggregated,
 //                   // always-terminal, always-approximate leaf per method
 //                   // summarizing every forward call site that couldn't be
-//                   // resolved to an indexed target) --
+//                   // resolved to an indexed target) | 'external' (v0.8 N1/
+//                   // N4, forward-compat -- resolver.js does not produce
+//                   // this kind yet, same status as seenElsewhere below: a
+//                   // reference into MANAGED-PACKAGE code this workspace has
+//                   // no source for, e.g. `zenq.Billing.charge(...)` or a
+//                   // DML target naming a managed object like
+//                   // `kwx__Ledger__c`. Always carries via:'external' (see
+//                   // the `via` field doc below) and, per N1's ExternalMeta
+//                   // shape, a `ns` field naming its namespace (e.g. 'zenq')
+//                   // -- read by externalNamespace()/managedBadge() below,
+//                   // with a label-derived fallback for a TNode that arrives
+//                   // without `ns` (see externalNamespace's own comment).
+//                   // TERMINAL in the callees direction (no source to
+//                   // recurse into); in the callers direction its children
+//                   // are the ordinary local caller subtree of every site
+//                   // that references it (per N4) -- this file needs no
+//                   // special-casing for either case, since it already
+//                   // renders whatever `children` array it is given
+//                   // generically, exactly like the 'flow' note just above) --
 //                   // NOTE (v0.4 F1b): 'flow' nodes are no longer
 //                   // guaranteed terminal -- a record-triggered flow's
 //                   // children are the DML sites on its object
@@ -49,6 +67,12 @@
 //                    // threading below, which turns it into a "(label)"
 //                    // badge ONLY when it differs from the traced target's
 //                    // own package (root.package).
+//     ns,           // string|undefined (v0.8 N1/N4, forward-compat): ONLY
+//                    // meaningful on a kind:'external' node -- its managed-
+//                    // package namespace (e.g. 'zenq'), mirroring
+//                    // ExternalMeta.ns from N1's index contract. Rendered as
+//                    // the 'managed: <ns>' badge (see managedBadge() below),
+//                    // never on any other kind.
 //     entries: [string], isTest,
 //     via: string|null,        // 'typed'|'static'|'new'|'this'|'super'|
 //                               // 'interface'|'unique-name'|'lexical'|
@@ -59,11 +83,16 @@
 //                               // approximate)|'ambiguous' (v0.7 B2: a
 //                               // duplicate-named class reference that
 //                               // neither same-package nor default-package
-//                               // preference could resolve -- approximate)
-//                               // -- this file renders whatever string it is
-//                               // given verbatim as a badge, so new via
-//                               // values need no code change here, only in
-//                               // the legend-equivalent docs a human reads.
+//                               // preference could resolve -- approximate)|
+//                               // 'external' (v0.8 N1/N2/N4, forward-compat:
+//                               // a reference into managed-package code --
+//                               // NOT approximate, per N2's precedence rule
+//                               // 3: a genuine namespace match is exact, not
+//                               // a guess) -- this file renders whatever
+//                               // string it is given verbatim as a badge, so
+//                               // new via values need no code change here,
+//                               // only in the legend-equivalent docs a human
+//                               // reads.
 //     sites: [SiteView],
 //     children: [TNode],
 //     cyclic, truncated, approximate,
@@ -156,6 +185,17 @@ const ICON_ANONYMOUS = 'terminal';
 const ICON_EXCEPTION = 'flame';
 const ICON_UNRESOLVED = 'question';
 
+// v0.8 (N6, forward-compat -- see the TNode.kind doc above): an EXTERNAL
+// node, a reference into managed-package code this workspace has no source
+// for. The spec text offered a choice of two vscode Codicon ids
+// ('package'/'globe'); 'package' is picked here since it echoes "managed
+// PACKAGE" directly and is visually distinct from every icon already used
+// above -- 'globe' would read more like a network/URL concept. Checked
+// alongside ICON_EXCEPTION/ICON_UNRESOLVED below (same "the kind alone
+// decides the icon" tier), since an external node could in principle carry
+// entries and must not fall back to the generic ICON_ENTRIES 'plug' glyph.
+const ICON_EXTERNAL = 'package';
+
 // A7: metadata-caller node icons, one per MetaRef.kind (see resolver.js's
 // buildMetaChildren / metaEntryLabel — these TNode.kind values are
 // 'lwc'|'aura'|'flow'|'omniscript'|'vf'|'cmdt' (v0.4 F4b adds the last one),
@@ -209,6 +249,10 @@ function iconForNode(node) {
   // 'dml-unresolved' is what distinguishes it; see the VIA_GLOSSARY entry
   // below), so no separate kind/icon branch is needed here at all.
   if (node.kind === 'unresolved') return ICON_UNRESOLVED;
+  // v0.8 (N6, forward-compat): same "the kind alone decides the icon" tier
+  // as exception/unresolved just above -- an external node could in
+  // principle carry entries too and must not collapse onto ICON_ENTRIES.
+  if (node.kind === 'external') return ICON_EXTERNAL;
   if (META_ICON_BY_KIND[node.kind]) return META_ICON_BY_KIND[node.kind];
   if (node.isTest) return ICON_TEST;
   if (node.entries && node.entries.length) return ICON_ENTRIES;
@@ -221,9 +265,41 @@ function labelForNode(node) {
   return prefix + (node && node.label != null ? node.label : '');
 }
 
+// v0.8 (N1/N4/N6, forward-compat -- see the TNode.kind/ns doc above):
+// this EXTERNAL node's own namespace, or null when the node isn't external
+// (or carries no derivable namespace at all). Reads `node.ns` when present
+// (the natural mirror of N1's ExternalMeta.ns), and otherwise DERIVES it
+// from the node's own label -- both of N1's documented external label
+// shapes ('zenq.Billing' for a namespaced method/class call, 'kwx__Ledger__c'
+// for a namespaced DML object) put the namespace token as everything before
+// the FIRST '.' or '__' -- so a hand-built/early TNode that has kind:
+// 'external' but hasn't been wired up with an explicit `ns` field yet still
+// renders a correct badge instead of silently losing it.
+function externalNamespace(node) {
+  if (!node || node.kind !== 'external') return null;
+  if (typeof node.ns === 'string' && node.ns) return node.ns;
+  const label = typeof node.label === 'string' ? node.label : '';
+  const dotIdx = label.indexOf('.');
+  if (dotIdx > 0) return label.slice(0, dotIdx);
+  const dunderIdx = label.indexOf('__');
+  if (dunderIdx > 0) return label.slice(0, dunderIdx);
+  return null;
+}
+
+// v0.8 (N4, forward-compat): the 'managed: <ns>' badge text for an EXTERNAL
+// node, or null when none applies -- exact wording per N4's CONTRACT
+// AMENDMENT text ("badge 'managed: <ns>'"). Kept as its own tiny helper
+// (rather than inlined into badgesForNode) so it is independently unit-
+// testable against a bare `{ kind, ns }`/`{ kind, label }` fixture, same
+// rationale as packageBadge()/isRootNode() below.
+function managedBadge(node) {
+  const ns = externalNamespace(node);
+  return ns ? `managed: ${ns}` : null;
+}
+
 // Badge order per contract: entries · caughtHere (shield) · test · via ·
-// package (v0.7 B3) · '~' when approximate · '↺ cycle' · '… capped' ·
-// '↪ seen elsewhere'.
+// managed:<ns> (v0.8 N4) · package (v0.7 B3) · '~' when approximate ·
+// '↺ cycle' · '… capped' · '↪ seen elsewhere'.
 // (The 'root' badge is NOT added here -- see isRootNode/shapeNode below: it
 // depends on the shaped `children` count, which this per-node-flags
 // function deliberately does not compute, so it stays cheaply unit-testable
@@ -254,6 +330,13 @@ function badgesForNode(node, pkgBadge, orientation) {
   if (node.caughtHere) badges.push('🛡');
   if (node.isTest) badges.push('test');
   if (node.via) badges.push(node.via);
+  // v0.8 (N4, forward-compat): the managed-package badge -- computed
+  // directly from `node` here (unlike pkgBadge, it needs no tree-wide
+  // context, just this node's own kind/ns/label), positioned right after
+  // `via` since it further qualifies the same "this is an external
+  // reference" fact the via:'external' badge just above already announced.
+  const managed = managedBadge(node);
+  if (managed) badges.push(managed);
   if (pkgBadge) badges.push(pkgBadge);
   if (node.approximate) badges.push('~');
   if (node.cyclic) badges.push('↺ cycle');
@@ -409,6 +492,16 @@ const VIA_GLOSSARY = {
   // (or 'N DML sites on unresolved SObject type' when N > 1), always
   // approximate + truncated (terminal).
   'dml-unresolved': "DML on unresolved SObject type — the DML statement's target could not be narrowed to a concrete SObject (e.g. a generic List<SObject>/SObject-typed variable), so no trigger or flow linkage could be traced (approximate)",
+  // v0.8 (N4/N6, forward-compat): exact tooltip wording per N4's CONTRACT
+  // AMENDMENT text ("tooltip 'managed package code — source not
+  // analyzable'"). This one entry alone satisfies N6's "glossary tooltip"
+  // requirement for the 'external' kind -- glossaryLinesForNode below
+  // already renders a `${via}: ${VIA_GLOSSARY[via]}` line for ANY node
+  // carrying a recognized via, with zero extra code needed here, exactly
+  // like every other via value in this table. NOT approximate (see the
+  // TNode.via field doc above), so this via never co-occurs with the '~'
+  // marker glossary line.
+  external: 'managed package code — source not analyzable',
 };
 
 const MARKER_GLOSSARY = {
@@ -779,7 +872,23 @@ function shapeResult(treeResult, orientation) {
 //                                      nested-under-stats / not-yet-produced-
 //                                      by-every-TreeResult shape as
 //                                      unresolvedSites above.)
+//   - treeResult.stats.externalRefs / treeResult.stats.externalNamespaces
+//                                     (v0.8 N5, forward-compat -- resolver.js
+//                                      does not produce either field yet):
+//                                      workspace-wide count of references now
+//                                      modeled as external (managed-package)
+//                                      nodes, and the sorted list of distinct
+//                                      namespaces they belong to. Per N5,
+//                                      these references are REMOVED from
+//                                      unresolvedSites' count, so this file
+//                                      renders ONE combined line ('N
+//                                      unresolved · M managed-package refs
+//                                      (ns1, ns2)') whenever externalRefs > 0,
+//                                      instead of the plain unresolvedSites
+//                                      line -- see the code below for the
+//                                      exact byte-identical-when-absent gate.
 //
+
 // v0.7 (A3) INTERPRETIVE DECISION on the pinned "callers-direction render is
 // byte-identical to today" bar: resolver.js's buildCallerTree now stamps
 // `direction: 'callers'` on EVERY TreeResult it returns, unconditionally --
@@ -844,7 +953,24 @@ function shapeHeaderLines(treeResult, orientation) {
     lines.push(`Result capped -- not every ${cappedNoun} could be expanded.`);
   }
   const unresolved = stats && stats.unresolvedSites;
-  if (typeof unresolved === 'number' && unresolved > 0) {
+  // v0.8 (N5, forward-compat -- resolver.js does not produce
+  // stats.externalRefs/stats.externalNamespaces yet): per N5's CONTRACT
+  // AMENDMENT text, once references are modeled as external nodes they are
+  // REMOVED from the unresolved tally, and the header "show[s] both: 'N
+  // unresolved · M managed-package refs (zenq, kwx)'". Gated strictly behind
+  // `externalRefs > 0` so a workspace with NO namespaced refs at all (every
+  // pre-v0.8 fixture, and adv-org's whole corpus per the v0.8 REGRESSION
+  // POLICY) takes the untouched `else` branch below and renders the EXACT
+  // pre-v0.8 wording -- this is what keeps that 10-target byte-identical bar
+  // satisfiable by a purely additive change here.
+  const externalRefs = stats && stats.externalRefs;
+  const externalNamespaces = stats && Array.isArray(stats.externalNamespaces) ? stats.externalNamespaces : [];
+  if (typeof externalRefs === 'number' && externalRefs > 0) {
+    const unresolvedPart = typeof unresolved === 'number' ? unresolved : 0;
+    const refWord = externalRefs === 1 ? 'ref' : 'refs';
+    const nsPart = externalNamespaces.length ? ` (${externalNamespaces.join(', ')})` : '';
+    lines.push(`${unresolvedPart} unresolved · ${externalRefs} managed-package ${refWord}${nsPart}.`);
+  } else if (typeof unresolved === 'number' && unresolved > 0) {
     lines.push(`${unresolved} call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).`);
   }
   // v0.7.1 (U3, M2 coordination point): anticipates metascan.js/resolver.js's
@@ -872,6 +998,11 @@ module.exports = {
   labelForNode,
   badgesForNode,
   packageBadge,
+  // v0.8 (N4/N6): external-node badge helpers, exported so test-uitree.js
+  // can unit-test them directly against bare fixtures, same rationale as
+  // packageBadge/isRootNode above.
+  externalNamespace,
+  managedBadge,
   isRootNode,
   siteLabel,
   siteDetailLine,

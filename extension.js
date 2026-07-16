@@ -26,6 +26,21 @@
 // buildSemanticIndex's behavior in that case stays byte-identical to
 // pre-v0.7.
 //
+// v0.8 / N3 additive contract (this round, plumbing ONLY -- see the
+// CONTRACT AMENDMENTS' own N3 text): the SAME `opts` argument also carries
+// `opts.ownNamespace: string|null`, this workspace's OWN managed-package
+// namespace read from sfdx-project.json's top-level `namespace` property
+// (discoverPackageMap() reads it in the same pass as packageOf, see that
+// function's header comment below). What resolver.js DOES with a non-null
+// ownNamespace (stripping it as a prefix before local class/object/metascan-
+// ref lookup, so e.g. `vtx.VertexPricingService` in a workspace whose own
+// namespace IS `vtx` resolves LOCAL rather than becoming an external node)
+// is entirely out of scope for this file -- resolver.js is frozen this
+// round, a different phase's job. Absent/empty `namespace` (the
+// overwhelmingly common unmanaged/unlocked-package workspace) yields
+// ownNamespace: null, which resolver.js's opts contract treats as "nothing
+// to strip" -- byte-identical to pre-v0.8 in that case.
+//
 // uitree.js (pure, no vscode import) turns a TreeResult's TNode into plain
 // UiNode objects; this file's only jobs are: scan + cache + parse workspace
 // files (Apex AND, per A7, LWC/Aura/Flow/OmniScript/VF metadata), resolve a
@@ -526,6 +541,21 @@ function computeMetaRefs(files) {
 // list, so the returned packageOf() returns null for every path -- see the
 // module-header note on buildSemanticIndex's opts contract for why that
 // keeps a packageless workspace's output byte-identical to pre-v0.7.
+//
+// v0.8 (N3): the SAME discovery pass also reads each sfdx-project.json's
+// top-level `namespace` property -- the org's OWN managed-package namespace
+// (e.g. `"namespace": "vtx"` for a namespaced org, absent/empty for an
+// unlocked/unmanaged workspace, which is the overwhelming common case and
+// must stay behaviorally inert -- see ownNamespace's attachment below).
+// This is pure plumbing: discoverPackageMap()/scanAndBuildIndex() only
+// EXTRACT the value and hand it to resolver.js as opts.ownNamespace,
+// alongside the existing opts.packageOf/opts.defaultPackage -- what
+// resolver.js (frozen this round, a different phase's job -- see N3's
+// CONTRACT AMENDMENT text) does with it (stripping the own-namespace prefix
+// before local class/object lookup, per N3) is entirely out of scope here.
+// No new vscode.workspace.fs read is added -- `json` is already parsed for
+// packageDirectories a few lines below, so this reads one more property off
+// the SAME parsed object, at zero extra I/O cost.
 const SFDX_PROJECT_GLOB_EXCLUDE = '{**/node_modules/**,**/.sfdx/**,**/.sf/**,**/.git/**}';
 
 // OS-separator-agnostic path normalization so prefix comparison in
@@ -561,6 +591,16 @@ async function discoverPackageMap() {
   // extension. See its attachment onto the returned packageOf function
   // below for why this isn't a second return value.
   let defaultPackage = null;
+  // v0.8 (N3): the OWN-ORG namespace -- first non-empty `namespace` string
+  // found across every discovered sfdx-project.json wins, same first-wins
+  // tie-break spirit as defaultPackage immediately above (a workspace with
+  // 2+ project files declaring DIFFERENT namespaces is a malformed/unusual
+  // setup no single "correct" answer exists for; picking the first found is
+  // deterministic and matches how this function already resolves every
+  // other cross-file ambiguity). Stays null (never an empty string) for the
+  // common unmanaged/no-namespace workspace -- see ownNamespace's
+  // attachment below for why that null is what keeps this plumbing inert.
+  let ownNamespace = null;
 
   for (const uri of uris) {
     let json;
@@ -569,6 +609,19 @@ async function discoverPackageMap() {
       json = JSON.parse(Buffer.from(bytes).toString('utf8'));
     } catch (e) {
       continue; // unreadable or invalid JSON -- skip this one project file, never fatal to the scan
+    }
+    // v0.8 (N3): read alongside packageDirectories below -- same parsed
+    // `json`, no extra file read. A non-string/empty/whitespace-only
+    // `namespace` (missing property, wrong JSON type, `""`) never sets
+    // ownNamespace -- exactly the "absent/empty -> no stripping" half of
+    // N3's contract, decided here at the source rather than pushed onto
+    // every downstream reader.
+    if (
+      ownNamespace == null &&
+      typeof json.namespace === 'string' &&
+      json.namespace.trim()
+    ) {
+      ownNamespace = json.namespace.trim();
     }
     const dirs = Array.isArray(json.packageDirectories) ? json.packageDirectories : [];
     // Strip the trailing 'sfdx-project.json' filename (whichever separator
@@ -610,6 +663,12 @@ async function discoverPackageMap() {
   // working completely unchanged; scanAndBuildIndex (below) is the only
   // reader of this property.
   packageOf.defaultPackage = defaultPackage;
+  // v0.8 (N3): same attachment convention as defaultPackage immediately
+  // above -- a third value riding on the one packageOf(fsPath) function
+  // every existing caller already treats as the whole return value, not a
+  // second/third return slot. null for the (overwhelmingly common) no-owner-
+  // namespace workspace.
+  packageOf.ownNamespace = ownNamespace;
   return packageOf;
 }
 
@@ -889,8 +948,46 @@ async function activate(context) {
     const defaultPackage = typeof packageOf.defaultPackage !== 'undefined' && packageOf.defaultPackage != null
       ? packageOf.defaultPackage
       : null;
-    const index = resolver.buildSemanticIndex(scan.factsList, { packageOf, defaultPackage });
-    resolver.attachMetaCallers(index, metaRefs);
+    // v0.8 (N3): same attach-and-extract convention as defaultPackage right
+    // above -- discoverPackageMap() already folded the org's own namespace
+    // (sfdx-project.json's `namespace` property) into this SAME packageOf()
+    // call, so no second discovery pass is needed here. null (not the
+    // typeof-undefined case a bare property access on a plain `() => null`
+    // fallback function would produce) for every workspace with no
+    // sfdx-project.json, no `namespace` property, or a discovery failure --
+    // resolver.js's opts contract treats a null/absent opts.ownNamespace as
+    // "nothing to strip", byte-identical to today (see N3's CONTRACT
+    // AMENDMENT text: "Absent/empty namespace property -> no stripping").
+    const ownNamespace = typeof packageOf.ownNamespace !== 'undefined' && packageOf.ownNamespace != null
+      ? packageOf.ownNamespace
+      : null;
+    // v0.8 (N3): metascan.js's own namespace-aware kinds (flow/cmdt/
+    // omniscript, alongside the pre-existing lwc/M1 case) tag a namespaced
+    // MetaRef with `.namespace` but never know the WORKSPACE's own
+    // namespace themselves (metascan.js stays index-free by design) -- per
+    // metascan.js's own `stripOwnNamespace(refs, ownNamespace)` header
+    // contract, THIS file is the one expected to call it, exactly once,
+    // AFTER scanning and BEFORE handing refs to attachMetaCallers(), so a
+    // ref naming this workspace's OWN namespace (e.g. an LWC import of
+    // `vtx.VertexPricingService` in a workspace whose own namespace IS
+    // `vtx`) reads `.namespace: null` by the time attachMetaCallers() sees
+    // it and resolves through the ordinary local-class path instead of
+    // being counted as an unattachable namespaced/managed-package ref --
+    // exactly N3's "references prefixed with the OWN namespace resolve to
+    // LOCAL classes/objects" for the metadata-ref surface. Guarded behind a
+    // typeof check (not a bare call) since metascan.js is owned by a
+    // different phase this round: if that function is absent/renamed,
+    // metaRefs simply passes through unchanged (today's byte-identical
+    // behavior) rather than throwing. A null/absent ownNamespace (the
+    // overwhelmingly common case) already makes stripOwnNamespace() itself
+    // a documented no-op, so this call is inert for every workspace that
+    // doesn't declare its own namespace.
+    const strippedMetaRefs =
+      ownNamespace && typeof metascan.stripOwnNamespace === 'function'
+        ? metascan.stripOwnNamespace(metaRefs, ownNamespace)
+        : metaRefs;
+    const index = resolver.buildSemanticIndex(scan.factsList, { packageOf, defaultPackage, ownNamespace });
+    resolver.attachMetaCallers(index, strippedMetaRefs);
     return { index, scan };
   }
 

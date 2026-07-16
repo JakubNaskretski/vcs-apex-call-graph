@@ -1,11 +1,13 @@
 'use strict';
 // Self-check for metascan.js (amendment A5): node test-metascan.js
 //
-// Three parts:
+// Four parts:
 //   1. Inline-string fixtures for every source kind (lwc/aura/flow/
 //      omniscript/vf) plus edge cases (multi-line imports, namespace-dotted
 //      specifiers, __tests__ exclusion, non-apex Flow actions, the
-//      escaped-string JSON decoy, malformed input never throwing).
+//      escaped-string JSON decoy, malformed input never throwing) -- plus,
+//      as its final subsection, v0.8's N1(c) metascan half (Flow/CMDT/
+//      os-meta namespace-field extraction) and N3's stripOwnNamespace() hook.
 //   2. A real pass over the read-only /Users/agent/work/code/example-data/
 //      adv-org corpus, asserting the EXACT refs MANIFEST.md's "UI / metadata
 //      callers" ground-truth section promises -- this is the bar the task
@@ -16,11 +18,17 @@
 //      namespace segment of `@salesforce/apex/ns.Class.method` specifiers
 //      instead of silently discarding it (the M2 fix that USES this field to
 //      gate attachMetaCallers() against a false attach onto a same-bare-name
-//      local class lives in resolver.js, out of scope for this file).
+//      local class lives in resolver.js, out of scope for this file) -- plus,
+//      as its final subsection, v0.8-A5/B5 real-corpus regression: the actual
+//      Vtx_Namespace_Probe_Flow.flow-meta.xml and
+//      Kappa_Trigger_Config.Namespace_Handler.md-meta.xml gauntlet-org
+//      fixtures, cross-checked against the LWC probe for the
+//      three-surface (Apex+LWC+Flow / Flow+CMDT) namespace+className
+//      consistency GROUND-TRUTH.md's v0.8 section documents.
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { parseMetaFile, scanBundle } = require('./metascan');
+const { parseMetaFile, scanBundle, stripOwnNamespace } = require('./metascan');
 
 const src = (lines) => lines.join('\n');
 
@@ -1161,6 +1169,392 @@ function refsOf(kind, refs) {
   );
 }
 
+// ===========================================================================
+// v0.8 — namespace/managed-package modeling: N1(c) (metascan half -- LWC was
+// already done in v0.7.1's M1; this amendment extends the same `namespace`
+// field to Flow actionNames, CMDT values, and os-meta remoteClass) + N3's
+// metascan-side stripOwnNamespace() hook. resolver.js's attachMetaCallers()
+// routing (the other half of N1(c)) and the extension's opts.ownNamespace
+// plumbing (N3) are both out of scope for this file/owner.
+// ===========================================================================
+
+// 25. Flow: dotted 3-segment 'ns.Class.method' actionName -- namespace folds
+//     the one leading segment, className/methodName are the trailing pair,
+//     exactly the shape v0.8-B5's GROUND-TRUTH pins for
+//     'zenq.KappaGateway.dispatch'.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <name>Call_Zenq_Dotted</name>',
+    '        <actionName>zenq.KappaGateway.dispatch</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeNamespaceProbeFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'KappaGateway');
+  assert.strictEqual(refs[0].methodName, 'dispatch');
+  assert.strictEqual(refs[0].namespace, 'zenq', "N1(c): dotted 'ns.Class.method' actionName must carry namespace");
+}
+
+// 26. Flow: dotted 4-segment 'ns.Outer.Inner.method' -- parity with the
+//     pre-existing LWC 4+-segment fold (M1's own header comment: "every
+//     leading segment before the trailing pair" folds into one dot-joined
+//     namespace string). Not a GROUND-TRUTH-pinned shape, but Flow's fix is
+//     documented as "the same kind of namespace-field fix M1 already gave
+//     lwc refs" -- this pins that the generalization is real, not just the
+//     3-segment special case.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <actionName>zenq.Outer.Inner.method</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeDeepNamespaceFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].namespace, 'zenq.Outer', '4-segment actionName folds every leading segment before the trailing pair');
+  assert.strictEqual(refs[0].className, 'Inner');
+  assert.strictEqual(refs[0].methodName, 'method');
+}
+
+// 27. Flow: bare 'ns__Class' actionName (no dot -- Invocable-style) --
+//     managed-object-style double-underscore split, methodName stays null
+//     (same shape a local bare actionName already produced). Exact
+//     GROUND-TRUTH v0.8-B5 shape for 'kwx__PostLedgerEntry'.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <name>Call_Kwx_Bare</name>',
+    '        <actionName>kwx__PostLedgerEntry</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeNamespaceProbeFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'PostLedgerEntry');
+  assert.strictEqual(refs[0].methodName, null);
+  assert.strictEqual(refs[0].namespace, 'kwx', "N1(c): bare 'ns__Class' actionName must carry namespace");
+}
+
+// 28. Flow: bare LOCAL actionName (no dot, no '__') -- byte-identical to
+//     pre-v0.8 output, namespace stays null.
+{
+  const refs = parseMetaFile({
+    path: 'flows/AcmeBackorderResolutionFlow.flow-meta.xml',
+    text: src([
+      '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+      '    <actionCalls>',
+      '        <actionName>AcmeOrderInvocable</actionName>',
+      '        <actionType>apex</actionType>',
+      '    </actionCalls>',
+      '</Flow>',
+    ]),
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'AcmeOrderInvocable');
+  assert.strictEqual(refs[0].methodName, null);
+  assert.strictEqual(refs[0].namespace, null, 'ordinary local bare actionName -- no false namespace');
+}
+
+// 29. Flow: dotted LOCAL 'Class.method' (2-segment, no namespace prefix) --
+//     byte-identical to pre-v0.8 output, namespace stays null. Regression
+//     pin for test #14's exact fixture shape.
+{
+  const refs = parseMetaFile({
+    path: 'flows/AcmeOrderStatusRecordTriggeredFlow.flow-meta.xml',
+    text: src([
+      '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+      '    <actionCalls>',
+      '        <actionName>AcmeOrderService.recalculatePricing</actionName>',
+      '        <actionType>apex</actionType>',
+      '    </actionCalls>',
+      '</Flow>',
+    ]),
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'AcmeOrderService');
+  assert.strictEqual(refs[0].methodName, 'recalculatePricing');
+  assert.strictEqual(refs[0].namespace, null, 'bare 2-segment Class.method -- no namespace prefix, unchanged from pre-v0.8');
+}
+
+// 30. CMDT: 'ns__Class' value -- same double-underscore split as Flow's bare
+//     form. Exact GROUND-TRUTH v0.8-B5 shape for 'kwx__PostLedgerEntry' --
+//     must land on className='PostLedgerEntry', namespace='kwx', the SAME
+//     pair Flow's bare actionName (#27 above) produces, proving the
+//     cross-surface consistency the doc calls for.
+{
+  const text = src([
+    '<CustomMetadata xmlns="http://soap.sforce.com/2006/04/metadata" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">',
+    '    <values>',
+    '        <field>Handler_Class_Name__c</field>',
+    '        <value xsi:type="xsd:string">kwx__PostLedgerEntry</value>',
+    '    </values>',
+    '</CustomMetadata>',
+  ]);
+  const refs = parseMetaFile({ path: 'customMetadata/Acme_Trigger_Config.Namespace_Handler.md-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'PostLedgerEntry');
+  assert.strictEqual(refs[0].namespace, 'kwx', "N1(c): CMDT 'ns__Class' value must carry namespace");
+  assert.strictEqual(refs[0].fieldName, 'Handler_Class_Name__c');
+}
+
+// 31. CMDT: an ordinary custom-object/field-style API name value (internal
+//     single-underscore word separators + a trailing '__c' suffix) must NOT
+//     be misparsed as namespaced -- the false-positive risk the design note
+//     above calls out by name. Real corpus regression pin: gauntlet-org's
+//     own 'Kappa_Order__c' SobjectApiName__c value (verified live against
+//     the actual fixture file further below) is the concrete instance of
+//     exactly this shape.
+{
+  const text = src([
+    '<CustomMetadata xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <values>',
+    '        <field>SobjectApiName__c</field>',
+    '        <value xsi:type="xsd:string">Kappa_Order__c</value>',
+    '    </values>',
+    '</CustomMetadata>',
+  ]);
+  const refs = parseMetaFile({ path: 'customMetadata/Acme_Trigger_Config.Decoy.md-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'Kappa_Order__c', 'object-API-name value must stay verbatim, not split');
+  assert.strictEqual(
+    refs[0].namespace,
+    null,
+    "'Kappa_Order__c' must NOT be misread as namespace='Kappa_Order' -- namespace tokens never contain '_'"
+  );
+}
+
+// 32. CMDT: ordinary local value (no '__' at all) -- byte-identical to
+//     pre-v0.8 output, namespace stays null. Regression pin for test #16f's
+//     exact fixture shape.
+{
+  const refs = parseMetaFile({
+    path: 'customMetadata/Acme_Integration_Config.Order_Sync_Handler.md-meta.xml',
+    text: src([
+      '<CustomMetadata xmlns="http://soap.sforce.com/2006/04/metadata">',
+      '    <values>',
+      '        <field>Handler_Class__c</field>',
+      '        <value xsi:type="xsd:string">AcmeOrderService</value>',
+      '    </values>',
+      '</CustomMetadata>',
+    ]),
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'AcmeOrderService');
+  assert.strictEqual(refs[0].namespace, null, 'ordinary local CMDT value -- no false namespace');
+}
+
+// 33. os-meta remoteClass: dotted 'ns.Class' -- everything before the
+//     trailing SINGLE class segment folds into namespace (a remoteClass
+//     value never embeds a method -- that always comes from the paired
+//     remoteMethod element, unlike LWC/Flow's trailing PAIR).
+{
+  const text = src([
+    '<OmniScript xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <elements>',
+    '        <remoteClass>zenq.KappaGateway</remoteClass>',
+    '        <remoteMethod>dispatch</remoteMethod>',
+    '    </elements>',
+    '</OmniScript>',
+  ]);
+  const refs = parseMetaFile({ path: 'omniscripts/AcmeNamespaceProbeOmniScript.os-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'KappaGateway');
+  assert.strictEqual(refs[0].methodName, 'dispatch');
+  assert.strictEqual(refs[0].namespace, 'zenq', "N1(c): os-meta dotted 'ns.Class' remoteClass must carry namespace");
+}
+
+// 34. os-meta remoteClass: bare 'ns__Class' (no dot) -- same
+//     double-underscore split as Flow/CMDT's bare forms.
+{
+  const text = src([
+    '<OmniScript xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <elements>',
+    '        <remoteClass>kwx__PostLedgerEntry</remoteClass>',
+    '        <remoteMethod>run</remoteMethod>',
+    '    </elements>',
+    '</OmniScript>',
+  ]);
+  const refs = parseMetaFile({ path: 'omniscripts/AcmeNamespaceProbeOmniScript.os-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'PostLedgerEntry');
+  assert.strictEqual(refs[0].methodName, 'run');
+  assert.strictEqual(refs[0].namespace, 'kwx', "N1(c): os-meta bare 'ns__Class' remoteClass must carry namespace");
+}
+
+// 35. os-meta remoteClass: ordinary local value (no dot, no '__') --
+//     byte-identical to pre-v0.8 output, namespace stays null. Regression
+//     pin for test #17's exact fixture shape.
+{
+  const refs = parseMetaFile({
+    path: 'omniscripts/AcmeShipmentOmniScript.os-meta.xml',
+    text: src([
+      '<OmniScript xmlns="http://soap.sforce.com/2006/04/metadata">',
+      '    <elements>',
+      '        <remoteClass>AcmeShipmentAuraService</remoteClass>',
+      '        <remoteMethod>refreshTracking</remoteMethod>',
+      '    </elements>',
+      '</OmniScript>',
+    ]),
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'AcmeShipmentAuraService');
+  assert.strictEqual(refs[0].namespace, null, 'ordinary local os-meta remoteClass -- no false namespace');
+}
+
+// 36. os-meta remoteClass: object-API-name-style decoy ('Kappa_Order__c'
+//     shape) must not misfire here either -- same guard as CMDT test #31,
+//     exercised on the XML remoteClass surface.
+{
+  const refs = parseMetaFile({
+    path: 'omniscripts/AcmeDecoyOmniScript.os-meta.xml',
+    text: src([
+      '<OmniScript xmlns="http://soap.sforce.com/2006/04/metadata">',
+      '    <elements>',
+      '        <remoteClass>Kappa_Order__c</remoteClass>',
+      '        <remoteMethod>whatever</remoteMethod>',
+      '    </elements>',
+      '</OmniScript>',
+    ]),
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'Kappa_Order__c');
+  assert.strictEqual(refs[0].namespace, null);
+}
+
+// 37. OmniScript/IP DataPack *.json remoteClass: deliberately OUT OF SCOPE
+//     for this amendment (see the v0.8 header note) -- a namespace-shaped
+//     remoteClass value in the JSON surface stays completely untouched
+//     (className verbatim, no `namespace` field set at all), proving this is
+//     a documented scope boundary and not an oversight or an inconsistent
+//     half-fix.
+{
+  const obj = { remoteClass: 'zenq.KappaGateway', remoteMethod: 'dispatch' };
+  const refs = parseMetaFile({
+    path: 'omniscripts/AcmeNamespaceProbe_DataPack.json',
+    text: JSON.stringify(obj),
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'zenq.KappaGateway', 'JSON DataPack remoteClass amendment out of scope -- verbatim');
+  assert.strictEqual(refs[0].methodName, 'dispatch');
+  assert.strictEqual('namespace' in refs[0], false, 'JSON DataPack refs never gain a namespace field in this amendment');
+}
+
+// ===========================================================================
+// N3 — stripOwnNamespace(refs, ownNamespace): metascan's own-namespace
+// stripping hook. Pure function; the extension (out of scope here) is
+// expected to call this once, after scanning, before handing refs to
+// resolver.js's attachMetaCallers().
+// ===========================================================================
+
+// 38. Absent/empty/non-string ownNamespace -> no stripping at all (N3:
+//     "Absent/empty namespace property -> no stripping, current behavior")
+//     -- returns the EXACT SAME array reference, not just an equal one.
+{
+  const refs = parseMetaFile({
+    path: 'lwc/kappaGatewayPanel/kappaGatewayPanel.js',
+    text: "import dispatch from '@salesforce/apex/vtx.VertexPricingService.repriceOrder';",
+  });
+  assert.strictEqual(stripOwnNamespace(refs, undefined), refs, 'undefined ownNamespace -> same array, no-op');
+  assert.strictEqual(stripOwnNamespace(refs, null), refs, 'null ownNamespace -> same array, no-op');
+  assert.strictEqual(stripOwnNamespace(refs, ''), refs, "empty-string ownNamespace -> same array, no-op");
+  assert.strictEqual(stripOwnNamespace(refs, '   '), refs, 'whitespace-only ownNamespace -> same array, no-op');
+  assert.strictEqual(stripOwnNamespace(refs, 42), refs, 'non-string ownNamespace -> same array, no-op');
+}
+
+// 39. Own-namespace refs fold to local (namespace -> null, className/
+//     methodName untouched -- already the split local name); other-namespace
+//     refs pass through unchanged; case-insensitive match (Apex identifiers
+//     are case-insensitive, same as every other lookup in this engine
+//     family). Exercises the exact B1 fixture shape
+//     ('vtx.VertexPricingService.repriceOrder' with own namespace 'vtx').
+{
+  const refs = parseMetaFile({
+    path: 'flows/VtxOwnNamespaceProbeFlow.flow-meta.xml',
+    text: src([
+      '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+      '    <actionCalls>',
+      '        <actionName>vtx.VertexPricingService.repriceOrder</actionName>',
+      '        <actionType>apex</actionType>',
+      '    </actionCalls>',
+      '    <actionCalls>',
+      '        <actionName>zenq.KappaGateway.dispatch</actionName>',
+      '        <actionType>apex</actionType>',
+      '    </actionCalls>',
+      '</Flow>',
+    ]),
+  });
+  assert.strictEqual(refs.length, 2);
+
+  const stripped = stripOwnNamespace(refs, 'vtx');
+  const own = stripped.find((r) => r.className === 'VertexPricingService');
+  const other = stripped.find((r) => r.className === 'KappaGateway');
+  assert.strictEqual(own.namespace, null, 'own-namespace (vtx) ref must fold to local -- no external node');
+  assert.strictEqual(own.methodName, 'repriceOrder', 'className/methodName untouched -- already the split local name');
+  assert.strictEqual(other.namespace, 'zenq', 'a DIFFERENT namespace must never be stripped just because SOME ownNamespace was passed');
+
+  // Case-insensitive match: Apex identifiers are case-insensitive.
+  const strippedUpper = stripOwnNamespace(refs, 'VTX');
+  assert.strictEqual(
+    strippedUpper.find((r) => r.className === 'VertexPricingService').namespace,
+    null,
+    'own-namespace match must be case-insensitive'
+  );
+}
+
+// 40. Refs with no `namespace` field at all (aura/vf, or any kind this
+//     amendment doesn't touch) pass through as the exact SAME object
+//     reference, never copied -- stripOwnNamespace must be a true no-op for
+//     kinds it has nothing to do.
+{
+  const auraRefs = parseMetaFile({
+    path: 'aura/AcmeSelfClosing/AcmeSelfClosing.cmp',
+    text: '<aura:component controller="AcmeSelfClosingController"/>',
+  });
+  const vfRefs = parseMetaFile({
+    path: 'pages/AcmeQuotePage.page',
+    text: '<apex:page controller="AcmeQuoteController"/>',
+  });
+  const strippedAura = stripOwnNamespace(auraRefs, 'anyns');
+  const strippedVf = stripOwnNamespace(vfRefs, 'anyns');
+  assert.strictEqual(strippedAura[0], auraRefs[0], 'aura ref (no namespace field) must pass through as the same object');
+  assert.strictEqual(strippedVf[0], vfRefs[0], 'vf ref (no namespace field) must pass through as the same object');
+}
+
+// 41. Purity: stripOwnNamespace never mutates its input array or any input
+//     ref object, even when it DOES fold a matching namespace to null.
+{
+  const refs = parseMetaFile({
+    path: 'lwc/kappaGatewayPanel/kappaGatewayPanel.js',
+    text: "import dispatch from '@salesforce/apex/vtx.KappaGateway.dispatch';",
+  });
+  const refsSnapshot = JSON.parse(JSON.stringify(refs));
+  const original = refs[0];
+  const stripped = stripOwnNamespace(refs, 'vtx');
+  assert.deepStrictEqual(refs, refsSnapshot, 'input array/objects must be byte-identical after the call -- pure function');
+  assert.notStrictEqual(stripped[0], original, 'a folded ref must be a NEW object, not the mutated original');
+  assert.strictEqual(original.namespace, 'vtx', 'the ORIGINAL ref object must be untouched -- namespace still vtx');
+  assert.strictEqual(stripped[0].namespace, null, 'the NEW ref reflects the fold');
+}
+
+// 42. Defensive: non-array `refs` input is returned verbatim, never throws
+//     (mirrors this file's "never throw, degrade gracefully" posture).
+{
+  assert.doesNotThrow(() => stripOwnNamespace(undefined, 'vtx'));
+  assert.strictEqual(stripOwnNamespace(undefined, 'vtx'), undefined);
+  assert.doesNotThrow(() => stripOwnNamespace(null, 'vtx'));
+  assert.strictEqual(stripOwnNamespace(null, 'vtx'), null);
+  assert.doesNotThrow(() => stripOwnNamespace([], 'vtx'));
+  assert.deepStrictEqual(stripOwnNamespace([], 'vtx'), []);
+}
+
 console.log('metascan.js inline-fixture self-check: all assertions passed');
 
 // ===========================================================================
@@ -1436,6 +1830,76 @@ if (!fs.existsSync(GAUNTLET_ROOT)) {
     /zenq\.KappaGateway\.dispatch/.test(refs[0].lineText),
     'lineText must show the real namespaced specifier verbatim'
   );
+}
+
+// ===========================================================================
+// v0.8-A5/B5 GAUNTLET-ORG REGRESSION -- real corpus fixtures for N1(c)'s
+// metascan half. Cross-checks that an Apex call site (KappaGatewayCaller.cls,
+// out of scope here -- resolver-owned), the LWC import above, a Flow
+// actionName, and a CMDT value ALL land on the same (namespace, className)
+// pair for the two shared namespace probes ('zenq'+'KappaGateway',
+// 'kwx'+'PostLedgerEntry') -- the three/two-surface consistency check
+// GROUND-TRUTH.md's v0.8-A5/B5 sections document. This test only exercises
+// metascan.js's OWN extraction; attachMetaCallers() actually routing these
+// to a shared external node is resolver.js's job, out of scope here.
+// ===========================================================================
+
+// v0.8-B5: the real Vtx_Namespace_Probe_Flow.flow-meta.xml fixture --
+// 'zenq.KappaGateway.dispatch' (dotted) must land on the exact same
+// (namespace, className, methodName) triple as the LWC probe above, and
+// 'kwx__PostLedgerEntry' (bare) must be split.
+{
+  const refs = parseMetaFile(readGauntlet('flows/Vtx_Namespace_Probe_Flow.flow-meta.xml'));
+  assert.strictEqual(refs.length, 2, 'v0.8-B5: exactly 2 apex actionCalls in the real Flow fixture');
+
+  const dotted = refs.find((r) => r.namespace === 'zenq');
+  assert.ok(dotted, 'v0.8-B5: the zenq-namespaced actionCall must be present');
+  assert.strictEqual(dotted.className, 'KappaGateway');
+  assert.strictEqual(dotted.methodName, 'dispatch');
+  assert.strictEqual(
+    dotted.className,
+    'KappaGateway',
+    'v0.8-A5/B5 cross-surface check: Flow must land on the SAME className as the LWC probe (zenq.KappaGateway)'
+  );
+
+  const bare = refs.find((r) => r.namespace === 'kwx');
+  assert.ok(bare, 'v0.8-B5: the kwx-namespaced bare actionCall must be present');
+  assert.strictEqual(bare.className, 'PostLedgerEntry');
+  assert.strictEqual(bare.methodName, null, 'bare ns__Class actionName is class-only');
+
+  assert.ok(refs.every((r) => r.flowObject === 'Vertex_Order__c'), 'F1(b) flowObject fields untouched by this amendment');
+}
+
+// v0.8-B5: the real Kappa_Trigger_Config.Namespace_Handler.md-meta.xml CMDT
+// record -- 'kwx__PostLedgerEntry' must split to the SAME (namespace,
+// className) pair the Flow's bare actionCall (above) produces, a second
+// cross-surface (Flow+CMDT) consistency check on one shared external node.
+{
+  const refs = parseMetaFile(readGauntlet('customMetadata/Kappa_Trigger_Config.Namespace_Handler.md-meta.xml'));
+  const handler = refs.find((r) => r.fieldName === 'Handler_Class_Name__c');
+  assert.ok(handler, 'v0.8-B5: the Handler_Class_Name__c value must be extracted');
+  assert.strictEqual(handler.className, 'PostLedgerEntry');
+  assert.strictEqual(handler.namespace, 'kwx', 'v0.8-B5: CMDT value must carry the namespace field');
+
+  // The pre-existing SobjectApiName__c value ('Kappa_Order__c') is an
+  // object-API-name-style decoy sitting in the SAME record -- must not be
+  // misread as a namespace token (see the inline test #31 for the isolated
+  // case; this is its real-corpus instance).
+  const decoy = refs.find((r) => r.fieldName === 'SobjectApiName__c');
+  assert.ok(decoy, 'the pre-existing SobjectApiName__c value is still extracted (identifier-shaped)');
+  assert.strictEqual(decoy.className, 'Kappa_Order__c');
+  assert.strictEqual(decoy.namespace, null, "real-corpus 'Kappa_Order__c' decoy must not be split as a namespace");
+}
+
+// v0.8: the pre-existing Kappa_Trigger_Config.Order_Handler.md-meta.xml
+// record (LOCAL, non-namespaced control) must be completely unaffected by
+// this amendment -- same class, same shape, namespace null.
+{
+  const refs = parseMetaFile(readGauntlet('customMetadata/Kappa_Trigger_Config.Order_Handler.md-meta.xml'));
+  const handler = refs.find((r) => r.fieldName === 'Handler_Class_Name__c');
+  assert.ok(handler);
+  assert.strictEqual(handler.className, 'KappaOrderTriggerHandler');
+  assert.strictEqual(handler.namespace, null, 'pre-existing LOCAL control record unaffected by v0.8');
 }
 
 console.log('metascan.js gauntlet-org regression self-check: all assertions passed (M1: namespace retained)');

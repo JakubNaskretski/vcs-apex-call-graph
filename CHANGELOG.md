@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.0
+
+Managed packages become part of the graph.
+
+- **External nodes**: references into managed namespaces (`zenq.Billing.charge()`,
+  `kwx__Ledger__c` DML, namespaced LWC imports, Flow actions and Custom Metadata
+  values) now appear as first-class `managed: <ns>` nodes instead of anonymous
+  "unresolved" counts. Terminal going forward (package source isn't analyzable) —
+  but fully **traceable as targets**: trace `zenq.Billing.charge` and see every
+  local call site, LWC import, and Flow action in your org that touches it.
+- **Own-org namespace**: if `sfdx-project.json` declares a namespace, references
+  prefixed with it resolve to your local classes and objects — never fabricated
+  as a foreign package.
+- **Local triggers on managed objects** (`trigger X on ns__Object__c`) participate
+  in DML linkage exactly like local objects.
+- Honest headers split the counts: "N unresolved · M managed-package refs (ns, …)".
+- Precedence is pinned by tests: a local class named like a namespace still wins
+  when it genuinely resolves; two-segment ambiguous calls stay unresolved rather
+  than guessing; platform types never become externals. Everything else verified
+  byte-identical against the published 0.7.1 artifact.
+
 ## 0.7.1
 
 Precision patch, driven by an independent hard-mode validation corpus

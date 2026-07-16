@@ -2,7 +2,7 @@
   "name": "apex-call-graph",
   "displayName": "Apex Call Graph",
   "description": "Trace who calls an Apex class or method — with the arguments at every call site — up to trigger/LWC/Flow/API entry points. Traces Flow, LWC, Aura and OmniScript callers too. Offline static analysis: real Apex parser, no org connection, no language server.",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "publisher": "Skrety",
   "license": "MIT",
   "engines": {

@@ -452,4 +452,85 @@ const { refineTargets } = require('./targets');
   assert.deepStrictEqual(labels, ['Weird (no package)', 'Weird (nova-shared)'].sort());
 }
 
+// ===========================================================================
+// v0.8 (N4/N6, forward-compat): '(managed)' suffix for external targets.
+// resolver.js does not stamp kind:'external' onto suggestTargets() output
+// yet (a different phase's job) -- every fixture below hand-builds the
+// documented `{ ..., kind: 'external' }` shape rather than a real
+// resolver.js run, exactly like this file's existing header comment already
+// does for `package` (B3).
+// ===========================================================================
+
+// 23. A plain external target gets the exact ' (managed)' suffix, and its
+//     `kind` is carried through onto the output item.
+{
+  const input = [{ label: 'zenq.Billing', classLower: 'zenq.billing', methodLower: null, kind: 'external' }];
+  const out = refineTargets(input);
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].label, 'zenq.Billing (managed)', "exact N4/N6 CONTRACT-pinned wording, e.g. 'zenq.Billing (managed)'");
+  assert.strictEqual(out[0].kind, 'external', 'kind is carried through onto the output item');
+}
+
+// 24. A non-external item (no `kind` at all -- every pre-v0.8 fixture) is
+//     completely untouched: no suffix, no `kind` key on the output either.
+{
+  const input = [{ label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null }];
+  const out = refineTargets(input);
+  assert.strictEqual(out[0].label, 'AcmeOrderUtil', 'REGRESSION: no kind field -> no managed suffix');
+  assert.ok(!Object.prototype.hasOwnProperty.call(out[0], 'kind'), 'REGRESSION: no kind field on input -> none on output either');
+}
+
+// 25. A non-'external' kind value (defensive -- resolver.js's contract only
+//     ever stamps 'external' today, but this file reacts to the literal
+//     string, not "any truthy kind") is carried through without a suffix.
+{
+  const input = [{ label: 'Foo', classLower: 'foo', methodLower: null, kind: 'method' }];
+  const out = refineTargets(input);
+  assert.strictEqual(out[0].label, 'Foo', "a kind other than 'external' never gets the managed suffix");
+  assert.strictEqual(out[0].kind, 'method', 'kind is still carried through verbatim');
+}
+
+// 26. Idempotency: re-applying refineTargets() to its own managed-suffixed
+//     output must not double-append the suffix (mirrors test 21's
+//     package-suffix idempotency check and test 12's constructor one).
+{
+  const input = [{ label: 'kwx.LedgerService', classLower: 'kwx.ledgerservice', methodLower: null, kind: 'external' }];
+  const once = refineTargets(input);
+  const twice = refineTargets(once);
+  assert.deepStrictEqual(twice, once, 'refineTargets must be idempotent when re-applied to its own managed-suffixed output');
+  assert.ok(!twice.some((o) => / \(managed\) \(managed\)$/.test(o.label)), 'must never double-suffix "(managed)"');
+}
+
+// 27. The managed suffix combines correctly with constructor relabeling
+//     (rule 2 runs first, then the managed suffix, per the header comment's
+//     documented ordering) and still dedupes/sorts correctly alongside it.
+{
+  const input = [
+    { label: 'zenq.Billing.<init>', classLower: 'zenq.billing', methodLower: '<init>', kind: 'external' },
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null },
+  ];
+  const out = refineTargets(input);
+  const billing = out.find((o) => o.classLower === 'zenq.billing');
+  assert.strictEqual(billing.label, 'zenq.Billing (constructor) (managed)', 'constructor relabel happens BEFORE the managed suffix, per the documented rule ordering');
+  assert.deepStrictEqual(out.map((o) => o.label), [...out.map((o) => o.label)].sort((a, b) => a.localeCompare(b)), 'output stays label-sorted with a managed entry mixed in');
+}
+
+// 28. An external item never participates in B3's duplicate-package
+//     suffixing (it carries no `package` field at all in N4's design) --
+//     confirms the two suffix mechanisms stay independent, no crash/
+//     unexpected interaction when both an external and a same-classLower
+//     dup-package item happen to coexist in one list.
+{
+  const input = [
+    { label: 'Billing', classLower: 'billing', methodLower: null, package: 'force-app' },
+    { label: 'Billing', classLower: 'billing', methodLower: null, package: 'nova-billing' },
+    { label: 'zenq.Billing', classLower: 'zenq.billing', methodLower: null, kind: 'external' },
+  ];
+  assert.doesNotThrow(() => refineTargets(input));
+  const out = refineTargets(input);
+  const ext = out.find((o) => o.classLower === 'zenq.billing');
+  assert.strictEqual(ext.label, 'zenq.Billing (managed)', 'external item unaffected by the unrelated same-list package-duplicate group');
+  assert.ok(!Object.prototype.hasOwnProperty.call(ext, 'package'), 'external item never gains a package field it never had');
+}
+
 console.log('apex-trace targets.js self-check: all assertions passed');

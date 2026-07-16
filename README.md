@@ -83,16 +83,19 @@ for this direction too — the target sits on the LEFT, callees flow RIGHT.
 
 - **Badges** (`[…]` after a node's label): the entries it declares (`@AuraEnabled`,
   `Batchable`, trigger header, …), `test`, the resolution kind (`typed`, `static`,
-  `new`, `interface`, `dml`, …), and markers — `~` approximate, `↺` cycle, `…` depth
-  cap reached, `↪ seen elsewhere` (this subtree was already shown once above, in a
-  diamond-shaped call graph — only its own call sites repeat, not its callers again),
-  `◉ root` (no known caller — entry point or dead code), `🛡` an ancestor catches the
-  exception being traced. Hover any node or badge for a one-line explanation.
+  `new`, `interface`, `dml`, `external`, …), and markers — `~` approximate, `↺` cycle,
+  `…` depth cap reached, `↪ seen elsewhere` (this subtree was already shown once above,
+  in a diamond-shaped call graph — only its own call sites repeat, not its callers
+  again), `◉ root` (no known caller — entry point or dead code), `🛡` an ancestor
+  catches the exception being traced, `managed: ns` (a [managed-package
+  reference](#managed-packages), package-icon glyph). Hover any node or badge for a
+  one-line explanation.
 - **Site rows** (indented under a node): the source line, plus a second line showing
   the overload signature and/or the arguments, when either is available.
 - A **note** above the tree calls out an honest zero-caller result instead of
   rendering a silent empty tree, and (when non-zero) a workspace-wide count of call
-  sites that couldn't be resolved.
+  sites that couldn't be resolved — split into a plain unresolved count and a
+  [managed-package](#managed-packages) ref count once any namespace references exist.
 
 ## Beyond Apex: metadata callers
 
@@ -164,18 +167,54 @@ share a name). QuickPick target labels get a package suffix too, but only for na
 that are actually duplicated. A workspace with no `sfdx-project.json` anywhere behaves
 exactly as before — no badges, no bucketing, first-registered class wins.
 
+## Managed packages
+
+A reference into a managed namespace — `ns.Class.method(...)`, `insert new
+ns__Object__c(...)`, or an LWC/Flow/Custom-Metadata reference naming
+`ns.Class.method`/`ns__Class` — shows up as its own **external** node
+(`managed: ns` badge, package-icon glyph) instead of vanishing into an
+"unresolved" count. What it can show:
+
+- **Who calls into it.** Trace the external node itself (pick it from the same
+  QuickPick you'd use for any other target — it's grouped and labeled
+  `ns.Class (managed)`) and you get the full, ordinary caller tree: every local
+  Apex call site, LWC import, Flow action, and Custom Metadata record that
+  references it, from every surface at once. Two differently-spelled or
+  differently-cased references to the same `(namespace, class)` pair land on
+  the **same** node; a different namespace or a different class name — even a
+  one-letter typo — is always a **distinct** node, never merged.
+- **A local trigger on a namespaced-looking object still links normally.** If
+  your workspace declares `trigger MyTrigger on ns__Object__c (...)`, DML on
+  `ns__Object__c` fans out to it exactly like it would for any local custom
+  object — the object *looking* namespaced doesn't change trigger matching.
+
+What it can never show:
+
+- **What the managed code itself does.** An external node is a dead end going
+  forward — there's no source to read, so "what does this call?" stops there.
+  That's not a bug to report; it's the boundary of static analysis without the
+  package's Apex.
+- A 2-segment call (`Foo.bar()`, no third segment) is **never** promoted to an
+  external node, even when `Foo` looks like it could be a namespace — that
+  shape is indistinguishable from an ordinary reference to a class this
+  workspace simply never declared, and stays in the plain unresolved count
+  instead (see the header's `N unresolved · M managed-package refs (ns, …)`
+  line for that split).
+- If your own workspace declares a namespace (`sfdx-project.json`'s
+  `"namespace"` property), references prefixed with *your own* namespace
+  resolve locally instead — they're not managed-package code at all, so they
+  never appear as an external node.
+
 ## Limits (known, by design)
 
 - Chains longer than 4 segments degrade to no edge (never a guessed one).
 - `Type.forName`/`Type.newInstance()` with a non-literal argument (including a
   `Type`-typed local/field, however it's named — the check is by declared type, not
   identifier text) is not traced: no constructor edge, and never a guessed one.
-- Namespace/managed-package references (`ns.Class.method()`, or an LWC/Aura/Flow
-  import of `@salesforce/apex/ns.Class.method`) are not resolved to any local class —
-  even when the bare, namespace-stripped tail happens to collide with a real local
-  class/method name — and are counted in the workspace-wide unresolved-sites tally
-  instead of being silently dropped. A namespace-qualified reference never falls back
-  to bare-tail matching, at any confidence level.
+- A 2-segment call (`Foo.bar()`) into an unknown class is never distinguished from a
+  2-segment call into an actual namespace — see [Managed packages](#managed-packages)
+  above for the 3-segment shapes that *are* modeled, and why 2-segment calls
+  deliberately aren't.
 - DML→trigger edges assume the trigger fires (validation rules and exceptions can
   prevent it at runtime). A DML statement whose target can't be narrowed to a
   concrete SObject type (e.g. a generic `List<SObject>`/`SObject`-typed variable
@@ -235,6 +274,11 @@ A real parse of every `.cls`/`.trigger`, then static resolution:
 - **ambiguous** — a class name duplicated across sfdx packages that neither the
   referring file's own package nor the default package could resolve: every remaining
   candidate gets an edge, marked approximate (see "Multi-package projects" above).
+- **external** — a 3-or-more-segment reference (`ns.Class.method(...)`) or a
+  managed-object DML target (`ns__Object__c`) whose leading segment isn't a local
+  variable, class, or your own declared namespace: edge to a dedicated external
+  (managed-package) node, **not** marked approximate — namespace precedence is a
+  confident rule, not a guess (see "Managed packages" above).
 - **lexical** — files with syntax errors degrade to v1's name-mention scan.
 - Overloads are arity-matched; inner classes work as `Outer.Inner`; platform types
   (`System.debug`, `Database.insert`, …) are excluded unless you shadow them with a

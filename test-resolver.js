@@ -3515,7 +3515,33 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
   const tree = buildCallerTree(index, { classLower: 'g71billing', methodLower: 'charge' });
   assert.deepStrictEqual(tree.root.children, [], 'v0.7.1/R1: zenq.G71Billing.charge() must NOT resolve onto the unrelated local G71Billing.charge (namespace-prefix bare-tail collision)');
   assert.strictEqual(tree.note, 'No callers found — this is likely an entry point or unused code.');
-  assert.strictEqual(index.stats.unresolvedSites, 1, 'v0.7.1/R1: the namespaced call must be counted as an honest unresolved site (both directions), not silently swallowed like a genuine platform-denylist exclusion');
+  // v0.8/N1(a)/N2 step 3 (REGRESSION POLICY category (a)): this EXACT shape
+  // is now the corpus's own promoted namespace probe (see gauntlet-org's
+  // GROUND-TRUTH.md v0.8-A1) -- the reference no longer stays an anonymous
+  // unresolved site, it becomes a first-class EXTERNAL node instead. The
+  // "no false LOCAL edge" invariant above is UNCHANGED; only where the
+  // reference lands changes.
+  assert.strictEqual(index.stats.unresolvedSites, 0, 'v0.8/N2: the namespaced call is no longer counted as unresolved -- it is now modeled as an external edge');
+  assert.strictEqual(index.stats.externalRefs, 1, 'v0.8/N5: exactly one external ref recorded');
+  assert.deepStrictEqual(index.stats.externalNamespaces, ['zenq'], 'v0.8/N5: the external namespace surfaces on index.stats');
+  const ext = index.externals.get('zenq.g71billing');
+  assert.ok(ext, 'v0.8/N1(a): an ExternalMeta for zenq.G71Billing must exist, keyed nslower.classlower');
+  assert.strictEqual(ext.ns, 'zenq');
+  assert.strictEqual(ext.className, 'G71Billing');
+  assert.strictEqual(ext.label, 'zenq.G71Billing', "v0.8/N1: external label is 'ns.Class' for a namespaced Apex call site");
+  assert.strictEqual(ext.refCount, 1);
+  assert.deepStrictEqual([...ext.methods], ['charge'], 'v0.8/N1: the observed method is recorded on the ExternalMeta');
+  // v0.8/N4: the external IS a valid trace target in the callers direction,
+  // with the referencing LOCAL site (G71LedgerBridge.postToLedger) as its
+  // caller -- "full normal caller tree above them".
+  const extTree = buildCallerTree(index, { classLower: 'zenq.g71billing', methodLower: null });
+  assert.strictEqual(extTree.root.kind, 'external');
+  assert.strictEqual(extTree.root.label, 'zenq.G71Billing');
+  assert.strictEqual(extTree.root.ns, 'zenq');
+  const extCaller = findChild(extTree.root.children, 'G71LedgerBridge.postToLedger');
+  assert.ok(extCaller, 'v0.8/N4: G71LedgerBridge.postToLedger must appear as a caller of the external zenq.G71Billing node');
+  assert.strictEqual(extCaller.via, 'external');
+  assert.strictEqual(extCaller.approximate, false, "v0.8/N2: 'external' is NOT approximate -- a genuine namespace match is exact, not a guess");
 }
 
 // ---- v0.7.1/R1 re-hunt: known-class head does not imply known chain ------
@@ -3570,7 +3596,37 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
     "v0.7.1/R1 re-hunt: the presence of a genuine local 'zenq' class must not resurrect the original bare-tail false edge for zenq.G71RehuntBilling.charge() either"
   );
 
-  assert.strictEqual(index.stats.unresolvedSites, 2, "v0.7.1/R1 re-hunt: both zenq.*-prefixed calls must be counted as honest unresolved sites, not silently misrouted");
+  // v0.8/N2 step 3 (REGRESSION POLICY category (a)): both zenq.*-prefixed
+  // calls are now external edges, NOT unresolved counts -- named regression
+  // test for the R1-guard interplay: a GENUINE local class named `zenq`
+  // (with its own unrelated inner class `Foo`) coexists in this exact
+  // fixture, and must neither (a) resurrect a false local edge (pinned
+  // above, unchanged) NOR (b) block/corrupt the external-node creation for
+  // either receiver -- both invariants proven simultaneously by one fixture.
+  assert.strictEqual(index.stats.unresolvedSites, 0, "v0.8/N2: both zenq.*-prefixed calls are no longer counted as unresolved");
+  assert.strictEqual(index.stats.externalRefs, 2);
+  assert.deepStrictEqual(index.stats.externalNamespaces, ['zenq']);
+  assert.strictEqual(index.externals.size, 2, 'v0.8/N1(a): two DISTINCT external nodes -- one per (ns, className) pair -- not merged just because they share the zenq namespace');
+
+  const kgExt = index.externals.get('zenq.g71rehuntkappagateway');
+  assert.ok(kgExt);
+  assert.strictEqual(kgExt.label, 'zenq.G71RehuntKappaGateway');
+  assert.deepStrictEqual([...kgExt.methods], ['dispatch']);
+
+  const billingExt = index.externals.get('zenq.g71rehuntbilling');
+  assert.ok(billingExt);
+  assert.strictEqual(billingExt.label, 'zenq.G71RehuntBilling');
+  assert.deepStrictEqual([...billingExt.methods], ['charge']);
+
+  // Neither external collides with the GENUINE local 'zenq' class or its
+  // real inner class 'zenq.Foo' -- index.classes keeps its own, completely
+  // separate identity for those (a class-keyed lookup, not externals-keyed).
+  assert.ok(index.classes.has('zenq'), "the genuine local 'zenq' class is still indexed normally");
+  assert.ok(index.classes.has('zenq.foo'), "the genuine local 'zenq.Foo' inner class is still indexed normally");
+  assert.ok(!index.externals.has('zenq.foo'), "the genuine local 'zenq.Foo' must never ALSO appear as an external node");
+
+  const kgExtTree = buildCallerTree(index, { classLower: 'zenq.g71rehuntkappagateway', methodLower: null });
+  assert.ok(findChild(kgExtTree.root.children, 'G71RehuntCaller.run'), 'v0.8/N4: G71RehuntCaller.run is a caller of the external zenq.G71RehuntKappaGateway node');
 }
 
 // ---- v0.7.1/R1 re-hunt over-correction guard: genuine Outer.Inner must still edge --
@@ -3598,6 +3654,14 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
     findChild(tree.root.children, 'G71RehuntCaller2.run'),
     "v0.7.1/R1 re-hunt over-correction check: zenq.G71RehuntBilling2.charge() -- a GENUINE Outer.Inner static call -- must still resolve; the guard must not blanket-exclude every dotted chain whose head is named 'zenq'"
   );
+  // v0.8/N2 steps 1-2 (pinned as a named regression test): a local class
+  // named like a namespace token that ACTUALLY resolves keeps winning --
+  // NO external node is ever fabricated for a chain local resolution
+  // already succeeded on, and the unresolvedSites count stays untouched too.
+  assert.strictEqual(index.externals.size, 0, 'v0.8/N2: a genuinely-resolving Outer.Inner static call must never ALSO create an external node');
+  assert.strictEqual(index.stats.unresolvedSites, 0);
+  assert.strictEqual(index.stats.externalRefs, 0);
+  assert.deepStrictEqual(index.stats.externalNamespaces, []);
 }
 
 // ---- v0.7.1/R2: Type-typed receiver denylist (by declared type) ----------
@@ -3776,6 +3840,544 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
   assert.strictEqual(marker.via, 'dml-unresolved');
   assert.strictEqual(marker.approximate, true);
   assert.strictEqual(marker.truncated, true);
+}
+
+// =========================================================================
+// v0.8: namespace/managed-package MODELING (N1(a)(b), N2, N3 resolver half
+// -- opts.ownNamespace, N4, N5). Fixtures below mirror gauntlet-org's actual
+// v0.8 corpus probes (GROUND-TRUTH.md's v0.8-A/v0.8-B sections) shape-for-
+// shape, under fresh V8-prefixed names, so this suite pins the exact same
+// scenarios the corpus exercises without depending on reading real files.
+// =========================================================================
+
+// ---- N1(a)/N2: KappaGatewayCaller-shape probes (case-fold dedup, cross-
+// namespace distinctness, typo negative control) -----------------------
+{
+  const V8KappaGateway = ty('V8KappaGateway', 'V8KappaGateway', {
+    methods: [mth('dispatch', { line: 1, params: [{ name: 'cmd', type: 'String' }] })],
+  });
+  const V8KappaGatewayCaller = ty('V8KappaGatewayCaller', 'V8KappaGatewayCaller', {
+    methods: [
+      mth('routeCommands', {
+        line: 1,
+        calls: [
+          cl('dot', 'dispatch', { receiver: 'zenq.V8KappaGateway', argTexts: ['cmd'], line: 3, lineText: 'zenq.V8KappaGateway.dispatch(cmd);' }),
+          // case-varied (Apex identifiers are case-insensitive) -- must
+          // attach to the SAME external node as the site above.
+          cl('dot', 'DISPATCH', { receiver: 'ZENQ.v8kappagateway', argTexts: ['cmd'], line: 9, lineText: 'ZENQ.v8kappagateway.DISPATCH(cmd);' }),
+          // different namespace, same class simple name -> DISTINCT node.
+          cl('dot', 'dispatch', { receiver: 'kwx.V8KappaGateway', argTexts: ['cmd'], line: 16, lineText: 'kwx.V8KappaGateway.dispatch(cmd);' }),
+          // typo'd class name (negative control) -> its OWN, separate node.
+          cl('dot', 'dispatch', { receiver: 'zenq.V8KappaGatewey', argTexts: ['cmd'], line: 21, lineText: 'zenq.V8KappaGatewey.dispatch(cmd);' }),
+        ],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(V8KappaGateway), mkFile(V8KappaGatewayCaller)]);
+
+  const zenqKg = index.externals.get('zenq.v8kappagateway');
+  assert.ok(zenqKg, 'v0.8/N1(a): zenq.V8KappaGateway.dispatch(cmd) creates an external node');
+  assert.strictEqual(zenqKg.refCount, 2, 'v0.8/N1(a): case-varied call sites (zenq.V8KappaGateway vs ZENQ.v8kappagateway) attach to ONE external node, not two -- the index key is case-folded exactly like every other lookup');
+  assert.strictEqual(zenqKg.label, 'zenq.V8KappaGateway', 'first-observation-wins label casing');
+  assert.deepStrictEqual([...zenqKg.methods], ['dispatch']);
+
+  const kwxKg = index.externals.get('kwx.v8kappagateway');
+  assert.ok(kwxKg, 'v0.8/N1(a): a DIFFERENT namespace (kwx), same class simple name as zenq.V8KappaGateway');
+  assert.notStrictEqual(zenqKg, kwxKg, 'external-node identity is the (namespace, class) pair, not the class name alone');
+  assert.strictEqual(kwxKg.refCount, 1);
+
+  const typoKg = index.externals.get('zenq.v8kappagatewey');
+  assert.ok(typoKg, "v0.8/N2 step 3: a 1-letter-typo'd class name still fires namespace precedence verbatim -- the engine has no knowledge it's a typo");
+  assert.notStrictEqual(typoKg, zenqKg, 'must stay a SEPARATE node from zenq.V8KappaGateway -- same namespace, different class text');
+  assert.strictEqual(typoKg.refCount, 1);
+
+  assert.strictEqual(index.externals.size, 3, 'exactly 3 distinct external nodes for this file (zenq.V8KappaGateway, kwx.V8KappaGateway, zenq.V8KappaGatewey)');
+  assert.strictEqual(index.stats.unresolvedSites, 0, 'v0.8/N5: none of the 4 sites are counted as unresolved -- all 4 are now external refs');
+  assert.strictEqual(index.stats.externalRefs, 4);
+  assert.deepStrictEqual(index.stats.externalNamespaces, ['kwx', 'zenq'], 'v0.8/N5: sorted, deduped namespace list');
+
+  // None of the four sites may ever attach to the local V8KappaGateway.dispatch
+  // caller tree -- unchanged v0.7.1 invariant, still true post-v0.8.
+  const localTree = buildCallerTree(index, { classLower: 'v8kappagateway', methodLower: 'dispatch' });
+  assert.deepStrictEqual(localTree.root.children, [], 'v0.8/N2: none of the 4 namespaced sites may ever land on the local V8KappaGateway.dispatch');
+
+  // v0.8/N4: caller-direction trace of the external shows the local
+  // referencing method, grouped (both L3 and L9 sites under ONE node).
+  const extTree = buildCallerTree(index, { classLower: 'zenq.v8kappagateway', methodLower: null });
+  assert.strictEqual(extTree.root.kind, 'external');
+  assert.strictEqual(extTree.root.label, 'zenq.V8KappaGateway');
+  assert.strictEqual(extTree.root.ns, 'zenq');
+  const routeCommandsCaller = findChild(extTree.root.children, 'V8KappaGatewayCaller.routeCommands');
+  assert.ok(routeCommandsCaller, 'v0.8/N4: V8KappaGatewayCaller.routeCommands is a caller of the external zenq.V8KappaGateway node');
+  assert.strictEqual(routeCommandsCaller.sites.length, 2, 'v0.8/N1(a): ONE node, TWO site rows (L3 + L9) -- not two nodes');
+  assert.strictEqual(routeCommandsCaller.via, 'external');
+  assert.strictEqual(routeCommandsCaller.approximate, false);
+}
+
+// ---- N2 step 3: inner-class tail-collision negative controls -----------
+// (BoltRelayCaller/BeaconCaller-shape) -- tail-matching plays no role in
+// the 3-segment precedence chain; N2 only ever consults HEAD.
+{
+  const V8BoltContainer = ty('V8BoltContainer', 'V8BoltContainer', { methods: [] });
+  const V8BoltRelayInner = ty('Relay', 'V8BoltContainer.Relay', { methods: [mth('fire', { line: 1 })] });
+  const V8BoltContainerFile = file(P('V8BoltContainer'), 'class', [V8BoltContainer, V8BoltRelayInner]);
+  const V8BoltRelayCaller = ty('V8BoltRelayCaller', 'V8BoltRelayCaller', {
+    methods: [mth('trigger', { line: 1, calls: [cl('dot', 'fire', { receiver: 'zenq.Relay', line: 3, lineText: 'zenq.Relay.fire();' })] })],
+  });
+  const index = buildSemanticIndex([V8BoltContainerFile, mkFile(V8BoltRelayCaller)]);
+  const ext = index.externals.get('zenq.relay');
+  assert.ok(ext, 'v0.8/N2 step 3: zenq.Relay.fire() becomes external even though "Relay" uniquely matches a LOCAL inner class workspace-wide -- inner-class tail-matching is not consulted, only HEAD ("zenq")');
+  const localTree = buildCallerTree(index, { classLower: 'v8boltcontainer.relay', methodLower: 'fire' });
+  assert.deepStrictEqual(localTree.root.children, [], 'must NOT land on V8BoltContainer.Relay.fire');
+}
+{
+  const V8KappaContainerA = ty('V8KappaContainerA', 'V8KappaContainerA', { methods: [] });
+  const V8BeaconA = ty('Beacon', 'V8KappaContainerA.Beacon', { methods: [mth('signal', { line: 1 })] });
+  const V8KappaContainerAFile = file(P('V8KappaContainerA'), 'class', [V8KappaContainerA, V8BeaconA]);
+  const V8KappaContainerB = ty('V8KappaContainerB', 'V8KappaContainerB', { methods: [] });
+  const V8BeaconB = ty('Beacon', 'V8KappaContainerB.Beacon', { methods: [mth('signal', { line: 1 })] });
+  const V8KappaContainerBFile = file(P('V8KappaContainerB'), 'class', [V8KappaContainerB, V8BeaconB]);
+  const V8BeaconCaller = ty('V8BeaconCaller', 'V8BeaconCaller', {
+    methods: [mth('ping', { line: 1, calls: [cl('dot', 'signal', { receiver: 'zenq.Beacon', line: 3, lineText: 'zenq.Beacon.signal();' })] })],
+  });
+  const index = buildSemanticIndex([V8KappaContainerAFile, V8KappaContainerBFile, mkFile(V8BeaconCaller)]);
+  const ext = index.externals.get('zenq.beacon');
+  assert.ok(
+    ext,
+    'v0.8/N2 step 3: zenq.Beacon.signal() becomes a CONFIDENT external edge -- the local N=2 inner-class ambiguity (KappaContainerA.Beacon / KappaContainerB.Beacon) is irrelevant since HEAD="zenq" already fails local-class resolution at step 2, before any inner-class tail-matching would even be attempted (this is the one promoted probe where the REASON changes: old = correctly-declined ambiguity, new = confident external resolution)'
+  );
+  assert.strictEqual(index.stats.unresolvedSites, 0);
+}
+
+// ---- N1(a)/N2 step 3: cross-namespace distinctness (minimal, single-
+// purpose version of the KappaGatewayCaller shape above) ------------------
+{
+  const V8NamespaceDistinctGatewayCaller = ty('V8NamespaceDistinctGatewayCaller', 'V8NamespaceDistinctGatewayCaller', {
+    methods: [
+      mth('openBoth', {
+        line: 2,
+        calls: [
+          cl('dot', 'open', { receiver: 'zenq.V8Gateway', line: 3, lineText: 'zenq.V8Gateway.open();' }),
+          cl('dot', 'open', { receiver: 'kwx.V8Gateway', line: 10, lineText: 'kwx.V8Gateway.open();' }),
+        ],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(V8NamespaceDistinctGatewayCaller)]);
+  const zenqGw = index.externals.get('zenq.v8gateway');
+  const kwxGw = index.externals.get('kwx.v8gateway');
+  assert.ok(zenqGw && kwxGw);
+  assert.notStrictEqual(zenqGw, kwxGw, 'v0.8/N1(a): same class simple name (V8Gateway), different namespace -> two DISTINCT external nodes, never merged');
+  assert.strictEqual(index.externals.size, 2);
+}
+
+// ---- N2 precedence traps: local class named like a namespace token ------
+// (ZenqLocalPrecedenceCaller-shape) -- WITH a real member wins locally;
+// WITHOUT one, namespace wins and no false local edge is fabricated.
+{
+  const V8ZenqLedger = ty('Ledger', 'v8zenq.Ledger', {
+    methods: [mth('post', { line: 1, isStatic: true, params: [{ name: 'amount', type: 'Decimal' }] })],
+  });
+  const V8Zenq = ty('v8zenq', 'v8zenq', { methods: [] });
+  const V8ZenqFile = file(P('V8Zenq'), 'class', [V8Zenq, V8ZenqLedger]);
+  const V8ZenqLocalPrecedenceCaller = ty('V8ZenqLocalPrecedenceCaller', 'V8ZenqLocalPrecedenceCaller', {
+    methods: [
+      mth('callWithLocalMember', {
+        line: 2,
+        calls: [cl('dot', 'post', { receiver: 'v8zenq.Ledger', argTexts: ['amount'], line: 3, lineText: 'v8zenq.Ledger.post(amount);' })],
+      }),
+      mth('callWithoutLocalMember', {
+        line: 10,
+        calls: [cl('dot', 'emit', { receiver: 'v8zenq.Signal', argTexts: ['cmd'], line: 11, lineText: 'v8zenq.Signal.emit(cmd);' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([V8ZenqFile, mkFile(V8ZenqLocalPrecedenceCaller)]);
+
+  const ledgerTree = buildCallerTree(index, { classLower: 'v8zenq.ledger', methodLower: 'post' });
+  assert.ok(
+    findChild(ledgerTree.root.children, 'V8ZenqLocalPrecedenceCaller.callWithLocalMember'),
+    'v0.8/N2 step 2: HEAD resolves to a GENUINE local top-level class ("v8zenq") AND Mid ("Ledger") resolves on it as a real inner class -- local-class-chain resolution wins outright'
+  );
+
+  const sigExt = index.externals.get('v8zenq.signal');
+  assert.ok(sigExt, 'v0.8/N2 step 3: v8zenq.Signal.emit(cmd) -- HEAD resolves to the local class but Mid ("Signal") does NOT resolve on it -- step 2 fails cleanly and falls through to step 3');
+  assert.strictEqual(sigExt.label, 'v8zenq.Signal');
+  assert.deepStrictEqual([...sigExt.methods], ['emit']);
+  assert.strictEqual(index.externals.size, 1, 'exactly one external (v8zenq.Signal) -- v8zenq.Ledger.post must NOT ALSO create one, per the local-member leg above');
+}
+
+// ---- N2's 2-segment carve-out: Head.method() NEVER creates an external --
+// (TwoSegmentUnknownCaller-shape)
+{
+  // A 2-segment call's receiver is a SINGLE identifier (no dot).
+  const V8TwoSegmentUnknownCaller = ty('V8TwoSegmentUnknownCaller', 'V8TwoSegmentUnknownCaller', {
+    methods: [
+      mth('callUnknownTwoSegment', {
+        line: 2,
+        calls: [cl('dot', 'doThing', { receiver: 'V8UnknownPkg', line: 3, lineText: 'V8UnknownPkg.doThing();' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(V8TwoSegmentUnknownCaller)]);
+  assert.strictEqual(index.externals.size, 0, 'v0.8/N2: a 2-segment call (Head.method(), no Mid) NEVER creates an external, regardless of how "namespace-like" Head looks -- ambiguous with an ordinary unresolved local reference');
+  assert.strictEqual(index.stats.unresolvedSites, 1, 'stays unresolved -- the pre-existing, non-namespace-promoted outcome for this shape');
+  assert.strictEqual(index.stats.externalRefs, 0);
+}
+
+// ---- N1(b)/N4: DML/publish managed-object externals ---------------------
+// (VertexLedgerBridge C5:13-shape) -- zero trigger targets preserved.
+{
+  const V8LedgerBridge = ty('V8LedgerBridge', 'V8LedgerBridge', {
+    methods: [
+      mth('postToLedger', {
+        line: 1,
+        dml: [dmlFact('insert', "new kwx__Ledger__c(Amount__c = amount)", { line: 13, lineText: 'insert new kwx__Ledger__c(Amount__c = amount);' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(V8LedgerBridge)]);
+  const ext = index.externals.get('kwx.ledger__c');
+  assert.ok(ext, 'v0.8/N1(b): insert new kwx__Ledger__c(...) creates a managed-OBJECT external node');
+  assert.strictEqual(ext.ns, 'kwx');
+  assert.strictEqual(ext.className, 'Ledger__c');
+  assert.strictEqual(ext.label, 'kwx__Ledger__c', 'v0.8/N1(b): label uses the underscore convention for a namespaced OBJECT reference, not the dot convention a namespaced CLASS/method reference gets');
+  assert.strictEqual(ext.refCount, 1);
+  assert.deepStrictEqual([...ext.methods], [], 'a DML object external has no "method" concept -- methods stays the empty Set');
+  assert.strictEqual(index.stats.externalNamespaces.includes('kwx'), true);
+
+  // Zero trigger targets -- no local trigger is declared on kwx__Ledger__c
+  // anywhere in this fixture -- the external node's existence must not
+  // fabricate a trigger fan-out that isn't really there.
+  const tree = buildCallerTree(index, { classLower: 'v8ledgerbridge', methodLower: 'posttoledger' });
+  assert.deepStrictEqual(tree.root.children, [], 'zero trigger fan-out for kwx__Ledger__c (no trigger declared on it)');
+
+  // v0.8/N4: the external IS a valid caller-direction trace target too,
+  // even though it originated from a DML site (not an Apex call).
+  const extTree = buildCallerTree(index, { classLower: 'kwx.ledger__c', methodLower: null });
+  assert.strictEqual(extTree.root.kind, 'external');
+  assert.strictEqual(extTree.root.label, 'kwx__Ledger__c');
+  assert.ok(findChild(extTree.root.children, 'V8LedgerBridge.postToLedger'));
+}
+
+// ---- N4: local trigger ON a managed object links exactly like a local
+// object (VtxKwxInvoiceService/VtxKwxInvoiceTrigger-shape, requirement 2b) --
+{
+  const V8InvoiceService = ty('V8KwxInvoiceService', 'V8KwxInvoiceService', {
+    methods: [
+      mth('postInvoice', {
+        line: 1,
+        dml: [dmlFact('insert', "new kwx__V8Invoice__c(Amount__c = amount)", { line: 3, lineText: 'insert new kwx__V8Invoice__c(Amount__c = amount);' })],
+      }),
+    ],
+  });
+  const V8InvoiceTriggerType = ty('V8KwxInvoiceTrigger', 'V8KwxInvoiceTrigger', { methods: [mth('(trigger)', { line: 1 })] });
+  const V8InvoiceTriggerFile = file(PT('V8KwxInvoiceTrigger'), 'trigger', [V8InvoiceTriggerType], {
+    triggerInfo: { object: 'kwx__V8Invoice__c', events: ['before insert'] },
+  });
+  const index = buildSemanticIndex([mkFile(V8InvoiceService), V8InvoiceTriggerFile]);
+
+  // The external OBJECT node still gets created (N1(b), independent
+  // mechanism)...
+  const ext = index.externals.get('kwx.v8invoice__c');
+  assert.ok(ext);
+  assert.strictEqual(ext.label, 'kwx__V8Invoice__c');
+
+  // ...AND the DML fans out to the LOCAL trigger declared on it, exactly
+  // like it would for any local object (N4: "event matching unchanged") --
+  // traced from the TRIGGER's own side ("who calls V8KwxInvoiceTrigger"),
+  // since the DML site is the CALLER here, not the target.
+  const trigTree = buildCallerTree(index, { classLower: 'v8kwxinvoicetrigger', methodLower: null });
+  const dmlCaller = findChild(trigTree.root.children, 'V8KwxInvoiceService.postInvoice');
+  assert.ok(dmlCaller, 'v0.8/N4: DML on kwx__V8Invoice__c fans out to the LOCAL trigger declared on it exactly like V4OrderTrigger/KappaOrderTrigger do for their own objects');
+  assert.strictEqual(dmlCaller.via, 'dml');
+  assert.strictEqual(dmlCaller.kind, 'method');
+}
+
+// ---- N3 (resolver half, opts.ownNamespace): own-namespace resolves
+// LOCALLY, no external node (VtxOwnNamespaceProbe-shape) -------------------
+{
+  const V8OwnPricingService = ty('V8OwnPricingService', 'V8OwnPricingService', {
+    methods: [mth('repriceOrder', { line: 1, params: [{ name: 'order', type: 'Object' }] })],
+  });
+  const V8OwnNamespaceProbe = ty('V8OwnNamespaceProbe', 'V8OwnNamespaceProbe', {
+    methods: [
+      mth('callOwnNamespaceClass', {
+        line: 2,
+        calls: [cl('dot', 'repriceOrder', { receiver: 'vtx.V8OwnPricingService', argTexts: ['order'], line: 3, lineText: 'vtx.V8OwnPricingService.repriceOrder(order);' })],
+      }),
+      mth('dmlOwnNamespaceObjectBareForm', {
+        line: 6,
+        dml: [dmlFact('insert', "new V8OwnConfig__c(Name = 'bare-form')", { line: 7, lineText: "insert new V8OwnConfig__c(Name = 'bare-form');" })],
+      }),
+      mth('dmlOwnNamespaceObjectPrefixedForm', {
+        line: 10,
+        dml: [dmlFact('insert', "new vtx__V8OwnConfig__c(Name = 'prefixed-form')", { line: 11, lineText: "insert new vtx__V8OwnConfig__c(Name = 'prefixed-form');" })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(V8OwnPricingService), mkFile(V8OwnNamespaceProbe)], { ownNamespace: 'vtx' });
+
+  // L3: own-namespace class call resolves LOCALLY (edge -> local class,
+  // via='static'), no external.
+  const tree = buildCallerTree(index, { classLower: 'v8ownpricingservice', methodLower: 'repriceorder' });
+  const caller = findChild(tree.root.children, 'V8OwnNamespaceProbe.callOwnNamespaceClass');
+  assert.ok(caller, "v0.8/N3: vtx.V8OwnPricingService.repriceOrder(...) resolves to the LOCAL class after own-namespace stripping -- 'vtx' is never treated as a namespace token because it IS the workspace's own declared namespace");
+  assert.strictEqual(caller.via, 'static');
+
+  // L7/L11: bare and vtx__-prefixed DML both land on the SAME local object
+  // identity, not two different objects.
+  assert.strictEqual((index.dmlSitesByObject.get('v8ownconfig__c') || []).length, 2, 'v0.8/N3: bare V8OwnConfig__c and vtx__V8OwnConfig__c collapse onto the SAME object identity');
+
+  // Positive control for the whole fixture: no external node anywhere,
+  // and the own-namespace token itself must never appear as an external's
+  // namespace.
+  assert.strictEqual(index.externals.size, 0, 'v0.8/N3: a live run that creates an external node for vtx.* / vtx__* is a BUG');
+  assert.strictEqual(index.stats.externalRefs, 0);
+  assert.deepStrictEqual(index.stats.externalNamespaces, []);
+}
+
+// ---- N3 (bonus symmetry check): a trigger declared directly on an
+// own-namespace-prefixed object registers under the SAME stripped identity
+// a bare-form DML resolves to. Not directly required by any gauntlet-org
+// v0.8-B fixture (which deliberately never pairs vtx__ with a trigger), but
+// a natural extension of N3's "in Apex receivers, DML object names, and
+// metascan refs" text -- pinned here as its own small, isolated check.
+{
+  const V8VtxFooService = ty('V8VtxFooService', 'V8VtxFooService', {
+    methods: [mth('doIt', { line: 1, dml: [dmlFact('insert', 'new V8Foo__c()', { line: 2, lineText: 'insert new V8Foo__c();' })] })],
+  });
+  const V8VtxFooTriggerType = ty('V8VtxFooTrigger', 'V8VtxFooTrigger', { methods: [mth('(trigger)', { line: 1 })] });
+  const V8VtxFooTriggerFile = file(PT('V8VtxFooTrigger'), 'trigger', [V8VtxFooTriggerType], {
+    triggerInfo: { object: 'vtx__V8Foo__c', events: ['before insert'] },
+  });
+  const index = buildSemanticIndex([mkFile(V8VtxFooService), V8VtxFooTriggerFile], { ownNamespace: 'vtx' });
+  const trigTree = buildCallerTree(index, { classLower: 'v8vtxfootrigger', methodLower: null });
+  const dmlCaller = findChild(trigTree.root.children, 'V8VtxFooService.doIt');
+  assert.ok(dmlCaller, 'v0.8/N3 (bonus): a trigger declared on the own-namespace-prefixed vtx__V8Foo__c registers under the SAME stripped object identity as a bare V8Foo__c DML');
+  assert.strictEqual(index.externals.size, 0);
+}
+
+// ---- N4: external nodes are TERMINAL in the callees direction -----------
+{
+  const V8CalleeDirCaller = ty('V8CalleeDirCaller', 'V8CalleeDirCaller', {
+    methods: [
+      mth('run', {
+        line: 1,
+        calls: [cl('dot', 'charge', { receiver: 'zenq.V8CalleeBilling', argTexts: ['amount'], line: 2, lineText: 'zenq.V8CalleeBilling.charge(amount);' })],
+        dml: [dmlFact('insert', 'new kwx__V8CalleeLedger__c()', { line: 3, lineText: 'insert new kwx__V8CalleeLedger__c();' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(V8CalleeDirCaller)]);
+  const tree = buildCalleeTree(index, { classLower: 'v8calleedircaller', methodLower: 'run' });
+
+  const extCallChild = tree.root.children.find((c) => c.kind === 'external' && c.label === 'zenq.V8CalleeBilling');
+  assert.ok(extCallChild, 'v0.8/N4: an external Apex call surfaces as a TERMINAL kind:external child in the callees direction');
+  assert.strictEqual(extCallChild.children.length, 0, 'terminal -- no children');
+  assert.strictEqual(extCallChild.truncated, true, 'permanently terminal -- no source to recurse into (same convention buildOneChildNode\'s exception branch uses)');
+  assert.strictEqual(extCallChild.approximate, false, "v0.8/N2: NOT approximate -- a genuine namespace match is exact, not a guess");
+  assert.strictEqual(extCallChild.ns, 'zenq');
+  assert.strictEqual(extCallChild.sites.length, 1);
+
+  const extDmlChild = tree.root.children.find((c) => c.kind === 'external' && c.label === 'kwx__V8CalleeLedger__c');
+  assert.ok(extDmlChild, 'v0.8/N4: a namespaced DML object ALSO surfaces as a TERMINAL kind:external child in the callees direction');
+  assert.strictEqual(extDmlChild.ns, 'kwx');
+  assert.strictEqual(extDmlChild.truncated, true);
+
+  assert.strictEqual(tree.stats.externalRefs, 2);
+  assert.deepStrictEqual(tree.stats.externalNamespaces, ['kwx', 'zenq']);
+}
+
+// ---- N4: suggestTargets includes externals, bare label, kind:'external' -
+{
+  const V8SuggestCaller = ty('V8SuggestCaller', 'V8SuggestCaller', {
+    methods: [mth('run', { line: 1, calls: [cl('dot', 'charge', { receiver: 'zenq.V8SuggestBilling', line: 2, lineText: 'zenq.V8SuggestBilling.charge();' })] })],
+  });
+  const index = buildSemanticIndex([mkFile(V8SuggestCaller)]);
+  const targets = suggestTargets(index);
+  const extItem = targets.find((t) => t.classLower === 'zenq.v8suggestbilling');
+  assert.ok(extItem, 'v0.8/N4: suggestTargets includes an item for the external node');
+  assert.strictEqual(extItem.label, 'zenq.V8SuggestBilling', "bare label -- the ' (managed)' suffix is targets.js's refineTargets() job, not resolver.js's (see targets.js's own N4/N6 header note)");
+  assert.strictEqual(extItem.kind, 'external');
+  assert.strictEqual(extItem.methodLower, null);
+  assert.ok(!Object.prototype.hasOwnProperty.call(extItem, 'package'), 'an external item never carries a package field');
+}
+
+// =========================================================================
+// N1(c): metascan-sourced externals (attachMetaCallers) -- LWC (explicit
+// ref.namespace, M1), Flow dotted-fold, Flow/CMDT bare double-underscore
+// fold, cross-surface consistency (Apex + LWC + Flow all landing on ONE
+// external node), and own-namespace metascan stripping.
+// =========================================================================
+
+// ---- LWC: explicit ref.namespace (M1) -> external, no longer metaUnresolved
+{
+  const V8KappaGatewayLwc = ty('V8KappaGatewayLwc', 'V8KappaGatewayLwc', {
+    methods: [mth('dispatch', { line: 1 })],
+  });
+  const index = buildSemanticIndex([mkFile(V8KappaGatewayLwc)]);
+  const metaRefs = [
+    {
+      kind: 'lwc',
+      label: 'v8kappaGatewayPanel',
+      className: 'V8KappaGatewayLwc',
+      methodName: 'dispatch',
+      namespace: 'zenq',
+      path: 'lwc/v8kappaGatewayPanel/v8kappaGatewayPanel.js',
+      line: 11,
+      lineText: "import dispatch from '@salesforce/apex/zenq.V8KappaGatewayLwc.dispatch';",
+    },
+  ];
+  attachMetaCallers(index, metaRefs);
+  const ext = index.externals.get('zenq.v8kappagatewaylwc');
+  assert.ok(ext, 'v0.8/N1(c): an LWC ref carrying a namespace attaches to an external node instead of metaUnresolved');
+  assert.strictEqual(ext.label, 'zenq.V8KappaGatewayLwc');
+  assert.deepStrictEqual([...ext.methods], ['dispatch']);
+  assert.strictEqual(index.stats.metaUnresolved, 0, 'v0.8/N5: metaUnresolved for a namespaced ref becomes an external attach instead');
+  assert.strictEqual(index.stats.externalRefs, 1);
+
+  // Must still NOT attach to the local V8KappaGatewayLwc.dispatch.
+  const localTree = buildCallerTree(index, { classLower: 'v8kappagatewaylwc', methodLower: 'dispatch' });
+  assert.deepStrictEqual(localTree.root.children, []);
+
+  // v0.8/N4: the LWC ref renders as a TERMINAL child under the external's
+  // own caller-direction trace (kind:'lwc', same as buildMetaChildren
+  // renders anywhere else).
+  const extTree = buildCallerTree(index, { classLower: 'zenq.v8kappagatewaylwc', methodLower: null });
+  const lwcChild = extTree.root.children.find((c) => c.kind === 'lwc');
+  assert.ok(lwcChild, 'v0.8/N4: the LWC import is a TERMINAL caller of the external node');
+  assert.strictEqual(lwcChild.label, 'v8kappaGatewayPanel');
+}
+
+// ---- Flow: dotted fold-in ('ns.Class.method' folded by metascan.js into
+// className='ns', methodName='Class.method') -> external, cross-checked
+// against the SAME Apex-sourced external node (A5/B5 cross-surface
+// consistency: one external node, multiple referencing surfaces).
+{
+  const V8KappaGatewayCaller2 = ty('V8KappaGatewayCaller2', 'V8KappaGatewayCaller2', {
+    methods: [
+      mth('routeCommands', {
+        line: 1,
+        calls: [cl('dot', 'dispatch', { receiver: 'zenq.V8FlowKappaGateway', argTexts: ['cmd'], line: 3, lineText: 'zenq.V8FlowKappaGateway.dispatch(cmd);' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(V8KappaGatewayCaller2)]);
+  // metascan.js's real (frozen) flow extraction naively splits the dotted
+  // actionName into { className: segs[0], methodName: segs.slice(1).join('.') }
+  // -- 'zenq.V8FlowKappaGateway.dispatch' -> { className:'zenq',
+  // methodName:'V8FlowKappaGateway.dispatch' }, exactly reproduced here.
+  const metaRefs = [
+    {
+      kind: 'flow',
+      label: 'V8NamespaceProbeFlow',
+      className: 'zenq',
+      methodName: 'V8FlowKappaGateway.dispatch',
+      path: 'flows/V8NamespaceProbeFlow.flow-meta.xml',
+      line: 22,
+      lineText: '<actionName>zenq.V8FlowKappaGateway.dispatch</actionName>',
+      flowObject: null,
+      flowRecordTriggerType: null,
+      flowTriggerType: null,
+    },
+  ];
+  attachMetaCallers(index, metaRefs);
+  const key = 'zenq.v8flowkappagateway';
+  const ext = index.externals.get(key);
+  assert.ok(ext, "v0.8/N1(c): a Flow actionName's dotted fold-in (className='zenq', methodName='V8FlowKappaGateway.dispatch') is detected and split into ns='zenq', class='V8FlowKappaGateway', method='dispatch'");
+  assert.strictEqual(ext.label, 'zenq.V8FlowKappaGateway');
+  assert.deepStrictEqual([...ext.methods], ['dispatch']);
+
+  // Same external node the Apex call site attaches to -- cross-surface
+  // consistency, one node not two.
+  assert.strictEqual(ext.refCount, 2, 'v0.8/N1(c): the Apex call site (from buildSemanticIndex) AND the Flow ref (from attachMetaCallers) BOTH attach to the SAME external node');
+
+  const extTree = buildCallerTree(index, { classLower: key, methodLower: null });
+  assert.ok(findChild(extTree.root.children, 'V8KappaGatewayCaller2.routeCommands'), 'the Apex caller is present');
+  assert.ok(extTree.root.children.some((c) => c.kind === 'flow'), 'the Flow ref is ALSO present, as a sibling terminal child');
+}
+
+// ---- Flow + CMDT: bare 'ns__Class' actionName/value (no dot -- Invocable-
+// style) -> external, split on the FIRST '__', cross-checked against a
+// SECOND metadata surface (Flow AND CMDT both landing on ONE node) --
+// excludes a value ending '__c' (an ordinary custom-object-API-name shape,
+// NOT a class reference).
+{
+  const index = buildSemanticIndex([]);
+  const flowRef = {
+    kind: 'flow',
+    label: 'V8NamespaceProbeFlow2',
+    className: 'kwx__V8PostLedgerEntry',
+    methodName: null,
+    path: 'flows/V8NamespaceProbeFlow2.flow-meta.xml',
+    line: 34,
+    lineText: '<actionName>kwx__V8PostLedgerEntry</actionName>',
+    flowObject: null,
+    flowRecordTriggerType: null,
+    flowTriggerType: null,
+  };
+  const cmdtRef = {
+    kind: 'cmdt',
+    label: 'V8Kappa_Trigger_Config.Namespace_Handler',
+    className: 'kwx__V8PostLedgerEntry',
+    methodName: null,
+    fieldName: 'Handler_Class_Name__c',
+    path: 'customMetadata/V8Kappa_Trigger_Config.Namespace_Handler.md-meta.xml',
+    line: 15,
+    lineText: '<value xsi:type="xsd:string">kwx__V8PostLedgerEntry</value>',
+  };
+  // Negative control, same file: an ordinary custom-object-shaped CMDT
+  // value (ends '__c') must NEVER be misread as a namespaced class ref.
+  const objectShapedRef = {
+    kind: 'cmdt',
+    label: 'V8Kappa_Trigger_Config.Namespace_Handler',
+    className: 'V8Kappa_Order__c',
+    methodName: null,
+    fieldName: 'SobjectApiName__c',
+    path: 'customMetadata/V8Kappa_Trigger_Config.Namespace_Handler.md-meta.xml',
+    line: 7,
+    lineText: '<value xsi:type="xsd:string">V8Kappa_Order__c</value>',
+  };
+  attachMetaCallers(index, [flowRef, cmdtRef, objectShapedRef]);
+
+  const key = 'kwx.v8postledgerentry';
+  const ext = index.externals.get(key);
+  assert.ok(ext, "v0.8/N1(c): a bare 'ns__Class' Flow actionName splits into ns='kwx', class='V8PostLedgerEntry', method=null");
+  assert.strictEqual(ext.label, 'kwx.V8PostLedgerEntry', "bare Invocable-style refs get the DOT display convention (a CLASS reference), not the underscore convention DML/publish OBJECT externals get");
+  assert.deepStrictEqual([...ext.methods], [], 'bare Invocable action -- no method segment, same methodName:null shape a local @InvocableMethod bare actionName already produces');
+  assert.strictEqual(ext.refCount, 2, 'v0.8/N1(c): the Flow actionName AND the CMDT value BOTH attach to the SAME external node -- a second cross-surface (Flow + CMDT) consistency check');
+
+  assert.strictEqual(index.externals.has('v8kappa_order.c'), false, 'the negative control must never create a spurious external key');
+  assert.strictEqual(index.externals.size, 1, 'the object-shaped CMDT value stays inert (local-attach, matching its exact pre-v0.8 fate) -- only ONE external node total');
+
+  const extTree = buildCallerTree(index, { classLower: key, methodLower: null });
+  assert.strictEqual(extTree.root.children.length, 2, 'both the flow and the cmdt terminal children are present as siblings');
+  assert.ok(extTree.root.children.some((c) => c.kind === 'flow'));
+  assert.ok(extTree.root.children.some((c) => c.kind === 'cmdt'));
+}
+
+// ---- N3: own-namespace metascan ref resolves LOCALLY, no external -------
+{
+  const V8OwnMetaTarget = ty('V8OwnMetaTarget', 'V8OwnMetaTarget', { methods: [mth('doWork', { line: 1 })] });
+  const index = buildSemanticIndex([mkFile(V8OwnMetaTarget)], { ownNamespace: 'vtx' });
+  const metaRefs = [
+    {
+      kind: 'lwc',
+      label: 'v8ownWidget',
+      className: 'V8OwnMetaTarget',
+      methodName: 'doWork',
+      namespace: 'vtx',
+      path: 'lwc/v8ownWidget/v8ownWidget.js',
+      line: 1,
+      lineText: "import doWork from '@salesforce/apex/vtx.V8OwnMetaTarget.doWork';",
+    },
+  ];
+  attachMetaCallers(index, metaRefs);
+  assert.strictEqual(index.externals.size, 0, "v0.8/N3: an LWC ref whose namespace IS the workspace's own must resolve locally, not externally");
+  const tree = buildCallerTree(index, { classLower: 'v8ownmetatarget', methodLower: 'dowork' });
+  const lwcChild = tree.root.children.find((c) => c.kind === 'lwc');
+  assert.ok(lwcChild, 'v0.8/N3: the own-namespace-stripped LWC ref attaches to the LOCAL class/method exactly like a bare (no-namespace) ref would');
 }
 
 console.log('test-resolver.js: all assertions passed.');

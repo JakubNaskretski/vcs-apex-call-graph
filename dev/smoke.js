@@ -689,5 +689,105 @@ function runAdvOrg() {
   console.log(`\nB5 packageless-identity check: stats.duplicateNames=${pkgIndexNoOpts.stats.duplicateNames} (bar: 0, no opts -> first-wins-drop, byte-identical to pre-v0.7)`);
 }
 
+// v0.8.0: MANAGED PACKAGES -- gauntlet-org corpus (Apex + Flow + CMDT + LWC),
+// with opts.ownNamespace='vtx' wired exactly like extension.js's real
+// sfdx-project.json discovery -> opts.ownNamespace plumbing. Demonstrates
+// external nodes BOTH directions:
+//   - callees: a local service calling into a managed namespace shows a
+//     TERMINAL external leaf (kind='external').
+//   - callers: tracing the external node itself as a root target shows
+//     every local Apex/LWC/Flow/CMDT referencing site as a normal caller
+//     tree above it (N4's "full normal caller tree above them").
+// Also demonstrates N3 (own-namespace resolves LOCALLY, no external node)
+// and N5's header wording ("N unresolved * M managed-package refs (ns)").
+const GAUNTLET_ORG_PROJECT_ROOT = '/Users/agent/work/code/example-data/gauntlet-org';
+const GAUNTLET_ORG_ROOT = path.join(GAUNTLET_ORG_PROJECT_ROOT, 'force-app', 'main', 'default');
+
+function walkGauntletOrg(dir, apexOut, metaOut) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) { walkGauntletOrg(full, apexOut, metaOut); continue; }
+    if (/\.(cls|trigger)$/i.test(e.name)) apexOut.push(full);
+    else if (/\.(cls|trigger)-meta\.xml$/i.test(e.name)) continue; // Apex sidecar only
+    else if (/\.js$/i.test(e.name) || /\.flow-meta\.xml$/i.test(e.name) || /\.md-meta\.xml$/i.test(e.name) || /\.os-meta\.xml$/i.test(e.name) || /\.(cmp|app)$/i.test(e.name) || /\.json$/i.test(e.name)) metaOut.push(full);
+  }
+}
+
+function runGauntletOrgManagedPackages() {
+  console.log('\n\n########################################################');
+  console.log('# v0.8.0 MANAGED PACKAGES (gauntlet-org, external nodes both directions)');
+  console.log('########################################################');
+
+  const apexOut = [];
+  const metaOut = [];
+  walkGauntletOrg(GAUNTLET_ORG_ROOT, apexOut, metaOut);
+  console.log(`Indexing: ${GAUNTLET_ORG_ROOT}`);
+  console.log(`Found ${apexOut.length} .cls/.trigger file(s), ${metaOut.length} metadata file(s).`);
+
+  let ownNamespace = null;
+  try {
+    const sfdxProject = JSON.parse(fs.readFileSync(path.join(GAUNTLET_ORG_PROJECT_ROOT, 'sfdx-project.json'), 'utf8'));
+    ownNamespace = typeof sfdxProject.namespace === 'string' && sfdxProject.namespace.trim() ? sfdxProject.namespace.trim() : null;
+  } catch (e) { /* no sfdx-project.json -> ownNamespace stays null */ }
+  console.log('ownNamespace (from sfdx-project.json):', JSON.stringify(ownNamespace));
+
+  const gFactsList = apexOut.map((p) => parser.parseFile({ path: p, text: fs.readFileSync(p, 'utf8') }));
+  const gIndex = resolver.buildSemanticIndex(gFactsList, { ownNamespace });
+
+  const gMetaRefs = [];
+  for (const f of metaOut) {
+    const text = fs.readFileSync(f, 'utf8');
+    for (const ref of metascan.parseMetaFile({ path: f, text })) { ref.path = f; gMetaRefs.push(ref); }
+  }
+  const gStrippedRefs = ownNamespace && typeof metascan.stripOwnNamespace === 'function'
+    ? metascan.stripOwnNamespace(gMetaRefs, ownNamespace)
+    : gMetaRefs;
+  resolver.attachMetaCallers(gIndex, gStrippedRefs);
+  console.log('gIndex.stats:', JSON.stringify(gIndex.stats));
+
+  // --- Forward direction: local service -> managed-package TERMINAL leaf.
+  printCalleeTree(
+    'VertexLedgerBridge.postToLedger -- forward: local Billing.charge edge UNCHANGED, PLUS two new external callee leaves (zenq.Billing external method, kwx__Ledger__c external object) [v0.8-A1]',
+    gIndex,
+    { classLower: 'vertexledgerbridge', methodLower: 'posttoledger' }
+  );
+  printCalleeTree(
+    'KappaGatewayCaller.routeCommands -- forward: 4 namespace-qualified call sites, now 3 DISTINCT external terminal leaves (zenq.KappaGateway refCount=2 case-folded, kwx.KappaGateway, zenq.KappaGatewey typo) instead of an aggregated unresolved leaf [v0.8-A2]',
+    gIndex,
+    { classLower: 'kappagatewaycaller', methodLower: 'routecommands' }
+  );
+
+  // --- Reverse direction: tracing the EXTERNAL node itself as a root
+  // target -- every local Apex/LWC/Flow referencing site is a normal
+  // caller-tree node above it (N4). zenq.KappaGateway is the one external
+  // node this corpus references from ALL THREE surfaces (Apex x2 + LWC +
+  // Flow), per GROUND-TRUTH.md v0.8-A5/B5's cross-surface consistency
+  // requirement.
+  printTree(
+    "zenq.KappaGateway (external node, traced as a CALLER-direction root target) -- reverse: KappaGatewayCaller.routeCommands (Apex, 2 sites) + KappaGatewayPanel (LWC import) + Vtx_Namespace_Probe_Flow (Flow actionName) all land on ONE shared external node [v0.8-A5/B5, N4]",
+    gIndex,
+    { classLower: 'zenq.kappagateway', methodLower: null }
+  );
+  printTree(
+    "kwx.PostLedgerEntry (external node, traced as a CALLER-direction root target) -- reverse: Flow bare actionName + CMDT record value BOTH land on this one node (Flow+CMDT cross-surface consistency) [v0.8-B5, N1(c)]",
+    gIndex,
+    { classLower: 'kwx.postledgerentry', methodLower: null }
+  );
+
+  // --- N3: own-namespace resolves LOCALLY, no external node -- contrast
+  // with the above.
+  printTree(
+    'VertexPricingService.repriceOrder -- own-namespace contrast: vtx.VertexPricingService.repriceOrder(order) (VtxOwnNamespaceProbe.cls) strips the workspace\'s OWN namespace and resolves as an ORDINARY local caller, alongside the pre-existing VertexOrderStaticFacade.triggerReprice caller -- NOT an external node [v0.8-B1, N3]',
+    gIndex,
+    { classLower: 'vertexpricingservice', methodLower: 'repriceorder' }
+  );
+
+  console.log(`\nSanity: no external node carries ns='${ownNamespace}' (the workspace's own namespace) -- `,
+    Array.from(gIndex.externals instanceof Map ? gIndex.externals.keys() : []).some((k) => k.startsWith(`${ownNamespace}.`)) ? 'FOUND ONE (BUG)' : 'confirmed absent, OK');
+}
+
 main();
 runAdvOrg();
+runGauntletOrgManagedPackages();
