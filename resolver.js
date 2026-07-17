@@ -137,6 +137,48 @@ const DEFAULT_MAX_NODES = 2000;
 // tree AND any metadata/flow children are folded in).
 const ZERO_CALLER_NOTE = 'No callers found — this is likely an entry point or unused code.';
 
+// v0.10/A1: fluent-chain receiver walk cap (resolveChainedReceiver) -- was a
+// hardcoded 4 pre-v0.10 ("4-segment walk cap"). Module constant so the limit
+// is declared exactly once. BEHAVIOR CHANGE, documented everywhere this
+// constant is used: a receiver chain of 5..12 `.method()` segments, which
+// previously fell through honestly unresolved past segment 4, now WALKS THE
+// FULL CHAIN and resolves (via 'typed') like any in-cap chain always has.
+// Only >12 segments (or a same-chain (type,method) cycle -- see
+// resolveChainedReceiver's own visited-guard doc) still drops honestly, the
+// exact same "fall through to rule 7 unique-name, which may also decline"
+// fate the pre-v0.10 >4 case always had.
+const CHAIN_MAX = 12;
+
+// v0.10/A3: shared clamp for buildCallerTree/buildExternalCallerTree/
+// buildCalleeTree's opts.maxDepth/opts.maxNodes (and, via
+// normalizeProgressiveOpts, opts.initialDepth) -- hardens the walker against
+// a future direct-invocation surface (e.g. a CLI) that might feed it
+// unclamped values; today's only callers are extension.js's own UI-driven
+// call sites, which always pass in-range integers (or omit the field
+// entirely, taking the DEFAULT_* below), so this clamp is a byte-for-byte
+// no-op for every EXISTING call site -- proved by the full suite passing
+// unchanged. `value` is coerced via Number(): a non-finite result (NaN --
+// covers both an actual NaN and any non-numeric input like a string that
+// doesn't parse, undefined, null -- Infinity, -Infinity) falls back to
+// `fallback` (the pre-v0.10 DEFAULT_MAX_DEPTH/DEFAULT_MAX_NODES constant, or
+// -- for initialDepth -- the caller's own already-clamped maxDepth). A
+// finite value is truncated to an integer, then clamped into [min, max]
+// inclusive -- an in-range value (e.g. maxDepth:3, maxNodes:10) passes
+// through completely untouched.
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  const truncated = Math.trunc(n);
+  if (truncated < min) return min;
+  if (truncated > max) return max;
+  return truncated;
+}
+// v0.10/A3: the [1, X] upper bounds clampInt enforces for maxDepth/maxNodes
+// specifically (initialDepth's upper bound is the CALLER's own already-
+// clamped maxDepth, not one of these two -- see normalizeProgressiveOpts).
+const MAX_DEPTH_CLAMP = 64;
+const MAX_NODES_CLAMP = 100000;
+
 // P1 (v0.9 progressive depth): shared opts-normalization for
 // buildCallerTree/buildExternalCallerTree/buildCalleeTree. initialDepth
 // defaults to maxDepth (== the ENTIRE tree auto-expands, exactly the
@@ -146,8 +188,14 @@ const ZERO_CALLER_NOTE = 'No callers found — this is likely an entry point or 
 // cycleKey already uses) -- normalized into a fresh Set (lowercased
 // defensively) so buildOneChildNode can do an O(1) `.has(cycleKey)` check
 // per node without re-deriving anything from opts on every call.
+// v0.10/A3: `maxDepth` here is ALREADY the caller's own clamped value (see
+// buildCallerTree/buildExternalCallerTree/buildCalleeTree, each of which
+// clamps its local `maxDepth` via clampInt before calling this), so
+// clamping initialDepth into [1, maxDepth] here automatically inherits that
+// bound -- no separate MAX_DEPTH_CLAMP reference needed in this function.
 function normalizeProgressiveOpts(opts, maxDepth) {
-  const initialDepth = (opts && opts.initialDepth != null) ? opts.initialDepth : maxDepth;
+  const rawInitialDepth = (opts && opts.initialDepth != null) ? opts.initialDepth : maxDepth;
+  const initialDepth = clampInt(rawInitialDepth, 1, maxDepth, maxDepth);
   const userExpandedKeys = new Set();
   if (opts && opts.expandedKeys) {
     for (const k of opts.expandedKeys) userExpandedKeys.add(lc(k));
@@ -650,8 +698,10 @@ function buildSemanticIndex(factsList, opts) {
   // own call sites below: (1) a 'dot' call whose receiver never resolved to
   // anything at all -- not a class, not a typed shadow, not a complex-
   // receiver bonus, not even the unique-name fallback (resolveDotOther);
-  // (2) a chained receiver exceeding the documented 4-segment walk cap
-  // (resolveChainedReceiver); (3) Type.forName(...) called with a
+  // (2) a chained receiver exceeding the documented CHAIN_MAX-segment walk
+  // cap (v0.10/A1: 12, was 4 pre-v0.10), OR hitting a same-chain
+  // (type,method) cycle before that (resolveChainedReceiver); (3)
+  // Type.forName(...) called with a
   // non-string-literal (variable) argument, whose runtime value can never
   // be known statically (handleTypeForName). Surfaced on the returned index
   // as `stats.unresolvedSites` and threaded through to every TreeResult
@@ -1801,29 +1851,34 @@ function buildSemanticIndex(factsList, opts) {
 
   // A3(c)/F2: 'a.b()' / 'a.b().c()' / 'Cls.b()' -- resolves the head
   // (identifier via type env, or a class name for a static chain start),
-  // then walks up to 4 `.method()`/collection-accessor segments. Each
-  // segment first tries F2's collection-accessor bonus (Map<K,V>.get()->V,
-  // Map<K,V>.values()->List<V>, List<T>/Set<T>.get()->T) against the
-  // CURRENT raw type text -- this is what lets a Map<K,V>/List<T>-typed hop
-  // participate in the chain at all, since it has no indexed class of its
-  // own to look up a declared method on. When the accessor bonus doesn't
-  // apply, falls back to the pre-F2 behavior: walk through the declaring
-  // method's returnType (following the extends chain to find it). Returns
-  // the final owning classLower, or null the moment any segment fails to
-  // resolve (declaring method not found, no returnType, or the resulting
-  // type head isn't a known user class/collection shape).
+  // then walks up to CHAIN_MAX (v0.10/A1: 12, was a hardcoded 4 pre-v0.10)
+  // `.method()`/collection-accessor segments. Each segment first tries F2's
+  // collection-accessor bonus (Map<K,V>.get()->V, Map<K,V>.values()->
+  // List<V>, List<T>/Set<T>.get()->T) against the CURRENT raw type text --
+  // this is what lets a Map<K,V>/List<T>-typed hop participate in the chain
+  // at all, since it has no indexed class of its own to look up a declared
+  // method on. When the accessor bonus doesn't apply, falls back to the
+  // pre-F2 behavior: walk through the declaring method's returnType
+  // (following the extends chain to find it). Returns the final owning
+  // classLower, or null the moment any segment fails to resolve (declaring
+  // method not found, no returnType, the resulting type head isn't a known
+  // user class/collection shape, or -- v0.10/A1 -- the walk revisits a
+  // (type,method) pair it has already visited earlier in THIS chain).
   function resolveChainedReceiver(receiverRaw, callerClassLower, cm, methodFacts) {
     const parsed = parseChainSegments(receiverRaw);
     if (!parsed || !parsed.segments.length) return null;
-    // A3(c) cap: 4 segments is the documented walk limit. A receiver with
-    // MORE than 4 segments is not "truncate and use whatever the 4th lands
-    // on" -- that would confidently attribute the outer call to a class the
-    // chain never actually reaches (see Chain5E/Chain5F hostile fixture).
-    // Exceeding the cap is itself a failure of this rule; fall through to
-    // existing rules (cast/ternary already tried, then rule 7 unique-name,
-    // which may also decline if the name isn't globally unique -- correctly
-    // yielding NO edge rather than a wrong one).
-    if (parsed.segments.length > 4) {
+    // A3(c)/v0.10(A1) cap: CHAIN_MAX segments is the documented walk limit
+    // (12 as of v0.10, was 4 pre-v0.10 -- see CHAIN_MAX's own header note
+    // for the BEHAVIOR CHANGE this widening is). A receiver with MORE than
+    // CHAIN_MAX segments is not "truncate and use whatever the CHAIN_MAXth
+    // lands on" -- that would confidently attribute the outer call to a
+    // class the chain never actually reaches (see Chain5E/Chain5F hostile
+    // fixture, now a 13-segment-cap-equivalent fixture family per the v0.10
+    // corpus). Exceeding the cap is itself a failure of this rule; fall
+    // through to existing rules (cast/ternary already tried, then rule 7
+    // unique-name, which may also decline if the name isn't globally
+    // unique -- correctly yielding NO edge rather than a wrong one).
+    if (parsed.segments.length > CHAIN_MAX) {
       // H4: one of the three named "dropped call site" categories -- counted
       // here (the single, precise source for this reason) regardless of
       // whether the caller was a dot-call (resolveDotOther, via
@@ -1842,6 +1897,20 @@ function buildSemanticIndex(factsList, opts) {
     let curTypeRaw = declaredType || parsed.head;
     let curClassLower = null;
     let curQualified = cm.qualified;
+    // v0.10/A1: per-CALL (fresh every invocation of this function -- i.e.
+    // per receiver text, not shared across chains) guard against a
+    // return-type CYCLE (A.next()->B, B.next()->A, ...): without this, a
+    // chain that happens to stay within CHAIN_MAX segments but oscillates
+    // between the same two (or more) types via the same-named method would
+    // "resolve" via ordinary deterministic function application -- correct
+    // in isolation, but exactly the kind of "confidently walked a loop"
+    // shape the CHAIN_MAX cap already refuses to trust past its own bound.
+    // Keyed on (curClassLower, segLower) -- i.e. "about to invoke THIS
+    // method on THIS already-resolved type" -- checked only in the
+    // findDeclaredMethodRaw branch below (a collection-accessor hop has no
+    // declaring class to key on, and applyCollectionAccessor's own domain
+    // -- Map/List/Set -- cannot cycle back to a user type by construction).
+    const visited = new Set();
     for (const segName of parsed.segments) {
       const segLower = lc(segName);
       const collResult = applyCollectionAccessor(curTypeRaw, segLower);
@@ -1855,6 +1924,15 @@ function buildSemanticIndex(factsList, opts) {
         if (!curClassLower) return null;
         curQualified = classes.get(curClassLower).qualified;
       }
+      const visitKey = `${curClassLower}#${segLower}`;
+      if (visited.has(visitKey)) {
+        // v0.10/A1: cycle hit -- degrades to no edge, the SAME "dropped
+        // call site" treatment (and the SAME H4 counter) as exceeding
+        // CHAIN_MAX, per the amendment's own text.
+        unresolvedSitesCount++;
+        return null;
+      }
+      visited.add(visitKey);
       const found = findDeclaredMethodRaw(curClassLower, segLower);
       if (!found || !found.methodFacts.returnType) return null;
       curTypeRaw = stripGenerics(found.methodFacts.returnType);
@@ -3464,6 +3542,27 @@ function resolveClassLowerSimple(index, rawTypeName) {
   return count === 1 ? match : null;
 }
 
+// v0.10/A2: true when classLower's OWN class, or any ancestor reached via
+// its extends chain, declares a non-ctor method named methodNameLower --
+// the "declared, own OR inherited" test the VF method-ref attach gate
+// (attachVfActionRef, below) needs. This is findDeclaredMethodRaw's
+// own-then-ancestors walk (that helper lives inside buildSemanticIndex's
+// closure, keyed off the live `classes` Map under construction) re-derived
+// as a standalone, index.classes-keyed equivalent -- attachMetaCallers runs
+// on an ALREADY-BUILT index, outside that closure, same "usable outside
+// buildSemanticIndex's closure" reasoning resolveClassLowerSimple's own
+// header note gives. An unindexed/unresolvable classLower (e.g. a VF
+// controller/extensions class that doesn't exist in this workspace)
+// answers false, never throws -- the attach gate treats that exactly like
+// "doesn't declare it".
+function classDeclaresMethod(index, classLower, methodNameLower) {
+  if (!classLower || !index.classes.has(classLower)) return false;
+  return !!walkExtendsChain(index, classLower, (cm) => {
+    const methods = (cm.typeFacts && cm.typeFacts.methods) || [];
+    return methods.some((mm) => !mm.isCtor && lc(mm.name) === methodNameLower) ? true : undefined;
+  });
+}
+
 // True when ancestorLower appears anywhere in excLower's OWN extends chain
 // (excLower itself included is handled by the caller's exact-match check
 // first; this only needs the strictly-above-excLower ancestors).
@@ -3487,8 +3586,8 @@ function catchMatchesException(index, catchEntry, tracingExceptionLower) {
 }
 
 function buildCallerTree(index, target, opts) {
-  const maxDepth = (opts && opts.maxDepth) || DEFAULT_MAX_DEPTH;
-  const maxNodes = (opts && opts.maxNodes) || DEFAULT_MAX_NODES;
+  const maxDepth = clampInt(opts && opts.maxDepth, 1, MAX_DEPTH_CLAMP, DEFAULT_MAX_DEPTH); // v0.10/A3
+  const maxNodes = clampInt(opts && opts.maxNodes, 1, MAX_NODES_CLAMP, DEFAULT_MAX_NODES); // v0.10/A3
   const { initialDepth, userExpandedKeys } = normalizeProgressiveOpts(opts, maxDepth); // P1
   const classLower = lc(target && target.classLower);
   const cm = index.classes.get(classLower);
@@ -3680,8 +3779,13 @@ function buildCallerTree(index, target, opts) {
 // with zero duplicated tree-walking logic. `key` is the external's own Map
 // key ('nslower.classlower'); `ext` is its ExternalMeta.
 function buildExternalCallerTree(index, key, ext, opts) {
-  const maxDepth = (opts && opts.maxDepth) || DEFAULT_MAX_DEPTH;
-  const maxNodes = (opts && opts.maxNodes) || DEFAULT_MAX_NODES;
+  // v0.10/A3: only ever reached THROUGH buildCallerTree (not itself
+  // exported), but clamps independently here too -- it re-derives
+  // maxDepth/maxNodes from the SAME raw `opts` buildCallerTree received,
+  // not from buildCallerTree's already-clamped local vars, so this is not
+  // redundant.
+  const maxDepth = clampInt(opts && opts.maxDepth, 1, MAX_DEPTH_CLAMP, DEFAULT_MAX_DEPTH);
+  const maxNodes = clampInt(opts && opts.maxNodes, 1, MAX_NODES_CLAMP, DEFAULT_MAX_NODES);
   const { initialDepth, userExpandedKeys } = normalizeProgressiveOpts(opts, maxDepth); // P1
   const root = {
     label: ext.label, kind: 'external', className: ext.label, path: '', line: 0,
@@ -3750,8 +3854,8 @@ function buildExternalCallerTree(index, key, ext, opts) {
 // (new code, since there is nothing to fork there either -- forward tracing
 // invented these relationships).
 function buildCalleeTree(index, target, opts) {
-  const maxDepth = (opts && opts.maxDepth) || DEFAULT_MAX_DEPTH;
-  const maxNodes = (opts && opts.maxNodes) || DEFAULT_MAX_NODES;
+  const maxDepth = clampInt(opts && opts.maxDepth, 1, MAX_DEPTH_CLAMP, DEFAULT_MAX_DEPTH); // v0.10/A3
+  const maxNodes = clampInt(opts && opts.maxNodes, 1, MAX_NODES_CLAMP, DEFAULT_MAX_NODES); // v0.10/A3
   const { initialDepth, userExpandedKeys } = normalizeProgressiveOpts(opts, maxDepth); // P1
   const classLower = lc(target && target.classLower);
   const cm = index.classes.get(classLower);
@@ -4337,6 +4441,96 @@ function detectMetaRefNamespace(ref, ownNamespaceLower) {
   return null;
 }
 
+// v0.10/A2: the RESOLVER half of the "VF METHOD BINDINGS" amendment.
+// metascan.js's own v0.10/A2 half (already landed -- see its header comment
+// block above extractVf/extractVfActionBinding) emits a SECOND 'vf' MetaRef
+// shape, one per `action="{!singleIdentifier}"` binding, alongside the
+// pre-existing class-level controller=/extensions= refs it has always
+// produced:
+//
+//   { kind:'vf', label, className:null, methodName:<single identifier>,
+//     line, lineText, controllerClass:string|null, extensionClasses:string[] }
+//
+// className is null -- metascan has no class index and cannot decide (nor
+// tries to) which of the page's controller/extensions classes actually
+// declares this method; that decision is made HERE. controllerClass/
+// extensionClasses are the SAME controller=/extensions= facts restamped
+// directly onto this ref (not requiring a cross-reference against other
+// refs sharing the same `label`, which would be fragile -- two distinct
+// pages can share a file stem, and ordering across a metaRefs array built
+// from multiple scans/files is not a contract this file can rely on).
+// controllerClass is null for a standardController-only page (no
+// controller=/extensions= at all); extensionClasses is [] when extensions=
+// is absent/empty (or the tag is `apex:component`, which has no
+// extensions= attribute at all).
+function attachVfActionRef(index, ref, metaCallers, metaMethodCallers) {
+  const methodLower = lc(ref.methodName);
+  const rawCandidates = [];
+  if (ref.controllerClass) rawCandidates.push(ref.controllerClass);
+  for (const ext of ref.extensionClasses || []) rawCandidates.push(ext);
+
+  // Dedup case-insensitively (controller/extensions attributes are bare
+  // class names, no namespace-qualification to worry about here -- same
+  // "just lc() it" convention the pre-existing class-level 'vf' attach
+  // already uses, see the classLower derivation a few lines below this
+  // function's own call site).
+  const seenLower = new Set();
+  const candidates = [];
+  for (const raw of rawCandidates) {
+    const classLower = lc(raw);
+    if (seenLower.has(classLower)) continue;
+    seenLower.add(classLower);
+    candidates.push(classLower);
+  }
+  // No controller AND no extensions declared at all (e.g. a
+  // standardController-only page) -- there is nothing to attach to at any
+  // level. This is the literal "no edge possible" case (VtxAccountSummaryPage
+  // ground truth, v0.10-B3): the ref is dropped entirely, same fate the
+  // page's own (nonexistent) class-level 'vf' refs already have today.
+  if (!candidates.length) return;
+
+  const declaring = candidates.filter((classLower) => classDeclaresMethod(index, classLower, methodLower));
+
+  if (declaring.length === 1) {
+    // Exactly one of the page's controller/extensions classes declares this
+    // method (own or inherited) -- attach a METHOD-level ref to THAT class.
+    // May be an extension, not the controller (the "extension not
+    // controller" ground-truth case, v0.10-B1 L6) -- whichever class
+    // actually declares it wins, no controller-first tie-break needed since
+    // there IS no tie here. Mirrors the pre-existing generic local-attach
+    // pattern exactly (push into BOTH metaCallers[class] -- auto-excluded
+    // from CLASS-level views by metaLevelPairs' own `!r.methodName` filter,
+    // since this ref still carries methodName -- and
+    // metaMethodCallers[class#method]).
+    const classLower = declaring[0];
+    if (!metaCallers.has(classLower)) metaCallers.set(classLower, []);
+    metaCallers.get(classLower).push(ref);
+    const key = `${classLower}#${methodLower}`;
+    if (!metaMethodCallers.has(key)) metaMethodCallers.set(key, []);
+    metaMethodCallers.get(key).push(ref);
+    return;
+  }
+
+  // Zero matches ("matches no class", v0.10-B1 L13) or more than one match
+  // ("ambiguous, declared on both", v0.10-B1 L7) -- no principled way to
+  // pick a single method-level target, so per the amendment's own text:
+  // class-level ref to the CONTROLLER only (never an extension -- there's
+  // no basis to prefer one extension over another either), with NO method
+  // fabricated. A methodName-bearing ref would be invisible to
+  // metaLevelPairs' class-level `!r.methodName` filter, so a stripped copy
+  // (methodName:null) is what actually gets registered -- this is the "no
+  // method fabrication" clause made concrete, not just a documentation
+  // note. Per v0.10-B1's own framing this "contributes no NEW edge" when
+  // the page already has an ordinary controller= class-level ref (both
+  // collapse onto the same metaCallers[controllerLower] list, rendered as
+  // one grouped TNode by buildMetaChildren's own (kind,label) grouping).
+  if (!ref.controllerClass) return; // no controller to fall back to
+  const controllerLower = lc(ref.controllerClass);
+  const classLevelRef = Object.assign({}, ref, { className: ref.controllerClass, methodName: null });
+  if (!metaCallers.has(controllerLower)) metaCallers.set(controllerLower, []);
+  metaCallers.get(controllerLower).push(classLevelRef);
+}
+
 // A6: attaches metascan.js's MetaRef[] output onto an existing index,
 // mutating it with metaCallers (by class) and metaMethodCallers (by
 // 'classLower#methodLower'). Pure and order-independent: safe to call
@@ -4364,7 +4558,21 @@ function attachMetaCallers(index, metaRefs) {
   // and in case a genuinely ambiguous/unattachable shape is added later.
   let metaUnresolvedCount = 0;
   for (const ref of metaRefs || []) {
-    if (!ref || !ref.className) continue;
+    if (!ref) continue;
+    // v0.10/A2: VF method-level action ref -- className is deliberately
+    // null (see attachVfActionRef's own header note just above it), so this
+    // MUST be dispatched before the ordinary `!ref.className` skip below,
+    // which would otherwise drop it silently.
+    // Namespace detection (detectMetaRefNamespace) deliberately does not
+    // run for this branch -- out of scope for this round (documented gap;
+    // an external/managed-package VF controller is a future round's
+    // concern, same "additive, not required to land in the same pass"
+    // posture v0.8/N1(c) itself used for the OTHER metadata surfaces).
+    if (ref.kind === 'vf' && ref.className == null && ref.methodName) {
+      attachVfActionRef(index, ref, metaCallers, metaMethodCallers);
+      continue;
+    }
+    if (!ref.className) continue;
     const detected = detectMetaRefNamespace(ref, ownNamespaceLower);
     if (detected && !detected.isOwn) {
       // v0.8/N1(c): external attach -- routes to the SAME external node an
@@ -4885,4 +5093,10 @@ module.exports = {
   buildCalleeTree,
   suggestTargets,
   attachMetaCallers,
+  // v0.10/A3: exported for direct unit-level pinning of the clamp math
+  // itself (test-resolver.js) -- every OTHER export above is exercised only
+  // behaviorally; clampInt is a pure, easily-isolated function, and the
+  // clamp boundaries (NaN/-5/1e9/Infinity/'x' inputs) are exactly the kind
+  // of thing best pinned directly rather than inferred from tree shape.
+  clampInt,
 };

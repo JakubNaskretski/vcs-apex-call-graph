@@ -711,7 +711,11 @@ function walkGauntletOrg(dir, apexOut, metaOut) {
     if (e.isDirectory()) { walkGauntletOrg(full, apexOut, metaOut); continue; }
     if (/\.(cls|trigger)$/i.test(e.name)) apexOut.push(full);
     else if (/\.(cls|trigger)-meta\.xml$/i.test(e.name)) continue; // Apex sidecar only
-    else if (/\.js$/i.test(e.name) || /\.flow-meta\.xml$/i.test(e.name) || /\.md-meta\.xml$/i.test(e.name) || /\.os-meta\.xml$/i.test(e.name) || /\.(cmp|app)$/i.test(e.name) || /\.json$/i.test(e.name)) metaOut.push(full);
+    // v0.10/A2: .page/.component are new source types for this corpus
+    // (Visualforce) -- their -meta.xml sidecars (.page-meta.xml/
+    // .component-meta.xml) are excluded the same implicit way every other
+    // sidecar here already is: they simply match none of these patterns.
+    else if (/\.js$/i.test(e.name) || /\.flow-meta\.xml$/i.test(e.name) || /\.md-meta\.xml$/i.test(e.name) || /\.os-meta\.xml$/i.test(e.name) || /\.(cmp|app)$/i.test(e.name) || /\.json$/i.test(e.name) || /\.(page|component)$/i.test(e.name)) metaOut.push(full);
   }
 }
 
@@ -863,7 +867,82 @@ function runProgressiveDepthDemo() {
   );
 }
 
+// v0.10.0 ROUND A: brief spot-check against the SAME gauntlet-org corpus --
+// one long fluent-chain call site (A1, CHAIN_MAX=12) + one Visualforce
+// action="{!method}" binding (A2). Reuses walkGauntletOrg/GAUNTLET_ORG_ROOT
+// exactly like runGauntletOrgManagedPackages above (own fresh index --
+// same "each demo function builds its own index" convention this file
+// already follows for runProgressiveDepthDemo).
+function runRoundADemo() {
+  console.log('\n\n########################################################');
+  console.log('# v0.10.0 ROUND A (gauntlet-org: long chain + VF method binding)');
+  console.log('########################################################');
+
+  const apexOut = [];
+  const metaOut = [];
+  walkGauntletOrg(GAUNTLET_ORG_ROOT, apexOut, metaOut);
+  let ownNamespace = null;
+  try {
+    const sfdxProject = JSON.parse(fs.readFileSync(path.join(GAUNTLET_ORG_PROJECT_ROOT, 'sfdx-project.json'), 'utf8'));
+    ownNamespace = typeof sfdxProject.namespace === 'string' && sfdxProject.namespace.trim() ? sfdxProject.namespace.trim() : null;
+  } catch (e) { /* no sfdx-project.json -> ownNamespace stays null */ }
+
+  const rFactsList = apexOut.map((p) => parser.parseFile({ path: p, text: fs.readFileSync(p, 'utf8') }));
+  const rIndex = resolver.buildSemanticIndex(rFactsList, { ownNamespace });
+  const rMetaRefs = [];
+  for (const f of metaOut) {
+    const text = fs.readFileSync(f, 'utf8');
+    for (const ref of metascan.parseMetaFile({ path: f, text })) { ref.path = f; rMetaRefs.push(ref); }
+  }
+  const rStrippedRefs = ownNamespace && typeof metascan.stripOwnNamespace === 'function'
+    ? metascan.stripOwnNamespace(rMetaRefs, ownNamespace)
+    : rMetaRefs;
+  resolver.attachMetaCallers(rIndex, rStrippedRefs);
+
+  // A1: long chain -- VtxReportQueryStage12.build, the traced call in
+  // VtxReportChainCaller.runTwelveSegmentChain (S=12, exactly at the new
+  // CHAIN_MAX cap). NOTE (corpus authoring gap, observed live 2026-07-17,
+  // out of this integrator's ownership -- example-data/gauntlet-org is a
+  // separate, non-git directory owned by the corpus-authoring phase, not
+  // this repo): VtxReportQueryStage1.cls..Stage12.cls each declare the
+  // PREVIOUS hop's verb name instead of their own (an off-by-one shift
+  // against both VtxReportChainCaller.cls's own call text and
+  // GROUND-TRUTH.md's documented hop-verb table), so the chain walk here
+  // actually breaks at the 2nd hop today and this tree prints EMPTY --
+  // not a resolver defect (dev/hostile-v030-check.js's Chain5F +
+  // dev/hostile-v040-check.js's 5-level-Map checks, and test.js's own
+  // from-scratch V10Chain0..V10Chain8 e2e fixture, all independently
+  // confirm CHAIN_MAX=12 resolves correctly against WELL-FORMED fixtures).
+  // Flagging here rather than silently masking it; a corpus fix should
+  // realign each StageN.cls's hop method to GROUND-TRUTH.md's table.
+  printTree(
+    'VtxReportQueryStage12.build -- A1 long-chain spot check (S=12, exactly at CHAIN_MAX): EXPECTED VtxReportChainCaller.runTwelveSegmentChain as a via=typed caller; prints empty today due to a gauntlet-org corpus authoring gap in the StageN.cls hop-verb ladder, see the NOTE above this call',
+    rIndex,
+    { classLower: 'vtxreportquerystage12', methodLower: 'build' }
+  );
+
+  // A1: the return-type CYCLE fixture is NOT affected by the ladder's
+  // hop-verb defect above (VtxChainCycleNodeA/B both just use `next()`
+  // throughout, so there's no verb-alignment to get wrong) -- shows the
+  // per-chain visited-guard genuinely degrading a 6-deep cycle to no edge.
+  printTree(
+    'VtxChainCycleNodeA.terminal / VtxChainCycleNodeB.terminal -- A1 cycle-guard spot check: VtxChainCycleCaller.runSixDeepCycle\'s 6-.next()-deep chain must NOT appear here (guard fires at the 3rd hop, well before CHAIN_MAX)',
+    rIndex,
+    { classLower: 'vtxchaincyclenodea', methodLower: 'terminal' }
+  );
+
+  // A2: VF method-level action binding -- VtxCatalogPage's root
+  // action="{!initCatalog}" attaches to its own controller (the clean,
+  // single-declaring-class case; see GROUND-TRUTH.md v0.10-B1 L1).
+  printTree(
+    'VtxCatalogController.initCatalog -- A2 VF method-binding spot check: VtxCatalogPage (kind=vf) expected as a direct caller, from its root <apex:page action="{!initCatalog}">',
+    rIndex,
+    { classLower: 'vtxcatalogcontroller', methodLower: 'initcatalog' }
+  );
+}
+
 main();
 runAdvOrg();
 runGauntletOrgManagedPackages();
 runProgressiveDepthDemo();
+runRoundADemo();

@@ -31,7 +31,7 @@ Every call site shows its source line **and** (when present) the overload signat
 and the arguments bound to your parameter names. `◉ root` marks a node with no known
 caller of its own — an entry point or dead code. The header line above the tree is
 honest about what couldn't be resolved workspace-wide (dynamic dispatch, platform
-calls, chains deeper than 4 segments), instead of staying silent about it.
+calls, chains deeper than 12 segments), instead of staying silent about it.
 
 ## Quickstart
 
@@ -172,12 +172,15 @@ Callers that live outside Apex appear as terminal root nodes (badge `metadata`):
 `@InvocableMethod`), **LWC** (`@salesforce/apex` imports — jest mocks excluded),
 **Aura** (markup `controller=` + `c.method` calls), **OmniScript / Integration
 Procedure** Remote Actions (Vlocity DataPack JSON and `.os-meta.xml`), and
-**Visualforce** (`controller`/`extensions`).
+**Visualforce** (`controller`/`extensions`, plus `action="{!method}"` bindings on
+`apex:page`/`commandButton`/`commandLink`/`actionFunction`/`actionSupport`/
+`actionPoller` — attached to whichever of the page's controller/extensions classes
+actually declares that method; see Limits below).
 
 Property accessors are real targets too — `quote.Status = x` is a caller of
 `(set Status)` — and every call site carries a type-resolved `overloadSig` when the
 target has overloads. Fluent chains (`a.b().c()`) resolve through return types up to
-4 segments; casts and ternary receivers are handled.
+12 segments; casts and ternary receivers are handled.
 
 ## Path Map
 
@@ -278,7 +281,15 @@ What it can never show:
 
 ## Limits (known, by design)
 
-- Chains longer than 4 segments degrade to no edge (never a guessed one).
+- Chains longer than 12 segments degrade to no edge (never a guessed one); a
+  return-type cycle (`A.next()` → `B`, `B.next()` → `A`, …) is detected mid-walk
+  (a per-chain guard on already-visited `(type, method)` pairs) and degrades to no
+  edge the same way, rather than looping or landing on a lucky-but-wrong class.
+- Visualforce `action="{!method}"` bindings are only extracted when the brace
+  expression is a single bare identifier — `action="{!obj.method}"` (dotted) or any
+  other compound expression (`{!a && b}`, `{!IF(x,y,z)}`) is skipped, not attempted.
+  `value="{!prop}"` bindings are out of scope entirely (property/accessor
+  territory, not an action) — never extracted, regardless of shape.
 - `Type.forName`/`Type.newInstance()` with a non-literal argument (including a
   `Type`-typed local/field, however it's named — the check is by declared type, not
   identifier text) is not traced: no constructor edge, and never a guessed one.

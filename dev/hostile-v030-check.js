@@ -207,7 +207,21 @@ check('cast-around-whole-ternary: wholeCastOfTernary() DOES resolve exactly, via
 });
 
 // =======================================================================
-// 7. 5-segment fluent chain -- A3(c) documented cap is 4 segments.
+// 7. 5-segment fluent chain -- A3(c)'s ORIGINAL documented cap was 4
+// segments; v0.10/A1 widened resolveChainedReceiver's walk cap to
+// CHAIN_MAX=12 (module constant in resolver.js), so a 5-segment receiver
+// (b,c,d,e,f before the traced .g() call, i.e. S=5) is now WELL WITHIN the
+// cap and must actually WALK THE FULL CHAIN and resolve -- this is the
+// documented, permitted v0.10 "chains 5..12 now resolve" behavior flip
+// (GROUND-TRUTH.md v0.10-E's own "stale-expectation flag" calls out this
+// EXACT pair of assertions as needing this update once CHAIN_MAX lands).
+// Chain5E remains the decoy it always was: the walk must not stop early
+// and credit whatever it's standing on at the OLD 4-segment boundary --
+// it must keep walking past Chain5E all the way to the REAL 5th-segment
+// class, Chain5F. So the decoy assertion is UNCHANGED (Chain5E.g must
+// never be credited, cap or no cap), while the "exceeding the cap"
+// assertion flips to its mirror image: Chain5F.g (the real target) must
+// now receive the edge, via='typed'.
 // =======================================================================
 
 check('5-segment chain: Chain5E (segment-4 boundary decoy) must NOT receive the edge', () => {
@@ -216,22 +230,23 @@ check('5-segment chain: Chain5E (segment-4 boundary decoy) must NOT receive the 
   assert.ok(!hit, `Chain5E.g must not be credited as the caller target for a 5-segment chain (got via=${hit && hit.via})`);
 });
 
-// A3(c)'s documented cap is 4 segments; this receiver has 5
-// (b,c,d,e,f before the traced .g() call). Per the fixture's own doc
-// comment, the correct outcome for exceeding the cap is "cleanly absent",
-// not a guessed resolution -- resolveChainedReceiver bails out (returns
-// null) the moment segments.length > 4, and rule 7's unique-name fallback
-// also declines here because 'g' is declared on two classes in this
-// fixture set (Chain5E's decoy + Chain5F's real one), so it is NOT
-// globally unique. Net expectation: the call site is absent from BOTH
-// classes' caller lists -- never silently mis-attributed to either.
-check('5-segment chain: exceeding the 4-segment cap yields NO edge at all (not a guess)', () => {
+// v0.10/A1: CHAIN_MAX=12 means a 5-segment receiver (b,c,d,e,f) is fully
+// within the cap -- resolveChainedReceiver walks all 5 hops and lands on
+// Chain5F (the real 5th-segment class), then resolves the traced `.g()`
+// call against it, via='typed'. Chain5E (the old segment-4 boundary decoy)
+// must still never be credited -- the walk does not stop early just
+// because a plausible-looking method of the same name (`g`) exists on an
+// intermediate class; it only stops (or resolves) at the class the chain
+// ACTUALLY lands on. This is the mirror image of the pre-v0.10 "exceeding
+// the cap yields no edge" assertion this check replaces.
+check('5-segment chain: within CHAIN_MAX=12, Chain5F (the real 5th-segment class) receives the edge, not the Chain5E decoy', () => {
   const decoySites = sitesFor(index, 'chain5e', 'g');
   const realSites = sitesFor(index, 'chain5f', 'g');
   const decoyHit = decoySites.find((s) => (s.lineText || '').includes('head.b().c().d().e().f().g()'));
   const realHit = realSites.find((s) => (s.lineText || '').includes('head.b().c().d().e().f().g()'));
   assert.strictEqual(decoyHit, undefined, 'Chain5E must not receive the edge');
-  assert.strictEqual(realHit, undefined, 'Chain5F must not receive the edge either -- exceeding the cap must fall all the way through to no edge, since the unique-name fallback is disabled by the decoy');
+  assert.ok(realHit, 'Chain5F must receive the edge -- a 5-segment chain is within CHAIN_MAX=12, so it must resolve rather than drop');
+  assert.strictEqual(realHit.via, 'typed', `expected via=typed for the in-cap chain walk, got ${realHit && realHit.via}`);
 });
 
 // =======================================================================

@@ -218,12 +218,21 @@ check('F2: 3-level nested Map (3 chained .get(), within the 4-segment cap)', () 
   note('F2 3-level', `implA sites=${aSites.length} implB sites=${bSites.length}`);
 });
 
-check('F2: 5-level nested Map (5 chained .get(), EXCEEDS 4-segment cap) must NOT produce a wrong/phantom edge', () => {
+// v0.10/A1: CHAIN_MAX widened from 4 to 12 (module constant in
+// resolver.js), so this 5-segment nested-Map chain (5 chained .get() calls)
+// is now WELL WITHIN the cap and must resolve like the 2-level/3-level
+// cases above -- fan-out to BOTH interface implementers, via='interface'.
+// This is the documented, permitted v0.10 "chains 5..12 now resolve"
+// behavior flip (same delta as dev/hostile-v030-check.js's Chain5F
+// assertion) -- was "must NOT produce a wrong/phantom edge" under the old
+// 4-segment cap, now "must resolve, same shape as the in-cap nested-Map
+// cases".
+check('F2: 5-level nested Map (5 chained .get(), WITHIN CHAIN_MAX=12) now resolves, same fan-out shape as the in-cap cases', () => {
   const aSites = sitesFor(index, 'hostilenestedimpla', 'run').filter((s) => s.callerMethod === 'dispatchFiveLevel');
   const bSites = sitesFor(index, 'hostilenestedimplb', 'run').filter((s) => s.callerMethod === 'dispatchFiveLevel');
-  note('F2 5-level (over cap)', `implA sites=${aSites.length} implB sites=${bSites.length}`);
-  assert.strictEqual(aSites.length, 0, `expected 0 edges past the 4-segment cap, got implA=${aSites.length}`);
-  assert.strictEqual(bSites.length, 0, `expected 0 edges past the 4-segment cap, got implB=${bSites.length}`);
+  note('F2 5-level (within CHAIN_MAX=12)', `implA sites=${aSites.length} implB sites=${bSites.length}`);
+  assert.ok(aSites.length >= 1 && bSites.length >= 1, `expected fan-out to BOTH implementers now that CHAIN_MAX=12 covers this 5-segment chain; got A=${aSites.length} B=${bSites.length}`);
+  assert.strictEqual(aSites[0].via, 'interface');
 });
 
 check('F2: mixed Map<String,List<Iface>> via .get(key).get(idx)', () => {

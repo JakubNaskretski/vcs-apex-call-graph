@@ -671,6 +671,91 @@ addFile('classes/Tpl071Sub.cls', [
   '}',
 ].join('\n'));
 
+// =========================================================================
+// v0.10/A1 e2e fixture: an 8-segment fluent receiver chain (hop0..hop7,
+// V10Chain0 -> V10Chain8), well beyond the pre-v0.10 4-segment cap but
+// safely within the new CHAIN_MAX=12. V10Chain7 ALSO declares a decoy
+// `land()` -- the SAME name as the real traced call -- so a resolver that
+// stopped walking one hop early (or fell through to rule 7's unique-name
+// fallback instead of genuinely walking the chain) would either produce no
+// edge at all (land() is not globally unique) or credit the wrong class;
+// via='typed' on the REAL target is the only way this check can pass,
+// exactly the same anti-false-positive shape GROUND-TRUTH.md's
+// VtxReportChainCaller/Stage-ladder fixture (and dev/hostile-v030's
+// Chain5E/Chain5F pair) already establish for this amendment.
+// =========================================================================
+addFile('classes/V10Chain0.cls', [
+  'public class V10Chain0 {',
+  '  public V10Chain1 hop0() { return new V10Chain1(); }',
+  '}',
+].join('\n'));
+addFile('classes/V10Chain1.cls', [
+  'public class V10Chain1 {',
+  '  public V10Chain2 hop1() { return new V10Chain2(); }',
+  '}',
+].join('\n'));
+addFile('classes/V10Chain2.cls', [
+  'public class V10Chain2 {',
+  '  public V10Chain3 hop2() { return new V10Chain3(); }',
+  '}',
+].join('\n'));
+addFile('classes/V10Chain3.cls', [
+  'public class V10Chain3 {',
+  '  public V10Chain4 hop3() { return new V10Chain4(); }',
+  '}',
+].join('\n'));
+addFile('classes/V10Chain4.cls', [
+  'public class V10Chain4 {',
+  '  public V10Chain5 hop4() { return new V10Chain5(); }',
+  '}',
+].join('\n'));
+addFile('classes/V10Chain5.cls', [
+  'public class V10Chain5 {',
+  '  public V10Chain6 hop5() { return new V10Chain6(); }',
+  '}',
+].join('\n'));
+addFile('classes/V10Chain6.cls', [
+  'public class V10Chain6 {',
+  '  public V10Chain7 hop6() { return new V10Chain7(); }',
+  '}',
+].join('\n'));
+addFile('classes/V10Chain7.cls', [
+  'public class V10Chain7 {',
+  '  public V10Chain8 hop7() { return new V10Chain8(); }',
+  // Decoy: the segment-7 boundary class also declares `land()`, so a
+  // resolver that stopped one hop short (or bailed to rule 7) would either
+  // wrongly credit THIS class or find land() non-unique and drop entirely.
+  '  public String land() { return \'DECOY V10Chain7.land\'; }',
+  '}',
+].join('\n'));
+addFile('classes/V10Chain8.cls', [
+  'public class V10Chain8 {',
+  '  public String land() { return \'REAL V10Chain8.land\'; }',
+  '}',
+].join('\n'));
+addFile('classes/V10ChainCaller.cls', [
+  'public class V10ChainCaller {',
+  '  public void run() {',
+  '    V10Chain0 q = new V10Chain0();',
+  '    q.hop0().hop1().hop2().hop3().hop4().hop5().hop6().hop7().land();',
+  '  }',
+  '}',
+].join('\n'));
+
+// =========================================================================
+// v0.10/A2 e2e fixture: Visualforce page action="{!method}" binding ->
+// method-level caller edge, real metascan.js -> resolver.js pipeline (not
+// synthetic TNode fixtures -- exercised via addFile()+parseMetaFile() just
+// like the LWC/Flow e2e stories above). `V10VfExtController` declares the
+// bound method; the page names it via a controller= attribute exactly like
+// metascan.js's own documented `<apex:page controller="Cls" ...>` pattern.
+// =========================================================================
+addFile('classes/V10VfExtController.cls', [
+  'public class V10VfExtController {',
+  '  public void runAction() { System.debug(\'ran\'); }',
+  '}',
+].join('\n'));
+
 // Sanity: no fixture should crash parseFile, and exactly the one deliberate
 // syntax error should carry parseError.
 for (const f of files) {
@@ -758,6 +843,19 @@ const pubStoryFlowFile = {
 };
 const pubStoryFlowMetaRefs = metascan.parseMetaFile(pubStoryFlowFile).map((ref) => Object.assign(ref, { path: pubStoryFlowFile.path }));
 resolver.attachMetaCallers(index, pubStoryFlowMetaRefs);
+
+// v0.10/A2 e2e: a real Visualforce .page file, run through the real
+// metascan.js action="{!method}" extraction, attached via the real
+// resolver.js attachVfActionRef gate -- same "real pipeline, not synthetic
+// TNode fixtures" story as the LWC/Flow legs above. Single controller, no
+// extensions, no ambiguity (the ordinary case; B1's disambiguation traps
+// are already covered by the real gauntlet-org corpus in dev/gauntlet/).
+const v10VfPageFile = {
+  path: '/ws/force-app/main/default/pages/V10VfActionPage.page',
+  text: '<apex:page controller="V10VfExtController">\n  <apex:commandButton value="Run" action="{!runAction}"/>\n</apex:page>',
+};
+const v10VfPageMetaRefs = metascan.parseMetaFile(v10VfPageFile).map((ref) => Object.assign(ref, { path: v10VfPageFile.path }));
+resolver.attachMetaCallers(index, v10VfPageMetaRefs);
 
 // ---------------------------------------------------------------------------
 // Assertions
@@ -1888,6 +1986,40 @@ const v08Index = resolver.buildSemanticIndex(v08Files);
   const fullDepthMapData = pathmap.buildPathMapData(fullDepth);
   assert.deepStrictEqual(convergedMapData, fullDepthMapData, 'e2e/pathmap: converged tree\'s map data matches the full-depth trace\'s map data exactly');
   assert.ok(convergedMapData.nodes.every((n) => n.expandable === false), 'e2e/pathmap: no residual expandable:true pill anywhere once converged');
+}
+
+// =========================================================================
+// v0.10/A1 e2e: 8-segment fluent receiver chain resolves within the widened
+// CHAIN_MAX=12 cap (see V10Chain0..V10Chain8/V10ChainCaller fixtures above).
+// Pre-v0.10 this receiver (8 `.hopN()` segments) would have exceeded the
+// old 4-segment cap and dropped to no edge; it must now resolve, via=
+// 'typed', to the REAL 8th-hop class -- never the V10Chain7 decoy that
+// shares the traced method's name one hop early.
+// =========================================================================
+{
+  const tree = callers('v10chain8', 'land');
+  const realCaller = findChild(tree, 'V10ChainCaller.run');
+  assert.ok(realCaller, 'e2e/v0.10-A1: an 8-segment chain (within CHAIN_MAX=12) must resolve to V10Chain8.land, not drop');
+  assert.strictEqual(realCaller.via, 'typed', `expected via=typed (genuine chain walk, not the rule-7 unique-name fallback), got ${realCaller && realCaller.via}`);
+
+  const decoyTree = callers('v10chain7', 'land');
+  const decoyHit = findChild(decoyTree, 'V10ChainCaller.run');
+  assert.ok(!decoyHit, 'e2e/v0.10-A1: the segment-7 decoy (V10Chain7.land) must never be credited -- the walk must go the full 8 hops, not stop one early');
+}
+
+// =========================================================================
+// v0.10/A2 e2e: Visualforce action="{!method}" binding -> method-level
+// caller edge, exercised through the real metascan.js -> resolver.js
+// pipeline (see the V10VfExtController/V10VfActionPage fixtures above).
+// The page's own label ("V10VfActionPage") must appear as a direct caller
+// of the DECLARING controller class's method, kind='vf'.
+// =========================================================================
+{
+  const tree = callers('v10vfextcontroller', 'runaction');
+  const pageCaller = tree.root.children.find((c) => c.label === 'V10VfActionPage' && c.kind === 'vf');
+  assert.ok(pageCaller, 'e2e/v0.10-A2: V10VfActionPage\'s action="{!runAction}" binding must attach a method-level VF caller edge to V10VfExtController.runAction');
+  assert.strictEqual(pageCaller.sites.length, 1, 'e2e/v0.10-A2: exactly one action-binding site');
+  assert.strictEqual(pageCaller.sites[0].line, 2, 'e2e/v0.10-A2: site line matches the apex:commandButton\'s own source line');
 }
 
 console.log('apex-trace end-to-end self-check: all assertions passed');

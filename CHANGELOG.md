@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.10.0
+
+Deeper chains, Visualforce methods.
+
+- **Fluent chains now resolve up to 12 segments** (previously 4) — long builder
+  chains like `q.selectFields().whereRegion()....build()` land on the right
+  method, with a cycle guard so a return-type loop degrades to no edge instead
+  of a guess. Beyond 12, still an honest drop.
+- **Visualforce action bindings are method-level**: `action="{!save}"` on
+  `apex:page`, `commandButton`, `commandLink`, `actionFunction`, `actionSupport`
+  and `actionPoller` now edges to the exact method — attached to whichever of
+  the page's controller/extension classes actually declares it (inherited
+  counts; ambiguous or unknown falls back to class level, never fabricated).
+  Value bindings (`value="{!prop}"`) remain out of scope.
+- Internal hardening: the engine now clamps its own depth/node limits
+  (defense-in-depth for future direct-invocation surfaces).
+
+
 ## 0.9.0
 
 Start shallow, expand on click — plus an icon and real settings.

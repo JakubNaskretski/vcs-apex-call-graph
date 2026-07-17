@@ -7,7 +7,7 @@
 // must-cover behaviors from the task brief (see the section markers below).
 
 const assert = require('assert');
-const { buildSemanticIndex, buildCallerTree, buildCalleeTree, suggestTargets, attachMetaCallers } = require('./resolver');
+const { buildSemanticIndex, buildCallerTree, buildCalleeTree, suggestTargets, attachMetaCallers, clampInt } = require('./resolver');
 
 // ---- fixture builders (mirror the frozen contract's field names exactly) --
 
@@ -555,13 +555,15 @@ const ChainCaller = ty('ChainCaller', 'ChainCaller', {
   ],
 });
 
-// ---- A3(c): chained receiver -- 5-segment chain must exceed the documented
-// 4-segment cap and fall through to NO edge, never a confidently-wrong one.
-// OverflowHop4 sits exactly at the segment-4 truncation boundary and
-// declares a decoy method with the SAME name as the real 5th-hop target, so
-// a naive slice(0,4)-and-use-it bug would wrongly credit OverflowHop4
-// instead of OverflowHop5 (or leave the site absent, which is also fine --
-// what must NEVER happen is landing on OverflowHop4).
+// ---- v0.10/A1 (was A3(c)): chained receiver -- a 5-segment chain is now
+// WELL WITHIN the widened CHAIN_MAX=12 cap (pre-v0.10 this exceeded the old
+// 4-segment cap and had to drop honestly -- see the REGRESSION-POLICY-
+// PERMITTED rewrite below). OverflowHop4 sits exactly at the OLD segment-4
+// truncation boundary and declares a decoy method with the SAME name as the
+// real 5th-hop target, so this fixture still earns its keep post-A1: it now
+// proves the walk goes ALL THE WAY to the real target (OverflowHop6) and
+// never stops early at the old boundary class (OverflowHop5) just because
+// that's where the pre-v0.10 cap used to bite.
 const OverflowHop6 = ty('OverflowHop6', 'OverflowHop6', { methods: [mth('landHere', { line: 1 })] });
 const OverflowHop5 = ty('OverflowHop5', 'OverflowHop5', {
   methods: [
@@ -1198,24 +1200,25 @@ attachMetaCallers(index, metaRefs);
   assert.strictEqual(caller.approximate, true);
 }
 
-// ---- A3(c): chained receiver -- 5 segments exceeds the documented 4-
-// segment cap; must NOT silently mis-attribute to the segment-4 boundary
-// class (OverflowHop5, which has a decoy method of the same name). Since
-// the decoy makes 'landHere' non-unique, rule 7's unique-name fallback is
-// also disabled, so the correct outcome is NO edge at all -- not a partial
-// win, not a guess. (Regression for the "4-segment cap silently truncates
-// and confidently mis-attributes" defect.)
+// ---- v0.10/A1 REWRITE (was A3(c) "5-segment chain must drop honestly"):
+// CHAIN_MAX widened from 4 to 12, so this 5-segment receiver (hop1..hop5)
+// now WALKS THE FULL CHAIN and resolves the trailing landHere() call to the
+// REAL target (OverflowHop6.landHere), via 'typed' -- never the decoy
+// sitting at the old segment-4 boundary (OverflowHop5.landHere). This is
+// the ONE permitted expectation rewrite the A1 amendment calls for
+// explicitly; every other pre-v0.10 assertion in this file is unchanged.
 {
   const overflowTargetTree = buildCallerTree(index, { classLower: 'overflowhop5', methodLower: 'landHere' });
   const wrongCaller = findChild(overflowTargetTree.root.children, 'OverflowChainCaller.runOverflow');
-  assert.ok(!wrongCaller, 'a 5-segment chain must NEVER be credited to the segment-4 boundary class (OverflowHop5) just because the walk was truncated there');
+  assert.ok(!wrongCaller, 'v0.10/A1: the walk must NEVER stop early and credit the old segment-4 boundary class (OverflowHop5) now that CHAIN_MAX=12 lets it keep going');
 
   const realTargetTree = buildCallerTree(index, { classLower: 'overflowhop6', methodLower: 'landHere' });
   const realCaller = findChild(realTargetTree.root.children, 'OverflowChainCaller.runOverflow');
-  assert.ok(!realCaller, 'exceeding the 4-segment cap must fall all the way through to NO edge (the decoy on OverflowHop5 disables the unique-name fallback too) -- not a confident guess at the real target either');
+  assert.ok(realCaller, 'v0.10/A1: a 5-segment chain is within CHAIN_MAX=12 -- it must now resolve to the REAL target (OverflowHop6.landHere), not drop');
+  assert.strictEqual(realCaller.via, 'typed', "v0.10/A1: resolved via the chained-receiver walk's own 'typed' via label, not a fallback rule");
 
-  assert.strictEqual(index.methodCallers.get('overflowhop5#landhere'), undefined, 'no caller entry at all for the decoy target');
-  assert.strictEqual(index.methodCallers.get('overflowhop6#landhere'), undefined, 'no caller entry at all for the real target -- absence, not mis-attribution, is the correct outcome once the cap is exceeded');
+  assert.strictEqual(index.methodCallers.get('overflowhop5#landhere'), undefined, 'v0.10/A1: still no caller entry at all for the decoy target');
+  assert.ok(index.methodCallers.get('overflowhop6#landhere'), 'v0.10/A1: a real caller entry now exists for the real target, unlike the pre-v0.10 "absence is correct" outcome');
 }
 
 // =========================================================================
@@ -2675,10 +2678,11 @@ const indexH2 = buildSemanticIndex(factsListH2);
 
 // =========================================================================
 // H4 (resolver half): index.stats.unresolvedSites counts call sites this
-// build positively identified as dropped (unknown receiver, chain > 4
-// segments, non-literal Type.forName); every TreeResult carries the same
-// workspace-wide count through unchanged (stats passthrough); a resolved
-// target with genuinely zero callers gets an honest info note.
+// build positively identified as dropped (unknown receiver, chain >
+// CHAIN_MAX segments [v0.10/A1: 12, was 4], non-literal Type.forName);
+// every TreeResult carries the same workspace-wide count through unchanged
+// (stats passthrough); a resolved target with genuinely zero callers gets
+// an honest info note.
 // =========================================================================
 const H4Known = ty('H4Known', 'H4Known', {
   methods: [mth('helper', { line: 1 }), mth('orphanMethod', { line: 2 })],
@@ -2692,11 +2696,16 @@ const H4Caller = ty('H4Caller', 'H4Caller', {
         // (1) unknown receiver: 'ghostReceiver' names nothing in scope, and
         // 'frobnicate' isn't a known method name anywhere in the index.
         cl('dot', 'frobnicate', { receiver: 'ghostReceiver', line: 1, lineText: 'ghostReceiver.frobnicate();' }),
-        // (2) chain > 4 segments (A3(c)'s documented walk-limit cap).
+        // (2) v0.10/A1: chain > CHAIN_MAX(12) segments -- was a 5-segment
+        // chain pre-v0.10 (over the OLD 4-segment cap); widened to 13
+        // segments here so this site still genuinely exercises the
+        // cap-exceeded path (the cap check runs BEFORE any head/type
+        // resolution, so segment COUNT alone -- not whether 'x' itself is a
+        // known local -- is what must trip it here).
         cl('dot', 'finalCall', {
-          receiver: 'x.hop1().hop2().hop3().hop4().hop5()',
+          receiver: 'x.hop1().hop2().hop3().hop4().hop5().hop6().hop7().hop8().hop9().hop10().hop11().hop12().hop13()',
           line: 2,
-          lineText: 'x.hop1().hop2().hop3().hop4().hop5().finalCall();',
+          lineText: 'x.hop1()...hop13().finalCall(); // 13 segments, one past CHAIN_MAX',
         }),
         // (3) Type.forName(...) with a non-literal (variable) argument.
         cl('dot', 'forName', { receiver: 'Type', argTexts: ['dynamicName'], line: 3, lineText: 'Type.forName(dynamicName);' }),
@@ -4845,6 +4854,279 @@ function buildV9ChainCallee5() {
   assert.strictEqual(survivor.pendingCount, 1);
   assert.deepStrictEqual(survivor.children, []);
   assert.strictEqual(tree.stats.frontierNodes, 1, 'exactly the one survivor counts toward frontierNodes -- the two callers dropped by the cap were never even visited, so they cannot inflate this count either');
+}
+
+// =========================================================================
+// v0.10 (Round A) new coverage
+// =========================================================================
+//
+// A1: CHAIN_MAX=12 (was 4) + per-chain (typeLower,methodLower) visited
+//     cycle guard.
+// A2: VF method-ref attach gate (resolver half only -- metascan.js's own
+//     extraction half is exercised in test-metascan.js, not here).
+// A3: buildCallerTree/buildCalleeTree opts clamping.
+//
+// Mirrors GROUND-TRUTH.md's v0.10-A/v0.10-B sections (example-data/
+// gauntlet-org) at a small, self-contained, hand-built scale -- these
+// fixtures are deliberately NOT the real corpus (this file never depends on
+// parser.js/metascan.js), just the same shapes.
+
+// ---- v0.10/A1: CHAIN_MAX segment-length matrix -------------------------
+// CMStageK ladder: CMStage(K-1).hopK() returns CMStageK, for K=1..13.
+// build() is declared on CMStage5/8/12/13 ONLY (4 declarations -- already
+// non-unique, so rule 7's unique-name fallback can never mask a dropped
+// chain as a false edge, same anti-fallback purpose GROUND-TRUTH.md's own
+// 13-declaration ladder uses). Four traced call sites off a fresh
+// CMStage0, at exactly the segment counts the amendment's own table calls
+// out: 5 (well within the old AND new cap), 8 (only resolves post-A1), 12
+// (exactly at the new cap), 13 (one past the new cap -- must still drop).
+{
+  function chainRecv(headName, n) {
+    let s = headName;
+    for (let i = 1; i <= n; i++) s += `.hop${i}()`;
+    return s;
+  }
+  const cmTypes = [];
+  for (let i = 0; i <= 13; i++) {
+    const methods = [];
+    if (i < 13) methods.push(mth(`hop${i + 1}`, { line: 1, returnType: `CMStage${i + 1}` }));
+    if ([5, 8, 12, 13].includes(i)) methods.push(mth('build', { line: 2 })); // non-unique decoy
+    cmTypes.push(ty(`CMStage${i}`, `CMStage${i}`, { methods }));
+  }
+  const CMChainCaller = ty('CMChainCaller', 'CMChainCaller', {
+    methods: [
+      mth('run5', {
+        line: 1,
+        locals: [{ name: 'q', type: 'CMStage0', line: 1 }],
+        calls: [cl('dot', 'build', { receiver: chainRecv('q', 5), line: 2, lineText: chainRecv('q', 5) + '.build();' })],
+      }),
+      mth('run8', {
+        line: 3,
+        locals: [{ name: 'q', type: 'CMStage0', line: 3 }],
+        calls: [cl('dot', 'build', { receiver: chainRecv('q', 8), line: 4, lineText: chainRecv('q', 8) + '.build();' })],
+      }),
+      mth('run12', {
+        line: 5,
+        locals: [{ name: 'q', type: 'CMStage0', line: 5 }],
+        calls: [cl('dot', 'build', { receiver: chainRecv('q', 12), line: 6, lineText: chainRecv('q', 12) + '.build();' })],
+      }),
+      mth('run13', {
+        line: 7,
+        locals: [{ name: 'q', type: 'CMStage0', line: 7 }],
+        calls: [cl('dot', 'build', { receiver: chainRecv('q', 13), line: 8, lineText: chainRecv('q', 13) + '.build();' })],
+      }),
+    ],
+  });
+  const cmIndex = buildSemanticIndex([...cmTypes.map(mkFile), mkFile(CMChainCaller)]);
+
+  const t5 = buildCallerTree(cmIndex, { classLower: 'cmstage5', methodLower: 'build' });
+  const c5 = findChild(t5.root.children, 'CMChainCaller.run5');
+  assert.ok(c5, 'v0.10/A1: a 5-segment chain resolves (was already true pre-v0.10, still true post-v0.10)');
+  assert.strictEqual(c5.via, 'typed');
+
+  const t8 = buildCallerTree(cmIndex, { classLower: 'cmstage8', methodLower: 'build' });
+  const c8 = findChild(t8.root.children, 'CMChainCaller.run8');
+  assert.ok(c8, 'v0.10/A1: an 8-segment chain now resolves (pre-v0.10 this exceeded the old 4-segment cap and dropped)');
+  assert.strictEqual(c8.via, 'typed');
+
+  const t12 = buildCallerTree(cmIndex, { classLower: 'cmstage12', methodLower: 'build' });
+  const c12 = findChild(t12.root.children, 'CMChainCaller.run12');
+  assert.ok(c12, 'v0.10/A1: a 12-segment chain resolves -- exactly AT the new CHAIN_MAX cap, still within bounds');
+  assert.strictEqual(c12.via, 'typed');
+
+  const t13 = buildCallerTree(cmIndex, { classLower: 'cmstage13', methodLower: 'build' });
+  const c13 = findChild(t13.root.children, 'CMChainCaller.run13');
+  assert.ok(!c13, 'v0.10/A1: a 13-segment chain is one past CHAIN_MAX=12 -- must still drop honestly, never a guessed edge onto CMStage12 or CMStage13');
+  assert.strictEqual(cmIndex.methodCallers.get('cmstage13#build'), undefined, 'no caller entry at all for the 13-segment target');
+
+  const t12Wrong = buildCallerTree(cmIndex, { classLower: 'cmstage12', methodLower: 'build' });
+  assert.strictEqual((t12Wrong.root.children || []).filter((c) => c.label === 'CMChainCaller.run13').length, 0, 'the dropped 13-segment call must NEVER be mis-credited to the 12-segment boundary class either');
+}
+
+// ---- v0.10/A1: per-chain (typeLower,methodLower) cycle guard ------------
+// CycNodeA.next() -> CycNodeB, CycNodeB.next() -> CycNodeA, forever. Both
+// also declare terminal() (non-unique -- disables rule 7 for the S=6 site).
+// S=0,1,2 stay within the not-yet-repeated part of the cycle and must
+// resolve normally; S=3 is the first hop that needs (CycNodeA,'next')
+// again (already visited at S=1's own first hop) and must drop; S=6
+// (traced .terminal()) is the headline "6-deep cycle still degrades
+// honestly" case GROUND-TRUTH.md's v0.10-A(iii) table calls out.
+{
+  function nextChain(n) {
+    let s = 'n';
+    for (let i = 0; i < n; i++) s += '.next()';
+    return s;
+  }
+  const CycNodeA = ty('CycNodeA', 'CycNodeA', {
+    methods: [mth('next', { line: 1, returnType: 'CycNodeB' }), mth('terminal', { line: 2 })],
+  });
+  const CycNodeB = ty('CycNodeB', 'CycNodeB', {
+    methods: [mth('next', { line: 1, returnType: 'CycNodeA' }), mth('terminal', { line: 2 })],
+  });
+  const CycCaller = ty('CycCaller', 'CycCaller', {
+    methods: [
+      mth('run', {
+        line: 1,
+        locals: [{ name: 'n', type: 'CycNodeA', line: 1 }],
+        calls: [
+          cl('dot', 'next', { receiver: nextChain(0), line: 1, lineText: 'n.next(); // S=0' }),
+          cl('dot', 'next', { receiver: nextChain(1), line: 2, lineText: 'n.next().next(); // S=1' }),
+          cl('dot', 'next', { receiver: nextChain(2), line: 3, lineText: '...S=2...' }),
+          cl('dot', 'next', { receiver: nextChain(3), line: 4, lineText: '...S=3, must drop...' }),
+          cl('dot', 'terminal', { receiver: nextChain(6), line: 5, lineText: '...S=6, must drop...' }),
+        ],
+      }),
+    ],
+  });
+  const cycIndex = buildSemanticIndex([mkFile(CycNodeA), mkFile(CycNodeB), mkFile(CycCaller)]);
+
+  // S=0 (bare 'n', 0 segments -- plain typed dispatch, not the chain walker
+  // at all) and S=2 (A->B->A, both hops genuinely new -- no repeat yet)
+  // BOTH land on CycNodeA.next -- two independent, correctly-resolved sites.
+  assert.strictEqual((cycIndex.methodCallers.get('cycnodea#next') || []).length, 2, 'S=0 and S=2 both correctly resolve to CycNodeA.next');
+  // S=1 (A->B, one genuinely new hop) lands on CycNodeB.next. S=3 would
+  // ALSO naively land here (A->B->A->B, a guardless walk revisits the same
+  // edge a second time) -- the guard must stop it BEFORE that, so this
+  // must stay at exactly 1 site, not 2.
+  assert.strictEqual((cycIndex.methodCallers.get('cycnodeb#next') || []).length, 1, 'v0.10/A1: S=3 must NOT also land on CycNodeB.next -- the cycle guard must fire before a naive walk would silently re-use the (CycNodeA,next)->(CycNodeB) edge a second time');
+  // S=6 (traced .terminal()) -- headline case: must drop entirely, on
+  // EITHER class (terminal() is non-unique, so rule 7 also correctly
+  // declines).
+  assert.strictEqual(cycIndex.methodCallers.get('cycnodea#terminal'), undefined, 'v0.10/A1: a 6-deep return-type cycle must degrade to NO edge, not a lucky/wrong guess -- CycNodeA.terminal');
+  assert.strictEqual(cycIndex.methodCallers.get('cycnodeb#terminal'), undefined, 'v0.10/A1: same, CycNodeB.terminal -- neither side of the cycle is credited');
+}
+
+// ---- v0.10/A3: clamp math (clampInt) unit tests -------------------------
+{
+  // Non-finite (or non-numeric) inputs fall back to the caller's default,
+  // exactly as if opts had omitted the field entirely.
+  assert.strictEqual(clampInt(NaN, 1, 64, 8), 8, 'NaN -> fallback');
+  assert.strictEqual(clampInt(Infinity, 1, 64, 8), 8, 'Infinity -> fallback');
+  assert.strictEqual(clampInt(-Infinity, 1, 64, 8), 8, '-Infinity -> fallback');
+  assert.strictEqual(clampInt('x', 1, 64, 8), 8, "non-numeric string ('x') -> fallback");
+  assert.strictEqual(clampInt(undefined, 1, 64, 8), 8, 'undefined -> fallback');
+  assert.strictEqual(clampInt(null, 1, 64, 8), 1, 'null -> Number(null) is 0 (finite!), which clamps to min, NOT the fallback -- every real call site already guards this with `opts && opts.maxDepth`, so a bare `null` never actually reaches clampInt in practice, but the function itself must still be internally consistent');
+  // Out-of-range but FINITE values clamp to the nearest bound -- NOT the
+  // fallback (a below-range value like -5 is not "absent", it is a real,
+  // if nonsensical, number).
+  assert.strictEqual(clampInt(-5, 1, 64, 8), 1, 'below range -> clamped to min');
+  assert.strictEqual(clampInt(1e9, 1, 64, 8), 64, 'above range -> clamped to max');
+  assert.strictEqual(clampInt(0, 1, 100000, 2000), 1, 'zero clamps to min like any other below-range finite value (differs from the old pre-v0.10 `value || fallback` idiom, which would have treated 0 as "absent")');
+  // In-range values pass through completely untouched.
+  assert.strictEqual(clampInt(3, 1, 64, 8), 3, 'in-range value untouched');
+  assert.strictEqual(clampInt(1, 1, 64, 8), 1, 'exactly at min -- untouched, not treated as "needs clamping"');
+  assert.strictEqual(clampInt(64, 1, 64, 8), 64, 'exactly at max -- untouched');
+  assert.strictEqual(clampInt(3.7, 1, 64, 8), 3, 'non-integer finite value truncated toward zero before range-checking');
+}
+
+// ---- v0.10/A3: end-to-end wiring proof (buildCallerTree/buildCalleeTree
+// actually apply the clamp, not just that clampInt is correct in isolation)
+{
+  const A3Target = ty('A3Target', 'A3Target', { methods: [mth('run', { line: 1 })] });
+  const A3Caller = ty('A3Caller', 'A3Caller', {
+    methods: [mth('call', { line: 1, calls: [cl('dot', 'run', { receiver: 'A3Target', line: 1, lineText: 'A3Target.run();' })] })],
+  });
+  const a3Index = buildSemanticIndex([mkFile(A3Target), mkFile(A3Caller)]);
+  const a3Target = { classLower: 'a3target', methodLower: 'run' };
+
+  const base = buildCallerTree(a3Index, a3Target, {});
+  const nanTree = buildCallerTree(a3Index, a3Target, { maxDepth: NaN, maxNodes: Infinity, initialDepth: 'x' });
+  assert.deepStrictEqual(nanTree, base, 'v0.10/A3: non-finite/non-numeric maxDepth/maxNodes/initialDepth must fall back to the EXACT same result as omitting opts entirely -- must not change any existing behavior');
+
+  const negTree = buildCallerTree(a3Index, a3Target, { maxDepth: -5, maxNodes: -5 });
+  assert.strictEqual(negTree.stats.nodes, 1, 'v0.10/A3: maxNodes clamped from -5 up to 1 -- only the root node is ever built');
+  assert.strictEqual(negTree.root.children.length, 0, 'a maxNodes:1 cap (clamped from -5) leaves no room for any children at all');
+  assert.strictEqual(negTree.stats.capped, true);
+
+  const hugeTree = buildCallerTree(a3Index, a3Target, { maxDepth: 1e9, maxNodes: 1e9 });
+  assert.strictEqual(hugeTree.stats.capped, false, 'v0.10/A3: maxNodes clamped to 100000 (not left as literal 1e9) is still far more than this tiny fixture needs -- behaves exactly like "effectively uncapped", proving the clamp did not break the huge-but-legitimate case');
+  const calleeBase = buildCalleeTree(a3Index, a3Target, {});
+  const calleeNan = buildCalleeTree(a3Index, a3Target, { maxDepth: NaN, maxNodes: 'x' });
+  assert.deepStrictEqual(calleeNan, calleeBase, 'v0.10/A3: same clamp wiring proof, callee direction');
+}
+
+// ---- v0.10/A2: VF method-ref attach gate (resolver half) ---------------
+// Hand-built MetaRefs matching the contract metascan.js's own v0.10/A2 half
+// actually emits (verified live against the real gauntlet-org VF corpus):
+// { kind:'vf', label, className:null, methodName, line, lineText,
+//   controllerClass:string|null, extensionClasses:string[] }. This section
+// exercises the ATTACH GATE only (attachMetaCallers' dispatch + the
+// declared-on-controller-or-extensions decision) -- metascan.js's own
+// extraction logic (which attribute shapes qualify) is out of scope here
+// and is covered by test-metascan.js instead.
+{
+  const VfBase = ty('VfBase', 'VfBase', { methods: [mth('inheritedAction', { line: 1 })] });
+  const VfController = ty('VfController', 'VfController', {
+    extendsType: 'VfBase',
+    methods: [mth('controllerAction', { line: 1 }), mth('bothAction', { line: 2 })],
+  });
+  const VfExtension = ty('VfExtension', 'VfExtension', {
+    methods: [mth('extensionAction', { line: 1 }), mth('bothAction', { line: 2 })],
+  });
+  const vfIndex = buildSemanticIndex([mkFile(VfBase), mkFile(VfController), mkFile(VfExtension)]);
+
+  function vfRef(methodName, line, controllerClass, extensionClasses) {
+    return {
+      kind: 'vf',
+      label: 'VfMatrixPage',
+      className: null,
+      methodName,
+      line,
+      lineText: `action="{!${methodName}}"`,
+      controllerClass,
+      extensionClasses: extensionClasses || [],
+    };
+  }
+
+  const vfRefs = [
+    vfRef('controllerAction', 1, 'VfController', ['VfExtension']), // controller-declared
+    vfRef('extensionAction', 2, 'VfController', ['VfExtension']),  // extension-declared (not the controller)
+    vfRef('inheritedAction', 3, 'VfController', ['VfExtension']),  // inherited (declared on VfController's OWN ancestor, VfBase)
+    vfRef('bothAction', 4, 'VfController', ['VfExtension']),       // ambiguous -- declared on BOTH
+    vfRef('vanishedAction', 5, 'VfController', ['VfExtension']),   // none declare it
+  ];
+  attachMetaCallers(vfIndex, vfRefs);
+
+  // controller-declared -> method-level edge on the controller.
+  const controllerTree = buildCallerTree(vfIndex, { classLower: 'vfcontroller', methodLower: 'controlleraction' });
+  assert.ok(findChild(controllerTree.root.children, 'VfMatrixPage'), 'v0.10/A2: controller-declared action binding attaches at the METHOD level on the controller');
+
+  // extension-declared -> method-level edge on the EXTENSION, not the
+  // controller (the "extension not controller" ground-truth shape).
+  const extensionTree = buildCallerTree(vfIndex, { classLower: 'vfextension', methodLower: 'extensionaction' });
+  assert.ok(findChild(extensionTree.root.children, 'VfMatrixPage'), 'v0.10/A2: extension-declared action binding attaches at the METHOD level on the EXTENSION');
+  assert.strictEqual(vfIndex.methodCallers.get('vfcontroller#extensionaction'), undefined, 'must NOT also (or instead) attach to the controller');
+
+  // inherited -> the CONTROLLER (own or inherited counts) gets the method-
+  // level edge, even though VfController itself never declares
+  // inheritedAction directly -- only its ancestor VfBase does.
+  const inheritedTree = buildCallerTree(vfIndex, { classLower: 'vfcontroller', methodLower: 'inheritedaction' });
+  assert.ok(findChild(inheritedTree.root.children, 'VfMatrixPage'), 'v0.10/A2: "declared, own OR inherited" -- an ancestor-declared method still attaches to the PAGE-DECLARED class (VfController), not VfBase');
+  assert.strictEqual(vfIndex.methodCallers.get('vfbase#inheritedaction'), undefined, 'the edge attaches to the controller class itself, never fabricated onto the ancestor that actually declares it');
+
+  // ambiguous (declared on BOTH controller and extension) -> class-level
+  // ref to the CONTROLLER only, no method fabricated on either class.
+  assert.strictEqual(vfIndex.methodCallers.get('vfcontroller#bothaction'), undefined, 'v0.10/A2: ambiguous ("declared on both") must NOT fabricate a method-level edge on the controller');
+  assert.strictEqual(vfIndex.methodCallers.get('vfextension#bothaction'), undefined, 'nor on the extension');
+  const controllerClassTree = buildCallerTree(vfIndex, { classLower: 'vfcontroller', methodLower: null });
+  assert.ok(findChild(controllerClassTree.root.children, 'VfMatrixPage'), 'v0.10/A2: the ambiguous binding still surfaces as a CLASS-level reference to the controller');
+
+  // none declare it -> same class-level-only fallback to the controller,
+  // no method fabricated anywhere.
+  assert.strictEqual(vfIndex.methodCallers.get('vfcontroller#vanishedaction'), undefined, 'v0.10/A2: "matches no class" must not fabricate a method-level edge');
+  assert.strictEqual(vfIndex.methodCallers.get('vfextension#vanishedaction'), undefined);
+
+  // No controller/extensions at all (standardController-only page) -- the
+  // literal "no edge possible" case: dropped entirely, not even a
+  // class-level fallback (there is no controller to fall back to).
+  const vfNoControllerRef = vfRef('edit', 1, null, []);
+  vfNoControllerRef.label = 'VfNoControllerPage';
+  attachMetaCallers(vfIndex, [vfNoControllerRef]);
+  let sawNoControllerPage = false;
+  for (const [, refs] of vfIndex.metaCallers) {
+    if (refs.some((r) => r.label === 'VfNoControllerPage')) sawNoControllerPage = true;
+  }
+  assert.strictEqual(sawNoControllerPage, false, 'v0.10/A2: a standardController-only page (no controllerClass, no extensionClasses) has NO edge possible at any level -- the ref is dropped entirely, not just left unresolved at the method level');
 }
 
 console.log('test-resolver.js: all assertions passed.');

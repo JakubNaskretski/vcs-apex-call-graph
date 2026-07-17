@@ -10,6 +10,8 @@
 //   parseMetaFile({path, text}) -> [MetaRef]
 //   MetaRef = { kind:'lwc'|'aura'|'flow'|'omniscript'|'vf'|'cmdt', label,
 //               className, methodName:string|null, line, lineText }
+//   (v0.10, A2: a 'vf' ref may ALSO be the method-level action-binding shape
+//   -- className:null plus controllerClass/extensionClasses -- see below.)
 //
 //   scanBundle(files) -> [MetaRef]      // files: [{path, text}]
 //
@@ -151,6 +153,70 @@
 //     it is opts-time plumbing the extension is expected to call explicitly
 //     (see the caller's own `opts.ownNamespace`, out of scope here) AFTER
 //     scanning and BEFORE handing refs to resolver.js's attachMetaCallers().
+//
+// v0.10 (Round A, A2) addition -- Visualforce ACTION-binding extraction.
+// Purely additive: the pre-existing class-level 'vf' shape
+// ({kind:'vf', className:<ControllerOrExtension>, methodName:null}) is
+// completely unchanged, byte-for-byte. New: a SECOND 'vf' shape, one per
+// `action="{!singleIdentifier}"` attribute found on an apex-namespaced tag
+// (`apex:page`'s own root tag, or `apex:commandButton`/`apex:commandLink`/
+// `apex:actionFunction`/`apex:actionSupport`/`apex:actionPoller` anywhere in
+// the file):
+//
+//   { kind:'vf', label, className: null, methodName: <the identifier>,
+//     line, lineText, controllerClass: string|null,
+//     extensionClasses: string[] }
+//
+//   - `className` is ALWAYS null on this shape -- metascan has no class
+//     index and does not (cannot) decide which of the page's controller/
+//     extensions classes actually declares the method; that is resolver.js's
+//     job (out of scope here), using the two carried fields below.
+//   - `controllerClass`/`extensionClasses` are the SAME controller=/
+//     extensions= facts the pre-existing class-level scan already extracts
+//     from the root tag, restamped onto every action-binding ref from this
+//     file (a page has exactly one root tag, so -- same reasoning F1(b) used
+//     for Flow's <start> block -- this is a file-level fact computed once,
+//     not re-derived per action= match). `controllerClass` is the bare
+//     `controller="..."` value or null (no `controller=` attribute at all --
+//     e.g. a `standardController`-only page); `extensionClasses` is the
+//     comma-split `extensions="..."` list, or `[]` when absent. Each ref
+//     gets its OWN copy of the array (never a shared mutable reference),
+//     keeping this file's "never hand out data a caller could accidentally
+//     corrupt for a sibling ref" posture.
+//   - The expression inside `{!...}` must be a SINGLE bare identifier
+//     (optional surrounding whitespace only) to be extracted at all --
+//     `{!obj.method}` (dotted -- an instance/property-qualified reference)
+//     and any other non-identifier shape (`{!a && b}`, `{!IF(x,y,z)}`, an
+//     empty `{!}`) are deliberately SKIPPED: no MetaRef is emitted for that
+//     attribute at all. Hard scope boundary per the A2 task brief, not a
+//     missed case -- resolving an object-qualified or compound expression to
+//     a method would need real expression parsing, which this file's regex/
+//     text-based design does not attempt.
+//   - `value="{!...}"` bindings (as opposed to `action="{!...}"`) are
+//     deliberately OUT OF SCOPE this round -- property/getter/accessor
+//     territory. The extractor only ever searches for an `action=` attribute
+//     in the first place, so this is "never even looked at", not "extracted
+//     then discarded" -- same documented-gap posture the OmniScript *.json
+//     `remoteClass` surface note above uses for ITS own stated-out-of-scope
+//     gap.
+//   - Extraction is UNCONDITIONAL on whether the page actually HAS a
+//     controller/extensions class list: a `standardController`-only page (no
+//     `controller=`/`extensions=` attribute at all) still yields a method-
+//     level ref per matching `action=` attribute, just with
+//     `controllerClass: null` and `extensionClasses: []` -- metascan's job is
+//     syntactic extraction only; it has no class index and cannot know in
+//     advance that a given ref will turn out to be unattachable. Turning an
+//     empty controller/extensions list into "no edge at all" is the
+//     resolver's job (out of scope here) -- see GROUND-TRUTH.md's v0.10-B3
+//     for the exact real-corpus case (VtxAccountSummaryPage.page's
+//     `{!edit}`/`{!save}`, both still extracted here with an empty class
+//     list, both destined to attach nowhere downstream).
+//   - If the root tag itself has no recognizable `<apex:page`/`<apex:component`
+//     opening (VF_ROOT_RE fails to match at all -- not even well-formed
+//     enough for this tolerant scanner), the WHOLE extractor -- class-level
+//     AND action-level -- yields nothing for that file: action bindings are
+//     never attempted on a file that doesn't look like Visualforce at all,
+//     same all-or-nothing gate the pre-existing class-level scan already used.
 //
 // Design notes:
 //
@@ -611,10 +677,69 @@ function extractCmdt(path, text, lineStarts, out) {
 
 // --- Visualforce ---------------------------------------------------------
 // <apex:page controller="Cls" extensions="Ext1,Ext2" ...> (or apex:component).
-// No fixtures exist in adv-org for this source type; still implemented per
-// the documented pattern, exercised only by inline fixtures below.
+// Class-level scan: exercised by inline fixtures below plus the real
+// gauntlet-org VF corpus (v0.10). Method-level (action=) scan added v0.10,
+// A2 -- see the header comment block above for the full field contract.
 const VF_ROOT_RE = /<apex:(?:page|component)\b[\s\S]*?>/;
 const VF_EXTENSIONS_ATTR_RE = /\bextensions\s*=\s*["']([^"']+)["']/;
+
+// v0.10 (A2): the six apex-namespaced tags whose `action="{!...}"` attribute
+// is a method binding this amendment extracts. `apex:page` is handled
+// separately below (it's the SAME root tag the class-level scan above
+// already matched via VF_ROOT_RE -- no need to search for it a second time);
+// the other five can appear any number of times anywhere in the file, so
+// they're matched with a global regex over the whole text. Lazy
+// `[\s\S]*?>` (same idiom VF_ROOT_RE/AURA_ROOT_RE already use) so a
+// multi-line tag -- attributes split across several lines -- is still
+// captured whole, up to its own closing `>`.
+const VF_ACTION_TAG_RE = /<apex:(?:commandButton|commandLink|actionFunction|actionSupport|actionPoller)\b[\s\S]*?>/g;
+
+// Matches an `action="..."` (or `action='...'`) attribute ANYWHERE inside an
+// already-isolated tag-text substring; `\b` keeps this from ever matching
+// mid-word inside some other attribute name (there is no real VF attribute
+// that ends in "...action", but this is the same defensive habit
+// CONTROLLER_ATTR_RE/VF_EXTENSIONS_ATTR_RE already use). Deliberately does
+// NOT anchor on `value=` -- `value="{!...}"` bindings are out of scope this
+// round (see the header comment block); this regex is never even run
+// against a `value=` attribute name.
+const VF_ACTION_ATTR_RE = /\baction\s*=\s*["']([^"']*)["']/;
+
+// v0.10 (A2): the brace-expression shape this amendment extracts -- a
+// SINGLE bare identifier, optional whitespace only. Anything else (a dotted
+// `{!obj.method}` instance/property reference, a compound expression like
+// `{!a && b}` or `{!IF(x,y,z)}`, an empty `{!}`) fails this test and the
+// attribute is skipped entirely -- no MetaRef emitted, per the A2 task
+// brief's explicit scope boundary (resolving anything beyond a bare
+// identifier would need real expression parsing, which this regex/text-based
+// file does not attempt).
+const VF_ACTION_SINGLE_IDENT_RE = /^\{!\s*([A-Za-z_]\w*)\s*\}$/;
+
+// v0.10 (A2): given one already-isolated tag-text substring (and its start
+// offset in the full file), extracts its `action="{!singleIdentifier}"`
+// binding (if any) into a method-level MetaRef, stamping the page-level
+// controllerClass/extensionClasses facts the caller already computed once
+// for this file. No-ops (pushes nothing) when the tag has no `action=`
+// attribute at all, or its expression isn't the single-identifier shape
+// above -- both silent, matching this file's general "tolerant, never
+// throws" posture.
+function extractVfActionBinding(tagText, tagStart, text, lineStarts, label, controllerClass, extensionClasses, out) {
+  const actionMatch = VF_ACTION_ATTR_RE.exec(tagText);
+  if (!actionMatch) return;
+  const identMatch = VF_ACTION_SINGLE_IDENT_RE.exec(actionMatch[1].trim());
+  if (!identMatch) return; // dotted / compound / non-identifier expression -- skip, per A2 scope
+  const idx = tagStart + actionMatch.index;
+  // className is ALWAYS null on this shape -- metascan has no class index
+  // and cannot decide (nor tries to) which of controllerClass/
+  // extensionClasses actually declares this method; that is resolver.js's
+  // job (out of scope here), using the two carried fields below.
+  const ref = makeRef('vf', label, null, identMatch[1], text, lineStarts, idx);
+  ref.controllerClass = controllerClass;
+  // Fresh copy per ref -- this file never hands out a shared mutable array
+  // reference across multiple refs, same purity habit stripOwnNamespace()
+  // documents for itself elsewhere.
+  ref.extensionClasses = extensionClasses.slice();
+  out.push(ref);
+}
 
 function extractVf(path, text, lineStarts, out) {
   const rootMatch = VF_ROOT_RE.exec(text);
@@ -622,22 +747,43 @@ function extractVf(path, text, lineStarts, out) {
   const tag = rootMatch[0];
   const label = stemOf(path);
 
+  // v0.10 (A2): controllerClass/extensionClasses are computed once here (a
+  // page/component has exactly one root tag) and restamped onto every
+  // action-binding ref below -- same "file-level fact, not re-derived per
+  // match" reasoning F1(b) already established for Flow's <start> block.
+  let controllerClass = null;
   const ctrlMatch = CONTROLLER_ATTR_RE.exec(tag);
   if (ctrlMatch) {
+    controllerClass = ctrlMatch[1];
     const idx = rootMatch.index + ctrlMatch.index;
     out.push(makeRef('vf', label, ctrlMatch[1], null, text, lineStarts, idx));
   }
 
+  let extensionClasses = [];
   const extMatch = VF_EXTENSIONS_ATTR_RE.exec(tag);
   if (extMatch) {
     const idx = rootMatch.index + extMatch.index;
-    const classes = extMatch[1]
+    extensionClasses = extMatch[1]
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
-    for (const cls of classes) {
+    for (const cls of extensionClasses) {
       out.push(makeRef('vf', label, cls, null, text, lineStarts, idx));
     }
+  }
+
+  // v0.10 (A2): action= bindings. The root tag's OWN action= (apex:page's
+  // page-level action, e.g. an onload handler) is checked against the same
+  // `tag`/`rootMatch.index` the class-level scan above already has in hand
+  // -- no second root-tag search. Every other qualifying tag
+  // (commandButton/commandLink/actionFunction/actionSupport/actionPoller)
+  // is then found anywhere else in the file, in document order.
+  extractVfActionBinding(tag, rootMatch.index, text, lineStarts, label, controllerClass, extensionClasses, out);
+
+  VF_ACTION_TAG_RE.lastIndex = 0;
+  let am;
+  while ((am = VF_ACTION_TAG_RE.exec(text))) {
+    extractVfActionBinding(am[0], am.index, text, lineStarts, label, controllerClass, extensionClasses, out);
   }
 }
 
@@ -655,7 +801,11 @@ function extractVf(path, text, lineStarts, out) {
  *                          recordTriggerType stamped onto every ref).
  *   .os-meta.xml        -> OmniScript XML remoteClass/remoteMethod.
  *   .json               -> OmniScript/IP DataPack remoteClass/remoteMethod.
- *   .page / .component  -> Visualforce controller=/extensions=.
+ *   .page / .component  -> Visualforce controller=/extensions= (class-level)
+ *                          + (v0.10, A2) action="{!method}" bindings on
+ *                          apex:page/commandButton/commandLink/
+ *                          actionFunction/actionSupport/actionPoller
+ *                          (method-level, single-identifier expressions only).
  *   .md-meta.xml        -> F4b Custom Metadata identifier-shaped <value>s.
  * Anything else (including malformed input) yields an empty array; this
  * function never throws.

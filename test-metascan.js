@@ -6,8 +6,13 @@
 //      omniscript/vf) plus edge cases (multi-line imports, namespace-dotted
 //      specifiers, __tests__ exclusion, non-apex Flow actions, the
 //      escaped-string JSON decoy, malformed input never throwing) -- plus,
-//      as its final subsection, v0.8's N1(c) metascan half (Flow/CMDT/
-//      os-meta namespace-field extraction) and N3's stripOwnNamespace() hook.
+//      as its final subsections: v0.8's N1(c) metascan half (Flow/CMDT/
+//      os-meta namespace-field extraction) and N3's stripOwnNamespace() hook,
+//      and v0.10 (Round A, A2)'s Visualforce ACTION-binding extraction
+//      (action="{!method}" on apex:page/commandButton/commandLink/
+//      actionFunction/actionSupport/actionPoller, single-identifier
+//      expressions only -- dotted/compound expressions and value= bindings
+//      deliberately skipped).
 //   2. A real pass over the read-only /Users/agent/work/code/example-data/
 //      adv-org corpus, asserting the EXACT refs MANIFEST.md's "UI / metadata
 //      callers" ground-truth section promises -- this is the bar the task
@@ -19,12 +24,16 @@
 //      instead of silently discarding it (the M2 fix that USES this field to
 //      gate attachMetaCallers() against a false attach onto a same-bare-name
 //      local class lives in resolver.js, out of scope for this file) -- plus,
-//      as its final subsection, v0.8-A5/B5 real-corpus regression: the actual
-//      Vtx_Namespace_Probe_Flow.flow-meta.xml and
+//      as its final subsections: v0.8-A5/B5 real-corpus regression (the
+//      actual Vtx_Namespace_Probe_Flow.flow-meta.xml and
 //      Kappa_Trigger_Config.Namespace_Handler.md-meta.xml gauntlet-org
 //      fixtures, cross-checked against the LWC probe for the
 //      three-surface (Apex+LWC+Flow / Flow+CMDT) namespace+className
-//      consistency GROUND-TRUTH.md's v0.8 section documents.
+//      consistency GROUND-TRUTH.md's v0.8 section documents), and v0.10-B
+//      real-corpus regression (the 4 real .page/.component gauntlet-org
+//      fixtures, asserting the EXACT refs GROUND-TRUTH.md's v0.10-B section
+//      promises for every action= binding, including the extension-only,
+//      declared-on-both, matches-no-class, and dotted-skip shapes).
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
@@ -1555,6 +1564,302 @@ function refsOf(kind, refs) {
   assert.deepStrictEqual(stripOwnNamespace([], 'vtx'), []);
 }
 
+// ===========================================================================
+// v0.10 (Round A, A2) — Visualforce ACTION-binding extraction. metascan-only
+// half of the amendment: resolver.js's attach logic (which of a page's
+// controller/extensions classes DECLARES the bound method) is out of scope
+// for this file/owner and is not exercised here — only the raw MetaRef
+// extraction (className:null, methodName, controllerClass, extensionClasses)
+// per GROUND-TRUTH.md's v0.10-B section.
+// ===========================================================================
+
+// 43. apex:page root action= (single identifier) -> method-level ref,
+//     alongside the pre-existing class-level controller= ref (untouched).
+{
+  const text = src([
+    '<apex:page controller="AcmeAssistController" action="{!initAssist}">',
+    '  <apex:outputText value="{!label}"/>',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmeAssistPage.page', text });
+  assert.strictEqual(refs.length, 2, '1 class-level controller ref + 1 method-level action ref');
+
+  const classRef = refs.find((r) => r.className === 'AcmeAssistController');
+  assert.ok(classRef, 'pre-existing class-level controller= ref must be untouched');
+  assert.strictEqual(classRef.methodName, null);
+
+  const actionRef = refs.find((r) => r.methodName === 'initAssist');
+  assert.ok(actionRef, 'apex:page root action= must be extracted');
+  assert.strictEqual(actionRef.kind, 'vf');
+  assert.strictEqual(actionRef.className, null, 'A2: className is ALWAYS null on the method-level shape');
+  assert.strictEqual(actionRef.line, 1);
+  assert.strictEqual(actionRef.controllerClass, 'AcmeAssistController');
+  assert.deepStrictEqual(actionRef.extensionClasses, []);
+}
+
+// 44. apex:commandButton action= -- multiple buttons in one file, each its
+//     own ref with the correct line number; extensions= list carried
+//     verbatim (comma-split, trimmed) onto every action ref.
+{
+  const text = src([
+    '<apex:page controller="AcmeOrderController" extensions="AcmeOrderExtOne,AcmeOrderExtTwo">',
+    '  <apex:form>',
+    '    <apex:commandButton value="Save" action="{!saveOrder}"/>',
+    '    <apex:commandButton value="Cancel" action="{!cancelOrder}"/>',
+    '  </apex:form>',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmeOrderPage.page', text });
+  const actionRefs = refs.filter((r) => r.className === null);
+  assert.strictEqual(actionRefs.length, 2);
+
+  const save = actionRefs.find((r) => r.methodName === 'saveOrder');
+  assert.ok(save);
+  assert.strictEqual(save.line, 3);
+  assert.strictEqual(save.controllerClass, 'AcmeOrderController');
+  assert.deepStrictEqual(save.extensionClasses, ['AcmeOrderExtOne', 'AcmeOrderExtTwo']);
+
+  const cancel = actionRefs.find((r) => r.methodName === 'cancelOrder');
+  assert.ok(cancel);
+  assert.strictEqual(cancel.line, 4);
+  assert.deepStrictEqual(cancel.extensionClasses, ['AcmeOrderExtOne', 'AcmeOrderExtTwo']);
+}
+
+// 45. apex:commandLink action=
+{
+  const text = src([
+    '<apex:page controller="AcmeLinkController">',
+    '  <apex:commandLink value="Retry" action="{!retry}"/>',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmeLinkPage.page', text });
+  const actionRef = refs.find((r) => r.methodName === 'retry');
+  assert.ok(actionRef, 'apex:commandLink action= must be extracted');
+  assert.strictEqual(actionRef.line, 2);
+}
+
+// 46. apex:actionFunction action=
+{
+  const text = src([
+    '<apex:page controller="AcmeFnController">',
+    '  <apex:actionFunction name="doSort" action="{!sortResults}" reRender="panel"/>',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmeFnPage.page', text });
+  const actionRef = refs.find((r) => r.methodName === 'sortResults');
+  assert.ok(actionRef, 'apex:actionFunction action= must be extracted');
+  assert.strictEqual(actionRef.line, 2);
+}
+
+// 47. apex:actionPoller action=
+{
+  const text = src([
+    '<apex:page controller="AcmePollController">',
+    '  <apex:actionPoller interval="30" action="{!refreshStatus}"/>',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmePollPage.page', text });
+  const actionRef = refs.find((r) => r.methodName === 'refreshStatus');
+  assert.ok(actionRef, 'apex:actionPoller action= must be extracted');
+  assert.strictEqual(actionRef.line, 2);
+}
+
+// 48. apex:actionSupport with a DOTTED (non-identifier) expression -- must be
+//     SKIPPED entirely: no MetaRef emitted for that attribute at all.
+{
+  const text = src([
+    '<apex:page controller="AcmeSupportController" extensions="AcmeSupportExt">',
+    '  <apex:actionSupport event="onchange" action="{!supportExt.legacyReset}"/>',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmeSupportPage.page', text });
+  assert.strictEqual(refs.length, 2, 'only the 2 pre-existing class-level refs -- the dotted action= contributes nothing');
+  assert.ok(refs.every((r) => r.className !== null), 'no method-level ref must appear');
+  assert.ok(
+    !refs.some((r) => r.methodName === 'legacyReset' || r.methodName === 'supportExt'),
+    'legacyReset must never appear as a methodName, whole or split'
+  );
+}
+
+// 49. Compound expression `{!a && b}` -- same skip as a dotted expression.
+{
+  const text = '<apex:page controller="AcmeCompoundController"><apex:commandButton action="{!a && b}"/></apex:page>';
+  const refs = parseMetaFile({ path: 'pages/AcmeCompoundPage.page', text });
+  assert.strictEqual(refs.length, 1, 'only the class-level controller= ref -- compound action= must be skipped');
+  assert.strictEqual(refs[0].className, 'AcmeCompoundController');
+}
+
+// 50. Empty `{!}` expression -- skipped (not a bare identifier).
+{
+  const text = '<apex:page controller="AcmeEmptyController"><apex:commandButton action="{!}"/></apex:page>';
+  const refs = parseMetaFile({ path: 'pages/AcmeEmptyPage.page', text });
+  assert.strictEqual(refs.length, 1, 'empty {!} action= must be skipped, not extracted as an empty-string method');
+}
+
+// 51. Whitespace-tolerant single identifier `{! methodName }` -- still
+//     extracted, identifier trimmed.
+{
+  const text = '<apex:page controller="AcmeSpacedController"><apex:commandButton action="{! spacedMethod }"/></apex:page>';
+  const refs = parseMetaFile({ path: 'pages/AcmeSpacedPage.page', text });
+  const actionRef = refs.find((r) => r.className === null);
+  assert.ok(actionRef);
+  assert.strictEqual(actionRef.methodName, 'spacedMethod');
+}
+
+// 52. value="{!prop}" bindings are OUT OF SCOPE this round -- must never be
+//     mistaken for an action= binding, on either the root tag or a child tag.
+{
+  const text = src([
+    '<apex:page controller="AcmeValueController" value="{!somethingIgnored}">',
+    '  <apex:outputText value="{!displayLabel}"/>',
+    '  <apex:commandButton value="{!buttonLabel}"/>',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmeValuePage.page', text });
+  assert.strictEqual(refs.length, 1, 'only the class-level controller= ref -- no value= binding is ever extracted');
+  assert.strictEqual(refs[0].className, 'AcmeValueController');
+}
+
+// 53. Multi-line tag: the action= attribute lands on a DIFFERENT physical
+//     line than the tag's own opening `<apex:commandButton` -- the emitted
+//     `line` must point at the action= attribute's own line, not the tag's
+//     opening line (this is the literal "line numbers correct" requirement
+//     for a multi-line tag).
+{
+  const text = src([
+    '<apex:page controller="AcmeMultiLineController">',
+    '  <apex:commandButton',
+    '      value="Go"',
+    '      action="{!doGo}"',
+    '      reRender="panel"/>',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmeMultiLinePage.page', text });
+  const actionRef = refs.find((r) => r.methodName === 'doGo');
+  assert.ok(actionRef, 'action= on a multi-line tag must still be found');
+  assert.strictEqual(actionRef.line, 4, 'line must be the action= attribute\'s OWN line, not the tag-opening line (2)');
+  assert.strictEqual(actionRef.lineText, 'action="{!doGo}"');
+}
+
+// 54. Multi-line apex:page ROOT tag whose own action= is on a later line
+//     than controller=/extensions= -- same "line points at the attribute,
+//     not the tag start" rule applies to the root tag too.
+{
+  const text = src([
+    '<apex:page',
+    '    controller="AcmeRootMultiLineController"',
+    '    extensions="AcmeRootMultiLineExt"',
+    '    action="{!rootInit}">',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmeRootMultiLinePage.page', text });
+  assert.strictEqual(refs.length, 3, '1 controller + 1 extension (class-level) + 1 action (method-level)');
+  const ctrlRef = refs.find((r) => r.className === 'AcmeRootMultiLineController');
+  assert.strictEqual(ctrlRef.line, 2, 'class-level controller= ref line -- unaffected by A2, still its own attribute line');
+  const extRef = refs.find((r) => r.className === 'AcmeRootMultiLineExt');
+  assert.strictEqual(extRef.line, 3);
+  const actionRef = refs.find((r) => r.methodName === 'rootInit');
+  assert.ok(actionRef);
+  assert.strictEqual(actionRef.line, 4, 'root action= line must be its own line (4), not the tag-opening line (1)');
+  assert.strictEqual(actionRef.controllerClass, 'AcmeRootMultiLineController');
+  assert.deepStrictEqual(actionRef.extensionClasses, ['AcmeRootMultiLineExt']);
+}
+
+// 55. `standardController`-only page (no controller=/extensions= at all) --
+//     action= bindings are still extracted (metascan does syntactic
+//     extraction only, unconditional on whether there's a class to attach
+//     to), but with controllerClass:null and extensionClasses:[] -- exactly
+//     GROUND-TRUTH.md's v0.10-B3 real-corpus shape
+//     (VtxAccountSummaryPage.page's `{!edit}`/`{!save}`).
+{
+  const text = src([
+    '<apex:page standardController="Account">',
+    '  <apex:commandButton value="Edit" action="{!edit}"/>',
+    '  <apex:commandButton value="Save" action="{!save}"/>',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmeStandardControllerPage.page', text });
+  assert.strictEqual(refs.length, 2, 'no class-level ref at all (standardController is not controller=), 2 action refs');
+  assert.ok(refs.every((r) => r.className === null));
+  for (const r of refs) {
+    assert.strictEqual(r.controllerClass, null, 'no controller= attribute anywhere on this page');
+    assert.deepStrictEqual(r.extensionClasses, [], 'no extensions= attribute anywhere on this page');
+  }
+  assert.deepStrictEqual(refs.map((r) => r.methodName).sort(), ['edit', 'save']);
+}
+
+// 56. apex:component (not apex:page) -- action bindings extracted identically
+//     on a component's child tags (apex:component has no `action=` attribute
+//     of its own in real Visualforce, and no `extensions=` attribute at all,
+//     but the extraction logic must not special-case that away).
+{
+  const text = src([
+    '<apex:component controller="AcmeCompController">',
+    '  <apex:commandButton value="Apply" action="{!applyFilter}"/>',
+    '  <apex:actionFunction name="clearAll" action="{!clearAll}"/>',
+    '</apex:component>',
+  ]);
+  const refs = parseMetaFile({ path: 'components/AcmeCompComponent.component', text });
+  assert.strictEqual(refs.length, 3, '1 class-level controller + 2 method-level action refs');
+  const applyRef = refs.find((r) => r.methodName === 'applyFilter');
+  assert.ok(applyRef);
+  assert.strictEqual(applyRef.controllerClass, 'AcmeCompController');
+  assert.deepStrictEqual(applyRef.extensionClasses, []);
+  const clearRef = refs.find((r) => r.methodName === 'clearAll');
+  assert.ok(clearRef);
+  assert.strictEqual(clearRef.line, 3);
+}
+
+// 57. Adjacent action tags on the SAME physical line -- the lazy tag regex
+//     must not let one tag's match bleed into the next; each gets its own
+//     ref at the correct (shared) line.
+{
+  const text =
+    '<apex:page controller="AcmeAdjacentController">' +
+    '<apex:commandButton action="{!first}"/>' +
+    '<apex:commandButton action="{!second}"/>' +
+    '</apex:page>';
+  const refs = parseMetaFile({ path: 'pages/AcmeAdjacentPage.page', text });
+  const actionRefs = refs.filter((r) => r.className === null);
+  assert.strictEqual(actionRefs.length, 2);
+  assert.deepStrictEqual(actionRefs.map((r) => r.methodName).sort(), ['first', 'second']);
+  assert.ok(actionRefs.every((r) => r.line === 1));
+}
+
+// 58. Purity: extensionClasses on each ref is its OWN array copy -- mutating
+//     one ref's extensionClasses must never affect a sibling ref's.
+{
+  const text = src([
+    '<apex:page controller="AcmePurityController" extensions="AcmePurityExt">',
+    '  <apex:commandButton action="{!methodOne}"/>',
+    '  <apex:commandButton action="{!methodTwo}"/>',
+    '</apex:page>',
+  ]);
+  const refs = parseMetaFile({ path: 'pages/AcmePurityPage.page', text });
+  const actionRefs = refs.filter((r) => r.className === null);
+  assert.strictEqual(actionRefs.length, 2);
+  assert.notStrictEqual(
+    actionRefs[0].extensionClasses,
+    actionRefs[1].extensionClasses,
+    'each ref must own a fresh array, not share one mutable reference'
+  );
+  actionRefs[0].extensionClasses.push('Mutated');
+  assert.deepStrictEqual(actionRefs[1].extensionClasses, ['AcmePurityExt'], 'sibling ref must be unaffected by the mutation above');
+}
+
+// 59. Defensive: a file with no apex:page/apex:component root tag at all --
+//     the WHOLE extractor (class-level AND action-level) yields nothing, and
+//     never throws, even though it contains action= look-alikes.
+{
+  assert.doesNotThrow(() =>
+    parseMetaFile({ path: 'pages/AcmeNotVfPage.page', text: '<div action="{!notReal}">not visualforce</div>' })
+  );
+  assert.deepStrictEqual(
+    parseMetaFile({ path: 'pages/AcmeNotVfPage.page', text: '<div action="{!notReal}">not visualforce</div>' }),
+    []
+  );
+}
+
 console.log('metascan.js inline-fixture self-check: all assertions passed');
 
 // ===========================================================================
@@ -1903,3 +2208,184 @@ if (!fs.existsSync(GAUNTLET_ROOT)) {
 }
 
 console.log('metascan.js gauntlet-org regression self-check: all assertions passed (M1: namespace retained)');
+
+// ===========================================================================
+// v0.10-B GAUNTLET-ORG REAL-CORPUS PASS -- Visualforce ACTION-binding
+// extraction (A2), asserting the EXACT refs GROUND-TRUTH.md's "v0.10-B.
+// Visualforce method-level action bindings" section (B1-B4) promises for the
+// four real .page/.component fixtures. Metascan-only: className is always
+// null on the method-level shape and controllerClass/extensionClasses are
+// asserted alongside it, but WHICH class a method actually attaches to is
+// resolver.js's job (out of scope here, pinned separately in
+// test-resolver.js once that phase lands).
+// ===========================================================================
+
+function methodRefsOf(refs) {
+  return refs.filter((r) => r.className === null);
+}
+
+// v0.10-B1: pages/VtxCatalogPage.page -- controller= + one extensions=;
+// covers ALL FIVE B1 shapes: page-root action, extension-only action,
+// ambiguous (declared on both) action, "matches no class" action, and the
+// dotted (skipped) actionSupport expression.
+{
+  const refs = parseMetaFile(readGauntlet('pages/VtxCatalogPage.page'));
+  assert.strictEqual(refs.length, 6, 'v0.10-B1: 2 class-level (controller+extension) + 4 method-level action refs');
+
+  const controllerRef = refs.find((r) => r.className === 'VtxCatalogController');
+  assert.ok(controllerRef, 'v0.10-B1: class-level controller= ref must be untouched by A2');
+  assert.strictEqual(controllerRef.methodName, null);
+  assert.strictEqual(controllerRef.line, 1);
+
+  const extRef = refs.find((r) => r.className === 'VtxCatalogFilterExtension');
+  assert.ok(extRef, 'v0.10-B1: class-level extensions= ref must be untouched by A2');
+  assert.strictEqual(extRef.methodName, null);
+  assert.strictEqual(extRef.line, 1);
+
+  const methodRefs = methodRefsOf(refs);
+  assert.strictEqual(methodRefs.length, 4);
+  for (const r of methodRefs) {
+    assert.strictEqual(r.kind, 'vf');
+    assert.strictEqual(r.className, null);
+    assert.strictEqual(r.label, 'VtxCatalogPage');
+    assert.strictEqual(r.controllerClass, 'VtxCatalogController', 'v0.10-B1: controllerClass carried on every action ref');
+    assert.deepStrictEqual(
+      r.extensionClasses,
+      ['VtxCatalogFilterExtension'],
+      'v0.10-B1: extensionClasses carried on every action ref'
+    );
+  }
+
+  // L1: apex:page root action="{!initCatalog}"
+  const initCatalog = methodRefs.find((r) => r.methodName === 'initCatalog');
+  assert.ok(initCatalog, 'v0.10-B1 L1: apex:page root action= must be extracted');
+  assert.strictEqual(initCatalog.line, 1);
+
+  // L6: apex:commandButton action="{!refreshResults}" -- declared on the
+  // EXTENSION only (not the controller); metascan doesn't know or care which
+  // class declares it -- it just extracts the raw binding.
+  const refreshResults = methodRefs.find((r) => r.methodName === 'refreshResults');
+  assert.ok(refreshResults, 'v0.10-B1 L6: extension-only action= must be extracted');
+  assert.strictEqual(refreshResults.line, 6);
+
+  // L7: apex:commandButton action="{!resetAll}" -- declared on BOTH
+  // controller and extension (ambiguous, bonus case); metascan extracts it
+  // identically either way, disambiguation is resolver-side.
+  const resetAll = methodRefs.find((r) => r.methodName === 'resetAll');
+  assert.ok(resetAll, 'v0.10-B1 L7: ambiguous (declared-on-both) action= must be extracted');
+  assert.strictEqual(resetAll.line, 7);
+
+  // L13: apex:actionFunction action="{!vanishedSortHandler}" -- matches NO
+  // declaring class; metascan extracts it anyway (it has no class index),
+  // resolver.js is what finds zero matches.
+  const vanishedSortHandler = methodRefs.find((r) => r.methodName === 'vanishedSortHandler');
+  assert.ok(vanishedSortHandler, 'v0.10-B1 L13: "matches no class" action= must still be extracted by metascan');
+  assert.strictEqual(vanishedSortHandler.line, 13);
+
+  // L14: apex:actionSupport action="{!filterExt.legacyReset}" -- DOTTED, not
+  // a single identifier -- must be SKIPPED entirely, no MetaRef at all.
+  assert.ok(
+    !refs.some((r) => r.methodName === 'legacyReset' || r.methodName === 'filterExt'),
+    'v0.10-B1 L14: dotted {!filterExt.legacyReset} must never appear as a methodName, whole or split'
+  );
+
+  // L10: apex:outputText value="{!statusLabel}" -- value=, not action=, must
+  // never be extracted.
+  assert.ok(!refs.some((r) => r.methodName === 'statusLabel'), 'v0.10-B1 L10: value= binding must never be extracted');
+}
+
+// v0.10-B2: pages/VtxOrderHistoryPage.page -- clean contrast page, one
+// controller, no extensions, no traps.
+{
+  const refs = parseMetaFile(readGauntlet('pages/VtxOrderHistoryPage.page'));
+  assert.strictEqual(refs.length, 4, 'v0.10-B2: 1 class-level controller + 3 method-level action refs');
+
+  const controllerRef = refs.find((r) => r.className === 'VtxOrderHistoryController');
+  assert.ok(controllerRef);
+  assert.strictEqual(controllerRef.methodName, null);
+
+  const methodRefs = methodRefsOf(refs);
+  assert.strictEqual(methodRefs.length, 3);
+  assert.deepStrictEqual(
+    methodRefs.map((r) => r.methodName).sort(),
+    ['exportHistory', 'refreshStatus', 'retryFailedSync']
+  );
+  for (const r of methodRefs) {
+    assert.strictEqual(r.controllerClass, 'VtxOrderHistoryController');
+    assert.deepStrictEqual(r.extensionClasses, [], 'v0.10-B2: no extensions= on this page at all');
+  }
+
+  const exportHistory = methodRefs.find((r) => r.methodName === 'exportHistory');
+  assert.strictEqual(exportHistory.line, 6, 'v0.10-B2 L6: apex:commandButton action=');
+  const retryFailedSync = methodRefs.find((r) => r.methodName === 'retryFailedSync');
+  assert.strictEqual(retryFailedSync.line, 7, 'v0.10-B2 L7: apex:commandLink action=');
+  const refreshStatus = methodRefs.find((r) => r.methodName === 'refreshStatus');
+  assert.strictEqual(refreshStatus.line, 11, 'v0.10-B2 L11: apex:actionPoller action=');
+
+  // L9: apex:outputText value="{!lastSyncedLabel}" -- must never be extracted.
+  assert.ok(
+    !refs.some((r) => r.methodName === 'lastSyncedLabel'),
+    'v0.10-B2 L9: value= binding must never be extracted'
+  );
+}
+
+// v0.10-B3: pages/VtxAccountSummaryPage.page -- standardController="Account"
+// ONLY, no controller=/extensions= at all -- the literal "no class list to
+// attach to" case. Metascan still extracts both action= bindings
+// syntactically (it has no class index and does not pre-judge
+// attachability), but controllerClass/extensionClasses are null/[] on both,
+// which is what lets the (out-of-scope) resolver decide there is no edge.
+{
+  const refs = parseMetaFile(readGauntlet('pages/VtxAccountSummaryPage.page'));
+  assert.strictEqual(
+    refs.length,
+    2,
+    'v0.10-B3: ZERO class-level refs (standardController is not controller=/extensions=) + 2 method-level action refs'
+  );
+  assert.ok(refs.every((r) => r.className === null), 'v0.10-B3: no class-level ref at all on this page');
+  for (const r of refs) {
+    assert.strictEqual(r.controllerClass, null, 'v0.10-B3: no controller= attribute exists on this page');
+    assert.deepStrictEqual(r.extensionClasses, [], 'v0.10-B3: no extensions= attribute exists on this page');
+  }
+  assert.deepStrictEqual(refs.map((r) => r.methodName).sort(), ['edit', 'save']);
+  const editRef = refs.find((r) => r.methodName === 'edit');
+  assert.strictEqual(editRef.line, 6);
+  const saveRef = refs.find((r) => r.methodName === 'save');
+  assert.strictEqual(saveRef.line, 7);
+}
+
+// v0.10-B4: components/VtxFilterPanel.component -- apex:component controller=,
+// no extensions= attribute possible at all (apex:component doesn't support
+// one) -- confirms A2 applies identically to .component, not just .page.
+{
+  const refs = parseMetaFile(readGauntlet('components/VtxFilterPanel.component'));
+  assert.strictEqual(refs.length, 3, 'v0.10-B4: 1 class-level controller + 2 method-level action refs');
+
+  const controllerRef = refs.find((r) => r.className === 'VtxFilterPanelController');
+  assert.ok(controllerRef);
+
+  const methodRefs = methodRefsOf(refs);
+  assert.strictEqual(methodRefs.length, 2);
+  for (const r of methodRefs) {
+    assert.strictEqual(r.controllerClass, 'VtxFilterPanelController');
+    assert.deepStrictEqual(r.extensionClasses, [], 'apex:component has no extensions= attribute at all');
+  }
+
+  const applyFilter = methodRefs.find((r) => r.methodName === 'applyFilter');
+  assert.strictEqual(applyFilter.line, 5, 'v0.10-B4 L5: apex:commandButton action=');
+  const clearFilters = methodRefs.find((r) => r.methodName === 'clearFilters');
+  assert.strictEqual(clearFilters.line, 6, 'v0.10-B4 L6: apex:actionFunction action=');
+}
+
+// v0.10-D tally cross-check: 6 + 4 + 2 + 3 = 15 total refs across the 4 new
+// VF fixtures (matches the per-file counts asserted individually above).
+{
+  const total =
+    parseMetaFile(readGauntlet('pages/VtxCatalogPage.page')).length +
+    parseMetaFile(readGauntlet('pages/VtxOrderHistoryPage.page')).length +
+    parseMetaFile(readGauntlet('pages/VtxAccountSummaryPage.page')).length +
+    parseMetaFile(readGauntlet('components/VtxFilterPanel.component')).length;
+  assert.strictEqual(total, 15, 'v0.10-B: 6 + 4 + 2 + 3 = 15 refs across the 4 new gauntlet-org VF fixtures');
+}
+
+console.log('metascan.js v0.10-B gauntlet-org VF regression self-check: all assertions passed (A2: action bindings)');
