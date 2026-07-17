@@ -21,6 +21,9 @@ const {
   rerootEntryFirst,
   externalNamespace,
   managedBadge,
+  frontierMethodKey,
+  frontierBadge,
+  shapeLoadMoreChild,
 } = require('./uitree');
 
 // --- labelForNode: approximate '~' prefix ---
@@ -1191,8 +1194,16 @@ assert.deepStrictEqual(
 // Small helper for these tests: UiNode children mix site rows (icon
 // 'arrow-small-right', never collapsible) and real node rows; a branch
 // "tip" is a node row with no node-row children of its own.
+//
+// v0.9 (P1/P3): also excludes the synthetic load-more item (`loadMore:true`,
+// see shapeLoadMoreChild) an expandable node's real children array gets a
+// sibling of -- it is neither a site row nor a real caller/callee row, and
+// (being a genuine childless UiNode itself) would otherwise get
+// misidentified as a branch "tip" by collectTips below. No pre-v0.9 fixture
+// ever sets `loadMore`, so this exclusion is a no-op for every existing
+// assertion built on top of this helper.
 function uiNodeChildren(ui) {
-  return (ui.children || []).filter((c) => c.iconId !== 'arrow-small-right');
+  return (ui.children || []).filter((c) => c.iconId !== 'arrow-small-right' && !c.loadMore);
 }
 function collectTips(ui, out) {
   const kids = uiNodeChildren(ui);
@@ -1681,5 +1692,180 @@ assert.deepStrictEqual(
   ],
   'N5 combined line slots into the existing fixed header-line ordering without disturbing the other stat lines'
 );
+
+// =========================================================================
+// v0.9 (P1/P3, forward-compat): progressive-depth frontier rendering.
+// resolver.js does not produce TNode.expandable/pendingCount/methodKey yet
+// (a separate phase's job -- same "forward-compat" status as v0.8's
+// kind:'external' before that phase landed) -- every fixture below is
+// hand-built against the documented shape.
+// =========================================================================
+
+// --- frontierMethodKey: explicit field wins, else derive from
+//     className+methodLower (mirrors externalNamespace's own pattern) ---
+assert.strictEqual(frontierMethodKey({ methodKey: 'oppservice#applydiscount' }), 'oppservice#applydiscount', 'explicit methodKey wins verbatim');
+assert.strictEqual(
+  // NOTE: methodLower is CONTRACT-documented as already-lowercased (that's
+  // the whole reason for the field's name) -- only `className` (documented
+  // in DECLARED casing, e.g. cm.qualified) needs lowercasing here.
+  frontierMethodKey({ className: 'OppService', methodLower: 'applydiscount' }),
+  'oppservice#applydiscount',
+  'derived from className (lowercased) + methodLower (already lowercase) -- resolver.js\'s own classLower#methodLower composite shape'
+);
+assert.strictEqual(frontierMethodKey({ className: 'OppService' }), 'oppservice', 'class-level target (no methodLower) derives the bare lowercased className');
+assert.strictEqual(frontierMethodKey({ className: 'OppService', methodLower: null }), 'oppservice', 'explicit null methodLower treated the same as absent');
+assert.strictEqual(frontierMethodKey({}), null, 'nothing derivable -> null, never a broken "#"-only key');
+assert.strictEqual(frontierMethodKey(null), null);
+
+// --- frontierBadge: '+N' / bare '+' / null ---
+assert.strictEqual(frontierBadge({ expandable: true, pendingCount: 3 }), '+3');
+assert.strictEqual(frontierBadge({ expandable: true, pendingCount: 0 }), '+0', 'a real zero pendingCount still renders "+0", not a bare "+" -- 0 is a number, not "unknown"');
+assert.strictEqual(frontierBadge({ expandable: true }), '+', 'expandable with no usable pendingCount renders a bare "+" rather than silently dropping the marker');
+assert.strictEqual(frontierBadge({ expandable: false, pendingCount: 3 }), null, 'not expandable -> no badge, regardless of pendingCount');
+assert.strictEqual(frontierBadge({}), null);
+assert.strictEqual(frontierBadge(null), null);
+
+// --- badgesForNode: the '+N' badge, contract order (… capped, then +N, then
+//     seen elsewhere) ---
+assert.deepStrictEqual(badgesForNode({ expandable: true, pendingCount: 5 }), ['+5']);
+assert.deepStrictEqual(
+  badgesForNode({ truncated: true, expandable: true, pendingCount: 2, seenElsewhere: true }),
+  ['… capped', '+2', '↪ seen elsewhere'],
+  "'… capped' (hard cap) precedes the frontier '+N' (soft, click-to-expand) badge, which precedes seenElsewhere"
+);
+assert.deepStrictEqual(
+  badgesForNode({ entries: ['Batchable'], isTest: true, via: 'typed', expandable: true, pendingCount: 1, approximate: true }),
+  ['Batchable', 'test', 'typed', '~', '+1'],
+  'frontier badge slots into the full established badge order without disturbing the others'
+);
+// Regression: no `expandable` field at all (every pre-v0.9 fixture) -> no
+// frontier badge, exact pre-v0.9 output -- re-affirms the existing fullNode
+// assertion near the top of this file still holds unmodified.
+assert.deepStrictEqual(badgesForNode({ via: 'typed', truncated: true }), ['typed', '… capped'], 'REGRESSION: absent expandable field never adds a badge');
+
+// --- isRootNode: expandable excluded from 'root', same family as
+//     cyclic/truncated/seenElsewhere ---
+assert.strictEqual(isRootNode({ children: [], expandable: true }), false, 'a frontier node is NOT a root -- it has unshown callers/callees pending, just like truncated/cyclic/seenElsewhere');
+assert.strictEqual(isRootNode({ children: [], expandable: false }), true, 'expandable:false is a genuine, ordinary childless root');
+assert.strictEqual(isRootNode({ children: [] }), true, 'REGRESSION: no expandable field at all -> unaffected, still a root');
+
+// --- shapeLoadMoreChild: the synthetic load-more UiNode ---
+const lmFixture = { expandable: true, pendingCount: 4, className: 'OppService', methodLower: 'applydiscount' };
+const lmCallers = shapeLoadMoreChild(lmFixture, undefined);
+assert.strictEqual(lmCallers.label, '+4 more callers…', 'default/absent direction -> "callers" noun');
+assert.strictEqual(lmCallers.description, '');
+assert(lmCallers.tooltip.includes('+4 — 4 more direct callers — expand to load'), 'tooltip carries the exact CONTRACT-specified wording, direction-resolved');
+assert.strictEqual(lmCallers.iconId, 'ellipsis');
+assert.strictEqual(lmCallers.jump, null, 'no source location of its own');
+assert.strictEqual(lmCallers.collapsible, false);
+assert.deepStrictEqual(lmCallers.children, []);
+assert.strictEqual(lmCallers.loadMore, true);
+assert.strictEqual(lmCallers.expandKey, 'oppservice#applydiscount');
+
+const lmCallees = shapeLoadMoreChild(lmFixture, 'callees');
+assert.strictEqual(lmCallees.label, '+4 more callees…', "direction:'callees' -> the callees noun");
+assert(lmCallees.tooltip.includes('4 more direct callees'));
+
+const lmNoCount = shapeLoadMoreChild({ expandable: true, className: 'Foo', methodLower: 'bar' }, undefined);
+assert.strictEqual(lmNoCount.label, 'More callers…', 'no usable pendingCount -> the label degrades to a plain "More callers…" instead of "+null more callers…"');
+assert(lmNoCount.tooltip.includes('+ — more direct callers — expand to load'));
+
+// --- shapeNode end-to-end (target-first): an expandable node with real
+//     children:[] gets collapsible:true via the ONE synthetic child ---
+const frontierNode = {
+  label: 'Foo.bar', kind: 'method', className: 'Foo', methodLower: 'bar',
+  path: '/ws/Foo.cls', line: 5, entries: [], isTest: false, via: 'typed',
+  sites: [], children: [], cyclic: false, truncated: false, approximate: false,
+  expandable: true, pendingCount: 2,
+};
+const frontierUi = shapeNode(frontierNode);
+assert.strictEqual(frontierUi.collapsible, true, 'a frontier node with zero real children is STILL collapsible -- the synthetic child makes it so');
+assert.strictEqual(frontierUi.children.length, 1, 'exactly one child: the synthetic load-more item');
+assert.strictEqual(frontierUi.children[0].loadMore, true);
+assert.strictEqual(frontierUi.children[0].expandKey, 'foo#bar');
+assert(frontierUi.description.split(' · ').includes('+2'), 'frontier badge reaches the rendered description');
+assert(!frontierUi.description.includes('◉ root'), 'a frontier node never gets the root badge, even though its real children array is empty');
+assert(frontierUi.tooltip.includes('+2 — 2 more direct callers — expand to load'), 'frontier glossary line reaches the node tooltip');
+
+// A node with REAL children plus a sites array still only gets the ONE
+// synthetic child appended on top -- expandable is orthogonal to whatever
+// sites/children the node already carries (defensive: today's engine never
+// actually produces this combination -- see the TNode.expandable field doc
+// -- but this file must not assume that and must not silently drop either
+// the real content or the frontier marker if it ever does).
+const frontierWithRealKid = {
+  ...frontierNode,
+  sites: [{ path: '/ws/Foo.cls', line: 6, col: 2, lineText: 'helper();', argsRendered: null, via: 'this' }],
+  children: [{ label: 'Bar.baz', kind: 'method', className: 'Bar', methodLower: 'baz', path: '/ws/Bar.cls', line: 1, entries: [], isTest: false, via: 'static', sites: [], children: [], cyclic: false, truncated: false, approximate: false }],
+};
+const frontierWithRealKidUi = shapeNode(frontierWithRealKid);
+assert.strictEqual(frontierWithRealKidUi.children.length, 3, 'site row + real child row + synthetic load-more row, all three present');
+assert.strictEqual(frontierWithRealKidUi.children[2].loadMore, true, 'the synthetic load-more child is always LAST');
+
+// --- shapeResult threads treeResult.direction into the frontier noun ---
+const frontierCalleesTree = { root: { ...frontierNode }, targetLabel: 'Foo.bar', note: null, direction: 'callees' };
+const frontierCalleesShaped = shapeResult(frontierCalleesTree);
+assert.strictEqual(frontierCalleesShaped[0].children[0].label, '+2 more callees…', 'shapeResult threads treeResult.direction down into shapeLoadMoreChild without a separate parameter at the call site');
+assert(frontierCalleesShaped[0].tooltip.includes('2 more direct callees'), 'and into the frontier glossary line');
+
+// =========================================================================
+// v0.9 (P1/P3): entry-first orientation frontier rendering -- DOCUMENTED
+// CHOICE (see uitree.js's ORIENTATION section, "v0.9 FRONTIER NODES" -- an
+// unexpanded frontier is treated as a fourth boundary-leaf kind, alongside
+// cyclic/truncated/seenElsewhere: it becomes its own entry-first ROOT,
+// keeps its frontier badge/synthetic child (excluded from '◉ root'), and
+// its real reversed-path children (its actual, KNOWN callees toward the
+// target) still render normally alongside that synthetic child.
+// =========================================================================
+const mCyclic2 = { label: 'Recur.step', kind: 'method', className: 'Recur', path: '/ws/Recur.cls', line: 2, entries: [], isTest: false, via: 'static', sites: [{ path: '/ws/Recur.cls', line: 8, col: 2, lineText: 'MidA.run(n - 1);', argsRendered: null, via: 'static' }], children: [], cyclic: true, truncated: false, approximate: false };
+const mFrontier = {
+  label: 'Deep2.caller', kind: 'method', className: 'Deep2', methodLower: 'caller',
+  path: '/ws/Deep2.cls', line: 9, entries: [], isTest: false, via: 'typed',
+  sites: [{ path: '/ws/Deep2.cls', line: 12, col: 2, lineText: 'MidD.go();', argsRendered: null, via: 'typed' }],
+  children: [], cyclic: false, truncated: false, approximate: false,
+  expandable: true, pendingCount: 3,
+};
+const mMidA2 = { label: 'MidA.run', kind: 'method', className: 'MidA', path: '/ws/MidA.cls', line: 2, entries: [], isTest: false, via: 'typed', sites: [{ path: '/ws/MidA.cls', line: 5, col: 2, lineText: 'T2.m();', argsRendered: null, via: 'typed' }], children: [mCyclic2], cyclic: false, truncated: false, approximate: false };
+const mMidD = { ...mMidA2, label: 'MidD.go', className: 'MidD', path: '/ws/MidD.cls', children: [mFrontier] };
+const mRoot2 = { label: 'T2.m', kind: 'method', className: 'T2', path: '/ws/T2.cls', line: 1, entries: [], isTest: false, via: null, sites: [], children: [mMidA2, mMidD], cyclic: false, truncated: false, approximate: false };
+const mShaped2 = shapeResult({ root: mRoot2, targetLabel: 'T2.m', note: null, direction: 'callers' }, 'entry-first');
+assert.strictEqual(mShaped2.length, 2, 'the cyclic leaf and the frontier leaf each become their own entry-first root -- no cross-boundary merging');
+const [mCycRootUi2, mFrontierRootUi] = mShaped2;
+assert.strictEqual(mCycRootUi2.label, 'Recur.step', 'sanity: the pre-existing cyclic-boundary behavior is unaffected by this round');
+
+assert.strictEqual(mFrontierRootUi.label, 'Deep2.caller', 'the frontier leaf anchors its own entry-first chain, same family as the cyclic/seenElsewhere/truncated boundary roots');
+assert(mFrontierRootUi.description.split(' · ').includes('+3'), 'the frontier badge survives re-rooting');
+assert(!mFrontierRootUi.description.includes('◉ root'), "an unexpanded frontier is an expandable BOUNDARY root entry-first, never a genuine '◉ root' -- it has real (just-not-yet-loaded) callers above it");
+assert(mFrontierRootUi.tooltip.includes('+3 — 3 more direct callers — expand to load'), 'the frontier glossary line survives re-rooting too');
+
+// The frontier root's children are BOTH the real reversed-path hop (MidD.go
+// -- what Deep2.caller actually, verifiably calls, per its own `sites`) AND
+// the synthetic load-more item (Deep2.caller's OWN unexpanded callers,
+// pending above it) -- two structurally different facts about this one
+// node, rendered side by side rather than one silently eclipsing the other.
+assert.strictEqual(mFrontierRootUi.children.length, 2, 'real reversed-path child + synthetic load-more child, both present');
+const mFrontierRealKid = mFrontierRootUi.children.find((c) => !c.loadMore);
+const mFrontierSyntheticKid = mFrontierRootUi.children.find((c) => c.loadMore);
+assert.strictEqual(mFrontierRealKid.label, 'MidD.go', 'the real reversed-path hop is unaffected by the node also being a frontier');
+assert.strictEqual(mFrontierRealKid.children[0].label, 'L12: MidD.go();', "the frontier root's OWN site (what it calls) shifts onto its real child exactly like every other entry-first edge");
+assert(mFrontierSyntheticKid, 'the synthetic load-more child is present alongside the real one');
+assert.strictEqual(mFrontierSyntheticKid.expandKey, 'deep2#caller', 'load-more child still carries a working expand key after re-rooting');
+assert.strictEqual(uiNodeChildren(mFrontierRootUi).length, 1, 'uiNodeChildren (real caller/callee rows only, no site rows, no load-more rows) sees exactly the one real hop');
+assert(collectTips(mFrontierRootUi, []).every((t) => t.label === 'T2.m'), 'every genuine branch tip past the frontier root still converges on the traced target -- the load-more synthetic child is correctly excluded from tip collection by uiNodeChildren');
+
+// Target-first control: the SAME node, unshaped by re-rooting, still shows
+// its frontier marker as a leaf -- "leaf" meaning no further CALLER rows
+// (its own `children`, i.e. who calls Deep2.caller, is the unexpanded/empty
+// part), even though it still has its own ordinary site row (Deep2.caller's
+// OWN call INTO MidD.go, an entirely different, already-known fact -- sites
+// and children are orthogonal, see the frontierWithRealKid test above).
+const mShaped2TF = shapeResult({ root: mRoot2, targetLabel: 'T2.m', note: null, direction: 'callers' });
+const mMidDUiTF = mShaped2TF[0].children.find((c) => c.label === 'MidD.go');
+const mFrontierTFKids = uiNodeChildren(mMidDUiTF);
+assert.strictEqual(mFrontierTFKids.length, 1, 'MidD.go has exactly one real caller/callee row: Deep2.caller');
+assert.strictEqual(mFrontierTFKids[0].label, 'Deep2.caller');
+assert.strictEqual(mFrontierTFKids[0].children.length, 2, 'target-first: Deep2.caller\'s own site row (L12: MidD.go();) plus the synthetic load-more child -- its (unexpanded) real CALLER children array is empty, but sites are unaffected');
+assert(mFrontierTFKids[0].children.some((c) => c.label === 'L12: MidD.go();'), "Deep2.caller's own outgoing call site still renders normally");
+assert.strictEqual(mFrontierTFKids[0].children.filter((c) => c.loadMore).length, 1, 'and exactly one synthetic load-more child among them');
 
 console.log('apex-trace uitree self-check: all assertions passed');

@@ -788,6 +788,82 @@ function runGauntletOrgManagedPackages() {
     Array.from(gIndex.externals instanceof Map ? gIndex.externals.keys() : []).some((k) => k.startsWith(`${ownNamespace}.`)) ? 'FOUND ONE (BUG)' : 'confirmed absent, OK');
 }
 
+// v0.9.0: PROGRESSIVE DEPTH -- initialDepth=2 trace against the SAME
+// inz-org corpus main() already indexes, showing the '+N' frontier badges
+// (rendered exactly as uitree.js's real badgesForNode/shapeLoadMoreChild
+// would show them in the actual TreeView -- renderUiNode below is the same
+// H9 real-shaping-pipeline renderer every other printTree/printCalleeTree
+// call in this file already uses), then ONE click-to-expand (mirroring
+// extension.js's LOAD_MORE_COMMAND handler: add the clicked frontier key to
+// opts.expandedKeys, rebuild) revealing that node's own direct callers.
+// ProductTriggerService.handleBeforeUpdate is picked over the
+// RawMaterialsPriceUpdateService chain above because its depth-2 frontier
+// node (ProductAdditionalCostTriggerService.recalculateMarginsOnProduct)
+// has pendingCount=2 (TWO direct callers behind it), a clearer '+N' demo
+// than a pendingCount=1 chain.
+function printProgressiveTree(title, index, target, opts) {
+  const tree = resolver.buildCallerTree(index, target, opts);
+  console.log('\n=== ' + title + ' ===');
+  for (const line of uitree.shapeHeaderLines(tree)) console.log(line);
+  const stats = tree.stats || {};
+  console.log(`stats: nodes=${stats.nodes} unique=${stats.uniqueMethods} unresolved=${stats.unresolvedSites} capped=${stats.capped} frontierNodes=${stats.frontierNodes}`);
+  const lines = [];
+  for (const uiNode of uitree.shapeResult(tree)) renderUiNode(uiNode, 0, lines);
+  console.log(lines.join('\n'));
+  return tree;
+}
+
+function runProgressiveDepthDemo() {
+  console.log('\n\n########################################################');
+  console.log('# v0.9.0 PROGRESSIVE DEPTH (initialDepth=2, +N frontier -> one expand)');
+  console.log('########################################################');
+
+  const filePaths = [];
+  walk(ROOT, filePaths);
+  const factsList = filePaths.map((p) => parser.parseFile({ path: p, text: fs.readFileSync(p, 'utf8') }));
+  const index = resolver.buildSemanticIndex(factsList);
+
+  const target = { classLower: 'producttriggerservice', methodLower: 'handlebeforeupdate' };
+
+  // Step 1: initialDepth=2 (the apexCallGraph.initialDepth DEFAULT) -- depth-1
+  // nodes (ProductTrigger) auto-expand, depth-2 nodes (e.g.
+  // ProductAdditionalCostTriggerService.recalculateMarginsOnProduct) hit the
+  // frontier and render with a '+N' badge plus a synthetic 'load more' child
+  // instead of eagerly recursing further, exactly what a freshly opened
+  // trace now shows by default (vs. pre-v0.9's always-eager-to-maxDepth=8).
+  const shallow = printProgressiveTree(
+    'ProductTriggerService.handleBeforeUpdate -- STEP 1: initialDepth=2 (collapsed, note the +N badges + \'load more\' rows below the frontier)',
+    index,
+    target,
+    { initialDepth: 2 }
+  );
+
+  // Step 2: simulate ONE click -- find the first frontier node (matches
+  // extension.js's LOAD_MORE_COMMAND handler picking the clicked node's own
+  // uitree.frontierMethodKey) and add its key to expandedKeys, then rebuild.
+  // Per the frozen P1 rule, this reveals ONLY that node's own direct
+  // children -- everything else at/behind the frontier stays collapsed.
+  function firstFrontierKey(node) {
+    if (node.expandable) return uitree.frontierMethodKey(node);
+    for (const c of node.children || []) {
+      const found = firstFrontierKey(c);
+      if (found) return found;
+    }
+    return null;
+  }
+  const clickedKey = firstFrontierKey(shallow.root);
+  console.log(`\n-- simulated click: expanding frontier key '${clickedKey}' (${shallow.stats.frontierNodes} frontier node(s) total before this click) --`);
+
+  const expandedKeys = new Set([clickedKey]);
+  printProgressiveTree(
+    'ProductTriggerService.handleBeforeUpdate -- STEP 2: after expanding ONE frontier click (that node\'s own direct callers now shown; deeper/other frontiers stay collapsed)',
+    index,
+    target,
+    { initialDepth: 2, expandedKeys }
+  );
+}
+
 main();
 runAdvOrg();
 runGauntletOrgManagedPackages();
+runProgressiveDepthDemo();

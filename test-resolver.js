@@ -4380,4 +4380,471 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
   assert.ok(lwcChild, 'v0.8/N3: the own-namespace-stripped LWC ref attaches to the LOCAL class/method exactly like a bare (no-namespace) ref would');
 }
 
+// =========================================================================
+// P1 (v0.9): progressive depth -- expandable/pendingCount/frontier stats,
+// expandedKeys semantics, the back-compat REGRESSION PIN, convergence, and
+// interplay with seenElsewhere/cycles/maxNodes. Mirrors resolver.js's own
+// P1 header comments (normalizeProgressiveOpts, buildOneChildNode's
+// frontier branch, groupPairsByKey) -- read those first if a test here
+// fails, they document the frozen semantics being pinned.
+//
+// Self-contained by design (matches this file's own top-of-file promise:
+// "does NOT depend on parser.js existing") -- the back-compat pin below is
+// a structural/logical proof (no node anywhere gets expandable/pendingCount
+// under default opts, and default-opts output is byte-identical across
+// every equivalent way of expressing "no opts") rather than a diff against
+// an externally-extracted old engine binary. Real-corpus-level protection
+// for the SAME pin is separately covered by dev/regress-v08.js (byte-
+// identical site-edges against the actual published v0.7.1 engine over
+// adv-org/gauntlet-org) and dev/gauntlet/run.js (0 BUG/0 NEW_GAP) -- both
+// re-verified to still pass after this round's resolver.js changes.
+// =========================================================================
+
+function keyOf(node) {
+  // Reconstructs the SAME 'classlower#methodlower' identity buildOneChildNode
+  // computes internally as cycleKey (see resolver.js). Valid for these
+  // fixtures because every class name here is unique workspace-wide (no B2
+  // duplicate-name/package collision, the one case where the registration
+  // key would diverge from a plain lowercased qualified name).
+  return `${(node.className || '').toLowerCase()}#${node.methodLower || ''}`;
+}
+
+function walkTree(node, fn) {
+  fn(node);
+  for (const c of node.children || []) walkTree(c, fn);
+}
+
+function collectExpandableKeys(root) {
+  const keys = [];
+  walkTree(root, (n) => { if (n.expandable) keys.push(keyOf(n)); });
+  return keys;
+}
+
+// Linear 5-level CALLER chain: V9Chain5Target.run <- L1.hop1 <- L2.hop2 <-
+// L3.hop3 <- L4.hop4 <- L5.hop5 (L5 is a genuine leaf -- no further
+// callers). Every method is static + class-name-receiver ('dot' via
+// 'static', the same shape test-resolver.js's own W7Target.doStatic
+// fixture already exercises) to keep call-site resolution unambiguous.
+function buildV9Chain5() {
+  const T = ty('V9Chain5Target', 'V9Chain5Target', { methods: [mth('run', { line: 1, isStatic: true })] });
+  const L1 = ty('V9Chain5L1', 'V9Chain5L1', {
+    methods: [mth('hop1', { line: 1, isStatic: true, calls: [cl('dot', 'run', { receiver: 'V9Chain5Target', line: 1, lineText: 'V9Chain5Target.run();' })] })],
+  });
+  const L2 = ty('V9Chain5L2', 'V9Chain5L2', {
+    methods: [mth('hop2', { line: 1, isStatic: true, calls: [cl('dot', 'hop1', { receiver: 'V9Chain5L1', line: 1, lineText: 'V9Chain5L1.hop1();' })] })],
+  });
+  const L3 = ty('V9Chain5L3', 'V9Chain5L3', {
+    methods: [mth('hop3', { line: 1, isStatic: true, calls: [cl('dot', 'hop2', { receiver: 'V9Chain5L2', line: 1, lineText: 'V9Chain5L2.hop2();' })] })],
+  });
+  const L4 = ty('V9Chain5L4', 'V9Chain5L4', {
+    methods: [mth('hop4', { line: 1, isStatic: true, calls: [cl('dot', 'hop3', { receiver: 'V9Chain5L3', line: 1, lineText: 'V9Chain5L3.hop3();' })] })],
+  });
+  const L5 = ty('V9Chain5L5', 'V9Chain5L5', {
+    methods: [mth('hop5', { line: 1, isStatic: true, calls: [cl('dot', 'hop4', { receiver: 'V9Chain5L4', line: 1, lineText: 'V9Chain5L4.hop4();' })] })],
+  });
+  const idx = buildSemanticIndex([mkFile(T), mkFile(L1), mkFile(L2), mkFile(L3), mkFile(L4), mkFile(L5)]);
+  return { index: idx, target: { classLower: 'v9chain5target', methodLower: 'run' } };
+}
+
+// Mirror of buildV9Chain5, but a forward CALLEE chain: V9CChain5Target.start
+// -> L1.step1 -> L2.step2 -> L3.step3 -> L4.step4 -> L5.step5 (leaf, makes
+// no further calls). Used for the "both directions" P1 coverage.
+function buildV9ChainCallee5() {
+  const L5 = ty('V9CChain5L5', 'V9CChain5L5', { methods: [mth('step5', { line: 1, isStatic: true })] });
+  const L4 = ty('V9CChain5L4', 'V9CChain5L4', {
+    methods: [mth('step4', { line: 1, isStatic: true, calls: [cl('dot', 'step5', { receiver: 'V9CChain5L5', line: 1, lineText: 'V9CChain5L5.step5();' })] })],
+  });
+  const L3 = ty('V9CChain5L3', 'V9CChain5L3', {
+    methods: [mth('step3', { line: 1, isStatic: true, calls: [cl('dot', 'step4', { receiver: 'V9CChain5L4', line: 1, lineText: 'V9CChain5L4.step4();' })] })],
+  });
+  const L2 = ty('V9CChain5L2', 'V9CChain5L2', {
+    methods: [mth('step2', { line: 1, isStatic: true, calls: [cl('dot', 'step3', { receiver: 'V9CChain5L3', line: 1, lineText: 'V9CChain5L3.step3();' })] })],
+  });
+  const L1 = ty('V9CChain5L1', 'V9CChain5L1', {
+    methods: [mth('step1', { line: 1, isStatic: true, calls: [cl('dot', 'step2', { receiver: 'V9CChain5L2', line: 1, lineText: 'V9CChain5L2.step2();' })] })],
+  });
+  const T = ty('V9CChain5Target', 'V9CChain5Target', {
+    methods: [mth('start', { line: 1, calls: [cl('dot', 'step1', { receiver: 'V9CChain5L1', line: 1, lineText: 'V9CChain5L1.step1();' })] })],
+  });
+  const idx = buildSemanticIndex([mkFile(T), mkFile(L1), mkFile(L2), mkFile(L3), mkFile(L4), mkFile(L5)]);
+  return { index: idx, target: { classLower: 'v9cchain5target', methodLower: 'start' } };
+}
+
+// ---- P1 REGRESSION PIN: initialDepth===maxDepth && expandedKeys empty ---
+// -> byte-identical to pre-P1 (v0.8) output, in every equivalent way of
+// expressing "no progressive-depth opts". Callers direction.
+{
+  const V9PinTarget = ty('V9PinTarget', 'V9PinTarget', { methods: [mth('run', { line: 1, isStatic: true })] });
+  const V9PinL1 = ty('V9PinL1', 'V9PinL1', {
+    methods: [mth('hop1', { line: 1, isStatic: true, calls: [cl('dot', 'run', { receiver: 'V9PinTarget', line: 1, lineText: 'V9PinTarget.run();' })] })],
+  });
+  const V9PinL2 = ty('V9PinL2', 'V9PinL2', {
+    methods: [mth('hop2', { line: 1, isStatic: true, calls: [cl('dot', 'hop1', { receiver: 'V9PinL1', line: 1, lineText: 'V9PinL1.hop1();' })] })],
+  });
+  const idx = buildSemanticIndex([mkFile(V9PinTarget), mkFile(V9PinL1), mkFile(V9PinL2)]);
+  const target = { classLower: 'v9pintarget', methodLower: 'run' };
+
+  const tNoOpts = buildCallerTree(idx, target);
+  const tUndefinedOpts = buildCallerTree(idx, target, undefined);
+  const tEmptyOpts = buildCallerTree(idx, target, {});
+  const tExplicitDefault = buildCallerTree(idx, target, { initialDepth: 8, expandedKeys: new Set() });
+  const tExplicitDefaultUndef = buildCallerTree(idx, target, { initialDepth: undefined, expandedKeys: undefined });
+
+  assert.deepStrictEqual(tUndefinedOpts, tNoOpts, 'P1 back-compat: opts undefined === opts omitted');
+  assert.deepStrictEqual(tEmptyOpts, tNoOpts, 'P1 back-compat: opts={} === opts omitted');
+  assert.deepStrictEqual(tExplicitDefault, tNoOpts, "P1 REGRESSION PIN: initialDepth===maxDepth && expandedKeys empty -> byte-identical to the pre-P1 default-opts output");
+  assert.deepStrictEqual(tExplicitDefaultUndef, tNoOpts, 'P1 back-compat: initialDepth/expandedKeys explicitly undefined behaves exactly like opts omitted');
+
+  let sawFrontierField = false;
+  walkTree(tNoOpts.root, (n) => {
+    if (n.expandable || Object.prototype.hasOwnProperty.call(n, 'pendingCount')) sawFrontierField = true;
+  });
+  assert.strictEqual(sawFrontierField, false, 'P1: under default opts, no node anywhere is ever marked expandable/pendingCount -- the frontier branch is provably unreachable when initialDepth===maxDepth');
+  assert.strictEqual(tNoOpts.stats.frontierNodes, 0, 'P1: stats.frontierNodes is the new additive field, 0 under default opts');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(tNoOpts.stats, 'frontierNodes'), true, 'frontierNodes is always present, even under default opts (additive, not conditional)');
+}
+
+// ---- P1 REGRESSION PIN, callees direction + not-found shells -----------
+{
+  const V9PinCalleeRoot = ty('V9PinCalleeRoot', 'V9PinCalleeRoot', {
+    methods: [mth('start', { line: 1, calls: [cl('dot', 'mid', { receiver: 'V9PinCalleeMid', line: 1, lineText: 'V9PinCalleeMid.mid();' })] })],
+  });
+  const V9PinCalleeMid = ty('V9PinCalleeMid', 'V9PinCalleeMid', {
+    methods: [mth('mid', { line: 1, isStatic: true, calls: [cl('dot', 'leaf', { receiver: 'V9PinCalleeLeaf', line: 1, lineText: 'V9PinCalleeLeaf.leaf();' })] })],
+  });
+  const V9PinCalleeLeaf = ty('V9PinCalleeLeaf', 'V9PinCalleeLeaf', { methods: [mth('leaf', { line: 1, isStatic: true })] });
+  const idx = buildSemanticIndex([mkFile(V9PinCalleeRoot), mkFile(V9PinCalleeMid), mkFile(V9PinCalleeLeaf)]);
+  const target = { classLower: 'v9pincalleeroot', methodLower: 'start' };
+
+  const cNoOpts = buildCalleeTree(idx, target);
+  const cExplicitDefault = buildCalleeTree(idx, target, { initialDepth: 8, expandedKeys: new Set() });
+  assert.deepStrictEqual(cExplicitDefault, cNoOpts, 'P1 REGRESSION PIN (callees direction): initialDepth===maxDepth && expandedKeys empty -> byte-identical');
+  assert.strictEqual(cNoOpts.stats.frontierNodes, 0);
+
+  // Not-found shells (both directions) also gain the additive field, always 0.
+  const notFoundCallers = buildCallerTree(idx, { classLower: 'nosuchclassv9', methodLower: null });
+  const notFoundCallees = buildCalleeTree(idx, { classLower: 'nosuchclassv9', methodLower: null });
+  assert.strictEqual(notFoundCallers.stats.frontierNodes, 0);
+  assert.strictEqual(notFoundCallees.stats.frontierNodes, 0);
+}
+
+// ---- P1: expandable/pendingCount shape + convergence, CALLERS direction -
+{
+  const { index: idx, target } = buildV9Chain5();
+  const tree = buildCallerTree(idx, target, { initialDepth: 2 });
+
+  const l1 = findChild(tree.root.children, 'V9Chain5L1.hop1');
+  assert.ok(l1, 'depth1 node (V9Chain5L1.hop1) is shown');
+  assert.strictEqual(l1.expandable, undefined, 'depth1 < initialDepth(2) -- L1 auto-expands, never marked expandable');
+  assert.strictEqual(l1.truncated, false);
+  assert.strictEqual(l1.children.length, 1, "L1 auto-expanded down to reveal its own caller L2 -- 'initialDepth default 2' shows 2 levels");
+
+  const l2 = l1.children[0];
+  assert.strictEqual(l2.label, 'V9Chain5L2.hop2');
+  assert.strictEqual(l2.expandable, true, 'depth2 >= initialDepth(2) and not in expandedKeys -- L2 is the frontier boundary');
+  assert.strictEqual(l2.pendingCount, 1, 'exactly one direct caller (L3) waits behind the frontier');
+  assert.deepStrictEqual(l2.children, [], 'a frontier node renders with NO children yet -- nothing materialized behind it');
+  assert.strictEqual(l2.truncated, false, 'expandable (depth frontier) is distinct from truncated (hard cap) -- L2 is nowhere near maxDepth(8)');
+
+  assert.strictEqual(tree.stats.frontierNodes, 1, 'exactly one frontier node in this shallow trace');
+
+  // Convergence: iteratively expand every frontier key surfaced so far and
+  // rebuild, until no frontier nodes remain -- must reproduce the full
+  // (maxDepth-bounded, i.e. v0.8-style) tree exactly.
+  const expandedKeys = new Set();
+  let converged = tree;
+  let iterations = 0;
+  while (converged.stats.frontierNodes > 0 && iterations < 10) {
+    for (const k of collectExpandableKeys(converged.root)) expandedKeys.add(k);
+    converged = buildCallerTree(idx, target, { initialDepth: 2, expandedKeys });
+    iterations++;
+  }
+  assert.ok(iterations > 0 && iterations < 10, `convergence took ${iterations} rounds (expected a handful for a 5-level chain)`);
+  assert.strictEqual(converged.stats.frontierNodes, 0, 'fully converged -- no frontier nodes left');
+
+  const fullTree = buildCallerTree(idx, target, {});
+  assert.deepStrictEqual(converged.root, fullTree.root, 'P1 convergence: iteratively expanding every frontier key reproduces the FULL v0.8-style tree exactly (deep-equal)');
+  assert.strictEqual(converged.stats.nodes, fullTree.stats.nodes);
+  assert.strictEqual(converged.stats.uniqueMethods, fullTree.stats.uniqueMethods);
+}
+
+// ---- P1: expandable/pendingCount shape + convergence, CALLEES direction -
+{
+  const { index: idx, target } = buildV9ChainCallee5();
+  const tree = buildCalleeTree(idx, target, { initialDepth: 2 });
+
+  const l1 = findChild(tree.root.children, 'V9CChain5L1.step1');
+  assert.ok(l1, 'depth1 node (V9CChain5L1.step1) is shown');
+  assert.strictEqual(l1.expandable, undefined);
+  assert.strictEqual(l1.children.length, 1);
+
+  const l2 = l1.children[0];
+  assert.strictEqual(l2.label, 'V9CChain5L2.step2');
+  assert.strictEqual(l2.expandable, true, 'callees direction: depth frontier applies identically to forward tracing');
+  assert.strictEqual(l2.pendingCount, 1);
+  assert.deepStrictEqual(l2.children, []);
+  assert.strictEqual(tree.stats.frontierNodes, 1);
+
+  const expandedKeys = new Set();
+  let converged = tree;
+  let iterations = 0;
+  while (converged.stats.frontierNodes > 0 && iterations < 10) {
+    for (const k of collectExpandableKeys(converged.root)) expandedKeys.add(k);
+    converged = buildCalleeTree(idx, target, { initialDepth: 2, expandedKeys });
+    iterations++;
+  }
+  assert.ok(iterations > 0 && iterations < 10);
+  assert.strictEqual(converged.stats.frontierNodes, 0);
+
+  const fullTree = buildCalleeTree(idx, target, {});
+  assert.deepStrictEqual(converged.root, fullTree.root, 'P1 convergence (callees direction): iteratively expanding every frontier key reproduces the FULL tree exactly');
+}
+
+// ---- P1: each click reveals EXACTLY the clicked node's direct children --
+// (expandStep>1 is a caller-side concern -- the engine itself always stays
+// single-level per opts.expandedKeys entry).
+{
+  const { index: idx, target } = buildV9Chain5();
+  const shallow = buildCallerTree(idx, target, { initialDepth: 1 });
+  const l1 = findChild(shallow.root.children, 'V9Chain5L1.hop1');
+  assert.strictEqual(l1.expandable, true, 'initialDepth=1 -- depth1 (1 < 1 is false) is already past the frontier');
+  assert.strictEqual(l1.pendingCount, 1);
+  assert.deepStrictEqual(l1.children, []);
+
+  const key1 = keyOf(l1); // 'v9chain5l1#hop1'
+  const oneClick = buildCallerTree(idx, target, { initialDepth: 1, expandedKeys: new Set([key1]) });
+  const l1b = findChild(oneClick.root.children, 'V9Chain5L1.hop1');
+  assert.strictEqual(l1b.expandable, undefined, 'L1 is now explicitly expanded -- no longer marked expandable itself');
+  assert.strictEqual(l1b.children.length, 1, "exactly ONE level revealed -- L1's own direct child (L2)");
+
+  const l2b = l1b.children[0];
+  assert.strictEqual(l2b.label, 'V9Chain5L2.hop2');
+  assert.strictEqual(l2b.expandable, true, "L2 is NOT auto-expanded just because its parent was -- a single click only ever reveals the clicked node's OWN direct children, nothing deeper");
+  assert.strictEqual(l2b.pendingCount, 1);
+  assert.deepStrictEqual(l2b.children, []);
+}
+
+// ---- P1 x back-compat: opts.maxDepth alone (no initialDepth) silently ---
+// defaults initialDepth to that maxDepth -- old-style hard truncation, NOT
+// the new frontier -- exactly the frozen back-compat rule, exercised here
+// against a NON-default maxDepth (the REGRESSION PIN above only proved it
+// at the literal default value 8).
+{
+  const { index: idx, target } = buildV9Chain5();
+  const tree = buildCallerTree(idx, target, { maxDepth: 3 });
+
+  const l1 = findChild(tree.root.children, 'V9Chain5L1.hop1');
+  const l2 = l1 && findChild(l1.children, 'V9Chain5L2.hop2');
+  const l3 = l2 && findChild(l2.children, 'V9Chain5L3.hop3');
+  assert.ok(l1 && l2 && l3);
+  assert.strictEqual(l1.expandable, undefined);
+  assert.strictEqual(l2.expandable, undefined);
+  assert.strictEqual(l3.expandable, undefined, 'initialDepth defaulted to maxDepth(3) -- L3 hits the OLD-STYLE hard depth cap, not the new frontier');
+  assert.strictEqual(l3.truncated, true, 'depth3 >= maxDepth(3) -- classic pre-P1 truncation, unchanged');
+  assert.deepStrictEqual(l3.children, []);
+  assert.strictEqual(tree.stats.frontierNodes, 0, 'no frontier nodes at all when initialDepth silently defaults to maxDepth, even a non-default one');
+}
+
+// ---- P1 x H1 interplay: a seenElsewhere reference node is NEVER --------
+// expandable -- DAG dedup (checked before the frontier branch) always wins.
+{
+  const V9DiaTarget = ty('V9DiaTarget', 'V9DiaTarget', { methods: [mth('run', { line: 1, isStatic: true })] });
+  const V9DiaA = ty('V9DiaA', 'V9DiaA', {
+    methods: [mth('viaA', { line: 1, isStatic: true, calls: [cl('dot', 'run', { receiver: 'V9DiaTarget', line: 1, lineText: 'V9DiaTarget.run();' })] })],
+  });
+  const V9DiaShared = ty('V9DiaShared', 'V9DiaShared', {
+    methods: [mth('direct', {
+      line: 1,
+      isStatic: true,
+      calls: [
+        cl('dot', 'run', { receiver: 'V9DiaTarget', line: 1, lineText: 'V9DiaTarget.run();' }),
+        cl('dot', 'viaA', { receiver: 'V9DiaA', line: 2, lineText: 'V9DiaA.viaA();' }),
+      ],
+    })],
+  });
+  const idx = buildSemanticIndex([mkFile(V9DiaTarget), mkFile(V9DiaA), mkFile(V9DiaShared)]);
+  const target = { classLower: 'v9diatarget', methodLower: 'run' };
+
+  const tree = buildCallerTree(idx, target, { initialDepth: 2 });
+  const a = findChild(tree.root.children, 'V9DiaA.viaA');
+  const sharedDirect = findChild(tree.root.children, 'V9DiaShared.direct');
+  assert.ok(a && sharedDirect, 'both direct callers of the target are shown at depth1');
+  assert.strictEqual(a.expandable, undefined, 'depth1 < initialDepth(2) -- both auto-expand');
+  assert.strictEqual(sharedDirect.expandable, undefined);
+
+  const sharedViaA = findChild(a.children, 'V9DiaShared.direct');
+  assert.ok(sharedViaA, 'V9DiaShared.direct is ALSO a caller of V9DiaA.viaA -- appears a second time, at depth2 under A');
+  assert.strictEqual(sharedViaA.seenElsewhere, true, 'this identity was already expanded once (as the depth1 sibling) -- DAG dedup wins');
+  assert.strictEqual(sharedViaA.expandable, undefined, 'P1 x H1 interplay: a seenElsewhere reference node is NEVER expandable -- it points at the occurrence already expanded elsewhere; seenElsewhere is checked BEFORE the frontier branch in buildOneChildNode');
+  assert.ok(!Object.prototype.hasOwnProperty.call(sharedViaA, 'pendingCount'), 'no pendingCount on a seenElsewhere node either');
+  assert.deepStrictEqual(sharedViaA.children, [], 'seenElsewhere nodes render with no children, same as pre-P1');
+}
+
+// ---- P1 x H1 REGRESSION: diamond fan-in reconverging BEYOND the frontier -
+// (bugfix regression) both occurrences of a shared identity are reached
+// PAST the initialDepth frontier (as opposed to the block above, where one
+// occurrence sits AT the frontier depth already-expanded and the other is
+// one hop further under it) -- e.g. Top is called by BOTH Left and Right,
+// and Left/Right themselves are the frontier boundary, so Top would only
+// ever be discovered by peeking behind two DIFFERENT frontier stubs, never
+// by a real expansion. Before the fix, buildOneChildNode's frontier branch
+// returned without registering cycleKey in ctx.expandedKeys, so neither
+// occurrence's seenElsewhere check (which runs BEFORE the frontier check)
+// ever fired -- both rendered as independent expandable:true stubs instead
+// of one real + one seenElsewhere reference. See resolver.js's frontier
+// branch comment (right above ctx.expandedKeys.add(cycleKey) in that
+// branch) for the fix itself.
+{
+  const V9DiaFTarget = ty('V9DiaFTarget', 'V9DiaFTarget', { methods: [mth('run', { line: 1, isStatic: true })] });
+  const V9DiaFLeft = ty('V9DiaFLeft', 'V9DiaFLeft', {
+    methods: [mth('mid', { line: 1, isStatic: true, calls: [cl('dot', 'run', { receiver: 'V9DiaFTarget', line: 1, lineText: 'V9DiaFTarget.run();' })] })],
+  });
+  const V9DiaFRight = ty('V9DiaFRight', 'V9DiaFRight', {
+    methods: [mth('mid', { line: 1, isStatic: true, calls: [cl('dot', 'run', { receiver: 'V9DiaFTarget', line: 1, lineText: 'V9DiaFTarget.run();' })] })],
+  });
+  const V9DiaFTop = ty('V9DiaFTop', 'V9DiaFTop', {
+    methods: [mth('call', {
+      line: 1,
+      isStatic: true,
+      calls: [
+        cl('dot', 'mid', { receiver: 'V9DiaFLeft', line: 1, lineText: 'V9DiaFLeft.mid();' }),
+        cl('dot', 'mid', { receiver: 'V9DiaFRight', line: 2, lineText: 'V9DiaFRight.mid();' }),
+      ],
+    })],
+  });
+  // Top itself has a further caller (Apex.entry) -- gives Top pendingCount=1
+  // so it's a genuine expandable frontier boundary in its own right (not
+  // just an honest leaf), matching the report's most illustrative repro
+  // shape where BOTH duplicate occurrences independently render
+  // expandable:true.
+  const V9DiaFApex = ty('V9DiaFApex', 'V9DiaFApex', {
+    methods: [mth('entry', { line: 1, isStatic: true, calls: [cl('dot', 'call', { receiver: 'V9DiaFTop', line: 1, lineText: 'V9DiaFTop.call();' })] })],
+  });
+  const idx = buildSemanticIndex([mkFile(V9DiaFTarget), mkFile(V9DiaFLeft), mkFile(V9DiaFRight), mkFile(V9DiaFTop), mkFile(V9DiaFApex)]);
+  const target = { classLower: 'v9diaftarget', methodLower: 'run' };
+
+  // Zero clicks, initialDepth=2: Left/Right (depth1) auto-expand (1 < 2),
+  // revealing Top (depth2) TWICE -- both occurrences are beyond the
+  // frontier simultaneously, reached via two different already-expanded
+  // parents. Must dedup to exactly one real (expandable) + one
+  // seenElsewhere reference, never two independent expandable stubs.
+  const tree = buildCallerTree(idx, target, { initialDepth: 2 });
+  const left = findChild(tree.root.children, 'V9DiaFLeft.mid');
+  const right = findChild(tree.root.children, 'V9DiaFRight.mid');
+  assert.ok(left && right, 'both direct callers auto-expand at depth1 < initialDepth(2)');
+  const topUnderLeft = findChild(left.children, 'V9DiaFTop.call');
+  const topUnderRight = findChild(right.children, 'V9DiaFTop.call');
+  assert.ok(topUnderLeft && topUnderRight, 'V9DiaFTop.call reached via BOTH Left and Right, beyond the frontier');
+
+  const topOccurrences = [topUnderLeft, topUnderRight];
+  const realOnes = topOccurrences.filter((n) => !n.seenElsewhere);
+  const seenElsewhereOnes = topOccurrences.filter((n) => n.seenElsewhere);
+  assert.strictEqual(realOnes.length, 1, 'H1 regression: exactly ONE real (non-seenElsewhere) occurrence of the shared diamond identity beyond the frontier, not two independent stubs');
+  assert.strictEqual(seenElsewhereOnes.length, 1, 'the other occurrence must be a seenElsewhere reference');
+  assert.strictEqual(realOnes[0].expandable, true, 'the real occurrence still carries its own expandable/pendingCount frontier badge (Top has a further caller: Apex.entry)');
+  assert.strictEqual(realOnes[0].pendingCount, 1, 'exactly one further caller (Apex.entry) waits behind V9DiaFTop.call');
+  assert.strictEqual(seenElsewhereOnes[0].expandable, undefined, 'a seenElsewhere reference is never expandable');
+  assert.ok(!Object.prototype.hasOwnProperty.call(seenElsewhereOnes[0], 'pendingCount'), 'no pendingCount on a seenElsewhere node either');
+  // Left/Right themselves are NOT frontier nodes -- depth1 < initialDepth(2)
+  // auto-expands them; it's their shared child V9DiaFTop.call (depth2) that
+  // is the frontier boundary. Exactly ONE frontier node, not two -- the
+  // seenElsewhere duplicate occurrence never reaches the frontier-counting
+  // branch at all (H1 dedup short-circuits it first).
+  assert.strictEqual(tree.stats.frontierNodes, 1, 'exactly one frontier node (the real V9DiaFTop.call occurrence) -- the seenElsewhere duplicate does not add a second');
+
+  // Convergence: expanding every frontier key round-by-round must still
+  // reproduce the full v0.8-style eager tree exactly (deep-equal) -- the
+  // literal VERIFICATION BAR requirement, now proven for a diamond shape
+  // (not just the linear V9Chain5 fixture above, which the bug slipped
+  // past).
+  const expandedKeys = new Set();
+  let converged = buildCallerTree(idx, target, { initialDepth: 2, expandedKeys });
+  let iterations = 0;
+  while (converged.stats.frontierNodes > 0 && iterations < 10) {
+    for (const k of collectExpandableKeys(converged.root)) expandedKeys.add(k);
+    converged = buildCallerTree(idx, target, { initialDepth: 2, expandedKeys });
+    iterations += 1;
+  }
+  assert.strictEqual(converged.stats.frontierNodes, 0, 'diamond fully converges to zero frontier nodes');
+  const fullTree = buildCallerTree(idx, target, {});
+  assert.deepStrictEqual(converged.root, fullTree.root, 'P1 x H1 diamond regression: expand-to-convergence reproduces the FULL v0.8-style tree exactly (deep-equal) -- one real + one seenElsewhere, same as eager');
+}
+
+// ---- P1 x cycles interplay: cyclic still wins over the frontier ---------
+// classification, including for a node reached through the NEW
+// expandedKeys-forced-expansion path (not just the plain initialDepth path).
+{
+  const V9CycTarget = ty('V9CycTarget', 'V9CycTarget', {
+    methods: [mth('entry', { line: 1, isStatic: true, calls: [cl('dot', 'hop', { receiver: 'V9CycHop', line: 5, lineText: 'V9CycHop.hop();' })] })],
+  });
+  const V9CycHop = ty('V9CycHop', 'V9CycHop', {
+    methods: [mth('hop', { line: 1, isStatic: true, calls: [cl('dot', 'entry', { receiver: 'V9CycTarget', line: 1, lineText: 'V9CycTarget.entry();' })] })],
+  });
+  const idx = buildSemanticIndex([mkFile(V9CycTarget), mkFile(V9CycHop)]);
+  const target = { classLower: 'v9cyctarget', methodLower: 'entry' };
+
+  // Baseline: with initialDepth=1, the ONLY direct caller (V9CycHop.hop) is
+  // already past the frontier (1 < 1 is false), so it renders as a frontier
+  // boundary and is NOT walked into -- the cycle back to the target is not
+  // even discovered yet.
+  const shallow = buildCallerTree(idx, target, { initialDepth: 1 });
+  const hop = findChild(shallow.root.children, 'V9CycHop.hop');
+  assert.ok(hop);
+  assert.strictEqual(hop.expandable, true);
+  assert.strictEqual(hop.pendingCount, 1);
+  assert.deepStrictEqual(hop.children, []);
+
+  // Force-expand it via expandedKeys -- its own direct caller is
+  // V9CycTarget.entry again, which IS on the current root-to-node ancestor
+  // path -- cyclic detection must still fire correctly for a node reached
+  // through the expandedKeys-forced path, winning over the frontier check
+  // (cyclic is checked first in buildOneChildNode, unconditionally).
+  const expanded = buildCallerTree(idx, target, { initialDepth: 1, expandedKeys: new Set([keyOf(hop)]) });
+  const hop2 = findChild(expanded.root.children, 'V9CycHop.hop');
+  assert.strictEqual(hop2.expandable, undefined, 'explicitly expanded -- no longer a frontier boundary itself');
+  assert.strictEqual(hop2.children.length, 1);
+
+  const backToTarget = hop2.children[0];
+  assert.strictEqual(backToTarget.label, 'V9CycTarget.entry');
+  assert.strictEqual(backToTarget.cyclic, true, 'P1 x cycles interplay: cyclic wins over the frontier classification');
+  assert.strictEqual(backToTarget.expandable, undefined, 'a cyclic node is never ALSO marked expandable -- the two flags are mutually exclusive');
+  assert.ok(!Object.prototype.hasOwnProperty.call(backToTarget, 'pendingCount'));
+  assert.deepStrictEqual(backToTarget.children, [], 'cyclic nodes stay terminal, exactly like pre-P1');
+}
+
+// ---- P1 x maxNodes cap interplay: `truncated` (cap) and `expandable` ----
+// (depth frontier) are fully independent, mutually exclusive, and never
+// conflated on the same OR different nodes.
+{
+  const V9CapTarget = ty('V9CapTarget', 'V9CapTarget', { methods: [mth('run', { line: 1, isStatic: true })] });
+  function mkV9CapBranch(name) {
+    const mid = ty(`V9Cap${name}`, `V9Cap${name}`, {
+      methods: [mth('mid', { line: 1, isStatic: true, calls: [cl('dot', 'run', { receiver: 'V9CapTarget', line: 1, lineText: 'V9CapTarget.run();' })] })],
+    });
+    const leaf = ty(`V9Cap${name}Caller`, `V9Cap${name}Caller`, {
+      methods: [mth('call', { line: 1, isStatic: true, calls: [cl('dot', 'mid', { receiver: `V9Cap${name}`, line: 1, lineText: `V9Cap${name}.mid();` })] })],
+    });
+    return [mid, leaf];
+  }
+  const [midA, leafA] = mkV9CapBranch('A');
+  const [midB, leafB] = mkV9CapBranch('B');
+  const [midC, leafC] = mkV9CapBranch('C');
+  const idx = buildSemanticIndex([mkFile(V9CapTarget), mkFile(midA), mkFile(leafA), mkFile(midB), mkFile(leafB), mkFile(midC), mkFile(leafC)]);
+  const target = { classLower: 'v9captarget', methodLower: 'run' };
+
+  const tree = buildCallerTree(idx, target, { initialDepth: 1, maxNodes: 2 });
+  assert.strictEqual(tree.root.children.length, 1, 'maxNodes=2 (root counts as 1) allows exactly ONE depth-1 child to be created; the other two direct callers are dropped by the cap, never even built');
+  assert.strictEqual(tree.stats.capped, true);
+  assert.strictEqual(tree.root.truncated, true, 'the CAP -- not the depth frontier -- is why the root is missing children; a distinct flag from expandable');
+  assert.strictEqual(tree.root.expandable, undefined, 'a capped node is never ALSO marked expandable -- the two mechanisms never collide on the same node');
+  assert.ok(!Object.prototype.hasOwnProperty.call(tree.root, 'pendingCount'));
+
+  const survivor = tree.root.children[0];
+  assert.strictEqual(survivor.truncated, false, 'the node that DID get built is not itself cap-truncated');
+  assert.strictEqual(survivor.expandable, true, "the survivor is independently past the initialDepth(1) frontier (its own caller exists) -- expandable and the sibling-level maxNodes cap are fully independent mechanisms, and they DO coexist across DIFFERENT nodes in the same tree");
+  assert.strictEqual(survivor.pendingCount, 1);
+  assert.deepStrictEqual(survivor.children, []);
+  assert.strictEqual(tree.stats.frontierNodes, 1, 'exactly the one survivor counts toward frontierNodes -- the two callers dropped by the cap were never even visited, so they cannot inflate this count either');
+}
+
 console.log('test-resolver.js: all assertions passed.');

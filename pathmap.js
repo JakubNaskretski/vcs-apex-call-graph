@@ -70,6 +70,29 @@
 //                  // a shield-glyph badge for it (see badgeGlyphs in
 //                  // CLIENT_JS_TEXT). Traversal continues past a caughtHere
 //                  // node, so it is purely an informational marker.
+//     expandable,  // boolean, v0.9 P1 (forward-compat -- resolver.js does
+//                  // not produce this yet, mirrors uitree.js's matching
+//                  // field doc verbatim): this node hit the progressive
+//                  // depth frontier -- real callers/callees exist
+//                  // (pendingCount says how many DIRECT groups) but weren't
+//                  // expanded this pass, so `children` is empty here even
+//                  // though the node is NOT actually childless. Rendered as
+//                  // a clickable '+N' pill (see the CLIENT_JS_TEXT pill
+//                  // note below), distinct from the plain read-only badge
+//                  // spans, and excluded from the 'root' flag (isRootNode
+//                  // below) -- same "there IS more, just not shown" family
+//                  // as cyclic/truncated/seenElsewhere.
+//     pendingCount,  // number|undefined, v0.9 P1 (forward-compat): ONLY
+//                    // meaningful alongside expandable:true -- see
+//                    // uitree.js's matching field doc.
+//     methodKey,     // string|undefined, v0.9 P1 (forward-compat): ONLY
+//                    // meaningful alongside expandable:true -- the
+//                    // methodKeyLower identity the pill's click-to-expand
+//                    // affordance posts back to the extension (see
+//                    // frontierMethodKey below); optional, same
+//                    // "explicit field wins, else derive from
+//                    // className+methodLower" pattern as `ns`/
+//                    // externalNamespace.
 //   }
 //
 // v0.7 (A3) direction: treeResult.direction is 'callers'|'callees'|absent.
@@ -235,6 +258,25 @@ function managedBadge(node) {
   return ns ? `managed: ${ns}` : null;
 }
 
+// v0.9 (P1/P4, forward-compat): mirrors uitree.js's frontierMethodKey
+// exactly -- see that file's comment for the full "explicit field wins,
+// else derive from className+methodLower" rationale. Kept as an
+// independent small implementation here rather than a cross-file require,
+// same rationale as isRootNode/packageBadge/externalNamespace/managedBadge
+// above (this file stays a standalone, dev-tool-friendly module -- and
+// CLIENT_JS_TEXT executes in the webview's own JS realm, which cannot
+// require() this Node module at all, so the client-side pill click handler
+// below re-derives the same key from the already-serialized node data
+// rather than calling this function directly).
+function frontierMethodKey(node) {
+  if (!node) return null;
+  if (typeof node.methodKey === 'string' && node.methodKey) return node.methodKey;
+  const cls = typeof node.className === 'string' ? node.className.toLowerCase() : '';
+  const method = typeof node.methodLower === 'string' && node.methodLower ? node.methodLower : null;
+  if (!cls && !method) return null;
+  return method ? `${cls}#${method}` : cls;
+}
+
 // ---- layout: simple leaf-order dendrogram ---------------------------------
 // TNode.children is a genuine tree — resolver.js's ancestor-path cycle
 // bookkeeping and maxDepth cap mean this is never a general DAG needing
@@ -321,10 +363,15 @@ function shapeSiteForData(s) {
 // dev-tool-friendly module (see this file's header note). No known caller
 // in THIS trace (childless), and not cyclic/truncated/seenElsewhere -- all
 // three of those mean "there IS more above, just not shown/expanded here".
+//
+// v0.9 (P1/P4, forward-compat): `expandable` joins the exclusion list, same
+// rationale/regression-safety as uitree.js's matching isRootNode update --
+// `t.expandable` is undefined on every pre-v0.9 fixture, so `!undefined` is
+// `true` and this is a no-op there.
 function isRootNode(t) {
   if (!t) return false;
   const hasChildren = !!(t.children && t.children.length);
-  return !hasChildren && !t.cyclic && !t.truncated && !t.seenElsewhere;
+  return !hasChildren && !t.cyclic && !t.truncated && !t.seenElsewhere && !t.expandable;
 }
 
 // v0.7 (B3): the node's package badge text, or null when none applies --
@@ -390,6 +437,14 @@ function shapeNodeForData(rec, targetPackage) {
     // already landed in `badges` above.
     ns: externalNamespace(t),
     sites: (t.sites || []).map(shapeSiteForData),
+    // v0.9 (P1/P4, forward-compat): NOT folded into `badges` above (unlike
+    // managed/pkgBadge) -- the frontier marker renders client-side as a
+    // distinct, CLICKABLE pill (see CLIENT_JS_TEXT's buildNodeEl), not a
+    // plain read-only badge span, so the client needs these raw fields to
+    // build that pill itself rather than a pre-rendered string.
+    expandable: !!t.expandable,
+    pendingCount: typeof t.pendingCount === 'number' ? t.pendingCount : null,
+    expandKey: frontierMethodKey(t),
   };
 }
 
@@ -551,6 +606,20 @@ const CSS_TEXT = `
     font-size: 10px; line-height: 1.5; padding: 0 5px; border-radius: 8px;
     background: var(--pm-bg); border: 1px solid var(--pm-border); color: var(--pm-muted); white-space: nowrap;
   }
+  /* v0.9 (P1/P4): the frontier '+N' pill -- deliberately DISTINCT from the
+     plain, read-only .badge spans above (solid link-color fill instead of an
+     outlined muted-text chip) so it visually reads as clickable, not just
+     informational. A dedicated block (not nested in .node-badges) since it
+     is appended as its own row, separate from the ordinary badge row -- see
+     buildNodeEl in CLIENT_JS_TEXT below and the pill-vs-body click
+     separation note there. */
+  .frontier-pill {
+    display: inline-block; margin-top: 4px; font-size: 10px; font-weight: 600; line-height: 1.6;
+    padding: 0 7px; border-radius: 9px; background: var(--pm-link); color: var(--pm-node-bg);
+    cursor: pointer; border: none;
+  }
+  .frontier-pill:hover { filter: brightness(1.15); }
+  .frontier-pill:active { filter: brightness(0.9); }
 
   .edge-path { fill: none; stroke: var(--pm-border); stroke-width: 1.5; }
   .edge-path.is-approx { stroke-dasharray: 4 3; stroke: var(--pm-approx); }
@@ -600,6 +669,22 @@ const CLIENT_JS_TEXT = `
     }
   }
 
+  // v0.9 (P1/P4): posted by a frontier node's '+N' pill click (see
+  // buildNodeEl below) -- {type:'expand', key} per the P2 CONTRACT
+  // AMENDMENT text verbatim. n.expandKey is server-computed
+  // (shapeNodeForData/frontierMethodKey in pathmap.js), never re-derived
+  // client-side, so this stays a pure postMessage relay, same shape as
+  // postOpen immediately above.
+  function requestExpand(n) {
+    if (!n || !n.expandKey) return;
+    var msg = { type: 'expand', key: n.expandKey };
+    if (vscodeApi) {
+      vscodeApi.postMessage(msg);
+    } else {
+      console.log('[apex-trace pathmap] expand', msg);
+    }
+  }
+
   function clearChildren(el) {
     while (el.firstChild) el.removeChild(el.firstChild);
   }
@@ -608,28 +693,37 @@ const CLIENT_JS_TEXT = `
   var directionEl = document.getElementById('pm-direction');
   var stats = document.getElementById('pm-stats');
   var noteEl = document.getElementById('pm-note');
-  header.textContent = DATA.meta.targetLabel || '(no target)';
-  // v0.7 (A3): direction sign-post -- left EMPTY (matching every pre-v0.7
-  // render byte-for-byte) whenever directionLabel is null, i.e. absent/
-  // undirected TreeResults; see directionHeaderLine's interpretive-decision
-  // comment for why that specific case must stay exactly "today".
-  if (DATA.meta.directionLabel) {
-    directionEl.textContent = DATA.meta.directionLabel;
+
+  // v0.9 (P1/P4): the header-rendering logic, factored into its own named
+  // function so the {type:'update'} handler (applyUpdate, near the bottom
+  // of this script) can reuse it VERBATIM instead of a second, driftable
+  // copy -- called once below for the initial render, exactly reproducing
+  // this file's pre-v0.9 top-level statement order/behavior.
+  function renderHeader() {
+    header.textContent = DATA.meta.targetLabel || '(no target)';
+    // v0.7 (A3): direction sign-post -- left EMPTY (matching every pre-v0.7
+    // render byte-for-byte) whenever directionLabel is null, i.e. absent/
+    // undirected TreeResults; see directionHeaderLine's interpretive-decision
+    // comment for why that specific case must stay exactly "today".
+    if (DATA.meta.directionLabel) {
+      directionEl.textContent = DATA.meta.directionLabel;
+    }
+    stats.textContent = DATA.meta.nodeCount + ' node' + (DATA.meta.nodeCount === 1 ? '' : 's') +
+      ', ' + DATA.meta.edgeCount + ' edge' + (DATA.meta.edgeCount === 1 ? '' : 's');
+    if (DATA.meta.note) {
+      noteEl.textContent = DATA.meta.note;
+    }
+    // v0.6 (H1/H4 forward-compat, H4's own header wording): additional header
+    // lines (capped / workspace-wide unresolved-sites count), precomputed
+    // server-side (see headerExtraLinesForResult) so this is a straight
+    // display concatenation, appended onto the note line rather than
+    // replacing it.
+    if (DATA.meta.headerExtra && DATA.meta.headerExtra.length) {
+      var extra = DATA.meta.headerExtra.join('  \\u2022  ');
+      noteEl.textContent = noteEl.textContent ? (noteEl.textContent + '  \\u2022  ' + extra) : extra;
+    }
   }
-  stats.textContent = DATA.meta.nodeCount + ' node' + (DATA.meta.nodeCount === 1 ? '' : 's') +
-    ', ' + DATA.meta.edgeCount + ' edge' + (DATA.meta.edgeCount === 1 ? '' : 's');
-  if (DATA.meta.note) {
-    noteEl.textContent = DATA.meta.note;
-  }
-  // v0.6 (H1/H4 forward-compat, H4's own header wording): additional header
-  // lines (capped / workspace-wide unresolved-sites count), precomputed
-  // server-side (see headerExtraLinesForResult) so this is a straight
-  // display concatenation, appended onto the note line rather than
-  // replacing it.
-  if (DATA.meta.headerExtra && DATA.meta.headerExtra.length) {
-    var extra = DATA.meta.headerExtra.join('  \\u2022  ');
-    noteEl.textContent = noteEl.textContent ? (noteEl.textContent + '  \\u2022  ' + extra) : extra;
-  }
+  renderHeader();
 
   var nodesLayer = document.getElementById('pm-nodes');
   var edgesSvg = document.getElementById('pm-edges');
@@ -648,7 +742,11 @@ const CLIENT_JS_TEXT = `
   edgesSvg.setAttribute('height', String(H));
 
   var nodeById = {};
-  DATA.nodes.forEach(function (n) { nodeById[n.id] = n; });
+  function indexNodes() {
+    nodeById = {};
+    DATA.nodes.forEach(function (n) { nodeById[n.id] = n; });
+  }
+  indexNodes();
 
   var SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -696,6 +794,27 @@ const CLIENT_JS_TEXT = `
       el.appendChild(badgeRow);
     }
 
+    // v0.9 (P1/P4): the frontier '+N' pill -- a DISTINCT, clickable element
+    // (see the .frontier-pill CSS rule) appended as its own row, separate
+    // from the plain read-only .badge spans above. PILL-VS-BODY CLICK
+    // SEPARATION: its own click listener calls ev.stopPropagation() FIRST,
+    // so the click never bubbles up to el's own 'click' listener below
+    // (which still jumps to source) -- clicking the pill posts {type:
+    // 'expand', key}, clicking anywhere else on the node body still jumps.
+    if (n.expandable) {
+      var pill = document.createElement('span');
+      pill.className = 'frontier-pill';
+      pill.textContent = '+' + (n.pendingCount == null ? '' : n.pendingCount);
+      var pillNoun = DATA.meta.direction === 'callees' ? 'callees' : 'callers';
+      var pillCount = n.pendingCount == null ? 'more' : String(n.pendingCount) + ' more';
+      pill.title = pillCount + ' direct ' + pillNoun + ' \\u2014 click to expand';
+      pill.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        requestExpand(n);
+      });
+      el.appendChild(pill);
+    }
+
     el.addEventListener('mouseenter', function () { cancelHideTooltip(); showTooltip(n, el); });
     el.addEventListener('mouseleave', scheduleHideTooltip);
     el.addEventListener('click', function () {
@@ -705,10 +824,6 @@ const CLIENT_JS_TEXT = `
 
     return el;
   }
-
-  DATA.nodes.forEach(function (n) {
-    nodesLayer.appendChild(buildNodeEl(n));
-  });
 
   // v0.7 (A3): 'to' is always the tree PARENT (edges are gathered child->
   // parent, see layoutTree/shapeEdgeForData -- this doesn't change with
@@ -736,28 +851,40 @@ const CLIENT_JS_TEXT = `
     return 'M ' + x1 + ' ' + y1 + ' C ' + midX + ' ' + y1 + ', ' + midX + ' ' + y2 + ', ' + x2 + ' ' + y2;
   }
 
-  DATA.edges.forEach(function (e) {
-    var from = nodeById[e.from];
-    var to = nodeById[e.to];
-    if (!from || !to) return;
+  // v0.9 (P1/P4): the node+edge DOM construction, factored into its own
+  // named function so the {type:'update'} handler (applyUpdate below) can
+  // rebuild the map from a fresh data blob by calling the EXACT same code
+  // the initial render already used, instead of a second, driftable copy.
+  // Called once below for the initial render.
+  function renderGraph() {
+    DATA.nodes.forEach(function (n) {
+      nodesLayer.appendChild(buildNodeEl(n));
+    });
 
-    var path = document.createElementNS(SVG_NS, 'path');
-    path.setAttribute('d', edgePath(from, to));
-    path.setAttribute('class', 'edge-path' + (e.approximate ? ' is-approx' : ''));
-    edgesSvg.appendChild(path);
+    DATA.edges.forEach(function (e) {
+      var from = nodeById[e.from];
+      var to = nodeById[e.to];
+      if (!from || !to) return;
 
-    if (e.via) {
-      var text = document.createElementNS(SVG_NS, 'text');
-      var midX = (from.x + NW + to.x) / 2;
-      var midY = (from.y + to.y) / 2 + NH / 2 - 4;
-      text.setAttribute('x', String(midX));
-      text.setAttribute('y', String(midY));
-      text.setAttribute('text-anchor', 'middle');
-      text.setAttribute('class', 'edge-label');
-      text.textContent = e.via;
-      edgesSvg.appendChild(text);
-    }
-  });
+      var path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('d', edgePath(from, to));
+      path.setAttribute('class', 'edge-path' + (e.approximate ? ' is-approx' : ''));
+      edgesSvg.appendChild(path);
+
+      if (e.via) {
+        var text = document.createElementNS(SVG_NS, 'text');
+        var midX = (from.x + NW + to.x) / 2;
+        var midY = (from.y + to.y) / 2 + NH / 2 - 4;
+        text.setAttribute('x', String(midX));
+        text.setAttribute('y', String(midY));
+        text.setAttribute('text-anchor', 'middle');
+        text.setAttribute('class', 'edge-label');
+        text.textContent = e.via;
+        edgesSvg.appendChild(text);
+      }
+    });
+  }
+  renderGraph();
 
   // ---- tooltip: call sites for the hovered node ---------------------------
   var hideTimer = null;
@@ -918,6 +1045,79 @@ const CLIENT_JS_TEXT = `
     panY = mouseY - contentY * scale;
     applyTransform();
   }, { passive: false });
+
+  // ---- update-in-place: {type:'update', data} ------------------------------
+  // v0.9 (P1/P4): posted by extension.js after a frontier click grows the
+  // trace (see requestExpand above) -- extension.js builds the data value
+  // with pathmap.js's own exported buildPathMapData(newTreeResult), the EXACT
+  // same shape this script's DATA already is, then calls
+  // panel.webview.postMessage({type:'update', data: data}). No jsonForScript
+  // escaping is needed on this path AT ALL: postMessage structured-clones a
+  // real JS object straight into this webview's 'message' event, it is
+  // NEVER re-parsed as embedded script-tag text, so the closing-tag-breakout
+  // risk jsonForScript defends against on the INITIAL blob (see this file's
+  // SECURITY header note) simply does not exist here. What DOES still apply,
+  // unchanged, is the DOM-safety invariant this whole file holds to (see
+  // this file's SECURITY header note): applyUpdate below renders everything
+  // it touches via the exact same createElement/textContent-only functions
+  // (renderHeader/renderGraph/buildNodeEl) the initial render already used
+  // -- there is no second, less careful code path.
+  //
+  // PRESERVE pan/zoom + legend state:
+  //   - pan/zoom: preserveTransformOnUpdate is a pure, DOM-free function
+  //     (also exported Node-side from pathmap.js, see that file's matching
+  //     export, so the "preserve, never re-derive" contract is unit-
+  //     testable independent of any browser) -- it is an intentional
+  //     IDENTITY pass-through: applyUpdate below calls it and reapplies the
+  //     result instead of calling fitInitial() again, so the just-rebuilt
+  //     canvas renders at the exact pan/zoom position the user already had,
+  //     never snapping back to a fitted default view.
+  //   - legend: the #pm-legend <details> element's open/closed state is
+  //     simply never referenced anywhere below -- there is no code path
+  //     that could reset it, so it is preserved automatically by omission.
+  function preserveTransformOnUpdate(prevTransform) {
+    var keptScale = prevTransform && typeof prevTransform.scale === 'number' ? prevTransform.scale : 1;
+    var keptPanX = prevTransform && typeof prevTransform.panX === 'number' ? prevTransform.panX : 24;
+    var keptPanY = prevTransform && typeof prevTransform.panY === 'number' ? prevTransform.panY : 24;
+    return { scale: keptScale, panX: keptPanX, panY: keptPanY };
+  }
+
+  function applyUpdate(newData) {
+    DATA = newData;
+    renderHeader();
+
+    W = DATA.layout.width;
+    H = DATA.layout.height;
+    NW = DATA.layout.nodeWidth;
+    NH = DATA.layout.nodeHeight;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    edgesSvg.setAttribute('width', String(W));
+    edgesSvg.setAttribute('height', String(H));
+    MIRRORED = !!(DATA.layout && DATA.layout.mirrored);
+
+    indexNodes();
+
+    // A lingering tooltip would describe a now-removed DOM node / stale
+    // data -- hidden rather than left open and wrong.
+    tooltip.hidden = true;
+
+    clearChildren(nodesLayer);
+    clearChildren(edgesSvg);
+    renderGraph();
+
+    var kept = preserveTransformOnUpdate({ scale: scale, panX: panX, panY: panY });
+    scale = kept.scale;
+    panX = kept.panX;
+    panY = kept.panY;
+    applyTransform();
+  }
+
+  window.addEventListener('message', function (event) {
+    var msg = event.data;
+    if (!msg || msg.type !== 'update' || !msg.data) return;
+    applyUpdate(msg.data);
+  });
 })();
 `;
 
@@ -941,6 +1141,7 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="k">&#x1F6E1;</span>caughtHere — an ancestor catch clause here catches the exception being traced (exact type, a USER exception ancestor, or bare Exception); paired with a "catches &lt;Exc&gt;" badge. Traversal still continues past this node — rethrow is unknowable</div>
     <div class="legend-row"><span class="k">&#x25C9;</span>root — no known caller in this trace: an entry point or unused/dead code. Never shown together with cyclic, truncated, or seenElsewhere (those all mean "there IS more above, it just isn't shown/expanded here")</div>
     <div class="legend-row"><span class="k">&#x21E2;</span>seenElsewhere — this method's caller subtree was already expanded once elsewhere in this same trace (per-run dedup); its own call sites are still shown here, only the deeper callers above it are collapsed</div>
+    <div class="legend-row"><span class="k">+N pill</span>(v0.9) progressive-depth frontier — N direct callers/callees exist but haven't been loaded yet (see apexCallGraph.initialDepth). A distinct, CLICKABLE pill, separate from the plain read-only badges above and from the node body itself — click the pill (not the node) to expand this node in place; clicking the node body still jumps to its source, exactly as before. Pan/zoom and the legend's own open/closed state are preserved across the expand</div>
     <div class="legend-row"><span class="k">(pkgLabel)</span>(v0.7 B3) package badge — shown on a node when its file lives in a DIFFERENT sfdx package directory than the traced target's; the label is the package name from sfdx-project.json's packageDirectories, or the path segment itself when that directory declares no package name. A single call site can fan out to two children with two DIFFERENT badges (see the "ambiguous" via below)</div>
     <div class="legend-row"><span class="k">managed: ns</span>(v0.8 N4) managed-package badge — shown on an "external" node, naming the managed-package namespace it belongs to (e.g. "managed: zenq")</div>
     <div class="legend-row"><span class="k">N dup. names</span>(v0.7 B3) header note — "&lt;N&gt; duplicate class names across packages" appears above the map whenever this workspace has classes sharing the same qualified name across two or more sfdx packages; resolution always prefers the referring file's own package first, then the default package, before falling back to the ambiguous fan-out below</div>
@@ -1054,13 +1255,20 @@ function headerExtraLinesForResult(treeResult) {
   return lines;
 }
 
-// renderPathMapHtml(treeResult, opts) -> string
-//
-// opts (all optional):
-//   legendOpen: boolean — render the legend <details> expanded by default
-//               (default false, kept collapsed so the canvas starts clean).
-function renderPathMapHtml(treeResult, opts) {
-  const options = opts || {};
+// v0.9 (P1/P4): the DATA blob (meta/layout/nodes/edges) renderPathMapHtml
+// embeds into the initial document, factored out into its own exported
+// function -- THE "rebuild helper" the update-in-place feature needs to be
+// unit-testable in Node (see this file's module.exports comment and
+// test-pathmap.js): extension.js calls this a SECOND time after a frontier
+// click grows the trace (buildCallerTree/buildCalleeTree re-run with the
+// expanded opts.expandedKeys) and posts the result straight to the webview
+// as panel.webview.postMessage({type:'update', data: buildPathMapData(...)})
+// -- see CLIENT_JS_TEXT's update-in-place section for the client half of
+// this contract. Every field/shape is identical to what renderPathMapHtml
+// already embedded pre-v0.9 (this is a pure extraction, not a new shape);
+// renderPathMapHtml below now simply calls this and JSON-embeds the result,
+// so the INITIAL render is byte-identical to before this round.
+function buildPathMapData(treeResult) {
   const root = treeResult && treeResult.root;
   const direction = treeResult && treeResult.direction;
   const layout = root
@@ -1082,7 +1290,7 @@ function renderPathMapHtml(treeResult, opts) {
   const nodesOut = layout.nodes.map((rec) => shapeNodeForData(rec, targetPackage));
   const edgesOut = layout.edges.map(shapeEdgeForData);
 
-  const data = {
+  return {
     meta: {
       targetLabel: (treeResult && treeResult.targetLabel) || '',
       note: (treeResult && treeResult.note) || null,
@@ -1110,6 +1318,47 @@ function renderPathMapHtml(treeResult, opts) {
     nodes: nodesOut,
     edges: edgesOut,
   };
+}
+
+// v0.9 (P1/P4): the ENTIRE "preserve pan/zoom on an in-place update" promise
+// captured as one pure, DOM-free function, exported so it is unit-testable
+// here in Node -- CLIENT_JS_TEXT's applyUpdate (search
+// 'preserveTransformOnUpdate' there) calls a textually-identical algorithm
+// on the client; kept as two independent copies rather than one shared
+// require, same rationale as isRootNode/packageBadge/externalNamespace/
+// managedBadge/frontierMethodKey above (this file stays a standalone,
+// dev-tool-friendly, zero-bundler module -- CLIENT_JS_TEXT executes in the
+// webview's own JS realm, which cannot require() this Node module).
+//
+// The function is intentionally an IDENTITY pass-through of `prevTransform`
+// -- preserving pan/zoom on an in-place data update means exactly "do
+// nothing to these three numbers", never re-deriving them from the new
+// data (which would be indistinguishable from silently losing the user's
+// current pan/zoom position, the exact regression this feature exists to
+// prevent -- note the function does not even ACCEPT a `newData` parameter,
+// so there is nothing for a future edit to accidentally start reading).
+// The pure-function boundary exists so that invariant is independently
+// checkable (see test-pathmap.js): a future change to the update path that
+// starts threading new-data-derived values into this function to
+// "helpfully" re-fit the view would show up as a changed function
+// signature/behavior a reviewer can catch, rather than a silent DOM
+// behavior change no test in this suite could ever observe (pathmap.js has
+// no browser/DOM harness -- see this file's header note).
+function preserveTransformOnUpdate(prevTransform) {
+  const scale = prevTransform && typeof prevTransform.scale === 'number' ? prevTransform.scale : 1;
+  const panX = prevTransform && typeof prevTransform.panX === 'number' ? prevTransform.panX : 24;
+  const panY = prevTransform && typeof prevTransform.panY === 'number' ? prevTransform.panY : 24;
+  return { scale, panX, panY };
+}
+
+// renderPathMapHtml(treeResult, opts) -> string
+//
+// opts (all optional):
+//   legendOpen: boolean — render the legend <details> expanded by default
+//               (default false, kept collapsed so the canvas starts clean).
+function renderPathMapHtml(treeResult, opts) {
+  const options = opts || {};
+  const data = buildPathMapData(treeResult);
 
   const legendOpenAttr = options.legendOpen ? ' open' : '';
   const dataScript = 'var DATA = ' + jsonForScript(data) + ';';
@@ -1164,4 +1413,14 @@ module.exports = {
   managedBadge,
   directionHeaderLine,
   headerExtraLinesForResult,
+  // v0.9 (P1/P4): progressive-depth update-in-place surface. `buildPathMapData`
+  // IS part of the frozen integration surface alongside renderPathMapHtml --
+  // extension.js calls it directly to build a {type:'update', data} postMessage
+  // payload without a full HTML re-render (see its own header comment).
+  // `preserveTransformOnUpdate` and `frontierMethodKey` are exported for
+  // test-pathmap.js / dev tooling, same rationale as everything else in this
+  // block.
+  buildPathMapData,
+  preserveTransformOnUpdate,
+  frontierMethodKey,
 };

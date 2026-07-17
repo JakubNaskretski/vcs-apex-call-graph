@@ -117,6 +117,50 @@
 //                     // 'root' badge (a seenElsewhere node is emphatically
 //                     // NOT "no known caller", it is "caller already shown
 //                     // above").
+//     expandable,   // boolean, v0.9 P1 (forward-compat -- resolver.js does
+//                    // not produce this yet): this node hit the PROGRESSIVE
+//                    // depth frontier (depth >= opts.initialDepth and its
+//                    // methodKey is not in opts.expandedKeys) -- real
+//                    // callers/callees exist (pendingCount > 0 says exactly
+//                    // how many DIRECT groups) but the engine deliberately
+//                    // did not expand them this pass, so `children` is empty
+//                    // here even though the node is NOT actually childless.
+//                    // Distinct from `truncated` (the maxDepth/maxNodes HARD
+//                    // caps, which the user cannot resolve by clicking) --
+//                    // an expandable node is a SOFT, interactive boundary:
+//                    // clicking it (native TreeView lazy-expand, or the
+//                    // path map's pill) adds its methodKey to
+//                    // opts.expandedKeys and re-traces, which is exactly
+//                    // how progressive depth grows the tree one click at a
+//                    // time. Rendered as a '+N' badge (frontierBadge below)
+//                    // plus a synthetic load-more child (see shapeNode) and,
+//                    // like every other "there IS more above/below, it's
+//                    // just not shown" flag (cyclic/truncated/
+//                    // seenElsewhere), excluded from the 'root' badge
+//                    // (isRootNode below) and from entry-first's
+//                    // `_entryFirstRoot` stamp (see rerootEntryFirst).
+//     pendingCount,  // number|undefined, v0.9 P1 (forward-compat): ONLY
+//                    // meaningful alongside expandable:true -- the count of
+//                    // DIRECT distinct caller/callee groups this node has
+//                    // that were not expanded. Read by frontierBadge/
+//                    // shapeNode below to render '+N'; absent/non-number is
+//                    // treated as "count unknown" (renders a bare '+').
+//     methodKey,     // string|undefined, v0.9 P1 (forward-compat): ONLY
+//                    // meaningful alongside expandable:true -- the exact
+//                    // `methodKeyLower` identity (resolver.js's own
+//                    // `${classLower}#${methodLower}` composite, or a bare
+//                    // classLower for a class-level target) this node's
+//                    // click-to-expand affordance must add to
+//                    // opts.expandedKeys to load its children. OPTIONAL:
+//                    // when absent, frontierMethodKey() below derives the
+//                    // identical string from the node's own `className` +
+//                    // `methodLower` fields (already present on every TNode,
+//                    // see above) -- the same "explicit field wins, else
+//                    // derive from fields already on the node" pattern
+//                    // externalNamespace() uses for `ns` below, so a
+//                    // hand-built/early TNode that has expandable:true but
+//                    // no explicit `methodKey` yet still renders a working
+//                    // load-more affordance instead of silently losing it.
 //   }
 //
 //   SiteView = {
@@ -153,6 +197,19 @@
 //     jump: { path, line, col } | null,   // line still 1-based, see above
 //     collapsible,    // boolean
 //     children: [UiNode],
+//     loadMore,       // boolean, v0.9 P1/P3 -- ONLY present (true) on the
+//                      // one synthetic child shapeNode appends to an
+//                      // expandable node (see shapeNode/shapeLoadMoreChild
+//                      // below); every ordinary UiNode simply omits this
+//                      // field, so `uiNode.loadMore` is the extension.js-
+//                      // side test for "this TreeItem is the click-to-
+//                      // expand affordance, not a real caller/callee".
+//     expandKey,      // string|null, v0.9 P1/P3 -- ONLY present alongside
+//                      // loadMore:true -- the methodKeyLower extension.js
+//                      // must add to opts.expandedKeys (see
+//                      // frontierMethodKey below) when this item is
+//                      // selected/activated, then re-trace and replace this
+//                      // node's children with the fresh result.
 //   }
 //
 // Ordering: resolver.js's buildCallerTree contract already states "Sort
@@ -297,9 +354,46 @@ function managedBadge(node) {
   return ns ? `managed: ${ns}` : null;
 }
 
+// v0.9 (P1/P3, forward-compat): the methodKeyLower identity a click-to-
+// expand affordance for this node must hand back to
+// opts.expandedKeys/buildCallerTree/buildCalleeTree -- see the TNode.
+// methodKey field doc above for the full "explicit field wins, else derive"
+// rationale. Returns null when there is nothing derivable at all (neither an
+// explicit methodKey nor a className), so callers can treat a null result as
+// "no working expand affordance" rather than emitting a broken '#' key.
+function frontierMethodKey(node) {
+  if (!node) return null;
+  if (typeof node.methodKey === 'string' && node.methodKey) return node.methodKey;
+  const cls = typeof node.className === 'string' ? node.className.toLowerCase() : '';
+  const method = typeof node.methodLower === 'string' && node.methodLower ? node.methodLower : null;
+  if (!cls && !method) return null;
+  return method ? `${cls}#${method}` : cls;
+}
+
+// v0.9 (P1/P3, forward-compat): the '+N' frontier badge text for an
+// expandable node, or null when the node isn't a frontier at all. `N` is
+// `pendingCount` when it's a real number; an expandable node that (for
+// whatever reason) arrives without a usable pendingCount still renders a
+// bare '+' rather than silently dropping the marker -- same "degrade
+// gracefully, never silently lose the flag" posture as every other
+// forward-compat helper in this file (externalNamespace/managedBadge above).
+function frontierBadge(node) {
+  if (!node || !node.expandable) return null;
+  const n = typeof node.pendingCount === 'number' ? node.pendingCount : null;
+  return n != null ? `+${n}` : '+';
+}
+
+// v0.9 (P3): the noun a frontier marker's text should use -- 'callees' only
+// for an explicit callees-direction trace, 'callers' for absent/'callers'
+// (mirrors every other direction-aware noun swap already in this file, e.g.
+// shapeHeaderLines' `cappedNoun`).
+function frontierNoun(direction) {
+  return direction === 'callees' ? 'callees' : 'callers';
+}
+
 // Badge order per contract: entries · caughtHere (shield) · test · via ·
 // managed:<ns> (v0.8 N4) · package (v0.7 B3) · '~' when approximate ·
-// '↺ cycle' · '… capped' · '↪ seen elsewhere'.
+// '↺ cycle' · '… capped' · '+N' frontier (v0.9 P3) · '↪ seen elsewhere'.
 // (The 'root' badge is NOT added here -- see isRootNode/shapeNode below: it
 // depends on the shaped `children` count, which this per-node-flags
 // function deliberately does not compute, so it stays cheaply unit-testable
@@ -324,6 +418,13 @@ function managedBadge(node) {
 // omitted-means-unchanged convention as pkgBadge. It only affects the
 // seenElsewhere badge's wording (see below); every other badge is
 // orientation-agnostic.
+//
+// v0.9 (P3): the frontier '+N' badge (see below) is direction-agnostic on
+// purpose -- it never spells out "callers"/"callees", just a bare count --
+// so it needs no new parameter here; the direction-aware NOUN only shows up
+// in the longer glossary tooltip line (see glossaryLinesForNode/
+// frontierNoun below), which already threads other tree-wide context
+// separately from this per-node function.
 function badgesForNode(node, pkgBadge, orientation) {
   const badges = [];
   if (node.entries && node.entries.length) badges.push(node.entries.join(', '));
@@ -352,6 +453,19 @@ function badgesForNode(node, pkgBadge, orientation) {
   // isRootNode below: a truncated node is (and was already) excluded from
   // the '◉ root' badge regardless of which cap fired.
   if (node.truncated) badges.push('… capped');
+  // v0.9 (P1/P3, forward-compat): the progressive-depth frontier badge --
+  // see the TNode.expandable/pendingCount field docs above and
+  // frontierBadge's own comment. Slotted right after '… capped': both
+  // badges mean "there is more here that isn't shown", truncated being the
+  // hard/non-interactive cap and this being the soft/click-to-load one, so
+  // reading them adjacently in that order (hard cap, then soft frontier)
+  // matches the two flags' actual severity. A node cannot carry both at
+  // once (truncated is stamped by the maxDepth/maxNodes HARD caps, which by
+  // construction fire only once expandable's SOFT initialDepth frontier
+  // would have already stopped expansion), but this file makes no
+  // assumption either way -- both simply render if both happen to be true.
+  const frontier = frontierBadge(node);
+  if (frontier) badges.push(frontier);
   // v0.6 (H1 forward-compat, H5 rendering): resolver.js does not produce
   // TNode.seenElsewhere yet -- this is purely additive and a no-op today.
   // v0.7.1: in the entry-first orientation the SAME flag reads
@@ -387,10 +501,20 @@ function packageBadge(node, targetPackage) {
 // fixtures with no `children` array) are unaffected by this addition;
 // callers that need the root badge call this from shapeNode instead, where
 // the real children array is always present.
+//
+// v0.9 (P1/P3, forward-compat): `expandable` joins the exclusion list for
+// the exact same reason -- a frontier node has an empty `children` array
+// purely because the engine chose not to expand it THIS pass (see the
+// TNode.expandable field doc above), not because it genuinely has no known
+// caller/callee. Purely additive: `node.expandable` is undefined on every
+// pre-v0.9 fixture, so `!undefined` is `true` and this check is a no-op
+// there -- the REGRESSION PIN (initialDepth === maxDepth && expandedKeys
+// empty -> output byte-identical to v0.8) holds because a v0.8-shaped
+// resolver.js never sets `expandable` at all.
 function isRootNode(node) {
   if (!node) return false;
   const hasChildren = !!(node.children && node.children.length);
-  return !hasChildren && !node.cyclic && !node.truncated && !node.seenElsewhere;
+  return !hasChildren && !node.cyclic && !node.truncated && !node.seenElsewhere && !node.expandable;
 }
 
 // v0.6 (H3): the site's marquee data -- overloadSig and argsRendered -- used
@@ -532,6 +656,23 @@ const MARKER_GLOSSARY = {
   package: "this node's file lives in a different sfdx package directory than the traced target's",
 };
 
+// v0.9 (P1/P3, forward-compat): the frontier glossary line, exact wording
+// per the CONTRACT AMENDMENT text ("tooltip 'N more direct callers/callees
+// — expand to load'") -- direction-resolved via frontierNoun since a real
+// trace always knows which direction it's tracing (the contract's own
+// slash-separated phrasing is describing the two possible renderings, not a
+// literal string to emit verbatim). Built here rather than as a single
+// fixed MARKER_GLOSSARY lookup because both the badge text and the count
+// are dynamic per node -- same rationale/pattern as the '(pkgLabel)' line
+// two lines below in glossaryLinesForNode.
+function frontierGlossaryLine(node, direction) {
+  const badge = frontierBadge(node);
+  const noun = frontierNoun(direction);
+  const n = typeof node.pendingCount === 'number' ? node.pendingCount : null;
+  const countText = n != null ? `${n} more direct ${noun}` : `more direct ${noun}`;
+  return `${badge} — ${countText} — expand to load`;
+}
+
 // v0.7 (B3): `pkgBadge` is the same optional pre-computed '(pkgLabel)'
 // string threaded through badgesForNode above -- see that function's
 // comment for why it is a parameter here rather than computed locally.
@@ -544,7 +685,11 @@ const MARKER_GLOSSARY = {
 // isRootNode's "childless and unflagged" rule is meaningless after
 // re-rooting (every branch TIP is childless there, and tips are the traced
 // target, the exact opposite of "no known caller").
-function glossaryLinesForNode(node, pkgBadge, orientation) {
+//
+// v0.9 (P1/P3): `direction` optional fourth argument, same
+// omitted-means-'callers' convention as badgesForNode/frontierNoun. Only
+// feeds the new frontier line below; every other line is direction-agnostic.
+function glossaryLinesForNode(node, pkgBadge, orientation, direction) {
   const entryFirst = orientation === ORIENTATION_ENTRY_FIRST;
   const lines = [];
   if (node && node.via && VIA_GLOSSARY[node.via]) lines.push(`${node.via}: ${VIA_GLOSSARY[node.via]}`);
@@ -555,6 +700,7 @@ function glossaryLinesForNode(node, pkgBadge, orientation) {
   if (node && node.caughtHere) lines.push(MARKER_GLOSSARY.caughtHere);
   if (node && node.cyclic) lines.push(MARKER_GLOSSARY.cyclic);
   if (node && node.truncated) lines.push(MARKER_GLOSSARY.truncated);
+  if (node && node.expandable) lines.push(frontierGlossaryLine(node, direction));
   if (node && node.seenElsewhere) {
     lines.push(entryFirst ? MARKER_GLOSSARY.seenElsewhereEntryFirst : MARKER_GLOSSARY.seenElsewhere);
   }
@@ -573,15 +719,49 @@ function glossaryLinesForNode(node, pkgBadge, orientation) {
 // EXISTING call site (including every pre-v0.7 test fixture) is unaffected.
 // v0.7.1: `orientation` optional third argument, passed straight through to
 // glossaryLinesForNode.
-function nodeTooltip(node, pkgBadge, orientation) {
+// v0.9 (P1/P3): `direction` optional fourth argument, passed straight
+// through to glossaryLinesForNode.
+function nodeTooltip(node, pkgBadge, orientation, direction) {
   const lines = [];
   if (node && node.path) lines.push(node.path);
-  const glossary = glossaryLinesForNode(node, pkgBadge, orientation);
+  const glossary = glossaryLinesForNode(node, pkgBadge, orientation, direction);
   if (glossary.length) {
     if (lines.length) lines.push('');
     lines.push(...glossary);
   }
   return lines.join('\n');
+}
+
+// v0.9 (P1/P3): the synthetic "load more" UiNode shapeNode appends as the
+// sole child of an `expandable` node (see the TNode.expandable field doc
+// and the UiNode.loadMore/expandKey field docs at the top of this file).
+// NATIVE LAZY TREE rendering (per the P2 CONTRACT AMENDMENT): this item is
+// what makes an expandable node with ZERO real TNode.children still render
+// Collapsed with something to expand into -- `collapsible` downstream comes
+// from `kids.length > 0` exactly like every other node (see shapeNode
+// below), so appending this one synthetic child is the ENTIRE mechanism,
+// no separate collapsible override needed. `jump: null` -- this item has no
+// source location of its own, so extension.js's existing
+// `if (uiNode.jump) it.command = ...` guard already leaves it commandless
+// by construction; extension.js is expected to instead special-case
+// `uiNode.loadMore` (own file, not this one) to wire the actual expand
+// behavior (add `expandKey` to opts.expandedKeys, re-trace, replace this
+// node's children with the fresh result).
+function shapeLoadMoreChild(node, direction) {
+  const noun = frontierNoun(direction);
+  const n = typeof node.pendingCount === 'number' ? node.pendingCount : null;
+  const label = n != null ? `+${n} more ${noun}…` : `More ${noun}…`;
+  return {
+    label,
+    description: '',
+    tooltip: frontierGlossaryLine(node, direction),
+    iconId: 'ellipsis',
+    jump: null,
+    collapsible: false,
+    children: [],
+    loadMore: true,
+    expandKey: frontierMethodKey(node),
+  };
 }
 
 // Recursive TNode -> UiNode. Sites render before child caller nodes (call
@@ -613,11 +793,24 @@ function nodeTooltip(node, pkgBadge, orientation) {
 // truthfully have "no known caller" (their children below are their
 // CALLEES in this orientation), and boundary roots (cyclic/truncated/
 // seenElsewhere) stay excluded, same rule as target-first.
-function shapeNode(node, targetPackage, orientation) {
+// v0.9 (P1/P3): `direction` is an OPTIONAL fourth argument, threaded down
+// every recursive call exactly like targetPackage/orientation. Omitted
+// (every pre-v0.9 call site), the frontier machinery below is a pure no-op
+// (see isRootNode/badgesForNode's own `node.expandable` guards -- undefined
+// on every pre-v0.9 TNode) and `direction` itself only ever reaches
+// shapeLoadMoreChild/frontierGlossaryLine, which are themselves only
+// invoked when `node.expandable` is true. When `node.expandable` IS true,
+// this appends `shapeLoadMoreChild`'s single synthetic item onto `kids`
+// BEFORE computing `collapsible`/`children` below -- an expandable TNode's
+// own `children` array is always empty (see the field doc: the engine
+// either expands a node's children fully or not at all, never partially),
+// so this is the only source of a non-empty `kids` array for such a node.
+function shapeNode(node, targetPackage, orientation, direction) {
   const entryFirst = orientation === ORIENTATION_ENTRY_FIRST;
   const uiSites = (node.sites || []).map(shapeSite);
-  const uiChildren = (node.children || []).map((child) => shapeNode(child, targetPackage, orientation));
-  const kids = uiSites.concat(uiChildren);
+  const uiChildren = (node.children || []).map((child) => shapeNode(child, targetPackage, orientation, direction));
+  let kids = uiSites.concat(uiChildren);
+  if (node.expandable) kids = kids.concat([shapeLoadMoreChild(node, direction)]);
   const pkgBadge = packageBadge(node, targetPackage);
   const badges = badgesForNode(node, pkgBadge, orientation);
   // v0.6 (H3): appended last -- root is mutually exclusive with
@@ -628,7 +821,7 @@ function shapeNode(node, targetPackage, orientation) {
   return {
     label: labelForNode(node),
     description: badges.join(' · '),
-    tooltip: nodeTooltip(node, pkgBadge, orientation),
+    tooltip: nodeTooltip(node, pkgBadge, orientation, direction),
     iconId: iconForNode(node),
     jump: node.path && typeof node.line === 'number' ? { path: node.path, line: node.line, col: 0 } : null,
     collapsible: kids.length > 0,
@@ -695,6 +888,40 @@ function shapeNode(node, targetPackage, orientation) {
 // exists to remove. effectiveOrientation() therefore neutralizes
 // 'entry-first' whenever treeResult.direction === 'callees'; extension.js
 // additionally hides/no-ops the toggle in that direction.
+//
+// v0.9 (P1/P3) FRONTIER NODES, DOCUMENTED CHOICE: a progressive-depth
+// frontier node (TNode.expandable:true, see the field doc up top) has an
+// EMPTY `children` array by construction -- the engine chose not to expand
+// it this pass -- so walk()'s existing "no children -> path ends here"
+// rule (unchanged by this round) already treats it exactly like a genuine
+// target-first LEAF: it terminates every path that reaches it, and (via
+// makeNode below) becomes the entry-first ROOT of its own chain, the same
+// way a cyclic/truncated/seenElsewhere boundary leaf already does. This is
+// the deliberate, chosen rendering (not an oversight): a frontier is, from
+// the re-rooted reader's point of view, just another kind of "the chain
+// keeps going, but not shown here" boundary -- the SAME family
+// cyclic/truncated/seenElsewhere already belong to -- so it gets the exact
+// same treatment those three get:
+//   - it is EXCLUDED from `_entryFirstRoot` (see makeNode below) so it does
+//     NOT pick up the '◉ root' badge -- a frontier boundary is emphatically
+//     not "no known caller", it is "caller(s) exist, just not expanded yet"
+//     (this mirrors isRootNode's target-first exclusion of `expandable`
+//     one-for-one);
+//   - it KEEPS its own `expandable`/`pendingCount`/`methodKey` fields
+//     (copied through by makeNode below) so shapeNode's frontier badge +
+//     synthetic load-more child (see shapeLoadMoreChild) render identically
+//     whether this node is being shown target-first or as an entry-first
+//     boundary root -- the click-to-expand affordance keeps working
+//     regardless of orientation, since expanding a node's children is an
+//     orientation-independent fact about THAT node, not about the view;
+//   - `expandable` also joins the trie merge key (keyOf below), alongside
+//     the pre-existing cyclic/truncated/seenElsewhere boundary flags, for
+//     the identical reason those are there: a frontier occurrence of a
+//     method must never silently merge with a DIFFERENT (expanded, or
+//     differently-pending) occurrence of the same method reached over a
+//     different edge elsewhere in the tree.
+// See test-uitree.js's "entry-first frontier" section for the pinned
+// end-to-end proof of this rendering.
 // =========================================================================
 
 // The single decision point for "does entry-first actually apply here":
@@ -745,6 +972,15 @@ function rerootEntryFirst(root) {
       !!src.cyclic,
       !!src.truncated,
       !!src.seenElsewhere,
+      // v0.9 (P1/P3, forward-compat): `expandable` joins the identity key
+      // alongside the pre-existing boundary flags above -- see the FRONTIER
+      // NODES doc paragraph in the ORIENTATION section above for why. Kept
+      // as three separate entries (rather than folding pendingCount/
+      // methodKey into a single composite) so the key stays readable/
+      // debuggable, matching this array's existing one-field-per-line style.
+      !!src.expandable,
+      typeof src.pendingCount === 'number' ? src.pendingCount : null,
+      src.methodKey != null ? src.methodKey : null,
       edgeSrc ? (edgeSrc.via != null ? edgeSrc.via : null) : null,
       edgeSrc ? !!edgeSrc.approximate : false,
       edgeSrc
@@ -771,14 +1007,23 @@ function rerootEntryFirst(root) {
     cyclic: src.cyclic,
     truncated: src.truncated,
     seenElsewhere: src.seenElsewhere,
+    // v0.9 (P1/P3, forward-compat): carried through unchanged -- see the
+    // FRONTIER NODES doc paragraph above -- so a frontier boundary root's
+    // own badge/synthetic-child rendering (shapeNode/shapeLoadMoreChild)
+    // works identically in entry-first as it does target-first.
+    expandable: src.expandable,
+    pendingCount: src.pendingCount,
+    methodKey: src.methodKey,
     via: edgeSrc ? edgeSrc.via : null,
     sites: edgeSrc ? edgeSrc.sites || [] : [],
     approximate: edgeSrc ? !!edgeSrc.approximate : false,
     children: [],
     // Genuine entry (an unflagged target-first leaf) at the start of this
     // path -> gets the '◉ root' badge in entry-first (see shapeNode);
-    // boundary leaves (cyclic/truncated/seenElsewhere) do not.
-    _entryFirstRoot: !!(isPathStart && !src.cyclic && !src.truncated && !src.seenElsewhere),
+    // boundary leaves (cyclic/truncated/seenElsewhere/expandable) do not --
+    // see the FRONTIER NODES doc paragraph above for why `expandable` joins
+    // this exclusion list one-for-one with the pre-existing three.
+    _entryFirstRoot: !!(isPathStart && !src.cyclic && !src.truncated && !src.seenElsewhere && !src.expandable),
   });
 
   // 2+3) Reverse each path, shift the edge data one step toward the
@@ -835,13 +1080,23 @@ function rerootEntryFirst(root) {
 // Effective 'entry-first' -> the re-rooted multi-root rendering; note
 // `targetPackage` is STILL the traced target's package (the target sits at
 // the branch tips there, but "which package is home" doesn't move).
+//
+// v0.9 (P1/P3): `treeResult.direction` is read here (not a new parameter --
+// it is already ON treeResult, unlike orientation which is a display-only
+// choice extension.js tracks separately) and threaded down through every
+// shapeNode call, so a frontier node's badge/glossary/synthetic child use
+// the correct 'callers'/'callees' noun without every caller of shapeResult
+// having to pass it explicitly. Absent/'callers' -> frontierNoun's own
+// default already reads 'callers', so this is a no-op for every pre-v0.9
+// TreeResult shape.
 function shapeResult(treeResult, orientation) {
   if (!treeResult || !treeResult.root) return [];
   const targetPackage = treeResult.root.package || null;
+  const direction = treeResult.direction;
   if (effectiveOrientation(treeResult, orientation) === ORIENTATION_ENTRY_FIRST) {
-    return rerootEntryFirst(treeResult.root).map((r) => shapeNode(r, targetPackage, ORIENTATION_ENTRY_FIRST));
+    return rerootEntryFirst(treeResult.root).map((r) => shapeNode(r, targetPackage, ORIENTATION_ENTRY_FIRST, direction));
   }
-  return [shapeNode(treeResult.root, targetPackage)];
+  return [shapeNode(treeResult.root, targetPackage, undefined, direction)];
 }
 
 // v0.6 (H1/H4, H5a rendering): plain-string header lines for extension.js to
@@ -1015,4 +1270,10 @@ module.exports = {
   // v0.7.1 orientation surface (see the ORIENTATION section above).
   effectiveOrientation,
   rerootEntryFirst,
+  // v0.9 (P1/P3): progressive-depth frontier helpers, exported so
+  // test-uitree.js can unit-test them directly against bare fixtures, same
+  // rationale as externalNamespace/managedBadge above.
+  frontierMethodKey,
+  frontierBadge,
+  shapeLoadMoreChild,
 };

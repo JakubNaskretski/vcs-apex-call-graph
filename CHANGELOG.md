@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.0
+
+Start shallow, expand on click — plus an icon and real settings.
+
+- **Progressive depth**: traces now start 2 levels deep (configurable). Frontier
+  nodes show a **"+N more callers"** pill; expanding a node in the tree lazily
+  loads its next level, and clicking a pill on the Path Map grows the graph in
+  place without resetting your pan/zoom. Expanding everything reproduces exactly
+  the old full-depth result — verified by test.
+- **Settings, finally**: `apexCallGraph.initialDepth` (default 2), `expandStep`,
+  `maxDepth`, `maxNodes`, and `excludeGlobs` under Settings → Apex Call Graph.
+  Set `initialDepth` to `maxDepth` for the old show-everything behavior.
+- **Marketplace icon**: the listing (and your extensions sidebar) now carries the
+  family design — callers converging into the traced symbol.
+
 ## 0.8.0
 
 Managed packages become part of the graph.

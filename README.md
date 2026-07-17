@@ -84,18 +84,86 @@ for this direction too — the target sits on the LEFT, callees flow RIGHT.
 - **Badges** (`[…]` after a node's label): the entries it declares (`@AuraEnabled`,
   `Batchable`, trigger header, …), `test`, the resolution kind (`typed`, `static`,
   `new`, `interface`, `dml`, `external`, …), and markers — `~` approximate, `↺` cycle,
-  `…` depth cap reached, `↪ seen elsewhere` (this subtree was already shown once above,
-  in a diamond-shaped call graph — only its own call sites repeat, not its callers
-  again), `◉ root` (no known caller — entry point or dead code), `🛡` an ancestor
-  catches the exception being traced, `managed: ns` (a [managed-package
-  reference](#managed-packages), package-icon glyph). Hover any node or badge for a
-  one-line explanation.
+  `…` depth cap reached, `+N` [more callers/callees waiting to be
+  expanded](#start-shallow-expand-on-click) (click to load), `↪ seen elsewhere` (this
+  subtree was already shown once above, in a diamond-shaped call graph — only its own
+  call sites repeat, not its callers again), `◉ root` (no known caller — entry point
+  or dead code), `🛡` an ancestor catches the exception being traced, `managed: ns` (a
+  [managed-package reference](#managed-packages), package-icon glyph). Hover any node
+  or badge for a one-line explanation.
 - **Site rows** (indented under a node): the source line, plus a second line showing
   the overload signature and/or the arguments, when either is available.
 - A **note** above the tree calls out an honest zero-caller result instead of
   rendering a silent empty tree, and (when non-zero) a workspace-wide count of call
   sites that couldn't be resolved — split into a plain unresolved count and a
   [managed-package](#managed-packages) ref count once any namespace references exist.
+
+## Start shallow, expand on click
+
+Traces don't eagerly walk the whole tree up front anymore. By default, a new trace
+shows **2 levels deep** — everything closer than that expands automatically, and a
+node with real callers/callees beyond that shows a `+N` badge (tree view) or a
+clickable `+N` pill (Path Map) instead of silently stopping. Click it — the native
+tree item, or the pill — and just that node's own direct callers/callees load in
+place, no re-scan, no losing your Path Map pan/zoom position. This keeps a first
+look at a heavily-called method (or a busy hub class) fast and readable instead of
+dumping hundreds of nodes at once; expand only the branches you actually care about.
+
+The transcript below is pasted **verbatim** from `node dev/smoke.js`:
+
+```
+=== ProductTriggerService.handleBeforeUpdate -- STEP 1: initialDepth=2 (collapsed) ===
+121 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).
+stats: nodes=4 unique=3 unresolved=121 capped=false frontierNodes=2
+ProductTriggerService.handleBeforeUpdate
+  ProductTrigger  [trigger on Product2 (before update) · static]
+      L3: ProductTriggerService.handleBeforeUpdate(Trigger.new, Trigger.oldMap);
+      -> newProducts: Trigger.new, oldProducts: Trigger.oldMap
+    ProductAdditionalCostTriggerService.recalculateMarginsOnProduct  [dml · +2]
+        L45: update productsToUpdate;
+        -> productsToUpdate
+      +2 more callers…
+    ProductPackagingMaterialTriggerService.recalculateMarginsOnProduct  [dml · +2]
+        L39: update productsToUpdate;
+        -> productsToUpdate
+      +2 more callers…
+
+-- after clicking the first +2 --
+
+=== ProductTriggerService.handleBeforeUpdate -- STEP 2: after expanding ONE frontier click ===
+stats: nodes=6 unique=5 unresolved=121 capped=false frontierNodes=3
+ProductTriggerService.handleBeforeUpdate
+  ProductTrigger  [trigger on Product2 (before update) · static]
+    ProductAdditionalCostTriggerService.recalculateMarginsOnProduct  [dml]
+        L45: update productsToUpdate;
+        -> productsToUpdate
+      ProductAdditionalCostTriggerService.executeAfterDelete  [this · +1]
+        +1 more callers…
+      ProductAdditionalCostTriggerService.executeAfterInsert  [this · +1]
+        +1 more callers…
+    ProductPackagingMaterialTriggerService.recalculateMarginsOnProduct  [dml · +2]
+      +2 more callers…
+```
+
+Clicking a `+N` only ever reveals *that* node's own direct callers/callees — nothing
+deeper auto-expands, so a wide tree stays navigable one click at a time. Re-tracing
+(a new target, or **Switch Trace Direction**) and toggling entry-first orientation
+both reset expansion back to the shallow default; re-rooting a mix of fully-expanded
+and still-collapsed branches would be ambiguous, so both start clean.
+
+Tune it in **Settings → Extensions → Apex Call Graph**:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `apexCallGraph.initialDepth` | `2` | How many levels auto-expand before you have to click. Lower = faster first look on a big org; raise it for small ones where you usually want the whole picture at once. |
+| `apexCallGraph.expandStep` | `1` | How many extra levels one click loads. |
+| `apexCallGraph.maxDepth` | `8` | Hard ceiling on trace depth, however far you click. |
+| `apexCallGraph.maxNodes` | `2000` | Fair cap on total nodes a single trace will materialize. |
+| `apexCallGraph.excludeGlobs` | `[]` | Extra glob patterns to exclude from workspace scanning, appended to the built-in excludes (`node_modules`, `.sfdx`, `.sf`, `.git`). |
+
+Setting `initialDepth` equal to `maxDepth` (with nothing ever clicked) reproduces the
+old always-eager v0.8 behavior exactly, byte for byte — this is a pure UX default
+change, not a new resolution rule.
 
 ## Beyond Apex: metadata callers
 
@@ -115,8 +183,11 @@ target has overloads. Fluent chains (`a.b().c()`) resolve through return types u
 
 **Apex Call Graph: Show Path Map** renders the trace as an interactive graph: entry roots
 flow left-to-right into your target, edges are labeled with their resolution kind,
-hovering a node lists its call sites with arguments, clicking jumps to source.
-Fully offline webview, no external resources.
+hovering a node lists its call sites with arguments, clicking jumps to source. A
+[frontier node](#start-shallow-expand-on-click) shows a clickable `+N` pill — separate
+from the node body, so clicking it expands in place while clicking the body still
+jumps to source — and expanding preserves your current pan/zoom position instead of
+re-fitting the view. Fully offline webview, no external resources.
 
 ## The transaction story
 

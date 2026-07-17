@@ -16,6 +16,7 @@ const parser = require('./parser');
 const resolver = require('./resolver');
 const metascan = require('./metascan');
 const uitree = require('./uitree');
+const pathmap = require('./pathmap');
 
 // ---------------------------------------------------------------------------
 // apexindex.js strip() self-check (kept from v1's test.js)
@@ -1706,6 +1707,187 @@ const v08Index = resolver.buildSemanticIndex(v08Files);
   const noOwnNsTree = resolver.buildCallerTree(noOwnNsIndex, { classLower: 'acmeownnstarget', methodLower: 'dowork' }, {});
   assert.deepStrictEqual(noOwnNsTree.root.children, [], 'v0.8/N3 negative control: WITHOUT opts.ownNamespace, acme.AcmeOwnNsTarget.doWork() must NOT resolve locally');
   assert.ok(noOwnNsIndex.externals instanceof Map && noOwnNsIndex.externals.has('acme.acmeownnstarget'), 'v0.8/N3 negative control: without ownNamespace, the SAME reference becomes an external node instead');
+}
+
+// =========================================================================
+// v0.9 (integrator): full-pipeline progressive-depth e2e story --
+// parser.parseFile -> resolver.buildSemanticIndex -> resolver.buildCallerTree
+// (initialDepth) -> uitree.shapeResult/shapeNode -> pathmap.buildPathMapData,
+// proving all three consuming modules agree on one node's frontier identity
+// end to end (not just resolver.js's own unit-level P1 pins in
+// test-resolver.js, or uitree.js/pathmap.js's own bare-TNode-fixture pins in
+// test-uitree.js/test-pathmap.js).
+//
+// Shape ("gauntlet-org"-style two-branch fork, real parsed Apex source, own
+// isolated fixture set/index like v08Files/v08NsFiles above so it cannot
+// perturb the main corpus's pinned counts):
+//
+//   GtOrgLeafService.process()                          <- depth 0 (target)
+//     <- GtOrgCallerA.callA()                            <- depth 1 (auto)
+//          <- GtOrgMidA.viaA()                           <- depth 2 (FRONTIER, pendingCount 2)
+//               <- GtOrgRootA1.upA1()                    <- depth 3 (leaf)
+//               <- GtOrgRootA2.upA2()                    <- depth 3 (leaf)
+//     <- GtOrgCallerB.callB()                            <- depth 1 (auto)
+//          <- GtOrgMidB.viaB()                           <- depth 2 (FRONTIER, pendingCount 1)
+//               <- GtOrgRootB1.upB1()                    <- depth 3 (leaf)
+//
+// With initialDepth=2, depth-1 nodes auto-expand (1 < 2) but depth-2 nodes
+// (viaA/viaB) hit the frontier (2 >= 2) -- exactly TWO frontier nodes,
+// with DIFFERING pendingCounts (2 vs 1), so a single pendingCount getting
+// silently hardcoded/copy-pasted across both branches would be caught.
+// =========================================================================
+{
+  const gtOrgFiles = [];
+  const addGtOrgFile = (relPath, text) => gtOrgFiles.push(parser.parseFile({ path: '/gtorgws/' + relPath, text }));
+
+  addGtOrgFile('classes/GtOrgLeafService.cls', [
+    'public class GtOrgLeafService {',
+    '  public static void process() { System.debug(\'leaf\'); }',
+    '}',
+  ].join('\n'));
+  addGtOrgFile('classes/GtOrgCallerA.cls', [
+    'public class GtOrgCallerA {',
+    '  public static void callA() { GtOrgLeafService.process(); }',
+    '}',
+  ].join('\n'));
+  addGtOrgFile('classes/GtOrgCallerB.cls', [
+    'public class GtOrgCallerB {',
+    '  public static void callB() { GtOrgLeafService.process(); }',
+    '}',
+  ].join('\n'));
+  addGtOrgFile('classes/GtOrgMidA.cls', [
+    'public class GtOrgMidA {',
+    '  public static void viaA() { GtOrgCallerA.callA(); }',
+    '}',
+  ].join('\n'));
+  addGtOrgFile('classes/GtOrgMidB.cls', [
+    'public class GtOrgMidB {',
+    '  public static void viaB() { GtOrgCallerB.callB(); }',
+    '}',
+  ].join('\n'));
+  addGtOrgFile('classes/GtOrgRootA1.cls', [
+    'public class GtOrgRootA1 {',
+    '  public static void upA1() { GtOrgMidA.viaA(); }',
+    '}',
+  ].join('\n'));
+  addGtOrgFile('classes/GtOrgRootA2.cls', [
+    'public class GtOrgRootA2 {',
+    '  public static void upA2() { GtOrgMidA.viaA(); }',
+    '}',
+  ].join('\n'));
+  addGtOrgFile('classes/GtOrgRootB1.cls', [
+    'public class GtOrgRootB1 {',
+    '  public static void upB1() { GtOrgMidB.viaB(); }',
+    '}',
+  ].join('\n'));
+
+  const gtOrgIndex = resolver.buildSemanticIndex(gtOrgFiles);
+  const gtOrgTarget = { classLower: 'gtorgleafservice', methodLower: 'process' };
+
+  const keyOfTNode = (n) => `${(n.className || '').toLowerCase()}#${n.methodLower || ''}`;
+  const walkTNode = (n, fn) => { fn(n); for (const c of n.children || []) walkTNode(c, fn); };
+  const findChildByLabel = (n, label) => (n.children || []).find((c) => c.label === label);
+
+  // ---- step 1: initialDepth=2 trace -> exactly 2 frontier nodes, correct
+  // (and DIFFERING) pendingCounts -------------------------------------------
+  const shallow = resolver.buildCallerTree(gtOrgIndex, gtOrgTarget, { initialDepth: 2 });
+  assert.strictEqual(shallow.stats.frontierNodes, 2, 'e2e: initialDepth=2 -- exactly 2 frontier nodes (viaA, viaB)');
+
+  const callA = findChildByLabel(shallow.root, 'GtOrgCallerA.callA');
+  const callB = findChildByLabel(shallow.root, 'GtOrgCallerB.callB');
+  assert.ok(callA && callB, 'e2e: both depth-1 direct callers present, auto-expanded');
+  assert.strictEqual(callA.expandable, undefined, 'e2e: depth1 < initialDepth(2) -- callA auto-expands, never marked expandable');
+
+  const viaA = findChildByLabel(callA, 'GtOrgMidA.viaA');
+  const viaB = findChildByLabel(callB, 'GtOrgMidB.viaB');
+  assert.ok(viaA && viaB, 'e2e: both depth-2 frontier nodes present (empty children, not pruned)');
+  assert.strictEqual(viaA.expandable, true, 'e2e: viaA hit the depth-2 frontier');
+  assert.strictEqual(viaB.expandable, true, 'e2e: viaB hit the depth-2 frontier');
+  assert.deepStrictEqual(viaA.children, [], 'e2e: a frontier node has empty children this pass');
+  assert.strictEqual(viaA.pendingCount, 2, 'e2e: viaA pendingCount is exactly 2 (upA1, upA2) -- not copy-pasted from viaB');
+  assert.strictEqual(viaB.pendingCount, 1, 'e2e: viaB pendingCount is exactly 1 (upB1) -- differs from viaA, proving both were computed independently');
+
+  // ---- step 2: uitree shaping agrees with resolver.js on both frontier
+  // nodes' identity/badge/synthetic load-more child --------------------------
+  const shallowUiRoots = uitree.shapeResult(shallow, 'target-first');
+  assert.strictEqual(shallowUiRoots.length, 1);
+  function findUiNodeByLabel(uiNode, label) {
+    if (uiNode.label === label) return uiNode;
+    for (const c of uiNode.children || []) {
+      const found = findUiNodeByLabel(c, label);
+      if (found) return found;
+    }
+    return null;
+  }
+  const viaAUi = findUiNodeByLabel(shallowUiRoots[0], 'GtOrgMidA.viaA');
+  const viaBUi = findUiNodeByLabel(shallowUiRoots[0], 'GtOrgMidB.viaB');
+  assert.ok(viaAUi && viaBUi, 'e2e/uitree: both frontier UiNodes located by label');
+  assert.ok(viaAUi.description.includes('+2'), "e2e/uitree: viaA's badge string includes the '+2' frontier marker");
+  assert.ok(viaBUi.description.includes('+1'), "e2e/uitree: viaB's badge string includes the '+1' frontier marker");
+  const viaALoadMore = (viaAUi.children || []).find((c) => c.loadMore);
+  const viaBLoadMore = (viaBUi.children || []).find((c) => c.loadMore);
+  assert.ok(viaALoadMore, 'e2e/uitree: viaA got a synthetic load-more child');
+  assert.ok(viaBLoadMore, 'e2e/uitree: viaB got a synthetic load-more child');
+  assert.strictEqual(viaALoadMore.expandKey, uitree.frontierMethodKey(viaA), "e2e/uitree: load-more child's expandKey matches uitree.frontierMethodKey(viaA)");
+  assert.strictEqual(viaBLoadMore.expandKey, uitree.frontierMethodKey(viaB), "e2e/uitree: load-more child's expandKey matches uitree.frontierMethodKey(viaB)");
+  assert.strictEqual(viaALoadMore.expandKey, 'gtorgmida#viaa', 'e2e/uitree: viaA expandKey is the expected classlower#methodlower identity');
+  assert.strictEqual(viaBLoadMore.expandKey, 'gtorgmidb#viab', 'e2e/uitree: viaB expandKey is the expected classlower#methodlower identity');
+
+  // ---- step 3: pathmap shaping agrees on the SAME identity/pendingCount ----
+  const shallowMapData = pathmap.buildPathMapData(shallow);
+  const viaAMapNode = shallowMapData.nodes.find((n) => n.label === 'GtOrgMidA.viaA');
+  const viaBMapNode = shallowMapData.nodes.find((n) => n.label === 'GtOrgMidB.viaB');
+  assert.ok(viaAMapNode && viaBMapNode, 'e2e/pathmap: both frontier map nodes located by label');
+  assert.strictEqual(viaAMapNode.expandable, true);
+  assert.strictEqual(viaAMapNode.pendingCount, 2);
+  assert.strictEqual(viaAMapNode.expandKey, 'gtorgmida#viaa', 'e2e/pathmap: expandKey agrees with uitree/resolver');
+  assert.strictEqual(viaBMapNode.expandable, true);
+  assert.strictEqual(viaBMapNode.pendingCount, 1);
+  assert.strictEqual(viaBMapNode.expandKey, 'gtorgmidb#viab', 'e2e/pathmap: expandKey agrees with uitree/resolver');
+
+  // ---- step 4: expand TWO frontiers (viaA's key, then viaB's key,
+  // mirroring extension.js's expandFrontierKey adding one clicked key at a
+  // time) -> converged tree matches a full-depth trace ----------------------
+  const expandedKeys = new Set();
+  expandedKeys.add(uitree.frontierMethodKey(viaA));
+  expandedKeys.add(uitree.frontierMethodKey(viaB));
+  const converged = resolver.buildCallerTree(gtOrgIndex, gtOrgTarget, { initialDepth: 2, expandedKeys });
+  assert.strictEqual(converged.stats.frontierNodes, 0, 'e2e: after expanding both frontier keys, zero frontier nodes remain (both branches bottom out at genuine leaves)');
+
+  const convCallA = findChildByLabel(converged.root, 'GtOrgCallerA.callA');
+  const convViaA = findChildByLabel(convCallA, 'GtOrgMidA.viaA');
+  const convUpA1 = findChildByLabel(convViaA, 'GtOrgRootA1.upA1');
+  const convUpA2 = findChildByLabel(convViaA, 'GtOrgRootA2.upA2');
+  assert.ok(convUpA1 && convUpA2, 'e2e: expanding viaA reveals BOTH of its direct callers (upA1, upA2)');
+  assert.strictEqual(convUpA1.expandable, undefined, 'e2e: upA1 is a genuine leaf -- no further callers, so never marked expandable (no dangling +0)');
+  assert.deepStrictEqual(convUpA1.children, [], 'e2e: upA1 has no callers of its own');
+
+  const convCallB = findChildByLabel(converged.root, 'GtOrgCallerB.callB');
+  const convViaB = findChildByLabel(convCallB, 'GtOrgMidB.viaB');
+  const convUpB1 = findChildByLabel(convViaB, 'GtOrgRootB1.upB1');
+  assert.ok(convUpB1, 'e2e: expanding viaB reveals its one direct caller (upB1)');
+
+  // The converged (initialDepth=2, both frontiers expanded) tree must be
+  // BYTE-IDENTICAL (deep-equal) to a plain full-depth trace (no
+  // initialDepth -- defaults to maxDepth, eager expansion throughout, same
+  // as pre-v0.9): progressive expansion one click at a time must reach
+  // exactly the same destination as tracing everything eagerly up front.
+  const fullDepth = resolver.buildCallerTree(gtOrgIndex, gtOrgTarget, {});
+  assert.deepStrictEqual(converged, fullDepth, 'e2e: converged (initialDepth=2 + both frontiers expanded) subtree matches a full-depth trace exactly');
+
+  // ---- step 5: the converged tree also shapes identically through uitree/
+  // pathmap (no residual frontier badges/pills/synthetic children anywhere) --
+  const convergedUiRoots = uitree.shapeResult(converged, 'target-first');
+  const fullDepthUiRoots = uitree.shapeResult(fullDepth, 'target-first');
+  assert.deepStrictEqual(convergedUiRoots, fullDepthUiRoots, 'e2e/uitree: converged tree shapes identically to the full-depth trace');
+  let anyLoadMore = false;
+  walkTNode(converged.root, (n) => { if (n.expandable) anyLoadMore = true; });
+  assert.strictEqual(anyLoadMore, false, 'e2e: no TNode anywhere in the converged tree is still marked expandable');
+
+  const convergedMapData = pathmap.buildPathMapData(converged);
+  const fullDepthMapData = pathmap.buildPathMapData(fullDepth);
+  assert.deepStrictEqual(convergedMapData, fullDepthMapData, 'e2e/pathmap: converged tree\'s map data matches the full-depth trace\'s map data exactly');
+  assert.ok(convergedMapData.nodes.every((n) => n.expandable === false), 'e2e/pathmap: no residual expandable:true pill anywhere once converged');
 }
 
 console.log('apex-trace end-to-end self-check: all assertions passed');

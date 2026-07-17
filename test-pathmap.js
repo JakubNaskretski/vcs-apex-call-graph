@@ -27,6 +27,9 @@ const {
   managedBadge,
   directionHeaderLine,
   headerExtraLinesForResult,
+  buildPathMapData,
+  preserveTransformOnUpdate,
+  frontierMethodKey,
 } = require('./pathmap');
 
 let passCount = 0;
@@ -1534,5 +1537,142 @@ assert.deepStrictEqual(
   ['5 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).'],
   'REGRESSION: externalRefs === 0 -> old wording, not the new combined line'
 );
+
+// =========================================================================
+// v0.9 (P1/P4, forward-compat): progressive-depth frontier rendering.
+// resolver.js does not produce TNode.expandable/pendingCount/methodKey yet
+// (a separate phase's job -- same "forward-compat" status as v0.8's
+// kind:'external' before that phase landed) -- every fixture below is
+// hand-built against the documented shape.
+// =========================================================================
+
+// --- frontierMethodKey: explicit field wins, else derive from
+//     className+methodLower (mirrors uitree.js's identical helper) ---
+check(frontierMethodKey({ methodKey: 'oppservice#applydiscount' }) === 'oppservice#applydiscount', 'explicit methodKey wins verbatim');
+check(
+  frontierMethodKey({ className: 'OppService', methodLower: 'applydiscount' }) === 'oppservice#applydiscount',
+  'derived from className (lowercased) + methodLower (already lowercase)'
+);
+check(frontierMethodKey({ className: 'OppService' }) === 'oppservice', 'class-level target derives the bare lowercased className');
+check(frontierMethodKey({}) === null, 'nothing derivable -> null');
+check(frontierMethodKey(null) === null);
+
+// --- buildPathMapData: frontier fields reach the per-node data shape ---
+const frontierLeaf = baseNode({
+  label: 'Deep.caller',
+  className: 'Deep',
+  methodLower: 'caller',
+  expandable: true,
+  pendingCount: 3,
+});
+const frontierParent = baseNode({ label: 'OppService.applyDiscount', children: [frontierLeaf] });
+const frontierTree = { root: frontierParent, targetLabel: 'OppService.applyDiscount', note: null, direction: 'callers' };
+const frontierData = buildPathMapData(frontierTree);
+const frontierLeafData = frontierData.nodes.find((n) => n.label === 'Deep.caller');
+check(!!frontierLeafData, 'frontier leaf node present in buildPathMapData output');
+check(frontierLeafData.expandable === true, 'expandable flag reaches the per-node data shape');
+check(frontierLeafData.pendingCount === 3, 'pendingCount reaches the per-node data shape');
+check(frontierLeafData.expandKey === 'deep#caller', 'expandKey derived from className+methodLower reaches the per-node data shape');
+check(frontierLeafData.root === false, 'REGRESSION-SAFETY: a childless frontier node is NOT flagged root -- it has unshown callers/callees pending, same family as cyclic/truncated/seenElsewhere');
+
+// Non-expandable childless sibling in the SAME render is unaffected -- still
+// a genuine root, proving the isRootNode exclusion is expandable-specific.
+const plainLeaf = baseNode({ label: 'Plain.leaf' });
+const mixedParent = baseNode({ label: 'OppService.applyDiscount', children: [frontierLeaf, plainLeaf] });
+const mixedData = buildPathMapData({ root: mixedParent, targetLabel: 'OppService.applyDiscount', note: null });
+const plainLeafData = mixedData.nodes.find((n) => n.label === 'Plain.leaf');
+check(plainLeafData.root === true, 'a non-expandable childless sibling in the same render is still a genuine root');
+check(plainLeafData.expandable === false, 'REGRESSION: expandable defaults to false, not undefined, on an ordinary fixture');
+check(plainLeafData.pendingCount === null, 'REGRESSION: pendingCount defaults to null on an ordinary fixture');
+check(plainLeafData.expandKey === null, "baseNode's default className is '' -- nothing derivable, expandKey null (harmless either way -- the client only reads it when expandable is true)");
+
+// A node with NO usable className/methodLower at all -> expandKey null,
+// never a broken/partial key.
+const noKeyLeaf = baseNode({ label: 'NoKey.leaf', className: '', expandable: true, pendingCount: 1 });
+const noKeyData = buildPathMapData({ root: baseNode({ label: 'Root', children: [noKeyLeaf] }), targetLabel: 'Root', note: null });
+check(noKeyData.nodes.find((n) => n.label === 'NoKey.leaf').expandKey === null, 'no derivable className -> expandKey null, not a broken key');
+
+// --- renderPathMapHtml end-to-end: frontier node serializes correctly, and
+//     the client script carries the pill/expand/update machinery ---
+const htmlFrontier = renderPathMapHtml(frontierTree);
+check(htmlFrontier.includes('"expandable":true'), 'expandable flag serialized in the embedded data blob');
+check(htmlFrontier.includes('"pendingCount":3'), 'pendingCount serialized');
+check(htmlFrontier.includes('"expandKey":"deep#caller"'), 'expandKey serialized');
+check(htmlFrontier.includes("n.pendingCount"), 'client script reads n.pendingCount to build the pill');
+check(htmlFrontier.includes('frontier-pill'), 'client script builds the frontier-pill element, and the stylesheet defines its rule');
+check(htmlFrontier.includes('.frontier-pill {'), 'stylesheet defines the frontier-pill visual rule, distinct from the plain .badge rule');
+check(htmlFrontier.includes("if (n.expandable)"), 'client script conditionally renders the pill only for expandable nodes');
+
+// pill-vs-body click separation: the pill's own click handler calls
+// ev.stopPropagation() BEFORE requesting expansion, so the click can never
+// bubble up to the node body's own 'click' listener (which still jumps to
+// source) -- string-level proof that the two handlers are wired in the
+// documented order within the same function body.
+{
+  const clientText = htmlFrontier; // CLIENT_JS_TEXT is embedded verbatim in the document
+  const pillClickIdx = clientText.indexOf("pill.addEventListener('click'");
+  check(pillClickIdx !== -1, "pill has its own 'click' listener, separate from the node body's");
+  const pillHandlerBody = clientText.slice(pillClickIdx, pillClickIdx + 200);
+  check(pillHandlerBody.indexOf('stopPropagation') < pillHandlerBody.indexOf('requestExpand'), 'stopPropagation() is called BEFORE requestExpand() inside the pill click handler -- the body click-to-jump listener never fires for a pill click');
+}
+check(htmlFrontier.includes("function requestExpand(n)"), "client script defines requestExpand, the pill's postMessage relay");
+check(htmlFrontier.includes("{ type: 'expand', key: n.expandKey }") || htmlFrontier.includes("type: 'expand'"), "pill click posts {type:'expand', key} per the P2 CONTRACT AMENDMENT");
+
+// --- update-in-place message handler ---
+check(htmlFrontier.includes("addEventListener('message'"), "client script registers a 'message' event handler for the update-in-place channel");
+check(htmlFrontier.includes("msg.type !== 'update'"), "message handler gates on {type:'update'}");
+check(htmlFrontier.includes('function applyUpdate('), 'applyUpdate is a named, reusable function (not inlined into the message handler)');
+check(htmlFrontier.includes('function renderGraph('), 'the node/edge DOM construction is factored into a reusable renderGraph function the update handler also calls');
+check(htmlFrontier.includes('function preserveTransformOnUpdate('), 'client script defines the SAME preserveTransformOnUpdate algorithm exported Node-side (see the unit tests below)');
+check(!htmlFrontier.includes('fitInitial();\\n  })();') , 'sanity: fitInitial IIFE marker text is not accidentally duplicated'); // loose guard, see the stronger check just below
+{
+  const applyUpdateIdx = htmlFrontier.indexOf('function applyUpdate(');
+  const applyUpdateEnd = htmlFrontier.indexOf('\n  window.addEventListener(\'message\'', applyUpdateIdx);
+  const applyUpdateBody = htmlFrontier.slice(applyUpdateIdx, applyUpdateEnd === -1 ? applyUpdateIdx + 1500 : applyUpdateEnd);
+  check(!applyUpdateBody.includes('fitInitial()'), 'applyUpdate never calls fitInitial() -- pan/zoom is PRESERVED, never re-fitted, on an in-place update');
+  check(applyUpdateBody.includes('preserveTransformOnUpdate('), 'applyUpdate calls preserveTransformOnUpdate to obtain the (unchanged) transform it reapplies');
+  check(applyUpdateBody.includes('applyTransform()'), 'applyUpdate reapplies the preserved transform after rebuilding the DOM');
+  check(!applyUpdateBody.includes("getElementById('pm-legend')"), 'applyUpdate never touches the #pm-legend element -- its open/closed state is preserved purely by never being referenced');
+  check(applyUpdateBody.includes('clearChildren(nodesLayer)') && applyUpdateBody.includes('clearChildren(edgesSvg)'), 'applyUpdate clears the previous nodes/edges DOM before rebuilding');
+  check(applyUpdateBody.includes('renderGraph()'), 'applyUpdate rebuilds via the shared renderGraph function, not a second copy of the node/edge loops');
+  check(!/innerHTML|insertAdjacentHTML|document\.write/.test(applyUpdateBody), 'INJECTION POSTURE: the update-in-place code path itself uses none of innerHTML/insertAdjacentHTML/document.write');
+}
+
+// --- legend documents the new pill ---
+check(htmlFrontier.includes('+N pill'), 'legend documents the frontier +N pill');
+check(htmlFrontier.toLowerCase().includes('expand this node in place'), 'legend explains the click-to-expand affordance');
+
+// --- INJECTION POSTURE (whole-document, not just the update path): assert
+//     no innerHTML/insertAdjacentHTML/document.write was introduced ANYWHERE
+//     in the rendered document by this round -- extends the pre-existing
+//     comment-only invariant (see this file's header note) with an actual
+//     assertion, across every fixture already built in this suite plus the
+//     new frontier one. ---
+for (const [name, html] of [
+  ['fixture1', html1], ['fixture2', html2], ['fixture3', html3], ['fixture4', html4],
+  ['fixture5', html5], ['fixture6', html6], ['fixture7', html7], ['fixture8', html8],
+  ['fixture9', html9], ['frontier', htmlFrontier],
+]) {
+  check(!html.includes('innerHTML'), name + ': INJECTION POSTURE: no innerHTML usage anywhere in the rendered document');
+  check(!html.includes('insertAdjacentHTML'), name + ': INJECTION POSTURE: no insertAdjacentHTML usage anywhere in the rendered document');
+  check(!html.includes('document.write'), name + ': INJECTION POSTURE: no document.write usage anywhere in the rendered document');
+}
+
+// --- buildPathMapData is exactly what renderPathMapHtml embeds (the
+//     refactor is a pure extraction, not a new shape) ---
+assert.deepStrictEqual(buildPathMapData(fixture1), extractData(html1), 'buildPathMapData(fixture1) is byte-identical to the DATA blob renderPathMapHtml(fixture1) actually embeds');
+passCount += 1;
+
+// =========================================================================
+// preserveTransformOnUpdate: pure, DOM-free "preserve, never re-derive"
+// invariant, unit-tested directly (mirrors the client-side algorithm of the
+// same name inside CLIENT_JS_TEXT, checked above via string presence).
+// =========================================================================
+assert.deepStrictEqual(preserveTransformOnUpdate({ scale: 2.5, panX: 10, panY: -5 }), { scale: 2.5, panX: 10, panY: -5 }, 'a real transform passes through completely unchanged');
+assert.deepStrictEqual(preserveTransformOnUpdate(null), { scale: 1, panX: 24, panY: 24 }, 'null -> the same defaults fitInitial() itself uses on a true first load');
+assert.deepStrictEqual(preserveTransformOnUpdate({}), { scale: 1, panX: 24, panY: 24 }, 'empty object -> defaults for every missing field');
+assert.deepStrictEqual(preserveTransformOnUpdate({ scale: 'not-a-number' }), { scale: 1, panX: 24, panY: 24 }, 'a non-number scale is treated as missing, not propagated as garbage');
+assert.deepStrictEqual(preserveTransformOnUpdate({ scale: 0.2, panX: 0, panY: 0 }), { scale: 0.2, panX: 0, panY: 0 }, 'falsy-but-valid numbers (0, MIN_SCALE) are preserved, not treated as missing');
+passCount += 5;
 
 console.log('apex-trace pathmap self-check: ' + passCount + ' assertions passed');

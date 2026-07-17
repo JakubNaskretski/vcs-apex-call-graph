@@ -52,6 +52,48 @@
 // contract, parse-error fallback now lives inside resolver.js itself
 // (files with FileFacts.parseError get lexical class-mention edges there,
 // via apexindex.strip). This file never touches apexindex.js directly.
+//
+// v0.9 / P2 (progressive depth + settings) -- CONTRACT AMENDMENT, additive
+// over everything above. This file owns:
+//   - contributes.configuration read-through (readSettings() below) for the
+//     5 new apexCallGraph.* settings (package.json, this round).
+//   - per-trace expansion state (a Set<methodKeyLower> per traceId) and the
+//     NATIVE lazy vscode.TreeItem expansion built on top of it -- see the
+//     "progressive-depth tree building" section below (buildTreeForTarget/
+//     expandFrontierKey) and LOAD_MORE_COMMAND's registerCommand in
+//     activate().
+//   - the Path Map webview's mirrored 'expand' message -> postMessage
+//     'update' path (postPathMapUpdate below), so a click on the map's own
+//     '+N' pill (pathmap.js's job to render) never re-sets the whole
+//     webview .html (which would blow away the user's pan/zoom).
+//
+// P1 (resolver.js) amends buildCallerTree/buildCalleeTree's opts with
+// `initialDepth` and `expandedKeys` (an iterable of methodKeyLower
+// strings, resolver.js's own internal `${classLower}#${methodLower}`
+// cycleKey convention), and TNode with `expandable`/`pendingCount` on a
+// depth-frontier node. Confirmed against the LANDED resolver.js:
+// `methodKey` is NOT stamped onto TNode as an explicit field (the internal
+// cycleKey stays private to resolver.js) -- P3 (uitree.js) instead exports
+// `frontierMethodKey(node)`, which derives the identical string from a
+// node's own `className`/`methodLower` fields (falling back to an explicit
+// `node.methodKey` if one is ever present), and this file imports + reuses
+// that SAME function everywhere it needs a node's identity (see the
+// require() above), rather than re-deriving it independently -- the one
+// thing that guarantees extension.js, uitree.js, and pathmap.js always
+// agree on one node's key string. uitree.js's shapeNode also appends a
+// SYNTHETIC load-more child (`loadMore:true`, `expandKey:'<key>'`) as the
+// sole entry in an expandable node's shaped `children` -- see toTreeItem's
+// `uiNode.loadMore` branch below for how this file wires that child's click
+// to LOAD_MORE_COMMAND. pathmap.js's client mirrors the same
+// frontierMethodKey derivation for its own '+N' pill and posts
+// {type:'expand', key} -- see showPathMapPanel's onDidReceiveMessage below.
+// pathmap.js is additionally expected to export `buildPathMapData(tree)`
+// (the same data blob renderPathMapHtml embeds inline, extracted so an
+// 'update' postMessage can ship just the data); guarded via a `typeof`
+// check, same idiom this file already uses for metascan.stripOwnNamespace
+// (v0.8 N3) above, so a pathmap.js build that hasn't landed this specific
+// export yet degrades to a full HTML re-set instead of breaking (see
+// postPathMapUpdate below).
 
 const vscode = require('vscode');
 const crypto = require('crypto');
@@ -60,10 +102,77 @@ const resolver = require('./resolver');
 const metascan = require('./metascan');
 const cachestore = require('./cachestore');
 const targets = require('./targets');
-const { shapeResult, shapeHeaderLines, effectiveOrientation } = require('./uitree');
-const { renderPathMapHtml } = require('./pathmap');
+const {
+  shapeResult,
+  shapeHeaderLines,
+  effectiveOrientation,
+  // v0.9 / P1/P3: shapeNode shapes ONE raw TNode (recursively) into a
+  // UiNode -- used to re-shape just the freshly-expanded node after a
+  // load-more click, instead of re-shaping (and re-diffing against) the
+  // whole tree. frontierMethodKey is the SAME methodKeyLower derivation
+  // uitree.js's own shapeLoadMoreChild uses to stamp UiNode.expandKey, and
+  // pathmap.js's client mirrors verbatim for its own '+N' pill's postMessage
+  // -- reusing it here (rather than re-deriving independently) is what
+  // guarantees extension.js, uitree.js, and pathmap.js always agree on one
+  // node's identity string.
+  shapeNode,
+  frontierMethodKey,
+} = require('./uitree');
+const { renderPathMapHtml, buildPathMapData } = require('./pathmap');
+
+// v0.9 / P2: internal-only command id (never listed in package.json's
+// contributes.commands -- it has no business appearing in the Command
+// Palette) that a tree-view load-more TreeItem's `.command` points at, see
+// toTreeItem's `uiNode.loadMore` branch below and this id's
+// registerCommand call in activate().
+const LOAD_MORE_COMMAND = 'apexTrace._loadMoreChildren';
 
 const MAX_DEPTH = 8;
+
+// v0.9 / P2: contributes.configuration section id (package.json, this
+// round) and the same 4 numeric defaults resolver.js's own
+// DEFAULT_MAX_DEPTH/DEFAULT_MAX_NODES already use internally (MAX_DEPTH
+// above mirrors DEFAULT_MAX_DEPTH) -- kept in sync deliberately so a
+// workspace that never opens Settings sees byte-identical maxDepth/maxNodes
+// behavior to pre-v0.9, and the only NEW user-visible default is
+// initialDepth (progressive rendering starts collapsed at depth 2 instead
+// of eagerly materializing the whole maxDepth=8 tree).
+const CONFIG_SECTION = 'apexCallGraph';
+const DEFAULT_INITIAL_DEPTH = 2;
+const DEFAULT_EXPAND_STEP = 1;
+const DEFAULT_MAX_NODES_SETTING = 2000;
+
+// v0.9 / P2: reads the 5 apexCallGraph.* settings fresh via
+// vscode.workspace.getConfiguration -- called at the start of every
+// scanAndBuildIndex() (a real trace) AND right before every tree-only
+// rebuild that doesn't rescan (orientation toggle, a frontier-node
+// expand click), so an edit in Settings takes effect on the very next
+// resolver call either way, same "re-discovered fresh every run"
+// philosophy as discoverPackageMap() below. Values are defensively
+// clamped to the package.json schema's own min/max: a workspace/user
+// settings.json can still hand-write an out-of-range or wrong-type value,
+// bypassing the Settings UI's own validation, and a malformed setting
+// should degrade to the nearest valid default rather than produce
+// surprising resolver.js behavior (e.g. a negative/NaN maxNodes).
+function readSettings() {
+  const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION);
+  const clampInt = (value, lo, hi, dflt) => {
+    const n = Math.round(Number(value));
+    if (!Number.isFinite(n)) return dflt;
+    return Math.min(hi, Math.max(lo, n));
+  };
+  const rawExcludes = cfg.get('excludeGlobs');
+  const excludeGlobs = Array.isArray(rawExcludes)
+    ? rawExcludes.filter((g) => typeof g === 'string' && g.trim().length > 0)
+    : [];
+  return {
+    initialDepth: clampInt(cfg.get('initialDepth'), 1, 8, DEFAULT_INITIAL_DEPTH),
+    expandStep: clampInt(cfg.get('expandStep'), 1, 4, DEFAULT_EXPAND_STEP),
+    maxDepth: clampInt(cfg.get('maxDepth'), 1, 20, MAX_DEPTH),
+    maxNodes: clampInt(cfg.get('maxNodes'), 100, 20000, DEFAULT_MAX_NODES_SETTING),
+    excludeGlobs,
+  };
+}
 
 // v0.7.1: workspaceState key persisting the caller-tree ORIENTATION toggle
 // ('target-first' | 'entry-first') across sessions -- see uitree.js's
@@ -130,10 +239,16 @@ class TraceProvider {
     this._emitter = new vscode.EventEmitter();
     this.onDidChangeTreeData = this._emitter.event;
     this._roots = []; // UiNode[]
+    this._traceId = 0;
   }
 
-  setRoots(uiNodes) {
+  // `traceId` (v0.9 / P2) is stamped onto every TreeItem this render
+  // produces (see toTreeItem below) so a LATER load-more click against one
+  // of them can tell whether it still belongs to the CURRENT trace -- see
+  // the staleness guard on LOAD_MORE_COMMAND's handler in activate() below.
+  setRoots(uiNodes, traceId) {
     this._roots = uiNodes || [];
+    this._traceId = traceId || 0;
     this._emitter.fire();
   }
 
@@ -142,15 +257,43 @@ class TraceProvider {
   }
 
   getChildren(el) {
-    if (!el) return this._roots.map(toTreeItem);
+    if (!el) return this._roots.map((n) => toTreeItem(n, this._traceId));
     return el._uiChildren || [];
+  }
+
+  // v0.9 / P2: targeted refresh -- tells vscode ONE element's own rendering
+  // (and, since vscode re-fetches, its children) may have changed, without
+  // disturbing any sibling/ancestor TreeItem elsewhere in the tree.
+  // LOAD_MORE_COMMAND's handler (activate(), below) calls this after
+  // mutating a frontier node's TreeItem in place. Contrast with setRoots'
+  // un-targeted fire(), a full-tree refresh reserved for an actual new
+  // trace.
+  refresh(el) {
+    this._emitter.fire(el);
   }
 }
 
 // UiNode.jump.line is still 1-based (uitree.js is pure and never touches
 // vscode types — see its header comment); vscode.Position/Range are
 // 0-based, so the conversion happens right here, at the boundary.
-function toTreeItem(uiNode) {
+//
+// v0.9 / P2: `traceId` is threaded through purely so a load-more click can
+// be checked against the CURRENT trace (see LOAD_MORE_COMMAND's handler
+// below); it has no effect on rendering. `parent` (also new) is the
+// enclosing TreeItem this call is building children FOR -- passed through
+// only so a `uiNode.loadMore` child (see below) can capture it as the
+// element its own click handler must mutate + refresh.
+//
+// Per the LANDED P1/P3 contract (uitree.js's shapeNode/shapeLoadMoreChild):
+// a frontier (uiNode.expandable) node's real `children` are simply empty,
+// and shapeNode has already appended exactly ONE synthetic item
+// (uiNode.loadMore:true, uiNode.expandKey:'<methodKeyLower>') as that
+// node's sole child -- so this function needs NO special-casing for
+// `expandable` at all; the existing eager recursive shaping already
+// renders that one synthetic child like any other UiNode. The only new
+// branch is for the synthetic child ITSELF: instead of a jump-to-source
+// command, it gets the internal load-more command wired below.
+function toTreeItem(uiNode, traceId, parent) {
   const it = new vscode.TreeItem(
     uiNode.label,
     uiNode.collapsible ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
@@ -158,9 +301,18 @@ function toTreeItem(uiNode) {
   it.description = uiNode.description;
   if (uiNode.tooltip) it.tooltip = uiNode.tooltip;
   if (uiNode.iconId) it.iconPath = new vscode.ThemeIcon(uiNode.iconId);
-  const kids = (uiNode.children || []).map(toTreeItem);
+  it._traceId = traceId || 0;
+  const kids = (uiNode.children || []).map((n) => toTreeItem(n, traceId, it));
   it._uiChildren = kids;
-  if (uiNode.jump) {
+  if (uiNode.loadMore) {
+    // v0.9 / P2<->P1/P3: uitree.js's shapeLoadMoreChild's own header note
+    // explicitly hands this wiring to extension.js ("add expandKey to
+    // opts.expandedKeys, re-trace, replace this node's children with the
+    // fresh result") -- `parent` is THIS item's enclosing TreeItem (the
+    // frontier node itself), the element LOAD_MORE_COMMAND's handler must
+    // mutate + refresh.
+    it.command = { command: LOAD_MORE_COMMAND, title: 'Load more', arguments: [uiNode.expandKey, traceId, parent] };
+  } else if (uiNode.jump) {
     const line = Math.max(0, (uiNode.jump.line || 1) - 1);
     const col = Math.max(0, uiNode.jump.col || 0);
     it.command = openCommand(uiNode.jump.path, line, col);
@@ -176,7 +328,24 @@ function openCommand(fsPath, line, col) {
   };
 }
 
-async function scanWorkspaceUris() {
+// v0.9 / P2: appends `extraGlobs` (apexCallGraph.excludeGlobs) onto a
+// builtin '{a,b,c}' brace-list exclude pattern. `extraGlobs` is expected to
+// already be individual glob strings (readSettings() already filtered out
+// non-string/blank entries) with no embedded commas of their own -- a glob
+// containing a literal comma would need its own brace-expansion, which is
+// rare enough for an exclude pattern that this naive split/join is not
+// worth complicating for. Returns `builtinPattern` completely unchanged
+// when there is nothing to append, so a workspace that never sets
+// excludeGlobs (the overwhelmingly common case) scans byte-identically to
+// pre-v0.9.
+function combineExcludePattern(builtinPattern, extraGlobs) {
+  if (!extraGlobs || !extraGlobs.length) return builtinPattern;
+  const inner = builtinPattern.replace(/^\{/, '').replace(/\}$/, '');
+  const parts = inner.split(',').concat(extraGlobs);
+  return '{' + parts.join(',') + '}';
+}
+
+async function scanWorkspaceUris(excludeGlobs) {
   // .sfdx/.sf hold the StandardApexLibrary platform stubs — indexing those
   // would shadow real classes with same-named stubs.
   // v0.5 (G4): '**/*.apex' added alongside .cls/.trigger -- anonymous Apex
@@ -184,9 +353,11 @@ async function scanWorkspaceUris() {
   // parser.parseFile the same way .cls/.trigger do; parser.js (out of scope
   // here) is what special-cases the .apex extension into anonymousUnit()
   // parsing. Same excludes as the pre-existing .cls/.trigger scan.
+  // v0.9 / P2: `excludeGlobs` (apexCallGraph.excludeGlobs) is appended via
+  // combineExcludePattern above -- see readSettings()'s header note.
   return vscode.workspace.findFiles(
     '**/*.{cls,trigger,apex}',
-    '{**/node_modules/**,**/.sfdx/**,**/.sf/**,**/.git/**}'
+    combineExcludePattern('{**/node_modules/**,**/.sfdx/**,**/.sf/**,**/.git/**}', excludeGlobs)
   );
 }
 
@@ -194,8 +365,8 @@ async function scanWorkspaceUris() {
 // new), reuses cached FileFacts for everything else, and prunes cache
 // entries for files no longer present. Returns the facts list plus counts
 // for the progress notification.
-async function scanAndParse(progress) {
-  const uris = await scanWorkspaceUris();
+async function scanAndParse(progress, excludeGlobs) {
+  const uris = await scanWorkspaceUris(excludeGlobs);
   const seen = new Set();
   const factsList = [];
   let parsed = 0;
@@ -272,8 +443,12 @@ const META_GLOBS = [
   '**/customMetadata/**/*.md-meta.xml',
 ];
 
-async function scanMetaWorkspaceUris() {
-  const results = await Promise.all(META_GLOBS.map((g) => vscode.workspace.findFiles(g, META_GLOB_EXCLUDE)));
+// v0.9 / P2: `excludeGlobs` folded into META_GLOB_EXCLUDE via
+// combineExcludePattern -- same apexCallGraph.excludeGlobs setting the Apex
+// scan above uses, so one setting covers both scans.
+async function scanMetaWorkspaceUris(excludeGlobs) {
+  const excludePattern = combineExcludePattern(META_GLOB_EXCLUDE, excludeGlobs);
+  const results = await Promise.all(META_GLOBS.map((g) => vscode.workspace.findFiles(g, excludePattern)));
   const seen = new Set();
   const uris = [];
   for (const arr of results) {
@@ -290,8 +465,8 @@ async function scanMetaWorkspaceUris() {
 // file into { path, text } pairs -- extraction itself (metascan.js) happens
 // separately in computeMetaRefs, since Aura needs cross-file bundle context
 // that isn't available file-by-file.
-async function scanMetaFiles(progress) {
-  const uris = await scanMetaWorkspaceUris();
+async function scanMetaFiles(progress, excludeGlobs) {
+  const uris = await scanMetaWorkspaceUris(excludeGlobs);
   const seen = new Set();
   const files = [];
   let read = 0;
@@ -837,6 +1012,126 @@ async function resolveTarget(index, direction) {
   return target;
 }
 
+// =========================================================================
+// v0.9 / P2: progressive-depth tree building. Every function in this
+// section is a plain function of its arguments (no vscode, no closure over
+// activate()'s session state) so it can be called identically from
+// LOAD_MORE_COMMAND's tree-view handler and the Path Map webview's
+// 'expand' message handler -- see their wiring inside activate() below.
+// =========================================================================
+
+// Shared resolver.js call shape used by a fresh trace (traceTarget),
+// orientation-toggle's expansion-reset rebuild, and expandFrontierKey's
+// stepped lazy-expansion rebuilds. `expandedKeys` is passed straight
+// through as opts.expandedKeys per the P1 CONTRACT AMENDMENT; against a
+// pre-P1 resolver.js (which does not read initialDepth/expandedKeys yet)
+// these are simply inert extra opts properties -- the whole tree
+// materializes eagerly up to maxDepth, exactly like pre-v0.9, until P1
+// lands.
+function buildTreeForTarget(index, target, dir, settings, expandedKeys) {
+  const opts = {
+    maxDepth: settings.maxDepth,
+    maxNodes: settings.maxNodes,
+    initialDepth: settings.initialDepth,
+    expandedKeys,
+  };
+  return dir === 'callees' ? resolver.buildCalleeTree(index, target, opts) : resolver.buildCallerTree(index, target, opts);
+}
+
+// v0.9 / P1<->P2 sub-contract: resolver.js's TNode does NOT stamp an
+// explicit `methodKey` identity field (confirmed against the landed
+// resolver.js -- its cycleKey stays purely internal); uitree.js's exported
+// frontierMethodKey() is the authoritative derivation both this file and
+// uitree.js's own shapeLoadMoreChild use, so every key this file computes
+// or compares is guaranteed to agree with the `expandKey` uitree.js/
+// pathmap.js already stamped onto their own synthetic load-more items. Not
+// gated on `node.expandable` here -- unlike directFrontierChildKeys below,
+// this needs to re-locate a node REGARDLESS of whether it is currently
+// frontier (the just-expanded node, mid-expandStep-loop, no longer is).
+//
+// Walks a raw TNode tree collecting every node whose derived key is in
+// `keySet` into `out` (Map<key, TNode>) -- used by expandFrontierKey to
+// re-locate, in a FRESHLY rebuilt tree, the exact node(s) whose key(s) were
+// just added to expandedKeys.
+function collectNodesByKeys(node, keySet, out) {
+  if (!node) return;
+  const key = frontierMethodKey(node);
+  if (key && keySet.has(key) && !out.has(key)) out.set(key, node);
+  for (const c of node.children || []) collectNodesByKeys(c, keySet, out);
+}
+
+// Direct (non-recursive) children of `nodes` that are themselves still
+// frontier (expandable:true) -- exactly the set expandStep's next
+// iteration should add, per P1's "engine stays single-level" design (see
+// expandFrontierKey's own header note below). Gated on `c.expandable`
+// (unlike collectNodesByKeys above) since only a genuinely-still-frontier
+// child is a meaningful next-round target.
+function directFrontierChildKeys(nodes) {
+  const keys = new Set();
+  for (const n of nodes) {
+    for (const c of n.children || []) {
+      if (!c || !c.expandable) continue;
+      const key = frontierMethodKey(c);
+      if (key) keys.add(key);
+    }
+  }
+  return keys;
+}
+
+// v0.9 / P1<->P2 CONTRACT: implements the expandStep mechanics P1's own
+// text documents as the CALLER's job -- "the engine stays single-level"
+// (adding one key to expandedKeys exposes only THAT node's own direct
+// children; grandchildren beyond initialDepth stay frontier), so loading
+// `settings.expandStep` levels on a single click is done here by looping:
+// add the clicked key, rebuild, look at exactly the just-exposed node's
+// direct children for any that are STILL frontier, add those too, and
+// repeat (expandStep - 1) more times (stopping early once nothing new is
+// exposed, e.g. a branch that bottoms out before reaching expandStep
+// levels). Mutates `expandedKeys` in place (the CALLER's per-trace Set) and
+// returns the final rebuilt TreeResult.
+function expandFrontierKey(index, target, dir, settings, expandedKeys, clickedKey) {
+  const step = Math.max(1, (settings && settings.expandStep) || 1);
+  let keysToAdd = new Set([clickedKey]);
+  let tree = null;
+  for (let i = 0; i < step && keysToAdd.size; i++) {
+    for (const k of keysToAdd) expandedKeys.add(k);
+    tree = buildTreeForTarget(index, target, dir, settings, expandedKeys);
+    const justExpanded = new Map();
+    collectNodesByKeys(tree.root, keysToAdd, justExpanded);
+    keysToAdd = directFrontierChildKeys([...justExpanded.values()]);
+  }
+  return tree || buildTreeForTarget(index, target, dir, settings, expandedKeys);
+}
+
+// Finds the raw TNode matching `key` anywhere under `root` (depth-first) --
+// used to re-locate the SPECIFIC node a load-more click just expanded, so
+// only ITS subtree needs re-shaping (via uitree.shapeNode), not the whole
+// tree.
+function findRawNodeByKey(root, key) {
+  if (!root) return null;
+  if (frontierMethodKey(root) === key) return root;
+  for (const c of root.children || []) {
+    const found = findRawNodeByKey(c, key);
+    if (found) return found;
+  }
+  return null;
+}
+
+// v0.9 / P2<->P4 sub-contract: ships an incremental 'update' postMessage to
+// an already-open Path Map panel instead of re-setting its whole .html
+// (which would discard the user's current pan/zoom -- see P4's own CONTRACT
+// AMENDMENT text). pathmap.buildPathMapData is P4's job to add; guarded via
+// typeof, same idiom this file already uses for metascan.stripOwnNamespace
+// (v0.8 N3) -- until it lands, this safely falls back to the pre-v0.9 full
+// HTML re-set so the feature degrades instead of breaking.
+function postPathMapUpdate(panel, tree) {
+  if (typeof buildPathMapData === 'function') {
+    panel.webview.postMessage({ type: 'update', data: buildPathMapData(tree) });
+  } else {
+    panel.webview.html = renderPathMapHtml(tree);
+  }
+}
+
 async function activate(context) {
   const provider = new TraceProvider();
   const view = vscode.window.createTreeView('apexTraceView', { treeDataProvider: provider });
@@ -883,8 +1178,64 @@ async function activate(context) {
   // toggle; nothing about the underlying result changes). Deliberately NOT
   // used by showPathMap: H6a's "always re-derive the map from a fresh
   // scan" decision stands unchanged.
-  let lastRender = null; // { tree, scan, dir }
+  // v0.9 / P2: gains `index`/`target`/`traceId` -- both the orientation-
+  // toggle rebuild and the frontier-expand handlers (getChildren/the map's
+  // 'expand' message, wired below) need to call resolver.js again against
+  // the SAME already-built index/target without re-scanning.
+  let lastRender = null; // { tree, scan, dir, index, target, traceId }
   let mapPanel = null; // singleton webview panel
+
+  // v0.9 / P2: per-trace expansion state -- see this file's header note on
+  // the P1 CONTRACT AMENDMENT for the full progressive-depth design.
+  // `expandedKeysByTrace` maps a monotonically increasing traceId to the
+  // Set<methodKeyLower> of frontier nodes the user has clicked open for
+  // THAT trace. Keyed by traceId (not just "the current Set") so a
+  // getChildren/onDidReceiveMessage callback captured by an OLD TreeItem or
+  // a queued webview message from a trace that has since been superseded
+  // (a new trace, a direction toggle) can detect it is stale -- its
+  // captured traceId no longer matches currentTraceId -- and no-op instead
+  // of expanding against a dead index/target. Only the CURRENT trace's
+  // entry is ever kept; a new one clears the map, since nothing reads a
+  // non-current trace's expansion set.
+  let currentTraceId = 0;
+  const expandedKeysByTrace = new Map();
+
+  // A brand-new trace (a fresh target resolution, a direction toggle via
+  // retraceLastTarget) always starts with ZERO expanded frontier nodes --
+  // "state resets on re-trace/direction" per the CONTRACT AMENDMENT.
+  function newTraceState() {
+    currentTraceId += 1;
+    expandedKeysByTrace.clear();
+    expandedKeysByTrace.set(currentTraceId, new Set());
+    return currentTraceId;
+  }
+
+  // Orientation toggle keeps the SAME trace (same target/direction, no
+  // re-scan) but per the CONTRACT AMENDMENT still "resets expansion state"
+  // -- see apexTrace.toggleOrientation below for why (re-rooting a tree
+  // that mixes fully-expanded-by-click branches with frontier stubs is
+  // exactly the ambiguity this sidesteps). Clears the CURRENT trace's Set
+  // in place rather than allocating a new traceId, since it is still,
+  // conceptually, the same trace.
+  function resetCurrentExpansion() {
+    let s = expandedKeysByTrace.get(currentTraceId);
+    if (!s) {
+      s = new Set();
+      expandedKeysByTrace.set(currentTraceId, s);
+    } else {
+      s.clear();
+    }
+    return s;
+  }
+
+  function currentExpandedKeys() {
+    let s = expandedKeysByTrace.get(currentTraceId);
+    if (!s) {
+      s = new Set();
+      expandedKeysByTrace.set(currentTraceId, s);
+    }
+    return s;
+  }
 
   // Scans the workspace (Apex + metadata) and builds the semantic index --
   // the shared first half of both computeTrace (interactive target
@@ -892,9 +1243,16 @@ async function activate(context) {
   // QuickPick). Returns null (having already shown the appropriate warning)
   // when there is nothing to scan.
   async function scanAndBuildIndex() {
+    // v0.9 / P2: read the 5 apexCallGraph.* settings ONCE at the top of
+    // this scan+index call -- excludeGlobs feeds both scans below;
+    // initialDepth/expandStep/maxDepth/maxNodes ride along on the returned
+    // object so traceTarget builds its tree against the SAME snapshot the
+    // scan itself used (a rare mid-scan settings edit can't produce a
+    // mismatched exclude-vs-depth result within one trace operation).
+    const settings = readSettings();
     const scan = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: 'Apex Call Graph: indexing workspace…' },
-      (progress) => scanAndParse(progress)
+      (progress) => scanAndParse(progress, settings.excludeGlobs)
     );
     if (!scan.factsList.length) {
       vscode.window.showWarningMessage('Apex Call Graph: no .cls/.trigger/.apex files in this workspace.');
@@ -912,7 +1270,7 @@ async function activate(context) {
     try {
       const metaScan = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'Apex Call Graph: indexing metadata (LWC/Aura/Flow/OmniScript)…' },
-        (progress) => scanMetaFiles(progress)
+        (progress) => scanMetaFiles(progress, settings.excludeGlobs)
       );
       metaRefs = computeMetaRefs(metaScan.files);
     } catch (e) {
@@ -988,7 +1346,7 @@ async function activate(context) {
         : metaRefs;
     const index = resolver.buildSemanticIndex(scan.factsList, { packageOf, defaultPackage, ownNamespace });
     resolver.attachMetaCallers(index, strippedMetaRefs);
-    return { index, scan };
+    return { index, scan, settings };
   }
 
   // Builds the tree for a KNOWN target against an already-built index, and
@@ -1015,8 +1373,12 @@ async function activate(context) {
   // state deliberately renders BYTE-IDENTICALLY to pre-v0.7.1 (no suffix,
   // no header line) -- absence of the marker means the default, and the
   // toggle command's own toast announces every switch.
-  function renderTraceResult(tree, scan, dir) {
-    provider.setRoots(shapeResult(tree, orientation));
+  // v0.9 / P2: `traceId` (see newTraceState/currentTraceId above) is
+  // threaded through to provider.setRoots so every TreeItem this render
+  // produces is stamped with the trace it belongs to -- needed by the
+  // staleness guard on LOAD_MORE_COMMAND's handler below.
+  function renderTraceResult(tree, scan, dir, traceId) {
+    provider.setRoots(shapeResult(tree, orientation), traceId);
     const directionLabel = dir === 'callees' ? 'callees of' : 'callers of';
     const orientationSuffix = effectiveOrientation(tree, orientation) === 'entry-first' ? ' — entry-first' : '';
     view.description = `${directionLabel} ${tree.targetLabel}${orientationSuffix} (parsed ${scan.parsed}, cached ${scan.cached})`;
@@ -1030,18 +1392,24 @@ async function activate(context) {
     view.message = headerLines.length ? headerLines.join('  •  ') : undefined;
   }
 
-  function traceTarget(index, scan, target, direction) {
+  // v0.9 / P2: `settings` comes from the SAME scanAndBuildIndex() call that
+  // produced `index`/`scan` (see computeTrace/retraceLastTarget below) --
+  // maxDepth/maxNodes/initialDepth now come from apexCallGraph.* settings
+  // instead of the old hardcoded `{ maxDepth: MAX_DEPTH }`. A brand-new
+  // trace always starts with a FRESH, empty expansion Set (newTraceState())
+  // -- "state resets on re-trace/direction" per the CONTRACT AMENDMENT;
+  // apexTrace.toggleDirection reaches this via retraceLastTarget, so it
+  // gets the same fresh-state treatment for free.
+  function traceTarget(index, scan, target, direction, settings) {
     const dir = direction === 'callees' ? 'callees' : 'callers';
-    const tree =
-      dir === 'callees'
-        ? resolver.buildCalleeTree(index, target, { maxDepth: MAX_DEPTH })
-        : resolver.buildCallerTree(index, target, { maxDepth: MAX_DEPTH });
+    const traceId = newTraceState();
+    const tree = buildTreeForTarget(index, target, dir, settings, currentExpandedKeys());
     if (!tree || !tree.root) {
       vscode.window.showWarningMessage('Apex Call Graph: could not resolve that target.');
       return null;
     }
 
-    renderTraceResult(tree, scan, dir);
+    renderTraceResult(tree, scan, dir, traceId);
     vscode.commands.executeCommand('setContext', 'apexTrace.hasResults', true);
     vscode.commands.executeCommand('setContext', 'apexTrace.direction', dir);
 
@@ -1062,7 +1430,13 @@ async function activate(context) {
     lastDirection = dir;
     // v0.7.1: everything toggleOrientation needs to re-render without a
     // re-scan (the path map deliberately excluded -- see lastRender's decl).
-    lastRender = { tree, scan, dir };
+    // v0.9 / P2: `index`/`target`/`traceId` added -- the orientation-toggle
+    // rebuild and the frontier-expand handlers (wired below) need them to
+    // call resolver.js again without re-scanning.
+    lastRender = { tree, scan, dir, index, target, traceId };
+    // A brand-new trace is genuinely new content -- always a full HTML
+    // re-set (never the incremental postMessage path, which is reserved
+    // for an in-place frontier expand -- see postPathMapUpdate above).
     if (mapPanel) mapPanel.webview.html = renderPathMapHtml(tree);
     return tree;
   }
@@ -1075,7 +1449,7 @@ async function activate(context) {
     if (!built) return null;
     const target = await resolveTarget(built.index, direction);
     if (!target) return null;
-    return traceTarget(built.index, built.scan, target, direction);
+    return traceTarget(built.index, built.scan, target, direction, built.settings);
   }
 
   // H6a: re-runs scanAndParse + rebuilds the index/tree for the last
@@ -1091,8 +1465,46 @@ async function activate(context) {
     if (!lastTarget) return null;
     const built = await scanAndBuildIndex();
     if (!built) return null;
-    return traceTarget(built.index, built.scan, lastTarget, direction || lastDirection);
+    return traceTarget(built.index, built.scan, lastTarget, direction || lastDirection, built.settings);
   }
+
+  // v0.9 / P2: the tree view's half of the progressive-depth contract --
+  // registered once (after traceTarget/lastRender/currentExpandedKeys exist
+  // as closures), invoked via LOAD_MORE_COMMAND's TreeItem.command on the
+  // synthetic load-more child uitree.js's shapeLoadMoreChild appends to a
+  // frontier node's shaped children (see toTreeItem's `uiNode.loadMore`
+  // branch above for how `expandKey`/`traceId`/`parentItem` get captured).
+  // A stale-trace click (traceId no longer current -- see currentTraceId's
+  // header note above), or one with nothing to expand against (no
+  // lastRender yet, or the freshly rebuilt tree no longer contains this
+  // key), is a safe no-op -- the tree view simply stays as it was.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(LOAD_MORE_COMMAND, (expandKey, traceId, parentItem) => {
+      if (!expandKey || !parentItem || !lastRender || traceId !== currentTraceId) return;
+      const settings = readSettings();
+      const expandedKeys = currentExpandedKeys();
+      const tree = expandFrontierKey(lastRender.index, lastRender.target, lastRender.dir, settings, expandedKeys, expandKey);
+      if (!tree || !tree.root) return;
+      lastRender.tree = tree;
+      const rawNode = findRawNodeByKey(tree.root, expandKey);
+      if (!rawNode) return;
+      const targetPackage = tree.root.package || null;
+      const freshUiNode = shapeNode(rawNode, targetPackage, orientation, tree.direction);
+      // Refresh the CLICKED node's own TreeItem in place (same object
+      // identity vscode already holds a reference to -- see
+      // TraceProvider.refresh's own note) with its now-real children,
+      // which replace the single load-more stub that was there before.
+      parentItem.label = freshUiNode.label;
+      parentItem.description = freshUiNode.description;
+      parentItem.tooltip = freshUiNode.tooltip || undefined;
+      parentItem.iconPath = freshUiNode.iconId ? new vscode.ThemeIcon(freshUiNode.iconId) : undefined;
+      parentItem.collapsibleState = freshUiNode.collapsible
+        ? vscode.TreeItemCollapsibleState.Collapsed
+        : vscode.TreeItemCollapsibleState.None;
+      parentItem._uiChildren = (freshUiNode.children || []).map((n) => toTreeItem(n, traceId, parentItem));
+      provider.refresh(parentItem);
+    })
+  );
 
   function showPathMapPanel(tree) {
     if (!mapPanel) {
@@ -1112,6 +1524,29 @@ async function activate(context) {
             selection: new vscode.Range(line, col, line, col),
             viewColumn: vscode.ViewColumn.One,
           });
+          return;
+        }
+        // v0.9 / P2<->P4: the map's own '+N' pill click posts
+        // {type:'expand', key} (pathmap.js's client-side requestExpand,
+        // key = its own frontierMethodKey mirror -- same derivation
+        // uitree.js/this file use, see the require() header note above).
+        // Drives the SAME per-trace expandedKeys Set the tree view's
+        // LOAD_MORE_COMMAND handler uses (registered above) -- a node
+        // expanded from either surface counts as expanded for both, even
+        // though this round does not live-push one surface's expansion
+        // into the other's already-rendered view. A stale message
+        // (mapPanel reused across a re-trace, msg.key referring to a node
+        // from a trace that no longer exists) is handled the same
+        // defensive way expandFrontierKey/findRawNodeByKey always do: "not
+        // found in the current tree" just yields no update.
+        if (msg && msg.type === 'expand' && msg.key && lastRender) {
+          const settings = readSettings();
+          const expandedKeys = currentExpandedKeys();
+          const tree = expandFrontierKey(lastRender.index, lastRender.target, lastRender.dir, settings, expandedKeys, msg.key);
+          if (tree && tree.root) {
+            lastRender.tree = tree;
+            postPathMapUpdate(mapPanel, tree);
+          }
         }
       });
     }
@@ -1171,8 +1606,29 @@ async function activate(context) {
       orientation = orientation === 'entry-first' ? 'target-first' : 'entry-first';
       await context.workspaceState.update(ORIENTATION_KEY, orientation);
       if (lastRender) {
-        // Re-render only -- no scan, no index rebuild, no resolver call.
-        renderTraceResult(lastRender.tree, lastRender.scan, lastRender.dir);
+        // v0.9 / P2: still no re-scan (readSettings()/buildTreeForTarget
+        // below are pure resolver.js calls against the already-built
+        // lastRender.index -- no vscode.workspace.fs I/O). Per the CONTRACT
+        // AMENDMENT ("orientation toggle reset[s] expansion state"), any
+        // progressive-depth clicks made under the OLD orientation are
+        // discarded first: re-rooting a tree that mixes fully-expanded-by-
+        // click branches with frontier stubs is exactly the ambiguity this
+        // sidesteps, so the new orientation always starts back at a clean
+        // initialDepth. One extra (cheap) resolver call, nowhere near the
+        // cost of an actual re-scan.
+        const expandedKeys = resetCurrentExpansion();
+        const settings = readSettings();
+        const tree = buildTreeForTarget(lastRender.index, lastRender.target, lastRender.dir, settings, expandedKeys);
+        // Defensive: the SAME index/target that already produced
+        // lastRender.tree once cannot legitimately fail to resolve the
+        // second time (nothing here touches the workspace or the index),
+        // but never swap in a broken result over a known-good one if that
+        // invariant is ever violated.
+        if (tree && tree.root) {
+          lastRender.tree = tree;
+          renderTraceResult(tree, lastRender.scan, lastRender.dir, currentTraceId);
+          if (mapPanel) mapPanel.webview.html = renderPathMapHtml(tree);
+        }
       }
       vscode.window.showInformationMessage(
         orientation === 'entry-first'

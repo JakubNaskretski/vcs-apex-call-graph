@@ -2,14 +2,16 @@
   "name": "apex-call-graph",
   "displayName": "Apex Call Graph",
   "description": "Trace who calls an Apex class or method — with the arguments at every call site — up to trigger/LWC/Flow/API entry points. Traces Flow, LWC, Aura and OmniScript callers too. Offline static analysis: real Apex parser, no org connection, no language server.",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "publisher": "Skrety",
   "license": "MIT",
+  "icon": "plugin-icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
-    "Other"
+    "Programming Languages",
+    "Visualization"
   ],
   "keywords": [
     "apex",
@@ -106,7 +108,48 @@
         "view": "apexTraceView",
         "contents": "Trace who calls an Apex class or method, or what it calls out to.\n[Who Calls This?](command:apexTrace.traceCallers)\n[What Does This Call?](command:apexTrace.traceCallees)\n[Open Path Map](command:apexTrace.showPathMap)"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Apex Call Graph",
+      "properties": {
+        "apexCallGraph.initialDepth": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "How many levels deep a trace expands automatically before you have to click to load more. Lower values keep traces fast and readable on large orgs; raise it for smaller ones where you usually want the whole picture at once."
+        },
+        "apexCallGraph.expandStep": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 4,
+          "description": "How many extra levels a single click loads when you expand a collapsed (\"+N more\") node in the tree view or the Path Map."
+        },
+        "apexCallGraph.maxDepth": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Hard ceiling on trace depth, however far you click to expand."
+        },
+        "apexCallGraph.maxNodes": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 100,
+          "maximum": 20000,
+          "description": "Fair cap on the total number of nodes a single trace will materialize, to keep very large or highly-connected orgs responsive."
+        },
+        "apexCallGraph.excludeGlobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra glob patterns to exclude from workspace scanning, appended to the built-in excludes (node_modules, .sfdx, .sf, .git)."
+        }
+      }
+    }
   },
   "dependencies": {
     "@apexdevtools/apex-parser": "^5.1.0"

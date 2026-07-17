@@ -137,6 +137,24 @@ const DEFAULT_MAX_NODES = 2000;
 // tree AND any metadata/flow children are folded in).
 const ZERO_CALLER_NOTE = 'No callers found — this is likely an entry point or unused code.';
 
+// P1 (v0.9 progressive depth): shared opts-normalization for
+// buildCallerTree/buildExternalCallerTree/buildCalleeTree. initialDepth
+// defaults to maxDepth (== the ENTIRE tree auto-expands, exactly the
+// pre-v0.9 behavior -- the REGRESSION PIN this round is frozen against).
+// expandedKeys is caller-supplied as an iterable of methodKeyLower strings
+// ('classlower#methodlower', the SAME format buildOneChildNode's own
+// cycleKey already uses) -- normalized into a fresh Set (lowercased
+// defensively) so buildOneChildNode can do an O(1) `.has(cycleKey)` check
+// per node without re-deriving anything from opts on every call.
+function normalizeProgressiveOpts(opts, maxDepth) {
+  const initialDepth = (opts && opts.initialDepth != null) ? opts.initialDepth : maxDepth;
+  const userExpandedKeys = new Set();
+  if (opts && opts.expandedKeys) {
+    for (const k of opts.expandedKeys) userExpandedKeys.add(lc(k));
+  }
+  return { initialDepth, userExpandedKeys };
+}
+
 // Verbatim from the frozen spec's PLATFORM DENYLIST clause.
 const PLATFORM_DENYLIST = new Set([
   'system', 'database', 'test', 'schema', 'math', 'json', 'string', 'integer',
@@ -3471,6 +3489,7 @@ function catchMatchesException(index, catchEntry, tracingExceptionLower) {
 function buildCallerTree(index, target, opts) {
   const maxDepth = (opts && opts.maxDepth) || DEFAULT_MAX_DEPTH;
   const maxNodes = (opts && opts.maxNodes) || DEFAULT_MAX_NODES;
+  const { initialDepth, userExpandedKeys } = normalizeProgressiveOpts(opts, maxDepth); // P1
   const classLower = lc(target && target.classLower);
   const cm = index.classes.get(classLower);
 
@@ -3508,6 +3527,7 @@ function buildCallerTree(index, target, opts) {
         metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
         externalRefs: (index.stats && index.stats.externalRefs) || 0,
         externalNamespaces: (index.stats && index.stats.externalNamespaces) || [],
+        frontierNodes: 0, // P1: additive -- a not-found shell has no nodes at all.
       },
     };
   }
@@ -3608,7 +3628,10 @@ function buildCallerTree(index, target, opts) {
   // DFS recursion -- specifically so a maxNodes cap (when it fires) stops
   // fairly across all branches rather than fully draining whichever branch
   // happened to be visited first.
-  const ctx = { maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set(), direction: 'callers' };
+  const ctx = {
+    maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set(), direction: 'callers',
+    initialDepth, userExpandedKeys, frontierNodes: 0, // P1
+  };
   const queue = [];
   root.children = buildChildrenLevel(index, allPairs, 1, ancestorPath, classLower, excCtx, ctx, queue, root);
   while (queue.length) {
@@ -3644,6 +3667,7 @@ function buildCallerTree(index, target, opts) {
       metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
       externalRefs: (index.stats && index.stats.externalRefs) || 0,
       externalNamespaces: (index.stats && index.stats.externalNamespaces) || [],
+      frontierNodes: ctx.frontierNodes, // P1: count of nodes rendered expandable:true (depth-frontier boundary, distinct from capped).
     },
   };
 }
@@ -3658,6 +3682,7 @@ function buildCallerTree(index, target, opts) {
 function buildExternalCallerTree(index, key, ext, opts) {
   const maxDepth = (opts && opts.maxDepth) || DEFAULT_MAX_DEPTH;
   const maxNodes = (opts && opts.maxNodes) || DEFAULT_MAX_NODES;
+  const { initialDepth, userExpandedKeys } = normalizeProgressiveOpts(opts, maxDepth); // P1
   const root = {
     label: ext.label, kind: 'external', className: ext.label, path: '', line: 0,
     methodLower: null,
@@ -3669,7 +3694,10 @@ function buildExternalCallerTree(index, key, ext, opts) {
   const apexSites = (index.externalCallers instanceof Map ? index.externalCallers.get(key) : null) || [];
   const pairs = apexSites.map((site) => ({ site, targetMethodLower: null }));
 
-  const ctx = { maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set(), direction: 'callers' };
+  const ctx = {
+    maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set(), direction: 'callers',
+    initialDepth, userExpandedKeys, frontierNodes: 0, // P1
+  };
   const queue = [];
   root.children = buildChildrenLevel(index, pairs, 1, new Set(), key, null, ctx, queue, root);
   while (queue.length) {
@@ -3704,6 +3732,7 @@ function buildExternalCallerTree(index, key, ext, opts) {
       metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
       externalRefs: (index.stats && index.stats.externalRefs) || 0,
       externalNamespaces: (index.stats && index.stats.externalNamespaces) || [],
+      frontierNodes: ctx.frontierNodes, // P1
     },
   };
 }
@@ -3723,6 +3752,7 @@ function buildExternalCallerTree(index, key, ext, opts) {
 function buildCalleeTree(index, target, opts) {
   const maxDepth = (opts && opts.maxDepth) || DEFAULT_MAX_DEPTH;
   const maxNodes = (opts && opts.maxNodes) || DEFAULT_MAX_NODES;
+  const { initialDepth, userExpandedKeys } = normalizeProgressiveOpts(opts, maxDepth); // P1
   const classLower = lc(target && target.classLower);
   const cm = index.classes.get(classLower);
 
@@ -3749,6 +3779,7 @@ function buildCalleeTree(index, target, opts) {
         unresolvedSites: (index.stats && index.stats.unresolvedSites) || 0,
         metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
         externalRefs: (index.stats && index.stats.externalRefs) || 0,
+        frontierNodes: 0, // P1: additive -- a not-found shell has no nodes at all.
         externalNamespaces: (index.stats && index.stats.externalNamespaces) || [],
       },
     };
@@ -3836,6 +3867,7 @@ function buildCalleeTree(index, target, opts) {
     direction: 'callees',
     dmlByCallerKey: indexSitesByCallerKey(index.dmlSitesByObject),
     publishByCallerKey: indexSitesByCallerKey(index.publishSitesByObject),
+    initialDepth, userExpandedKeys, frontierNodes: 0, // P1
   };
   const queue = [];
   root.children = buildChildrenLevel(index, pairs, 1, ancestorPath, classLower, null, ctx, queue, root);
@@ -3870,6 +3902,7 @@ function buildCalleeTree(index, target, opts) {
       metaUnresolved: (index.stats && index.stats.metaUnresolved) || 0,
       externalRefs: (index.stats && index.stats.externalRefs) || 0,
       externalNamespaces: (index.stats && index.stats.externalNamespaces) || [],
+      frontierNodes: ctx.frontierNodes, // P1
     },
   };
 }
@@ -4481,7 +4514,13 @@ function findSoleInvocableMethod(index, classLower) {
 // (the tree root for the two top-level invocations, `task.node` for every
 // subsequent queue-driven expansion) -- see the maxNodes-cap `break` below
 // for why it's needed.
-function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower, excCtx, ctx, queue, ownerNode) {
+// P1 (v0.9 progressive depth): the exact grouping/keying logic
+// buildChildrenLevel has always used to collapse a pairs[] list into one
+// TNode per distinct caller/callee identity -- pulled out unchanged (byte-
+// identical behavior) so buildOneChildNode's frontier branch can PEEK at
+// "how many distinct groups would the next level contain" (-> pendingCount)
+// without materializing any TNodes or touching ctx.nodeCount/expandedKeys.
+function groupPairsByKey(pairs) {
   const groups = new Map();
   for (const item of pairs) {
     const site = item.site;
@@ -4514,6 +4553,11 @@ function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower,
     if (!groups.has(key)) groups.set(key, { gClassLower, gMethodLabel, isLexical, kindOverride: item.kindOverride || null, items: [] });
     groups.get(key).items.push(item);
   }
+  return groups;
+}
+
+function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower, excCtx, ctx, queue, ownerNode) {
+  const groups = groupPairsByKey(pairs);
   const out = [];
   for (const g of groups.values()) {
     if (ctx.nodeCount >= ctx.maxNodes) {
@@ -4705,6 +4749,62 @@ function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excC
     node.truncated = true;
     return { node, expandTask: null };
   }
+
+  // P1 (v0.9 progressive depth): a node beyond the shallow initialDepth
+  // frontier does NOT auto-expand unless its OWN identity (cycleKey) was
+  // explicitly requested via opts.expandedKeys (one entry per prior click --
+  // see buildCallerTree/buildCalleeTree's opts-normalization comment for how
+  // ctx.userExpandedKeys is built). Frozen rule, verbatim: a node expands if
+  // (depth < initialDepth) OR (cycleKey in userExpandedKeys) -- nothing
+  // more. Children of an expanded-by-key node are subject to the exact same
+  // two-part test again one level down (their own depth vs initialDepth,
+  // their own cycleKey vs userExpandedKeys), so a single click only ever
+  // reveals the clicked node's OWN direct children -- expandStep>1 is a
+  // CALLER-side concern (add step-1 more rounds of newly-exposed frontier
+  // keys and rebuild), the engine itself always stays single-level per call.
+  // This check runs strictly AFTER the maxDepth hard cap above, so a node
+  // beyond BOTH thresholds is always `truncated`, never `expandable` -- see
+  // this file's own P1 header note: "truncated (cap) stays distinct from
+  // expandable (depth frontier)". With the back-compat default
+  // (initialDepth === maxDepth), `depth < ctx.initialDepth` is always true
+  // whenever we reach this line (we already know depth < ctx.maxDepth from
+  // the check above), so this branch can never fire -- output is
+  // byte-identical to pre-v0.9 for every existing caller that doesn't pass
+  // initialDepth/expandedKeys.
+  const withinInitialDepth = depth < ctx.initialDepth;
+  const explicitlyExpanded = ctx.userExpandedKeys.has(cycleKey);
+  if (!withinInitialDepth && !explicitlyExpanded) {
+    // H1 fix: a frontier stub is still "the shown occurrence" of this
+    // identity for the rest of THIS build, exactly like a real expansion is
+    // (see the ctx.expandedKeys.add(cycleKey) a few lines below, on the
+    // real-expansion path). Registering it here too means any OTHER
+    // occurrence of the same cycleKey reached later in the same traversal
+    // (e.g. the other branch of a diamond fan-in) hits the seenElsewhere
+    // check above instead of independently peeking pendingCount and
+    // rendering its own duplicate expandable:true stub. Without this, two
+    // occurrences of a shared identity beyond the frontier both bypass
+    // seenElsewhere (neither is registered yet when the other is checked)
+    // and render as two un-deduped nodes -- breaking the expand-to-
+    // convergence deep-equal-to-eager-v0.8-tree guarantee for any diamond-
+    // shaped call graph. Must run regardless of pendingCount (even a
+    // pendingCount===0 leaf still counts as "shown" here).
+    ctx.expandedKeys.add(cycleKey);
+    const peekPairs = direction === 'callees'
+      ? calleeMethodLevelPairs(index, g.gClassLower, methodLower2)
+      : methodLevelPairs(index, g.gClassLower, methodLower2);
+    const pendingCount = groupPairsByKey(peekPairs).size;
+    // Only stamp expandable/pendingCount when there is genuinely something
+    // pending -- a node with literally zero further callers/callees behind
+    // the frontier is an honest leaf, not a frontier boundary, and must
+    // render exactly like one (no dangling "+0 more" affordance).
+    if (pendingCount > 0) {
+      node.expandable = true;
+      node.pendingCount = pendingCount;
+      ctx.frontierNodes++;
+    }
+    return { node, expandTask: null };
+  }
+
   ctx.expandedKeys.add(cycleKey);
   const nextPath = new Set(ancestorPath);
   nextPath.add(cycleKey);
