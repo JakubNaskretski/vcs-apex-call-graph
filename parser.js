@@ -140,6 +140,7 @@ const {
   NewExpressionContext,
   PrimaryExpressionContext,
   IdPrimaryContext,
+  LiteralPrimaryContext,
 } = require('@apexdevtools/apex-parser');
 
 // --- small text/source helpers ------------------------------------------
@@ -162,6 +163,62 @@ function simpleIdentifierName(exprCtx) {
   const primary = exprCtx.primary();
   if (!(primary instanceof IdPrimaryContext)) return null;
   return primary.id().getText();
+}
+
+// PARSER CONTRACT (v0.11 Round B / B1): unescapes a single-quoted Apex
+// StringLiteral token's raw getText() (which still carries its surrounding
+// quotes, e.g. `'VtxRouterHandler'` or `'it\'s'`) into the actual string
+// VALUE the literal denotes -- this is what locals[].literal /
+// TypeFacts.constants[].literal carry, since resolver.js needs the real
+// string content to feed class-lookup (a raw quoted/escaped slice would
+// never match a class name). Apex's escape set mirrors Java's common
+// subset (\\, \', \", \n, \r, \t, \b, \f); any other backslash-escaped
+// character is passed through literally (conservative -- no attempt at
+// \uXXXX or octal decoding, none of which the fixture corpus exercises).
+function unescapeApexStringLiteral(raw) {
+  const inner = raw.length >= 2 ? raw.slice(1, -1) : '';
+  return inner.replace(/\\(.)/g, (whole, c) => {
+    switch (c) {
+      case 'n': return '\n';
+      case 'r': return '\r';
+      case 't': return '\t';
+      case 'b': return '\b';
+      case 'f': return '\f';
+      default: return c; // \\ -> \, \' -> ', \" -> ", anything else -> itself
+    }
+  });
+}
+
+// PARSER CONTRACT (B1): source-faithful "is this expression exactly a
+// single string literal?" check, shared by locals[].literal (single-
+// assignment local proof) and TypeFacts.constants (static final String
+// field proof). A string literal parses as PrimaryExpressionContext ->
+// LiteralPrimaryContext -> LiteralContext exposing StringLiteral() (single-
+// quoted, e.g. `'x'`) or MultilineStringLiteral() (triple-quoted) --
+// verified against the same grammar shapes simpleIdentifierName() already
+// relies on for the sibling IdPrimaryContext case. Returns the literal's
+// unescaped string VALUE, or null for any other expression shape (concat,
+// ternary, method call, non-literal, ...) -- callers treat null as "does
+// not qualify", never as an empty-string literal.
+function stringLiteralValue(exprCtx) {
+  if (!exprCtx || !(exprCtx instanceof PrimaryExpressionContext)) return null;
+  const primary = exprCtx.primary();
+  if (!primary || !(primary instanceof LiteralPrimaryContext)) return null;
+  const lit = primary.literal();
+  if (!lit) return null;
+  const strTok = lit.StringLiteral ? lit.StringLiteral() : null;
+  if (strTok) return unescapeApexStringLiteral(strTok.getText());
+  // Multiline (triple-quoted) string literals don't process the same
+  // backslash-escape set -- just strip the delimiters. No fixture in this
+  // corpus currently exercises this shape; handled defensively so a
+  // multiline-literal initializer degrades to "its raw contents" rather
+  // than silently returning null.
+  const mlTok = lit.MultilineStringLiteral ? lit.MultilineStringLiteral() : null;
+  if (mlTok) {
+    const raw = mlTok.getText();
+    return raw.length >= 6 ? raw.slice(3, -3) : '';
+  }
+  return null;
 }
 
 // BUG FIX (finding #5): @apexdevtools/apex-parser's CharStream is built with
@@ -295,6 +352,18 @@ class FactsListener extends ApexParserBaseListener {
     // enterDotExpression(ctx) visit can tell "this is a write, already
     // emitted as 'set'" apart from "this is a plain read, emit 'get'".
     this.propWriteTargets = new WeakSet();
+    // PARSER CONTRACT (B1): MethodFacts (mf) object -> Set<localName> of
+    // names seen as the target of an assignment/compound-assignment/inc-dec
+    // expression anywhere while that scope was active. Purely a bookkeeping
+    // side-channel (never attached to the mf object itself, so it can't leak
+    // into FileFacts) -- consulted and discarded in finalizeLiteralLocals()
+    // at scope-pop time, once every statement in that method body has been
+    // walked and no further reassignment can be discovered for it. Because
+    // the walk is single-pass top-down and Apex requires declare-before-use,
+    // every local's declaration is always visited before any reassignment
+    // of it, so it's safe to set `literal` optimistically at declaration
+    // time and clear it here if a reassignment turns up later.
+    this.reassignedNamesByScope = new WeakMap();
   }
 
   pushScope(ctx, mf) {
@@ -304,9 +373,45 @@ class FactsListener extends ApexParserBaseListener {
 
   popScopeIfPushed(ctx) {
     if (this.pushedScopes.has(ctx)) {
+      this.finalizeLiteralLocals(this.scopeStack[this.scopeStack.length - 1]);
       this.scopeStack.pop();
       this.pushedScopes.delete(ctx);
     }
+  }
+
+  // PARSER CONTRACT (B1): records that `name` was seen as an
+  // assignment/compound-assignment/inc-dec TARGET while `mf` was the active
+  // scope -- see enterAssignExpression/enterPostOpExpression/
+  // enterPreOpExpression below, all of which route through this same
+  // bookkeeping regardless of which specific operator fired.
+  markReassigned(name) {
+    const scope = this.currentScope();
+    if (!scope) return;
+    let set = this.reassignedNamesByScope.get(scope);
+    if (!set) {
+      set = new Set();
+      this.reassignedNamesByScope.set(scope, set);
+    }
+    set.add(name);
+  }
+
+  // PARSER CONTRACT (B1): at scope-pop time (the whole method body has been
+  // walked), strip `literal` from any local whose name was ever seen as a
+  // reassignment target anywhere in this scope. Purely syntactic/name-based
+  // (not block/reachability-aware, per the CONTRACT's own note) -- a
+  // same-named local declared in a disjoint sibling block would also lose
+  // its `literal` here even though it's individually never reassigned; that
+  // is an accepted conservative approximation (under-resolving is safe,
+  // over-resolving is not).
+  finalizeLiteralLocals(mf) {
+    if (!mf) return;
+    const reassigned = this.reassignedNamesByScope.get(mf);
+    if (reassigned && reassigned.size) {
+      for (const local of mf.locals) {
+        if (reassigned.has(local.name)) delete local.literal;
+      }
+    }
+    this.reassignedNamesByScope.delete(mf);
   }
 
   currentType() {
@@ -380,10 +485,20 @@ class FactsListener extends ApexParserBaseListener {
     });
   }
 
-  addLocal(name, type, ctx) {
+  // PARSER CONTRACT (B1): `literal` is set ONLY when the declaration
+  // initializer is a single string literal -- see stringLiteralValue(). It
+  // is attached optimistically here (before any later-in-method
+  // reassignment can be known); finalizeLiteralLocals() strips it back off
+  // at scope-pop time if a reassignment of this name ever turns up. Callers
+  // that have no initializer to check (enhanced-for loop vars, catch
+  // clauses) simply omit the argument, leaving the field absent -- the
+  // frozen "optional" contract, never present-but-null.
+  addLocal(name, type, ctx, literal) {
     const scope = this.currentScope();
     if (!scope) return;
-    scope.locals.push({ name, type, line: ctx.start.line });
+    const local = { name, type, line: ctx.start.line };
+    if (literal !== null && literal !== undefined) local.literal = literal;
+    scope.locals.push(local);
   }
 
   // F1: DML statement facts. ctx is the whole DML *StatementContext (its
@@ -467,6 +582,14 @@ class FactsListener extends ApexParserBaseListener {
           : [],
       annotations,
       fields: [],
+      // PARSER CONTRACT (B1-b): static final String fields with a
+      // single-literal initializer -- populated by enterFieldDeclaration.
+      // Present (possibly empty) on every TypeFacts uniformly, including
+      // the trigger/anonymous-script synthetic pseudo-types, even though
+      // neither grammar shape can actually produce a field declaration in
+      // practice -- keeps the shape uniform for resolver.js so it never
+      // needs to null-check `.constants` per type kind.
+      constants: [],
       properties: [],
       methods: [],
     };
@@ -504,6 +627,14 @@ class FactsListener extends ApexParserBaseListener {
       implementsTypes: [],
       annotations,
       fields: [],
+      // PARSER CONTRACT (B1-b): static final String fields with a
+      // single-literal initializer -- populated by enterFieldDeclaration.
+      // Present (possibly empty) on every TypeFacts uniformly, including
+      // the trigger/anonymous-script synthetic pseudo-types, even though
+      // neither grammar shape can actually produce a field declaration in
+      // practice -- keeps the shape uniform for resolver.js so it never
+      // needs to null-check `.constants` per type kind.
+      constants: [],
       properties: [],
       methods: [],
     };
@@ -526,6 +657,14 @@ class FactsListener extends ApexParserBaseListener {
       implementsTypes: [],
       annotations,
       fields: [],
+      // PARSER CONTRACT (B1-b): static final String fields with a
+      // single-literal initializer -- populated by enterFieldDeclaration.
+      // Present (possibly empty) on every TypeFacts uniformly, including
+      // the trigger/anonymous-script synthetic pseudo-types, even though
+      // neither grammar shape can actually produce a field declaration in
+      // practice -- keeps the shape uniform for resolver.js so it never
+      // needs to null-check `.constants` per type kind.
+      constants: [],
       properties: [],
       methods: [],
     };
@@ -553,6 +692,7 @@ class FactsListener extends ApexParserBaseListener {
       implementsTypes: [],
       annotations: [],
       fields: [],
+      constants: [],
       properties: [],
       methods: [],
     };
@@ -587,6 +727,7 @@ class FactsListener extends ApexParserBaseListener {
       implementsTypes: [],
       annotations: [],
       fields: [],
+      constants: [],
       properties: [],
       methods: [],
     };
@@ -711,9 +852,26 @@ class FactsListener extends ApexParserBaseListener {
     if (!type) return;
     const { modifiers } = splitModifiers(findModifierList(ctx));
     const isStatic = modifiers.includes('static');
+    const isFinal = modifiers.includes('final');
     const fieldType = ctx.typeRef().getText();
+    // PARSER CONTRACT (B1-b): 'String' is matched case-insensitively (Apex
+    // identifiers/type names are case-insensitive), same convention used
+    // nowhere else in this file only because no other rule cared about a
+    // specific type name before now.
+    const isStringType = fieldType.toLowerCase() === 'string';
     for (const vd of ctx.variableDeclarators().variableDeclarator_list()) {
-      type.fields.push({ name: vd.id().getText(), type: fieldType, isStatic });
+      const name = vd.id().getText();
+      type.fields.push({ name, type: fieldType, isStatic });
+      // B1-b: qualifies for TypeFacts.constants ONLY when static + final +
+      // String-typed + a single-literal initializer, ALL four -- any one
+      // missing (non-static, non-final, non-String, or a non-literal/
+      // computed initializer) means the field is simply never pushed here,
+      // which is what makes it unresolvable for cross-class Type.forName
+      // lookups later (see VtxHandlerNames.cls's b-neg fixtures).
+      if (isStatic && isFinal && isStringType) {
+        const literal = stringLiteralValue(vd.expression ? vd.expression() : null);
+        if (literal !== null) type.constants.push({ name, literal });
+      }
     }
     // Field initializer expressions (if any) are walked as children of this
     // node; route any calls found there to the type's synthetic '(init)'.
@@ -794,7 +952,11 @@ class FactsListener extends ApexParserBaseListener {
   enterLocalVariableDeclaration(ctx) {
     const type = ctx.typeRef().getText();
     for (const vd of ctx.variableDeclarators().variableDeclarator_list()) {
-      this.addLocal(vd.id().getText(), type, vd);
+      // PARSER CONTRACT (B1-a): single-literal initializer proof lives
+      // purely at THIS declaration site -- vd.expression() is the
+      // initializer (null when there is none, e.g. `String s;`).
+      const literal = stringLiteralValue(vd.expression ? vd.expression() : null);
+      this.addLocal(vd.id().getText(), type, vd, literal);
     }
   }
 
@@ -848,6 +1010,29 @@ class FactsListener extends ApexParserBaseListener {
     });
   }
 
+  // PARSER CONTRACT (B1): `x++` / `x--` (postfix). PostOpExpressionContext
+  // is the ONLY shape this production covers (unlike PreOpExpression below,
+  // which also covers unary +/-), so no INC()/DEC() gate is needed -- kept
+  // anyway as defensive belt-and-suspenders against a future grammar shape
+  // change, matching this file's existing style (see enterThrowStatement).
+  enterPostOpExpression(ctx) {
+    if (!(ctx.INC && ctx.INC()) && !(ctx.DEC && ctx.DEC())) return;
+    const name = simpleIdentifierName(ctx.expression());
+    if (name) this.markReassigned(name);
+  }
+
+  // PARSER CONTRACT (B1): `++x` / `--x` (prefix). PreOpExpressionContext
+  // ALSO covers unary `+x`/`-x` (same production, distinguished by
+  // ADD()/SUB() vs INC()/DEC() -- verified live against the installed
+  // grammar's .d.ts) -- only the INC/DEC tokens denote a mutation, so a
+  // unary-plus/minus expression (which never mutates its operand) must NOT
+  // mark a reassignment.
+  enterPreOpExpression(ctx) {
+    if (!(ctx.INC && ctx.INC()) && !(ctx.DEC && ctx.DEC())) return;
+    const name = simpleIdentifierName(ctx.expression());
+    if (name) this.markReassigned(name);
+  }
+
   // ---- calls --------------------------------------------------------
 
   enterDotExpression(ctx) {
@@ -887,6 +1072,16 @@ class FactsListener extends ApexParserBaseListener {
   // otherwise emit for that same node.
   enterAssignExpression(ctx) {
     const lhs = ctx.expression(0);
+    // PARSER CONTRACT (B1): a bare-identifier LHS (`handlerName = ...` /
+    // `handlerName += ...` / any compound-assign operator -- all share this
+    // one AssignExpressionContext production, same as the A1 prop-write
+    // case below) marks that name reassigned for the currently active
+    // scope, clearing any `literal` on a same-named local at scope-pop
+    // time. Runs unconditionally, independent of the A1 dotted-property
+    // handling that follows (a bare name is never a DotExpressionContext,
+    // so the two cases can't both fire for the same LHS node).
+    const bareName = simpleIdentifierName(lhs);
+    if (bareName) this.markReassigned(bareName);
     if (!(lhs instanceof DotExpressionContext)) return;
     if (lhs.dotMethodCall()) return; // defensive: not a valid assignment target anyway
     const anyId = lhs.anyId();

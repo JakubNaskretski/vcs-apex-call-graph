@@ -2,11 +2,20 @@
 // Inspect which .sfdx stub files get parseError set, and why, to distinguish
 // real parser robustness issues from expected stub-file quirks (interfaces-
 // only headers, reserved words used as identifiers in old stub code, etc).
+//
+// The StandardApexLibrary stub corpus is Salesforce's own generic platform
+// stub library (not org-specific data), but it's only materialized locally
+// by an actual `sf`/`sfdx` CLI run against a real org, so none of the
+// fictional example corpora ship one. Point this at any local
+// .sfdx/tools/... stub directory you have (1st CLI arg); with none given
+// and none found under adv-org, this reports 0 files rather than
+// fabricating a result -- see dev/timing-full-corpus.js's header comment
+// for how to generate one locally.
 const fs = require('fs');
 const path = require('path');
 const parser = require('../parser');
 
-const SFDX_STUBS = '/Users/agent/work/code/example-data/inz-org/.sfdx';
+const SFDX_STUBS = process.argv[2] || '/Users/agent/work/code/example-data/adv-org/.sfdx';
 
 function walk(dir, out) {
   let entries;
@@ -19,6 +28,9 @@ function walk(dir, out) {
 
 const files = [];
 walk(SFDX_STUBS, files);
+if (!files.length) {
+  console.log(`No .sfdx stub files found at ${SFDX_STUBS}. Pass a local stub directory as an argument (see this file's header comment).`);
+}
 const errored = [];
 for (const p of files) {
   const text = fs.readFileSync(p, 'utf8');

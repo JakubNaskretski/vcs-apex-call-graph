@@ -66,12 +66,11 @@ function trace(index, label, classLower, methodLower) {
   if (hl.length) { console.log('--- PER-SITE DATA NOT SHOWN INLINE (tooltip-only args + dropped overloadSig) ---'); console.log(hl.join('\n')); }
 }
 
-const inz = buildIndex('/Users/agent/work/code/example-data/inz-org/force-app', null);
 const adv = buildIndex('/Users/agent/work/code/example-data/adv-org/force-app/main/default', '/Users/agent/work/code/example-data/adv-org/scripts');
 
-// inz-org
-trace(inz, 'inz: RawMaterialsPriceUpdateBatch (class, Schedulable<-Batch chain)', 'rawmaterialspriceupdatebatch', null);
-trace(inz, 'inz: ProductTriggerService.handleBeforeUpdate (trigger chain)', 'producttriggerservice', 'handlebeforeupdate');
+// adv-org — Batch<-Schedulable chain / trigger-service chain
+trace(adv, 'adv: AcmeOrderBatchProcessor.execute (method-level, Schedulable<-Batch chain)', 'acmeorderbatchprocessor', 'execute');
+trace(adv, 'adv: AcmeOrderTriggerHandler.handle (trigger chain)', 'acmeordertriggerhandler', 'handle');
 
 // adv-org — overloads (overloadSig visibility)
 trace(adv, 'adv: AcmePricingEngine.calculatePrice (4 overloads)', 'acmepricingengine', 'calculateprice');

@@ -1373,6 +1373,288 @@ assert.strictEqual(baseName('OppService.cls-meta.xml'), 'OppService');
   assert.strictEqual(narrowingsTotal, 2, 'total narrowings across the corpus matches AcmeShapeNarrowingAuditor.cls\'s 2 methods');
 }
 
+// ===========================================================================
+// 29. PARSER CONTRACT (v0.11 Round B / B1): locals[].literal -- single
+//     string-literal initializer, cleared if the parser proves a
+//     reassignment (assignment/compound-assignment/inc-dec, anywhere in the
+//     method body). Uses the real corpus fixture (VtxDynamicFactory.cls)
+//     that was purpose-built for this contract, one method per sub-shape.
+// ===========================================================================
+{
+  const fs = require('fs');
+  const path = require('path');
+  const classesDir = '/Users/agent/work/code/example-data/gauntlet-org/force-app/main/default/classes';
+  const parseCorpusFile = (p) => parseFile({ path: p, text: fs.readFileSync(p, 'utf8') });
+
+  const factoryFacts = parseCorpusFile(path.join(classesDir, 'VtxDynamicFactory.cls'));
+  assert.strictEqual(factoryFacts.parseError, null, 'VtxDynamicFactory.cls parses cleanly');
+  const factoryType = factoryFacts.types[0];
+
+  const literalLocal = findMethod(factoryType, 'createFromLiteralLocal');
+  const hn1 = literalLocal.locals.find((l) => l.name === 'handlerName');
+  assert.ok(hn1, '(a) handlerName local found');
+  assert.strictEqual(hn1.literal, 'VtxRouterHandler', '(a) single-literal initializer, never reassigned -> literal set to the unquoted value');
+
+  const reassignedLocal = findMethod(factoryType, 'createFromReassignedLocal');
+  const hn2 = reassignedLocal.locals.find((l) => l.name === 'handlerName');
+  assert.ok(hn2, '(a-neg) handlerName local found');
+  assert.strictEqual(
+    Object.prototype.hasOwnProperty.call(hn2, 'literal'),
+    false,
+    '(a-neg) same single-literal-initializer shape, but reassigned later in the method (even inside a conditional) -> literal must be absent'
+  );
+
+  // (b)/(b-neg) shapes touch cross-class constant resolution -- a
+  // resolver.js concern. The LOCAL side of this same method (handlerType)
+  // is itself declared via Type.forName(...), a non-literal initializer --
+  // not a param, but still correctly ineligible for locals[].literal.
+  const ownConstant = findMethod(factoryType, 'createFromOwnConstant');
+  const handlerTypeLocal = ownConstant.locals.find((l) => l.name === 'handlerType');
+  assert.ok(handlerTypeLocal, '(b) own-constant method declares one local (handlerType)');
+  assert.strictEqual(
+    Object.prototype.hasOwnProperty.call(handlerTypeLocal, 'literal'),
+    false,
+    '(b) handlerType is initialized from a Type.forName(...) call, not a literal -- literal must be absent'
+  );
+
+  const paramFed = findMethod(factoryType, 'createFromParam');
+  assert.deepStrictEqual(paramFed.locals.map((l) => l.name), ['handlerType'], '(e) createFromParam declares one local (handlerType); handlerName is a param, never eligible for literal[]');
+}
+
+// ===========================================================================
+// 30. PARSER CONTRACT (v0.11 Round B / B1): locals[].literal reassignment
+//     proof, exhaustive operator coverage -- plain '=', every compound-
+//     assign operator, prefix/postfix '++'/'--', and the negative case
+//     (unary +/- must NOT count as a mutation, since PreOpExpressionContext
+//     covers both shapes in one grammar production).
+// ===========================================================================
+{
+  const text = src([
+    'public class LiteralReassignCoverage {',
+    '  public void plainAssign() {',
+    "    String a = 'x';",
+    "    a = 'y';",
+    '  }',
+    '  public void compoundAssign() {',
+    "    String b = 'x';",
+    "    b += 'y';",
+    '  }',
+    '  public void postIncrement() {',
+    "    String c = 'x';",
+    '    c++;',
+    '  }',
+    '  public void preDecrement() {',
+    "    String d = 'x';",
+    '    --d;',
+    '  }',
+    '  public void unaryMinusIsNotAMutation() {',
+    '    Integer e = 5;',
+    '    Integer f = -e;',
+    '  }',
+    '  public void neverReassigned() {',
+    "    String g = 'x';",
+    '    System.debug(g);',
+    '  }',
+    '  public void concatenationInitializer() {',
+    "    String h = 'x' + 'y';",
+    '  }',
+    '  public void methodCallInitializer() {',
+    '    String i = computeName();',
+    '  }',
+    '  public String computeName() { return null; }',
+    '}',
+  ]);
+  const facts = parseFile({ path: 'LiteralReassignCoverage.cls', text });
+  assert.strictEqual(facts.parseError, null);
+  const type = facts.types[0];
+  const localOf = (methodName, varName) => findMethod(type, methodName).locals.find((l) => l.name === varName);
+  const hasLiteral = (methodName, varName) => Object.prototype.hasOwnProperty.call(localOf(methodName, varName), 'literal');
+
+  assert.strictEqual(hasLiteral('plainAssign', 'a'), false, "plain '=' reassignment clears literal");
+  assert.strictEqual(hasLiteral('compoundAssign', 'b'), false, "compound '+=' reassignment clears literal");
+  assert.strictEqual(hasLiteral('postIncrement', 'c'), false, "postfix '++' clears literal");
+  assert.strictEqual(hasLiteral('preDecrement', 'd'), false, "prefix '--' clears literal");
+  assert.strictEqual(localOf('neverReassigned', 'g').literal, 'x', 'never-reassigned single-literal local keeps literal');
+  assert.strictEqual(hasLiteral('concatenationInitializer', 'h'), false, 'concatenation initializer is not a single literal -> literal absent from the start');
+  assert.strictEqual(hasLiteral('methodCallInitializer', 'i'), false, 'method-call initializer is not a literal -> literal absent from the start');
+
+  // unary minus: `Integer f = -e;` must NOT mark `e` reassigned (PreOpExpressionContext
+  // ADD()/SUB() shape, not INC()/DEC()) -- there is no String literal local
+  // in this method to check directly, so assert on a parallel local instead.
+  const unaryText = src([
+    'public class UnaryMinusCoverage {',
+    '  public void run() {',
+    "    String j = 'x';",
+    '    Integer k = 5;',
+    '    Integer m = -k;',
+    '    System.debug(j);',
+    '  }',
+    '}',
+  ]);
+  const unaryFacts = parseFile({ path: 'UnaryMinusCoverage.cls', text: unaryText });
+  assert.strictEqual(unaryFacts.parseError, null);
+  const unaryMethod = findMethod(unaryFacts.types[0], 'run');
+  const jLocal = unaryMethod.locals.find((l) => l.name === 'j');
+  assert.strictEqual(jLocal.literal, 'x', "unrelated local 'j' unaffected by a unary-minus expression on a different variable ('k')");
+}
+
+// ===========================================================================
+// 31. PARSER CONTRACT (v0.11 Round B / B1): TypeFacts.constants -- static
+//     final String fields with a single-literal initializer, using the real
+//     corpus fixture (VtxHandlerNames.cls) purpose-built for this contract:
+//     ROUTER qualifies; LEGACY_HANDLER_NAME (non-final) and
+//     COMPUTED_HANDLER_NAME (final but non-literal initializer) both must
+//     NOT appear in TypeFacts.constants at all.
+// ===========================================================================
+{
+  const fs = require('fs');
+  const path = require('path');
+  const classesDir = '/Users/agent/work/code/example-data/gauntlet-org/force-app/main/default/classes';
+  const parseCorpusFile = (p) => parseFile({ path: p, text: fs.readFileSync(p, 'utf8') });
+
+  const namesFacts = parseCorpusFile(path.join(classesDir, 'VtxHandlerNames.cls'));
+  assert.strictEqual(namesFacts.parseError, null, 'VtxHandlerNames.cls parses cleanly');
+  const namesType = namesFacts.types[0];
+
+  assert.deepStrictEqual(
+    namesType.constants,
+    [{ name: 'ROUTER', literal: 'VtxRouterHandler' }],
+    'ONLY the static-final-String-literal ROUTER qualifies; the non-final and non-literal-init siblings are excluded entirely, not just marked'
+  );
+  assert.ok(
+    namesType.fields.some((f) => f.name === 'LEGACY_HANDLER_NAME'),
+    'LEGACY_HANDLER_NAME is still an ordinary field -- only excluded from constants[], not from fields[]'
+  );
+  assert.ok(
+    namesType.fields.some((f) => f.name === 'COMPUTED_HANDLER_NAME'),
+    'COMPUTED_HANDLER_NAME is still an ordinary field -- only excluded from constants[], not from fields[]'
+  );
+
+  // Own-class qualifying constant (VtxDynamicFactory.cls's ESCALATION_HANDLER)
+  // -- cross-checked here too since it's the "bare-reference, own class"
+  // half of the (b) contract shape (VtxHandlerNames.ROUTER above covers the
+  // "qualified, cross-class" half).
+  const factoryFacts = parseCorpusFile(path.join(classesDir, 'VtxDynamicFactory.cls'));
+  assert.strictEqual(factoryFacts.parseError, null);
+  assert.deepStrictEqual(
+    factoryFacts.types[0].constants,
+    [{ name: 'ESCALATION_HANDLER', literal: 'VtxEscalationHandler' }],
+    'own-class static-final-String-literal constant captured'
+  );
+}
+
+// ===========================================================================
+// 32. PARSER CONTRACT (v0.11 Round B / B1): TypeFacts.constants negative
+//     coverage the real corpus fixtures don't isolate individually -- non-
+//     static final String (instance-level), non-String static final
+//     (Integer), and multi-declarator field lines where only some
+//     declarators qualify.
+// ===========================================================================
+{
+  const text = src([
+    'public class ConstantsCoverage {',
+    "  public static final String QUALIFIES = 'yes';",
+    "  public final String instanceLevelNotStatic = 'no';", // final but not static
+    '  public static final Integer NOT_A_STRING = 5;', // static+final but not String
+    "  public static String notFinal = 'no';", // static but not final
+    "  public static final String multiA = 'a', multiB = computeIt();", // mixed declarators on one line
+    '  private static String computeIt() { return \'z\'; }',
+    '}',
+  ]);
+  const facts = parseFile({ path: 'ConstantsCoverage.cls', text });
+  assert.strictEqual(facts.parseError, null);
+  const type = facts.types[0];
+
+  const names = type.constants.map((c) => c.name).sort();
+  assert.deepStrictEqual(names, ['QUALIFIES', 'multiA'].sort(), 'only the two genuinely static+final+String+single-literal fields qualify');
+  assert.strictEqual(type.constants.find((c) => c.name === 'QUALIFIES').literal, 'yes');
+  assert.strictEqual(type.constants.find((c) => c.name === 'multiA').literal, 'a', 'multi-declarator line: the literal-initialized declarator qualifies even though its sibling on the same line does not');
+  assert.ok(!type.constants.some((c) => c.name === 'multiB'), 'multi-declarator line: the method-call-initialized sibling does NOT qualify');
+  assert.ok(!type.constants.some((c) => c.name === 'instanceLevelNotStatic'), 'final-but-not-static excluded');
+  assert.ok(!type.constants.some((c) => c.name === 'NOT_A_STRING'), 'static+final-but-not-String excluded');
+  assert.ok(!type.constants.some((c) => c.name === 'notFinal'), 'static-but-not-final excluded');
+
+  // Every TypeFacts still carries `constants` as an array uniformly, even
+  // when empty -- checked on a plain interface (which can never itself
+  // declare a field, but should still get the shape).
+  const ifaceFacts = parseFile({ path: 'Empty.cls', text: src(['public interface Empty {', '  void go();', '}']) });
+  assert.strictEqual(ifaceFacts.parseError, null);
+  assert.deepStrictEqual(ifaceFacts.types[0].constants, [], 'interfaces get an empty constants[] uniformly, never undefined/absent');
+}
+
+// ===========================================================================
+// 33. FileFacts SNAPSHOT PIN (v0.11 Round B / B1): 3 diverse PRE-EXISTING
+//     gauntlet-org corpus files (none touched by the v0.11 Round B corpus
+//     phase -- a class with fields/generics/DML/nested-dot-chains, a plain
+//     trigger, and a class with SOQL/casts/an existing Type.forName(param)
+//     call), deep-compared against parseFile() output CAPTURED BEFORE this
+//     round's parser.js changes existed (commit 0e3d24a, "0.10.0"), with
+//     the two new additive fields (TypeFacts.constants, locals[].literal)
+//     stripped from the FRESH output first. Proves every other field --
+//     calls/dml/throwsSites/catches/narrowings/fields/properties/params/
+//     annotations/modifiers/line/col/lineText/kind/triggerInfo/... -- is
+//     byte-identical, i.e. this round's parser.js changes are additive-only,
+//     exactly per the v0.11 REGRESSION POLICY ("Everything else byte-
+//     identical"). Regenerate BASELINE_JSON only if these 3 specific corpus
+//     files are ever legitimately edited upstream (they are frozen fixtures
+//     from earlier gauntlet-org rounds, not this round's own additions, so
+//     that should never happen in the ordinary course of this contract).
+// ===========================================================================
+{
+  const fs = require('fs');
+
+  const BASELINE_JSON = `[{"path":"/Users/agent/work/code/example-data/gauntlet-org/force-app/main/default/classes/KappaUnitOfWork.cls","kind":"class","name":"KappaUnitOfWork","parseError":null,"triggerInfo":null,"types":[{"name":"KappaUnitOfWork","qualified":"KappaUnitOfWork","isInterface":false,"isEnum":false,"extendsType":null,"implementsTypes":[],"annotations":[],"fields":[{"name":"newRecordsByType","type":"Map<Schema.SObjectType,List<SObject>>","isStatic":false}],"properties":[],"methods":[{"name":"(init)","isCtor":false,"isStatic":false,"returnType":null,"line":13,"endLine":13,"annotations":[],"modifiers":[],"params":[],"locals":[],"calls":[{"kind":"new","receiver":null,"method":"Map","argTexts":[],"lineText":"private Map<Schema.SObjectType, List<SObject>> newRecordsByType = new Map<Schema.SObjectType, List<SObject>>();","line":13,"col":70}],"dml":[],"throwsSites":[],"catches":[],"narrowings":[]},{"name":"registerNew","isCtor":false,"isStatic":false,"returnType":"void","line":15,"endLine":21,"annotations":[],"modifiers":["public"],"params":[{"name":"record","type":"SObject"}],"locals":[{"name":"tkey","type":"Schema.SObjectType","line":16}],"calls":[{"kind":"dot","receiver":"record","method":"getSObjectType","argTexts":[],"lineText":"Schema.SObjectType tkey = record.getSObjectType();","line":16,"col":34},{"kind":"dot","receiver":"newRecordsByType","method":"containsKey","argTexts":["tkey"],"lineText":"if (!newRecordsByType.containsKey(tkey)) {","line":17,"col":13},{"kind":"dot","receiver":"newRecordsByType","method":"put","argTexts":["tkey","new List<SObject>()"],"lineText":"newRecordsByType.put(tkey, new List<SObject>());","line":18,"col":12},{"kind":"new","receiver":null,"method":"List","argTexts":[],"lineText":"newRecordsByType.put(tkey, new List<SObject>());","line":18,"col":39},{"kind":"dot","receiver":"newRecordsByType.get(tkey)","method":"add","argTexts":["record"],"lineText":"newRecordsByType.get(tkey).add(record);","line":20,"col":8},{"kind":"dot","receiver":"newRecordsByType","method":"get","argTexts":["tkey"],"lineText":"newRecordsByType.get(tkey).add(record);","line":20,"col":8}],"dml":[],"throwsSites":[],"catches":[],"narrowings":[]},{"name":"commitWork","isCtor":false,"isStatic":false,"returnType":"void","line":23,"endLine":28,"annotations":[],"modifiers":["public"],"params":[],"locals":[{"name":"tkey","type":"Schema.SObjectType","line":24},{"name":"records","type":"List<SObject>","line":25}],"calls":[{"kind":"dot","receiver":"newRecordsByType","method":"keySet","argTexts":[],"lineText":"for (Schema.SObjectType tkey : newRecordsByType.keySet()) {","line":24,"col":39},{"kind":"dot","receiver":"newRecordsByType","method":"get","argTexts":["tkey"],"lineText":"List<SObject> records = newRecordsByType.get(tkey);","line":25,"col":36}],"dml":[{"op":"insert","targetText":"records","line":26,"col":12,"lineText":"insert records;"}],"throwsSites":[],"catches":[],"narrowings":[]},{"name":"insertDirect","isCtor":false,"isStatic":false,"returnType":"void","line":34,"endLine":36,"annotations":[],"modifiers":["public"],"params":[{"name":"order","type":"Kappa_Order__c"}],"locals":[],"calls":[],"dml":[{"op":"insert","targetText":"order","line":35,"col":8,"lineText":"insert order;"}],"throwsSites":[],"catches":[],"narrowings":[]}]}]},{"path":"/Users/agent/work/code/example-data/gauntlet-org/force-app/main/default/triggers/KappaOrderUowTrigger.trigger","kind":"trigger","name":"KappaOrderUowTrigger","parseError":null,"triggerInfo":{"object":"Kappa_Order__c","events":["after insert"]},"types":[{"name":"KappaOrderUowTrigger","qualified":"KappaOrderUowTrigger","isInterface":false,"isEnum":false,"extendsType":null,"implementsTypes":[],"annotations":[],"fields":[],"properties":[],"methods":[{"name":"(trigger)","isCtor":false,"isStatic":false,"returnType":null,"line":5,"endLine":7,"annotations":[],"modifiers":[],"params":[],"locals":[],"calls":[{"kind":"dot","receiver":"System","method":"debug","argTexts":["'kappa order uow trigger fired'"],"lineText":"System.debug('kappa order uow trigger fired');","line":6,"col":4}],"dml":[],"throwsSites":[],"catches":[],"narrowings":[]}]}]},{"path":"/Users/agent/work/code/example-data/gauntlet-org/force-app/main/default/classes/KappaGenericTriggerDispatcher.cls","kind":"class","name":"KappaGenericTriggerDispatcher","parseError":null,"triggerInfo":null,"types":[{"name":"KappaGenericTriggerDispatcher","qualified":"KappaGenericTriggerDispatcher","isInterface":false,"isEnum":false,"extendsType":null,"implementsTypes":[],"annotations":[],"fields":[],"properties":[],"methods":[{"name":"dispatch","isCtor":false,"isStatic":false,"returnType":"void","line":11,"endLine":26,"annotations":[],"modifiers":["public"],"params":[{"name":"sobjectApiName","type":"String"}],"locals":[{"name":"configs","type":"List<Kappa_Trigger_Config__mdt>","line":12},{"name":"config","type":"Kappa_Trigger_Config__mdt","line":18},{"name":"handlerType","type":"Type","line":19},{"name":"handler","type":"KappaTriggerHandler","line":23}],"calls":[{"kind":"dot","receiver":"Type","method":"forName","argTexts":["config.Handler_Class_Name__c"],"lineText":"Type handlerType = Type.forName(config.Handler_Class_Name__c);","line":19,"col":31},{"kind":"prop","accessor":"get","receiver":"config","method":"Handler_Class_Name__c","argTexts":[],"lineText":"Type handlerType = Type.forName(config.Handler_Class_Name__c);","line":19,"col":44},{"kind":"dot","receiver":"handlerType","method":"newInstance","argTexts":[],"lineText":"KappaTriggerHandler handler = (KappaTriggerHandler) handlerType.newInstance();","line":23,"col":64},{"kind":"dot","receiver":"handler","method":"run","argTexts":[],"lineText":"handler.run();","line":24,"col":12}],"dml":[],"throwsSites":[],"catches":[],"narrowings":[]}]}]}]`;
+
+  const baseline = JSON.parse(BASELINE_JSON);
+  assert.strictEqual(baseline.length, 3, 'pin covers exactly 3 files');
+
+  // Strips ONLY the two additive B1 fields from a fresh parseFile() result,
+  // round-tripped through JSON first so `undefined`-vs-absent and other
+  // non-JSON-shape quirks can never produce a false mismatch or false pass.
+  function stripB1Additions(facts) {
+    const clone = JSON.parse(JSON.stringify(facts));
+    for (const t of clone.types || []) {
+      delete t.constants;
+      for (const m of t.methods || []) {
+        for (const l of m.locals || []) {
+          delete l.literal;
+        }
+      }
+    }
+    return clone;
+  }
+
+  for (const base of baseline) {
+    const text = fs.readFileSync(base.path, 'utf8');
+    const fresh = parseFile({ path: base.path, text });
+    assert.strictEqual(fresh.parseError, null, `${base.path} still parses cleanly`);
+    const stripped = stripB1Additions(fresh);
+    assert.deepStrictEqual(
+      stripped,
+      base,
+      `${base.path}: FileFacts byte-identical to the pre-B1 baseline once locals[].literal/TypeFacts.constants are stripped`
+    );
+
+    // Sanity check the pin is exercising real shape, not a no-op strip: these
+    // 3 files legitimately have zero qualifying constants and zero literal
+    // locals, so `constants` must be present-but-empty and no local may
+    // carry `literal` at all (never present-but-falsy).
+    for (const t of fresh.types) {
+      assert.ok(Array.isArray(t.constants), `${base.path}: TypeFacts.constants present as an array`);
+      assert.deepStrictEqual(t.constants, [], `${base.path}: no qualifying static-final-String constant in this pinned file`);
+      for (const m of t.methods) {
+        for (const l of m.locals) {
+          assert.strictEqual(
+            Object.prototype.hasOwnProperty.call(l, 'literal'),
+            false,
+            `${base.path}#${m.name} local '${l.name}': no single-string-literal initializer in this pinned file`
+          );
+        }
+      }
+    }
+  }
+}
+
 // --- also: completely unparseable garbage never throws, and empty text never throws ---
 {
   assert.doesNotThrow(() => parseFile({ path: 'Garbage.cls', text: '{{{ not apex at all ]]] ###' }));

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.11.0
+
+Dynamic dispatch through constants, and smarter generic DML.
+
+- **`Type.forName` follows literals wherever they provably live**: a
+  single-assignment local, a `static final String` constant (own class or
+  `OtherClass.CONST`), or a ternary of two literals (both candidates edged) —
+  all marked `~ dynamic`. Params, reassigned variables, concatenation and
+  cross-method flow still honestly don't resolve. Namespaced literal values
+  (`'ns.Class'`) land on the managed external node, never a same-named local
+  class.
+- **Generic-collection DML narrows itself**: a `List<SObject>` that gets
+  `add(new Invoice__c(...))` / `addAll(typedList)` in the same method links its
+  `insert`/`update` to those objects' triggers and record-triggered Flows
+  (marked `~`), replacing the generic marker. No in-method evidence — the
+  honest "DML on unresolved SObject type" marker stays.
+- Docs and examples are now sourced exclusively from the purpose-built fictional
+  corpora.
+
+
 ## 0.10.0
 
 Deeper chains, Visualforce methods.

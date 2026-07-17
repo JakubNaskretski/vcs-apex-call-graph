@@ -386,6 +386,87 @@ function splitTopLevelCommas(s) {
   return out;
 }
 
+// v0.11/B1 BUG FIX: paren-depth-aware replacement for the old
+// TERNARY_LITERAL_RE. The regex's permissive `[\s\S]+?` condition-prefix
+// plus optional trailing `\)?` let it match a ternary NESTED INSIDE an
+// unrelated wrapping call expression -- e.g. Type.forName's single arg
+// `someWrapper(x ? 'FooHandler' : 'BarHandler')` matched in full (the
+// regex simply treats "someWrapper(x " as an arbitrarily long condition
+// prefix and the call's own closing ')' as the ternary's "optional
+// wrapping paren"), fabricating two false dynamic ctor edges even though
+// Type.forName's REAL argument is `someWrapper(...)` -- an arbitrary,
+// unknown-at-parse-time call result that must stay unresolved per the B1
+// contract ("anything else ... stays unresolved-counted exactly as
+// today"). This scanner only accepts a GENUINE top-level ternary: after
+// stripping zero or more full-string-spanning wrapping paren pairs (a
+// leading '(' whose matching ')' is the very last character -- Apex never
+// requires these for a plain call argument, but a fixture/author may still
+// include them), it locates the first '?' that sits at paren-depth 0
+// relative to what's left. In the false-positive shape above, the '?'
+// only ever appears at depth 1 (still inside someWrapper's own,
+// non-wrapping '(' ), so no depth-0 '?' is ever found and the match
+// correctly fails. Quote contents are skipped while scanning so a literal
+// containing '(' / ')' / '?' / ':' can never perturb the depth count.
+// Returns [lit1, lit2] (both branches decoded as this file's other quoted-
+// literal matches are) or null when the text isn't a bare-literal ternary.
+function matchTernaryStringLiterals(text) {
+  function skipQuoted(s, i) {
+    const q = s[i];
+    let j = i + 1;
+    while (j < s.length) {
+      if (s[j] === '\\') { j += 2; continue; }
+      if (s[j] === q) return j;
+      j++;
+    }
+    return s.length - 1;
+  }
+  function stripFullWrap(s) {
+    let cur = s;
+    for (;;) {
+      if (cur.length < 2 || cur[0] !== '(' || cur[cur.length - 1] !== ')') return cur;
+      let depth = 0;
+      let full = false;
+      for (let i = 0; i < cur.length; i++) {
+        const ch = cur[i];
+        if (ch === '"' || ch === "'") { i = skipQuoted(cur, i); continue; }
+        if (ch === '(') depth++;
+        else if (ch === ')') {
+          depth--;
+          if (depth === 0) { full = i === cur.length - 1; break; }
+        }
+      }
+      if (!full) return cur;
+      cur = cur.slice(1, -1).trim();
+    }
+  }
+  function findTopLevel(s, ch) {
+    let depth = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '"' || c === "'") { i = skipQuoted(s, i); continue; }
+      if (c === '(') depth++;
+      else if (c === ')') { depth--; if (depth < 0) return -1; }
+      else if (c === ch && depth === 0) return i;
+    }
+    return -1;
+  }
+  function matchQuoted(s) {
+    const t = s.trim();
+    const m = t.match(/^"([^"]*)"$/) || t.match(/^'([^']*)'$/);
+    return m ? m[1] : null;
+  }
+  const inner = stripFullWrap(String(text == null ? '' : text).trim());
+  const qIdx = findTopLevel(inner, '?');
+  if (qIdx <= 0) return null; // no top-level '?' (or an empty condition) -- not a ternary at all
+  const after = inner.slice(qIdx + 1);
+  const cIdx = findTopLevel(after, ':');
+  if (cIdx === -1) return null;
+  const lit1 = matchQuoted(after.slice(0, cIdx));
+  const lit2 = matchQuoted(after.slice(cIdx + 1));
+  if (lit1 == null || lit2 == null) return null;
+  return [lit1, lit2];
+}
+
 // F2: Map<K,V>.get()->V, Map<K,V>.values()->List<V> (kept chainable), and
 // List<T>/Set<T>.get()->T. Returns null (not '') whenever rawTypeGeneric
 // isn't a recognized generic-collection shape, or accessorNameLower isn't
@@ -1169,19 +1250,32 @@ function buildSemanticIndex(factsList, opts) {
   // N2's own text: "a genuine namespace match is exact, not a guess"), fed
   // to BOTH externalCallers (reverse/caller-direction trace) and
   // externalForwardsByCallerKey (forward/callee-direction terminal leaf).
-  function attachExternalApexSite(nsRaw, classNameRaw, methodLower, callerClassLower, callerMethodLabel, call) {
+  // v0.11/B1(d): `via` defaults to 'external' (every pre-existing caller
+  // omits it, so this is byte-identical for every genuine ns.Class(...)
+  // Apex call site) -- the ONE other caller, B1's literal-flow namespaced-
+  // external case (tryAttachExternalLiteral, below), passes 'dynamic'
+  // instead: the reference is real (the class genuinely lives in that
+  // managed package), but WHICH literal reaches this call site is an
+  // inference over the same three strictly-verifiable dataflow shapes B1's
+  // local-class branch already uses, not a syntactic certainty -- so it
+  // keeps the 'dynamic'/approximate:true vocabulary the rest of B1 uses,
+  // rather than N2's "genuine namespace match is exact, not a guess"
+  // via='external' reasoning (that reasoning is about the SYNTACTIC shape
+  // of a call expression, which literal-flow never has).
+  function attachExternalApexSite(nsRaw, classNameRaw, methodLower, callerClassLower, callerMethodLabel, call, via) {
+    const viaFinal = via || 'external';
     const key = getOrCreateExternal(nsRaw, classNameRaw, 'dot');
     const ext = externals.get(key);
     if (methodLower) ext.methods.add(methodLower);
     ext.refCount++;
-    const site = makeCallSite(callerClassLower, callerMethodLabel, call, 'external', methodLower, null);
+    const site = makeCallSite(callerClassLower, callerMethodLabel, call, viaFinal, methodLower, null);
     if (!externalCallers.has(key)) externalCallers.set(key, []);
     externalCallers.get(key).push(site);
     const ccm = classes.get(callerClassLower);
     const callerKey = `${callerClassLower}#${lc(callerMethodLabel)}`;
     if (!externalForwardsByCallerKey.has(callerKey)) externalForwardsByCallerKey.set(callerKey, []);
     externalForwardsByCallerKey.get(callerKey).push({
-      key, ext, path: ccm ? ccm.path : '', line: call.line, col: call.col, lineText: call.lineText, args: call.argTexts || [],
+      key, ext, via: viaFinal, path: ccm ? ccm.path : '', line: call.line, col: call.col, lineText: call.lineText, args: call.argTexts || [],
     });
   }
 
@@ -1273,7 +1367,7 @@ function buildSemanticIndex(factsList, opts) {
     const callerKey = `${callerClassLower}#${lc(callerMethodLabel)}`;
     if (!externalForwardsByCallerKey.has(callerKey)) externalForwardsByCallerKey.set(callerKey, []);
     externalForwardsByCallerKey.get(callerKey).push({
-      key, ext, path: ccm.path, line: callLike.line, col: callLike.col, lineText: callLike.lineText, args: callLike.argTexts || [],
+      key, ext, via: 'external', path: ccm.path, line: callLike.line, col: callLike.col, lineText: callLike.lineText, args: callLike.argTexts || [],
     });
   }
 
@@ -1487,6 +1581,19 @@ function buildSemanticIndex(factsList, opts) {
     return found === undefined ? null : found;
   }
 
+  // v0.11/B1+B2: shared "does this exact name have a LOCAL declaration in
+  // this method" lookup -- last-match-wins (a re-declaration in a later
+  // block shadows an earlier same-named local), same convention
+  // findReceiverType already uses for its own inline locals scan. Used by
+  // both B1 (single-assignment literal locals) and B2 (generic-DML target
+  // must be a LOCAL, never a param/field) -- neither may fall through to a
+  // param or field the way ordinary TYPE ENV lookups do, so this is
+  // deliberately narrower than findReceiverType.
+  function findLocalFact(methodFacts, name) {
+    const rl = lc(name);
+    return (methodFacts && methodFacts.locals || []).slice().reverse().find((l) => lc(l.name) === rl) || null;
+  }
+
   // TYPE ENV lookup: local shadows param shadows field (own then inherited
   // via extends chain), per the frozen TYPE ENV clause.
   function findReceiverType(classLower, methodFacts, receiverName) {
@@ -1510,7 +1617,7 @@ function buildSemanticIndex(factsList, opts) {
     return found === undefined ? null : found;
   }
 
-  function makeCallSite(callerClassLower, callerMethodLabel, call, via, targetMethodName, overloadSig) {
+  function makeCallSite(callerClassLower, callerMethodLabel, call, via, targetMethodName, overloadSig, approximateOverride) {
     const ccm = classes.get(callerClassLower);
     return {
       callerClass: ccm.qualified,
@@ -1524,6 +1631,17 @@ function buildSemanticIndex(factsList, opts) {
       via,
       targetMethod: targetMethodName || null,
       overloadSig: overloadSig || null, // A4: optional 'name(TypeHead, ...)' for a true overload family
+      // v0.11/B2: per-EDGE approximate override, independent of `via` --
+      // ONLY ever true for a narrowed-generic-DML edge (still via='dml', so
+      // the honest "the trigger genuinely fires" via vocabulary stays
+      // intact, but the underlying object identity is itself an inference,
+      // not a certainty, so the badge must say so). Every pre-existing
+      // caller omits this argument -- `approximate` is therefore false on
+      // every site this round didn't touch, byte-identical to before this
+      // field existed (shapeSites/shapeCalleeSites never copy it into the
+      // rendered SiteView, so its mere presence here is invisible to every
+      // existing consumer of that output shape).
+      approximate: !!approximateOverride,
     };
   }
 
@@ -1588,10 +1706,10 @@ function buildSemanticIndex(factsList, opts) {
     return 'call';
   }
 
-  function writeMethodEdge(callerClassLower, callerMethodLabel, targetClassLower, nameLower, call, via, targetMethodName, overloadSig, forward) {
+  function writeMethodEdge(callerClassLower, callerMethodLabel, targetClassLower, nameLower, call, via, targetMethodName, overloadSig, forward, approximateOverride) {
     const key = `${targetClassLower}#${nameLower}`;
     if (!methodCallers.has(key)) methodCallers.set(key, []);
-    methodCallers.get(key).push(makeCallSite(callerClassLower, callerMethodLabel, call, via, targetMethodName, overloadSig));
+    methodCallers.get(key).push(makeCallSite(callerClassLower, callerMethodLabel, call, via, targetMethodName, overloadSig, approximateOverride));
     // A1: forward defaults to true -- every ordinary resolution rule (1-7,
     // incl. DML-trigger/publish-trigger/async edges, which all fund through
     // this same function) records itself as a forward edge too, UNLESS the
@@ -1603,6 +1721,7 @@ function buildSemanticIndex(factsList, opts) {
         targetKey: key,
         kind: forwardKindForVia(via),
         via,
+        approximate: !!approximateOverride, // v0.11/B2: see makeCallSite's own note -- mirrored here for the callee-direction ForwardEdge shape
         line: call.line,
         col: call.col,
         lineText: call.lineText,
@@ -2485,7 +2604,7 @@ function buildSemanticIndex(factsList, opts) {
 
   // F1(b): records every valid DML site regardless of trigger match, for
   // record-triggered-flow children lookups later (buildMetaChildren).
-  function recordDmlSite(op, objectLower, callerClassLower, callerMethodLabel, callLike) {
+  function recordDmlSite(op, objectLower, callerClassLower, callerMethodLabel, callLike, approximateOverride) {
     const ccm = classes.get(callerClassLower);
     if (!ccm) return;
     const entry = {
@@ -2497,6 +2616,12 @@ function buildSemanticIndex(factsList, opts) {
       col: callLike.col,
       lineText: callLike.lineText,
       args: callLike.argTexts || [],
+      // v0.11/B2: see makeCallSite's own note -- true ONLY for a narrowed-
+      // generic-DML site; every pre-existing caller omits the argument, so
+      // this is false (not merely falsy-by-absence) on every site that
+      // predates B2, and buildFlowChildren's own per-entry check below
+      // treats false/undefined identically anyway.
+      approximate: !!approximateOverride,
     };
     if (!dmlSitesByObject.has(objectLower)) dmlSitesByObject.set(objectLower, []);
     dmlSitesByObject.get(objectLower).push(entry);
@@ -2507,15 +2632,15 @@ function buildSemanticIndex(factsList, opts) {
   // events -- a single upsert/merge statement can (and, per the v0.4 spec,
   // deliberately does in this corpus) match more than one trigger on the
   // same object.
-  function emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, objectLower, callLike) {
-    recordDmlSite(op, objectLower, callerClassLower, callerMethodLabel, callLike);
+  function emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, objectLower, callLike, approximateOverride) {
+    recordDmlSite(op, objectLower, callerClassLower, callerMethodLabel, callLike, approximateOverride);
     const triggers = triggersByObject.get(objectLower) || [];
     if (!triggers.length) return;
     const opEvents = opToTriggerEvents(op);
     for (const t of triggers) {
       const tEvents = ((t.triggerInfo && t.triggerInfo.events) || []).map(lc);
       if (opEvents.some((e) => tEvents.includes(e))) {
-        writeMethodEdge(callerClassLower, callerMethodLabel, lc(t.qualified), '(trigger)', callLike, 'dml', '(trigger)', null);
+        writeMethodEdge(callerClassLower, callerMethodLabel, lc(t.qualified), '(trigger)', callLike, 'dml', '(trigger)', null, undefined, approximateOverride);
       }
     }
   }
@@ -2539,6 +2664,70 @@ function buildSemanticIndex(factsList, opts) {
     unresolvedDmlForwardCounts.set(callerKey, (unresolvedDmlForwardCounts.get(callerKey) || 0) + 1);
   }
 
+  // v0.11/B2: generic-DML narrowing. Only ever consulted once the DML
+  // target has already reduced to the literal `SObject` placeholder above.
+  // Per the frozen B2 CONTRACT: the target must be a LOCAL variable (never
+  // a param/field -- findLocalFact, not findReceiverType, so a same-named
+  // param/field can never masquerade as narrowing evidence); intra-method
+  // `add`/`addAll` DOT calls on that SAME variable name are the only
+  // evidence source (cross-method evidence -- params, fields, a callee's
+  // return type -- is explicitly out of scope this round); each qualifying
+  // call's single argText is resolved through the SAME
+  // resolveDmlTargetObject machinery the DML target itself uses (a `new
+  // Concrete__c(...)` construction, or a bare identifier whose type-env
+  // declared type is itself concrete) -- an argText that resolves to
+  // NOTHING, or that itself only reduces to the generic `SObject`
+  // placeholder (e.g. addAll-ing another generically-typed collection), is
+  // silently skipped, exactly like an ordinary unresolved DML target would
+  // be. The UNION of every distinct concrete type found across ALL
+  // qualifying evidence calls fans out to trigger + record-flow linkage
+  // per type (emitDmlTriggerEdges, reused verbatim -- flow fan-out comes
+  // along for free since that function already calls recordDmlSite), each
+  // edge via='dml'/approximate:true (the narrowed badge -- see
+  // makeCallSite's own note). Returns whether ANY narrowing evidence was
+  // found -- false means the caller must fall back to the honest marker,
+  // exactly as before B2 existed.
+  //
+  // BUG FIX: evidence must be a POSITIONAL guarantee, not merely "some
+  // add()/addAll() call on this variable name exists ANYWHERE in the
+  // method" -- an add() call textually AFTER the DML statement already ran
+  // cannot possibly describe what was actually in the collection AT insert
+  // time (e.g. `insert pending; pending.add(new Kappa_Order__c(...));` --
+  // the add() happens to a list that has already been submitted; the real
+  // runtime insert() call site sees an EMPTY collection). `dmlLine` is the
+  // DML statement's/Database.xxx() call's own source line; only evidence
+  // calls with `c.line < dmlLine` (strictly BEFORE, matching Apex's
+  // top-to-bottom statement execution order within a straight-line method
+  // body) ever count -- a call on the same line never qualifies either
+  // (Apex has no legitimate same-line-before/after distinction worth
+  // trusting here, and a DML statement's own line never itself contains an
+  // add()/addAll() call in practice).
+  function tryNarrowGenericDml(callerClassLower, callerMethodLabel, mf, op, targetText, callLike, dmlLine) {
+    const raw = String(targetText || '').trim();
+    if (!SIMPLE_IDENT_RE.test(raw)) return false; // only a bare local-variable target ever qualifies
+    if (!findLocalFact(mf, raw)) return false; // must be a LOCAL declaration, never a param/field
+    const targetLower = lc(raw);
+    const evidence = new Map(); // objectLower -> resolveDmlTargetObject() result
+    for (const c of mf.calls || []) {
+      if (c.kind !== 'dot') continue;
+      if (lc(c.receiver) !== targetLower) continue;
+      const ml = lc(c.method);
+      if (ml !== 'add' && ml !== 'addall') continue;
+      if (!(c.line < dmlLine)) continue; // BUG FIX: evidence written at/after the DML line never counts
+      const argTexts = c.argTexts || [];
+      if (!argTexts.length) continue;
+      const resolvedArg = resolveDmlTargetObject(argTexts[0], callerClassLower, mf);
+      if (!resolvedArg || resolvedArg.lower === 'sobject') continue; // no evidence, or itself still generic -- doesn't count
+      if (!evidence.has(resolvedArg.lower)) evidence.set(resolvedArg.lower, resolvedArg);
+    }
+    if (!evidence.size) return false; // zero valid evidence -- caller keeps the honest marker
+    for (const resolvedType of evidence.values()) {
+      emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, resolvedType.lower, callLike, true);
+      if (resolvedType.external) attachExternalDmlSite(resolvedType.external.ns, resolvedType.external.className, callerClassLower, callerMethodLabel, callLike);
+    }
+    return true;
+  }
+
   // F1: statement-form DML (parser.js's MethodFacts.dml -- one entry per
   // insert/update/delete/undelete/upsert/merge STATEMENT).
   function handleDmlStatement(callerClassLower, callerMethodLabel, mf, dmlFact) {
@@ -2547,7 +2736,10 @@ function buildSemanticIndex(factsList, opts) {
     const resolved = resolveDmlTargetObject(dmlFact.targetText, callerClassLower, mf);
     if (!resolved) return;
     if (resolved.lower === 'sobject') { // v0.7.1/R8
-      recordUnresolvedDmlSite(callerClassLower, callerMethodLabel);
+      const callLike = { line: dmlFact.line, col: dmlFact.col, lineText: dmlFact.lineText, argTexts: [dmlFact.targetText] };
+      if (!tryNarrowGenericDml(callerClassLower, callerMethodLabel, mf, op, dmlFact.targetText, callLike, dmlFact.line)) {
+        recordUnresolvedDmlSite(callerClassLower, callerMethodLabel); // v0.11/B2: zero-evidence path -- marker stays exactly as today
+      }
       return;
     }
     const callLike = { line: dmlFact.line, col: dmlFact.col, lineText: dmlFact.lineText, argTexts: [dmlFact.targetText] };
@@ -2583,38 +2775,241 @@ function buildSemanticIndex(factsList, opts) {
     const resolved = resolveDmlTargetObject(targetText, callerClassLower, mf);
     if (!resolved) return;
     if (resolved.lower === 'sobject') { // v0.7.1/R8, same reasoning as handleDmlStatement
-      recordUnresolvedDmlSite(callerClassLower, callerMethodLabel);
+      if (!tryNarrowGenericDml(callerClassLower, callerMethodLabel, mf, op, targetText, call, call.line)) {
+        recordUnresolvedDmlSite(callerClassLower, callerMethodLabel); // v0.11/B2: zero-evidence path -- marker stays exactly as today
+      }
       return;
     }
     emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, resolved.lower, call);
     if (resolved.external) attachExternalDmlSite(resolved.external.ns, resolved.external.className, callerClassLower, callerMethodLabel, call);
   }
 
-  // F4a: Type.forName('LiteralClassName') -- single string-literal arg only;
-  // a non-literal arg (a variable) never qualifies (its runtime value is
-  // unknowable statically), by design, regardless of what it might hold.
-  // Independent of ordinary dispatch for the same reason as the
-  // Database.xxx() case above ('type' is platform-denylisted, so ordinary
-  // dispatch already produces zero edges for this receiver on its own --
-  // this is purely additive, never a conflicting resolution).
-  function handleTypeForName(callerClassLower, callerMethodLabel, call) {
+  // v0.11/B1(b) BUG FIX: mirrors resolveDotOther rule 5's own
+  // duplicate-bucket handling (resolveDuplicateBucket / classBuckets --
+  // same-package, else default-package, else EVERY remaining candidate
+  // via='ambiguous') instead of the plain resolveType() this branch used to
+  // call directly. Plain resolveType() returns classBuckets' arbitrary
+  // first-wins hit for a duplicated class name -- for `ClassName.CONST`
+  // that meant an ambiguous class name silently picked ONE package's
+  // constant (parse-order-dependent, non-deterministic across runs) instead
+  // of failing safely or fanning out like ordinary `ClassName.method()`
+  // dispatch does for the exact same ambiguous class. Returns
+  // { literal: string, forcedVia: 'ambiguous'|null }[] -- forcedVia is only
+  // set to 'ambiguous' when the bucket lookup itself came back 'ambiguous'
+  // (an unambiguous bucket, or no package metadata at all, leaves forcedVia
+  // null so handleTypeForName's default via='dynamic' applies, byte-
+  // identical to pre-fix behavior in that case). An 'ambiguous' bucket
+  // returns one entry per WINNING candidate class that actually declares
+  // the constant (never a single shared literal string reused across
+  // candidates -- each winner's OWN constant value is looked up
+  // independently, so two ambiguous classes with DIFFERING literal values
+  // for the same constant name each contribute their own, distinct
+  // candidate). Deliberately returns LITERAL VALUES only, same as every
+  // other branch of resolveTypeForNameLiteralCandidates -- which winner
+  // class supplied the constant is settled right here; which target class
+  // that literal VALUE itself names (e.g. 'FromA' -> class FromA) is a
+  // wholly separate question handleTypeForName's own resolveType/
+  // resolveTypeStrict lookup still answers per candidate, unchanged.
+  function resolveQualifiedConstantCandidates(classRaw, constNameLower, callerClassLower) {
+    const ccm0 = classes.get(callerClassLower);
+    const classMatch = resolveType(classRaw, ccm0 ? ccm0.qualified : null);
+    if (!classMatch) return [];
+    const bucketResult = packageMetadataDiscovered
+      ? resolveDuplicateBucket(classMatch, ccm0 && ccm0.package != null ? ccm0.package : null)
+      : { winners: [classMatch], via: 'static' };
+    if (bucketResult.via === 'ambiguous') {
+      const out = [];
+      for (const winnerClassLower of bucketResult.winners) {
+        const lit = resolveConstantLiteral(winnerClassLower, constNameLower);
+        if (lit != null) out.push({ literal: lit, forcedVia: 'ambiguous' });
+      }
+      return out; // may be empty -- none of the ambiguous candidates declare this constant
+    }
+    const lit = resolveConstantLiteral(bucketResult.winners[0], constNameLower);
+    return lit != null ? [{ literal: lit, forcedVia: null }] : [];
+  }
+
+  // v0.11/B1 BUG FIX: paren-depth-aware ternary matcher (matchTernaryStringLiterals,
+  // defined at module scope near splitTopLevelCommas) replaces a plain regex
+  // whose permissive `[\s\S]+?` condition-prefix + optional trailing `)`
+  // could match a ternary NESTED INSIDE an unrelated wrapping call
+  // expression -- see that function's own header note for the full repro
+  // and reasoning.
+
+  // v0.11/B1(b): looks up `constNameLower` in classLower's OWN
+  // TypeFacts.constants (the parser's additive contract -- one entry per
+  // static final String field with a single-literal initializer; a
+  // non-final field, or one whose initializer isn't a single literal,
+  // simply never appears here at all -- see the PARSER CONTRACT). Returns
+  // the literal string value, or null when no qualifying constant of that
+  // name exists on this exact class (never walks the extends chain --
+  // B1's own spec text is "own class or qualified cross-class", never
+  // "inherited").
+  function resolveConstantLiteral(classLower, constNameLower) {
+    const cm = classes.get(classLower);
+    if (!cm || !cm.typeFacts) return null;
+    const found = (cm.typeFacts.constants || []).find((c) => lc(c.name) === constNameLower);
+    return found && found.literal != null ? found.literal : null;
+  }
+
+  // v0.11/B1: given a Type.forName(...) call's single argText, returns the
+  // array of candidates it resolves to under the three additive B1 forms,
+  // or [] when it qualifies under NONE of them (still covers the
+  // pre-existing F4a inline-literal case as its first branch). Each
+  // candidate is `{ literal, forcedVia }` -- literal is the STRING VALUE,
+  // run through the SAME resolveType/external-fallback machinery an inline
+  // literal already used to find its OWN target class (which class a
+  // literal VALUE names is never shortcut here, even for the B1(b)
+  // ambiguous-constant case below -- only WHICH class's constant field
+  // supplied that literal was ambiguous, not what the literal itself
+  // means); forcedVia overrides the edge's default via='dynamic' when
+  // non-null (only the B1(b) ambiguous-duplicate-class fan-out sets it, to
+  // 'ambiguous' -- see resolveQualifiedConstantCandidates' own header note).
+  //   (direct)  a plain quoted string -- unchanged pre-B1 behavior.
+  //   (c)       a ternary of two quoted string literals -> BOTH values.
+  //   (b)       a dotted 'ClassName.CONST' reference -> that class's own
+  //             TypeFacts.constants (own class only, no extends-chain
+  //             walk), ambiguity-aware via resolveQualifiedConstantCandidates.
+  //   (a) + (b) a bare identifier -> checked as a LOCAL first (via
+  //             findLocalFact -- present with a `literal` only when the
+  //             parser proved a single-literal initializer AND no other
+  //             assignment anywhere in the method; a local of that name
+  //             with no `literal` is a positively-confirmed negative,
+  //             e.g. (a-neg)'s reassigned case, and must NOT fall through
+  //             to a same-named constant -- a local always SHADOWS a
+  //             class constant in real Apex scoping), else as the CALLING
+  //             class's own bare constant. A method PARAMETER never
+  //             appears in MethodFacts.locals at all (the parser's
+  //             locals[]/literal contract is local-declarations-only), so
+  //             (e)'s param-fed case falls all the way through to [].
+  function resolveTypeForNameLiteralCandidates(argText, callerClassLower, mf) {
+    const plain = (literal) => ({ literal, forcedVia: null });
+    const trimmed = String(argText == null ? '' : argText).trim();
+    const direct = trimmed.match(/^"([^"]*)"$/) || trimmed.match(/^'([^']*)'$/);
+    if (direct) return [plain(direct[1])];
+    const tern = matchTernaryStringLiterals(trimmed);
+    if (tern) return [plain(tern[0]), plain(tern[1])];
+    const dotIdx = trimmed.indexOf('.');
+    if (dotIdx > 0 && trimmed.indexOf('.', dotIdx + 1) === -1) {
+      const classRaw = trimmed.slice(0, dotIdx);
+      const constName = trimmed.slice(dotIdx + 1);
+      if (SIMPLE_IDENT_RE.test(classRaw) && SIMPLE_IDENT_RE.test(constName)) {
+        // qualified-but-unresolved / no-such-constant (b-neg) -> [] negative,
+        // never falls through further.
+        return resolveQualifiedConstantCandidates(classRaw, lc(constName), callerClassLower);
+      }
+    }
+    if (SIMPLE_IDENT_RE.test(trimmed)) {
+      const local = findLocalFact(mf, trimmed);
+      if (local) return local.literal != null ? [plain(local.literal)] : []; // a local always shadows a same-named constant -- reassigned/non-literal local is a hard negative
+      const lit = resolveConstantLiteral(callerClassLower, lc(trimmed));
+      if (lit != null) return [plain(lit)];
+    }
+    return [];
+  }
+
+  // v0.11/B1(d): mirrors tryAttachExternalTwoSegmentReceiver's own N2-step-3
+  // shape checks (genuine 2-segment 'ns.Class' token, ns not denylisted/
+  // own-namespace, Mid doesn't resolve as a real local member) but for a
+  // literal VALUE reached through dataflow rather than a call expression's
+  // own receiver text -- and, per B1's own "via='dynamic'" text, attaches
+  // via 'dynamic' (an inference over WHICH literal reaches this site), not
+  // 'external' (N2's "the call expression's own syntax is exact"). An
+  // own-namespace-prefixed literal is deliberately left unresolved rather
+  // than stripped-and-retried locally (N3 parity for THIS shape isn't
+  // pinned by any B1 ground-truth fixture, and the corpus's own B1(d)
+  // fixture uses a genuinely foreign namespace) -- never promoted to an
+  // external either way, so no false managed-package node is ever
+  // fabricated for the workspace's own code.
+  function tryAttachExternalLiteral(litValue, callerClassLower, callerMethodLabel, call) {
+    const raw = String(litValue == null ? '' : litValue).trim();
+    const dotIdx = raw.indexOf('.');
+    if (dotIdx <= 0) return false;
+    const rest = raw.slice(dotIdx + 1);
+    if (rest.indexOf('.') !== -1) return false; // only a genuine 2-segment 'ns.Class' literal shape qualifies
+    const head = raw.slice(0, dotIdx);
+    if (!SIMPLE_IDENT_RE.test(head) || !SIMPLE_IDENT_RE.test(rest)) return false;
+    if (PLATFORM_DENYLIST.has(lc(head))) return false;
+    if (ownNamespaceLower && lc(head) === ownNamespaceLower) return false;
+    if (headClassHasMember(head, rest)) return false;
+    attachExternalApexSite(head, rest, '<init>', callerClassLower, callerMethodLabel, call, 'dynamic');
+    return true;
+  }
+
+  // F4a/v0.11-B1: Type.forName(...) -- resolves through FOUR strictly-
+  // verifiable dataflow shapes (the pre-existing inline string literal,
+  // plus B1's three additive forms above), all landing via='dynamic',
+  // approximate:true, through the SAME class-lookup rules an inline
+  // literal already used (incl. B1(d)'s namespace/external fallback).
+  // Anything else (params, reassigned locals, non-final/non-literal
+  // constants, concatenation, an arbitrary expression) stays unresolved-
+  // counted exactly as before B1 existed. Independent of ordinary dispatch
+  // for the same reason as the Database.xxx() case above ('type' is
+  // platform-denylisted, so ordinary dispatch already produces zero edges
+  // for this receiver on its own -- this is purely additive, never a
+  // conflicting resolution).
+  function handleTypeForName(callerClassLower, callerMethodLabel, mf, call) {
     if (call.kind !== 'dot') return;
     if (lc(call.receiver) !== 'type') return;
     if (lc(call.method) !== 'forname') return;
     const args = call.argTexts || [];
     if (args.length !== 1) return;
     const argText = String(args[0] == null ? '' : args[0]).trim();
-    const litMatch = argText.match(/^"([^"]*)"$/) || argText.match(/^'([^']*)'$/);
-    if (!litMatch) {
-      // H4: the third named "dropped call site" category -- a variable
-      // (non-literal) arg whose runtime value can never be known statically.
+    const candidates = resolveTypeForNameLiteralCandidates(argText, callerClassLower, mf);
+    if (!candidates.length) {
+      // H4: the third named "dropped call site" category -- an arg text
+      // that never qualifies under any of the four literal-flow shapes
+      // (variable, reassigned local, non-final/computed constant, param).
       unresolvedSitesCount++;
-      return; // not a string literal -> negative case (variable arg)
+      return;
     }
     const ccm = classes.get(callerClassLower);
-    const targetLower = resolveType(litMatch[1], ccm ? ccm.qualified : null);
-    if (!targetLower) return; // unknown class -> negative case
-    writeCtorEdge(callerClassLower, callerMethodLabel, targetLower, call, 'dynamic');
+    for (const candidate of candidates) {
+      const litValue = candidate.literal;
+      // v0.11/B1(b) BUG FIX: candidate.forcedVia ('ambiguous', set only by
+      // resolveQualifiedConstantCandidates' ambiguous-bucket branch)
+      // overrides the default 'dynamic' via below -- but the litValue
+      // STILL goes through the exact same resolveType/resolveTypeStrict/
+      // tryAttachExternalLiteral lookup as any other candidate. Which
+      // Handler.NAME constant supplied this literal was the ambiguous
+      // step (already resolved above); what class the literal VALUE itself
+      // names is a completely separate question this lookup keeps
+      // answering unchanged -- forcing the edge straight at the winning
+      // Handler-bucket class itself here would be a different bug (the
+      // literal's VALUE, e.g. 'FromA', names an unrelated class, not
+      // 'Handler').
+      // BUG FIX (v0.11/B1(d), found live against the real gauntlet-org
+      // corpus -- resolveType()'s tier-3 bare-LAST-SEGMENT-uniqueness
+      // fallback is EXACTLY the mechanism N2/R1 already disabled for
+      // ordinary receiver-text resolution (see resolveTypeStrict's own
+      // header note and isUnknownNamespacedReceiver's use of it): a
+      // literal VALUE like 'zenq.Billing' must not be allowed to alias
+      // onto an unrelated local class merely because ITS bare tail
+      // ('Billing') happens to collide -- gauntlet-org genuinely declares
+      // a local `Billing` class (T11's own Billing.charge fixture), so
+      // plain resolveType() here silently produced a false ctor edge to
+      // the WRONG class instead of falling through to the external node
+      // the B1(d) CONTRACT text explicitly requires. A literal with no dot
+      // (every (a)/(b)/(c) candidate) is unaffected -- resolveType's
+      // bare-tail fallback is exactly the desired, pre-B1-unchanged
+      // behavior for a plain class-name literal; only a DOTTED literal
+      // (only ever reachable via (d)) needs the stricter, no-bare-tail
+      // lookup before falling through to tryAttachExternalLiteral below.
+      const targetLower = litValue.indexOf('.') === -1
+        ? resolveType(litValue, ccm ? ccm.qualified : null)
+        : resolveTypeStrict(litValue, ccm ? ccm.qualified : null);
+      if (targetLower) {
+        writeCtorEdge(callerClassLower, callerMethodLabel, targetLower, call, candidate.forcedVia || 'dynamic');
+        continue;
+      }
+      // (d): unresolved locally -- try the namespace/external fallback
+      // before giving up on this candidate (a literal matching NEITHER a
+      // local class NOR a qualifying external is a genuine "no target"
+      // outcome for that one candidate, same as the pre-existing single-
+      // literal negative case -- no unresolvedSitesCount bump here,
+      // mirroring that case's own "unknown class -> negative case" rule).
+      tryAttachExternalLiteral(litValue, callerClassLower, callerMethodLabel, call);
+    }
   }
 
   // =========================================================================
@@ -2877,7 +3272,7 @@ function buildSemanticIndex(factsList, opts) {
           // F1/F4a/G1/G5: independent of ordinary dispatch above (see each
           // function's own header comment for why).
           handleDatabaseMethodDml(ownClassLower, callerMethodLabel, mf, call);
-          handleTypeForName(ownClassLower, callerMethodLabel, call);
+          handleTypeForName(ownClassLower, callerMethodLabel, mf, call);
           handleEventBusPublish(ownClassLower, callerMethodLabel, mf, call);
           handleAsyncHop(ownClassLower, callerMethodLabel, call);
           // A1/A6: this call site produced literally zero forward edges
@@ -3282,6 +3677,11 @@ function calleeItemFromEdge(index, edge) {
       args: edge.args || [],
       argsRendered: edge.argsRendered || '',
       via: edge.via,
+      // v0.11/B2: carries the ForwardEdge's own approximate override
+      // through to the callee-direction "site" shape buildOneChildNode
+      // reads (see writeMethodEdge's own note) -- every pre-existing
+      // ForwardEdge sets this false, so this is a no-op everywhere else.
+      approximate: !!edge.approximate,
       overloadSig: edge.overloadSig || null,
     },
     targetMethodLower: gMethodLower,
@@ -4055,7 +4455,12 @@ function makeCalleeFlowNode(flow, via, siteEntry) {
     children: [],
     cyclic: false,
     truncated: true, // A2: "record-triggered flow node... terminal in this direction"
-    approximate: false,
+    // v0.11/B2: true only when the underlying DML site itself was a
+    // narrowed-generic-DML edge (siteEntry.approximate -- see
+    // recordDmlSite's own note); a 'publish' siteEntry (from
+    // publishSitesByObject) never carries this field, so stays false,
+    // byte-identical to the pre-B2 hardcoded value.
+    approximate: siteEntry.approximate === true,
     seenElsewhere: false,
   };
 }
@@ -4129,6 +4534,15 @@ function appendCalleeExtrasForMethod(index, node, classLower, methodLower, ctx) 
     }
     for (const group of extGroups.values()) {
       const first = group[0];
+      // v0.11/B1(d): a genuine syntactic ns.Class(...) call keeps via=
+      // 'external'/approximate:false (N2: "a genuine namespace match is
+      // exact, not a guess"); B1's literal-flow namespaced-external case
+      // is the one other source of an externalForwardsByCallerKey entry,
+      // and carries via='dynamic' instead (see attachExternalApexSite's
+      // own note) -- APPROX_VIA-derived here exactly like every other
+      // via-driven approximate computation in this file, so 'dynamic'
+      // correctly reads as approximate:true.
+      const nodeVia = first.via || 'external';
       extras.push({
         label: first.ext.label,
         kind: 'external',
@@ -4139,20 +4553,20 @@ function appendCalleeExtrasForMethod(index, node, classLower, methodLower, ctx) 
         ns: first.ext.ns,
         entries: [],
         isTest: false,
-        via: 'external',
+        via: nodeVia,
         sites: group.map((g) => ({
           path: g.path || '',
           line: g.line || 0,
           col: g.col || 0,
           lineText: g.lineText || '',
           argsRendered: (g.args || []).join(', '),
-          via: 'external',
+          via: g.via || 'external',
           overloadSig: null,
         })),
         children: [],
         cyclic: false,
         truncated: true, // permanently terminal -- no source to recurse into (N4), same convention buildOneChildNode's 'exception' branch uses
-        approximate: false, // N2: a genuine namespace match is exact, not a guess
+        approximate: APPROX_VIA.has(nodeVia),
         seenElsewhere: false,
       });
     }
@@ -4388,7 +4802,12 @@ function buildFlowChildren(index, objectLower, via, matchOps) {
       children: [],
       cyclic: false,
       truncated: false,
-      approximate: false,
+      // v0.11/B2: true only when EVERY DML site grouped onto this ONE
+      // (caller, object, op) node is itself a narrowed-generic-DML site
+      // (entry.approximate -- see recordDmlSite's own note); a 'publish'
+      // entry (from publishSitesByObject) never carries this field, so
+      // every publish-flow node stays false, byte-identical to before.
+      approximate: items.every((e) => e.approximate === true),
     });
   }
   out.sort(sortTNodes);
@@ -4815,7 +5234,15 @@ function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower,
 // expandTask for the caller to enqueue.
 function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excCtx, ctx) {
   const direction = ctx.direction === 'callees' ? 'callees' : 'callers';
-  const approximate = g.items.length > 0 && g.items.every((it) => APPROX_VIA.has(it.site.via));
+  // v0.11/B2: a site's own `approximate` override (true ONLY for a
+  // narrowed-generic-DML edge -- see makeCallSite's own note) joins the
+  // pre-existing APPROX_VIA-membership check, OR'd per site -- this is the
+  // ONE place a via='dml' edge can ever be approximate, without adding a
+  // new via value or disturbing every other via's pre-existing byte-
+  // identical APPROX_VIA-only behavior (every site this round didn't touch
+  // carries approximate:false/undefined, so `|| it.site.approximate ===
+  // true` is a no-op for them).
+  const approximate = g.items.length > 0 && g.items.every((it) => APPROX_VIA.has(it.site.via) || it.site.approximate === true);
 
   if (g.isLexical) {
     const first = g.items[0].site;

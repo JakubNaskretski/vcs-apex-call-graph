@@ -1,22 +1,34 @@
 'use strict';
-// Adversarial-verifier perf script: parses inz-org force-app (19 files) AND
-// the full .sfdx StandardApexLibrary stub corpus (~2.3k files), separately
-// and combined, and checks against the PERF TARGETS in the frozen spec:
-//   - 19-file force-app cold index < 1s
-//   - 2.3k-file stub corpus < 60s
+// Adversarial-verifier perf script: parses the adv-org force-app (77 files)
+// AND, if present, a local .sfdx StandardApexLibrary stub corpus (~2.3k
+// files when generated), separately and combined, and checks against the
+// PERF TARGETS in the frozen spec:
+//   - force-app cold index < 1s
+//   - ~2.3k-file stub corpus < 60s
 // Also asserts parseFile() never throws (wrapped defensively anyway, but we
 // specifically watch for any exception escaping the call).
 //
-// Usage: node dev/timing-full-corpus.js
+// The StandardApexLibrary stub corpus is Salesforce's own generic platform
+// stub library, not org-specific data -- but it's only materialized locally
+// by an actual `sf`/`sfdx` CLI run against a real org (e.g. `sf project
+// retrieve start` after `sf org login`), so it isn't checked into this repo
+// and ADV_ORG_ROOT/.sfdx is empty by default. If you want the large-corpus
+// leg of this perf check, point SFDX_STUBS (2nd CLI arg) at any local
+// .sfdx/tools/... stub directory you already have (e.g. by running the CLI
+// once against example-data/adv-org, which has its own sfdx-project.json);
+// absent that, this script reports 0 files for that leg rather than
+// fabricating a result.
+//
+// Usage: node dev/timing-full-corpus.js [path-to-force-app] [path-to-.sfdx-stubs]
 
 const fs = require('fs');
 const path = require('path');
 const parser = require('../parser');
 const resolver = require('../resolver');
 
-const ORG_ROOT = '/Users/agent/work/code/example-data/inz-org';
-const FORCE_APP = path.join(ORG_ROOT, 'force-app');
-const SFDX_STUBS = path.join(ORG_ROOT, '.sfdx');
+const ADV_ORG_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const FORCE_APP = process.argv[2] || path.join(ADV_ORG_ROOT, 'force-app');
+const SFDX_STUBS = process.argv[3] || path.join(ADV_ORG_ROOT, '.sfdx');
 
 function walk(dir, out) {
   let entries;
@@ -76,10 +88,13 @@ function main() {
 
   console.log(`force-app files: ${forceAppFiles.length}`);
   console.log(`.sfdx stub files: ${stubFiles.length}`);
+  if (!stubFiles.length) {
+    console.log(`(no .sfdx stub corpus found at ${SFDX_STUBS} -- the ~2.3k-file perf leg below is a no-op until one is generated locally; see this file's header comment)`);
+  }
 
-  // --- 19-file force-app cold index, target < 1s (parse + resolver build) ---
+  // --- force-app cold index, target < 1s (parse + resolver build) ---
   const t0 = Date.now();
-  const fa = parseAll(forceAppFiles, 'force-app (19-file target)');
+  const fa = parseAll(forceAppFiles, `force-app (${forceAppFiles.length}-file target)`);
   const idxT0 = Date.now();
   const forceAppIndex = resolver.buildSemanticIndex(fa.factsList);
   const idxT1 = Date.now();
@@ -89,9 +104,12 @@ function main() {
   console.log(`force-app COLD TOTAL (parse+index): ${forceAppColdTotal}ms  -- target < 1000ms -- ${forceAppColdTotal < 1000 ? 'PASS' : 'FAIL'}`);
   if (forceAppIndex.duplicates.length) console.log('Duplicates (force-app): ' + forceAppIndex.duplicates.join(', '));
 
-  // --- 2.3k-file stub corpus, target < 60s (parse only, per spec wording) ---
-  const stubResult = parseAll(stubFiles, '.sfdx StandardApexLibrary stub corpus (~2.3k-file target)');
-  console.log(`stub corpus PARSE ONLY: ${stubResult.parseMs}ms -- target < 60000ms -- ${stubResult.parseMs < 60000 ? 'PASS' : 'FAIL'}`);
+  // --- ~2.3k-file stub corpus (when present), target < 60s (parse only, per
+  // spec wording) -- SKIP (not PASS/FAIL) when no stub corpus is available.
+  const stubResult = parseAll(stubFiles, `.sfdx StandardApexLibrary stub corpus (${stubFiles.length} file(s))`);
+  console.log(stubFiles.length
+    ? `stub corpus PARSE ONLY: ${stubResult.parseMs}ms -- target < 60000ms -- ${stubResult.parseMs < 60000 ? 'PASS' : 'FAIL'}`
+    : 'stub corpus PARSE ONLY: SKIPPED (0 files found)');
 
   const stubIdxT0 = Date.now();
   const stubIndex = resolver.buildSemanticIndex(stubResult.factsList);
@@ -110,8 +128,10 @@ function main() {
   console.log(`combined PARSE+INDEX total: ${combined.parseMs + (combIdxT1 - combIdxT0)}ms`);
 
   console.log('\n=== SUMMARY ===');
-  console.log(`force-app (19 files) cold total: ${forceAppColdTotal}ms (target <1000ms) -> ${forceAppColdTotal < 1000 ? 'PASS' : 'FAIL'}`);
-  console.log(`stub corpus (${stubFiles.length} files) parse: ${stubResult.parseMs}ms (target <60000ms) -> ${stubResult.parseMs < 60000 ? 'PASS' : 'FAIL'}`);
+  console.log(`force-app (${forceAppFiles.length} files) cold total: ${forceAppColdTotal}ms (target <1000ms) -> ${forceAppColdTotal < 1000 ? 'PASS' : 'FAIL'}`);
+  console.log(stubFiles.length
+    ? `stub corpus (${stubFiles.length} files) parse: ${stubResult.parseMs}ms (target <60000ms) -> ${stubResult.parseMs < 60000 ? 'PASS' : 'FAIL'}`
+    : 'stub corpus (0 files) parse: SKIPPED (no local .sfdx stub corpus found)');
   console.log(`Total parseFile() throws across ALL files (force-app+stubs+combined re-parse): ${fa.throwCount + stubResult.throwCount + combined.throwCount}`);
 }
 

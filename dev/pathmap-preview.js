@@ -7,16 +7,14 @@
 // vscode dependency).
 //
 // Usage: node dev/pathmap-preview.js [path-to-force-app-main-default]
-// v0.9.0: defaults to the inz-org corpus (the user's fictional thesis org --
-// see CLAUDE.md's Salesforce test-data rule), targeting
-// ProductTriggerService.handleBeforeUpdate in the REVERSE (callers)
+// v0.9.0: defaults to the adv-org corpus, targeting
+// AcmeOrderTriggerHandler.handle in the REVERSE (callers)
 // direction at PROGRESSIVE DEPTH (opts.initialDepth: 2, mirroring
 // apexCallGraph.initialDepth's own new default) instead of the old eager
 // maxDepth:8 -- this is the richest available real-corpus shape for
 // demonstrating the v0.9 '+N' frontier PILL rendering (P4): depth-1
-// (ProductTrigger) auto-expands, but its two depth-2 callers
-// (ProductAdditionalCostTriggerService.recalculateMarginsOnProduct and
-// ProductPackagingMaterialTriggerService.recalculateMarginsOnProduct) both
+// (AcmeOrderTrigger) auto-expands, but its two depth-2 callers
+// (AcmeOrderService.recalculatePricing and AcmeOrderUtil.markApproved) both
 // hit the frontier with pendingCount=2 apiece, so the rendered map shows
 // TWO distinct, clickable '+2' pills (see pathmap.js's .frontier-pill CSS
 // and buildNodeEl) rather than eagerly recursing the whole tree the way
@@ -31,8 +29,8 @@
 // whichever single shape is most illustrative for the CURRENT round, and is
 // free to move.)
 // metascan.js only runs when ROOT looks like an SFDX force-app default dir
-// (has lwc/aura/flows/omniscripts siblings) — an inz-org-style override
-// still works Apex-only, same as before.
+// (has lwc/aura/flows/omniscripts siblings) — a bare-corpus override still
+// works Apex-only, same as before.
 //
 // Not part of the test suite (test-pathmap.js is the self-check that must
 // stay green) — this is a manual, human-eyeball dev tool.
@@ -44,10 +42,10 @@ const resolver = require('../resolver');
 const metascan = require('../metascan');
 const { renderPathMapHtml } = require('../pathmap');
 
-const ROOT = process.argv[2] || '/Users/agent/work/code/example-data/inz-org/force-app/main/default';
+const ROOT = process.argv[2] || '/Users/agent/work/code/example-data/adv-org/force-app/main/default';
 // v0.5.0 (G4): scripts/*.apex lives outside force-app entirely -- same
 // sibling-root shape dev/smoke.js's ADV_ORG_SCRIPTS_ROOT uses. Only
-// consulted when ROOT is left at its adv-org default (an inz-org-style
+// consulted when ROOT is left at its adv-org default (a bare-corpus
 // override has no such sibling, same guard smoke.js doesn't need since it
 // hardcodes the adv-org path for this corpus). gauntlet-org's own
 // force-app/ has no sibling scripts/ dir, so this is simply a silent no-op
@@ -55,7 +53,7 @@ const ROOT = process.argv[2] || '/Users/agent/work/code/example-data/inz-org/for
 const SCRIPTS_ROOT = path.join(path.dirname(path.dirname(path.dirname(ROOT))), 'scripts');
 // v0.8.0: sfdx-project.json's own `namespace` property, read exactly like
 // extension.js's real discoverPackageMap -> opts.ownNamespace plumbing (N3).
-// Absent/unreadable sfdx-project.json (e.g. an inz-org-style ROOT override
+// Absent/unreadable sfdx-project.json (e.g. a bare-corpus ROOT override
 // with no project file at all) -> null, current pre-v0.8 behavior.
 const PROJECT_ROOT = path.dirname(path.dirname(path.dirname(ROOT)));
 let ownNamespace = null;
@@ -67,7 +65,7 @@ const OUT_FILE = path.join(__dirname, 'pathmap-preview.html');
 const SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git']);
 const META_SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git', '__tests__']);
 
-const TARGET = { classLower: 'producttriggerservice', methodLower: 'handlebeforeupdate' };
+const TARGET = { classLower: 'acmeordertriggerhandler', methodLower: 'handle' };
 
 function walk(dir, out) {
   let entries;
@@ -185,7 +183,7 @@ function main() {
       }
     }
   } catch (e) {
-    // scripts/ dir optional -- an inz-org-style override may not have one.
+    // scripts/ dir optional -- a bare-corpus override may not have one.
   }
   console.log('Found ' + filePaths.length + ' .cls/.trigger/.apex file(s) (' + anonScriptCount + ' anonymous script(s)).');
 

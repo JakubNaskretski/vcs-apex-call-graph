@@ -4,18 +4,19 @@
 // to be green in CI-style runs) — a manual dev tool.
 //
 // Usage: node dev/smoke.js [path-to-force-app]
-// Defaults to /Users/agent/work/code/example-data/inz-org/force-app per the
-// integrator task brief. Prints caller trees (with argsRendered) for:
-//   - RawMaterialsPriceUpdateService.updateRawMaterialsPrice
-//     (must surface the Batch<-Schedulable chain when tracing the Batch class)
-//   - ProductTriggerService.handleBeforeUpdate (must surface the Trigger chain)
+// Defaults to the adv-org corpus's force-app (Apex-only pass -- no metascan,
+// unlike runAdvOrg() below which additionally attaches LWC/Aura/Flow/
+// OmniScript metadata callers over the SAME corpus). Prints caller trees
+// (with argsRendered) for:
+//   - AcmeOrderBatchProcessor (class-level: must surface the
+//     Schedulable<-Batch chain, via AcmeNightlyReconciliationScheduler)
+//   - AcmeOrderTriggerHandler.handle (must surface the Trigger chain)
 // and reports cold parse+index timing.
 //
 // v0.3.0 (A7): ALSO indexes the adv-org advanced corpus (Apex + metadata --
-// LWC/Aura/Flow/OmniScript) at a hardcoded path (that corpus is a fixed,
-// read-only fixture, unlike the CLI-overridable inz-org ROOT above) and
-// prints the amendment-coverage spot checks called out in the integrator
-// task brief -- see runAdvOrg() below.
+// LWC/Aura/Flow/OmniScript) at a hardcoded path and prints the amendment-
+// coverage spot checks called out in the integrator task brief -- see
+// runAdvOrg() below.
 
 const fs = require('fs');
 const path = require('path');
@@ -25,7 +26,7 @@ const metascan = require('../metascan');
 const uitree = require('../uitree');
 const targets = require('../targets');
 
-const ROOT = process.argv[2] || '/Users/agent/work/code/example-data/inz-org/force-app';
+const ROOT = process.argv[2] || '/Users/agent/work/code/example-data/adv-org/force-app';
 const SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git']);
 
 // adv-org corpus root and its metadata-file skip set (adds __tests__: LWC
@@ -259,26 +260,30 @@ function main() {
   console.log(`Parse errors: ${errCount}/${factsList.length}`);
   if (index.duplicates.length) console.log('Duplicates: ' + index.duplicates.join(', '));
 
+  // Method-level trace on the service the batch re-enters: surfaces the
+  // full async convergence -- AcmeOrderBatchProcessor.execute calls back
+  // into AcmeOrderService.processOrders, which is ALSO what schedules a
+  // fresh batch run, closing a real (and correctly ↺-cycle-flagged) loop.
   printTree(
-    'RawMaterialsPriceUpdateService.updateRawMaterialsPrice',
+    'AcmeOrderService.processOrders',
     index,
-    { classLower: 'rawmaterialspriceupdateservice', methodLower: 'updaterawmaterialsprice' }
+    { classLower: 'acmeorderservice', methodLower: 'processorders' }
   );
 
   // Class-level trace on the Batch itself: this is where the Schedulable ->
-  // Batch 'new' edge (Database.executeBatch(new RawMaterialsPriceUpdateBatch()))
+  // Batch 'new' edge (Database.executeBatch(new AcmeOrderBatchProcessor()))
   // surfaces, since nothing calls .execute() directly (it's a Batchable
   // entry point invoked by the platform, not user code).
   printTree(
-    'RawMaterialsPriceUpdateBatch (class-level, shows Schedulable<-Batch chain)',
+    'AcmeOrderBatchProcessor (class-level, shows Schedulable<-Batch chain)',
     index,
-    { classLower: 'rawmaterialspriceupdatebatch', methodLower: null }
+    { classLower: 'acmeorderbatchprocessor', methodLower: null }
   );
 
   printTree(
-    'ProductTriggerService.handleBeforeUpdate',
+    'AcmeOrderTriggerHandler.handle',
     index,
-    { classLower: 'producttriggerservice', methodLower: 'handlebeforeupdate' }
+    { classLower: 'acmeordertriggerhandler', methodLower: 'handle' }
   );
 }
 
@@ -790,21 +795,40 @@ function runGauntletOrgManagedPackages() {
 
   console.log(`\nSanity: no external node carries ns='${ownNamespace}' (the workspace's own namespace) -- `,
     Array.from(gIndex.externals instanceof Map ? gIndex.externals.keys() : []).some((k) => k.startsWith(`${ownNamespace}.`)) ? 'FOUND ONE (BUG)' : 'confirmed absent, OK');
+
+  // --- README HERO SOURCE: VertexRepriceBatch.execute (method-level) -- the
+  // cleanest Batch<-Schedulable chain in either fictional corpus: nothing
+  // but VertexNightlyAdjustmentJob.execute constructs a VertexRepriceBatch
+  // (via async-hop rule G5), and nothing schedules that job (Schedulable
+  // .execute has no caller of its own in this corpus -- registered via
+  // Setup > Scheduled Jobs in a real org), so it's an honest `◉ root`.
+  // Method-level (not class-level) deliberately -- a class-level trace on a
+  // Batchable also picks up its '<init>' constructor edge from the SAME
+  // 'Database.executeBatch(new X())' call site, which duplicates that site
+  // line under the class node (pre-existing, unrelated to this port -- the
+  // README hero's prior target was also traced at the method level for
+  // exactly this reason). This exact transcript is pasted verbatim into
+  // README.md's "See it in action" hero.
+  printTree(
+    'VertexRepriceBatch.execute',
+    gIndex,
+    { classLower: 'vertexrepricebatch', methodLower: 'execute' }
+  );
 }
 
 // v0.9.0: PROGRESSIVE DEPTH -- initialDepth=2 trace against the SAME
-// inz-org corpus main() already indexes, showing the '+N' frontier badges
+// adv-org corpus main() already indexes, showing the '+N' frontier badges
 // (rendered exactly as uitree.js's real badgesForNode/shapeLoadMoreChild
 // would show them in the actual TreeView -- renderUiNode below is the same
 // H9 real-shaping-pipeline renderer every other printTree/printCalleeTree
 // call in this file already uses), then ONE click-to-expand (mirroring
 // extension.js's LOAD_MORE_COMMAND handler: add the clicked frontier key to
 // opts.expandedKeys, rebuild) revealing that node's own direct callers.
-// ProductTriggerService.handleBeforeUpdate is picked over the
-// RawMaterialsPriceUpdateService chain above because its depth-2 frontier
-// node (ProductAdditionalCostTriggerService.recalculateMarginsOnProduct)
-// has pendingCount=2 (TWO direct callers behind it), a clearer '+N' demo
-// than a pendingCount=1 chain.
+// AcmeOrderTriggerHandler.handle is picked because its depth-2 frontier
+// carries TWO separate nodes (AcmeOrderService.recalculatePricing and
+// AcmeOrderUtil.markApproved) each with pendingCount=2 (TWO direct callers
+// behind it), a clearer '+N' demo -- two distinct pills, not just one -- than
+// a single pendingCount=1 chain.
 function printProgressiveTree(title, index, target, opts) {
   const tree = resolver.buildCallerTree(index, target, opts);
   console.log('\n=== ' + title + ' ===');
@@ -827,16 +851,16 @@ function runProgressiveDepthDemo() {
   const factsList = filePaths.map((p) => parser.parseFile({ path: p, text: fs.readFileSync(p, 'utf8') }));
   const index = resolver.buildSemanticIndex(factsList);
 
-  const target = { classLower: 'producttriggerservice', methodLower: 'handlebeforeupdate' };
+  const target = { classLower: 'acmeordertriggerhandler', methodLower: 'handle' };
 
   // Step 1: initialDepth=2 (the apexCallGraph.initialDepth DEFAULT) -- depth-1
-  // nodes (ProductTrigger) auto-expand, depth-2 nodes (e.g.
-  // ProductAdditionalCostTriggerService.recalculateMarginsOnProduct) hit the
+  // nodes (AcmeOrderTrigger) auto-expand, depth-2 nodes (e.g.
+  // AcmeOrderService.recalculatePricing, AcmeOrderUtil.markApproved) hit the
   // frontier and render with a '+N' badge plus a synthetic 'load more' child
   // instead of eagerly recursing further, exactly what a freshly opened
   // trace now shows by default (vs. pre-v0.9's always-eager-to-maxDepth=8).
   const shallow = printProgressiveTree(
-    'ProductTriggerService.handleBeforeUpdate -- STEP 1: initialDepth=2 (collapsed, note the +N badges + \'load more\' rows below the frontier)',
+    'AcmeOrderTriggerHandler.handle -- STEP 1: initialDepth=2 (collapsed, note the +N badges + \'load more\' rows below the frontier)',
     index,
     target,
     { initialDepth: 2 }
@@ -860,7 +884,7 @@ function runProgressiveDepthDemo() {
 
   const expandedKeys = new Set([clickedKey]);
   printProgressiveTree(
-    'ProductTriggerService.handleBeforeUpdate -- STEP 2: after expanding ONE frontier click (that node\'s own direct callers now shown; deeper/other frontiers stay collapsed)',
+    'AcmeOrderTriggerHandler.handle -- STEP 2: after expanding ONE frontier click (that node\'s own direct callers now shown; deeper/other frontiers stay collapsed)',
     index,
     target,
     { initialDepth: 2, expandedKeys }
@@ -941,8 +965,86 @@ function runRoundADemo() {
   );
 }
 
+// v0.11.0 ROUND B: brief spot-check against the SAME gauntlet-org corpus --
+// literal-flow Type.forName dynamic dispatch (B1) + generic-DML narrowing
+// (B2). Reuses walkGauntletOrg/GAUNTLET_ORG_ROOT exactly like
+// runGauntletOrgManagedPackages/runRoundADemo above (own fresh index --
+// same "each demo function builds its own index" convention this file
+// already follows). Full per-sub-shape coverage lives in
+// dev/gauntlet/run.js's v0.11-B1/B2 sections; this is a human-readable
+// spot check, not a substitute for that mechanical diff.
+function runRoundBDemo() {
+  console.log('\n\n########################################################');
+  console.log('# v0.11.0 ROUND B (gauntlet-org: literal-flow Type.forName + generic-DML narrowing)');
+  console.log('########################################################');
+
+  const apexOut = [];
+  const metaOut = [];
+  walkGauntletOrg(GAUNTLET_ORG_ROOT, apexOut, metaOut);
+  let ownNamespace = null;
+  try {
+    const sfdxProject = JSON.parse(fs.readFileSync(path.join(GAUNTLET_ORG_PROJECT_ROOT, 'sfdx-project.json'), 'utf8'));
+    ownNamespace = typeof sfdxProject.namespace === 'string' && sfdxProject.namespace.trim() ? sfdxProject.namespace.trim() : null;
+  } catch (e) { /* no sfdx-project.json -> ownNamespace stays null */ }
+
+  const bFactsList = apexOut.map((p) => parser.parseFile({ path: p, text: fs.readFileSync(p, 'utf8') }));
+  const bIndex = resolver.buildSemanticIndex(bFactsList, { ownNamespace });
+  const bMetaRefs = [];
+  for (const f of metaOut) {
+    const text = fs.readFileSync(f, 'utf8');
+    for (const ref of metascan.parseMetaFile({ path: f, text })) { ref.path = f; bMetaRefs.push(ref); }
+  }
+  const bStrippedRefs = ownNamespace && typeof metascan.stripOwnNamespace === 'function'
+    ? metascan.stripOwnNamespace(bMetaRefs, ownNamespace)
+    : bMetaRefs;
+  resolver.attachMetaCallers(bIndex, bStrippedRefs);
+
+  // B1(a)/(b)/(c): VtxRouterHandler.<init> is reached by THREE distinct
+  // literal-flow shapes at once -- createFromLiteralLocal (single-
+  // assignment local), createFromCrossClassConstant (qualified
+  // VtxHandlerNames.ROUTER), and createFromTernary's else-branch -- all
+  // via='dynamic', approximate. VtxDynamicFactory.createFromReassignedLocal
+  // (a-neg) must NOT appear here despite once holding this same literal
+  // value.
+  printTree(
+    'VtxRouterHandler.<init> -- B1(a)/(b)/(c) literal-flow spot check: EXPECTED 3 callers (createFromLiteralLocal, createFromCrossClassConstant, createFromTernary), all via=dynamic; createFromReassignedLocal (reassigned local, a-neg) must be ABSENT',
+    bIndex,
+    { classLower: 'vtxrouterhandler', methodLower: '<init>' }
+  );
+
+  // B1(d): createFromNamespacedLiteral's Type.forName('zenq.Billing') must
+  // land on the EXTERNAL node zenq.Billing, not the unrelated LOCAL Billing
+  // class (this corpus genuinely declares one -- see T11's own
+  // Billing.charge fixture) -- the exact false-positive the resolveType()
+  // bare-tail-fallback bug (fixed this round) would otherwise produce.
+  printCalleeTree(
+    'VtxDynamicFactory.createFromNamespacedLiteral -- B1(d) namespaced-literal spot check: EXPECTED an external kind=external child labeled "zenq.Billing", via=dynamic, approximate -- NOT a phantom edge to the local Billing class',
+    bIndex,
+    { classLower: 'vtxdynamicfactory', methodLower: 'createfromnamespacedliteral' }
+  );
+
+  // B2: commitBothTypes narrows to BOTH Kappa_Order__c (2 triggers) and
+  // Kappa_Shipment__c (1 trigger) -- 3 narrowed ~dml edges, honest marker
+  // gone.
+  printCalleeTree(
+    'VtxUnitOfWorkNarrowing.commitBothTypes -- B2 generic-DML narrowing spot check: EXPECTED 3 trigger children (KappaOrderTrigger, KappaOrderUowTrigger, KappaShipmentTrigger), via=dml approximate; NO "DML on unresolved SObject type" marker',
+    bIndex,
+    { classLower: 'vtxunitofworknarrowing', methodLower: 'commitbothtypes' }
+  );
+
+  // B2 zero-evidence contrast: commitWithNoInMethodEvidence must keep the
+  // honest marker, no narrowed edges -- same corpus, same class, opposite
+  // outcome, side by side with the positive case above.
+  printCalleeTree(
+    'VtxUnitOfWorkNarrowing.commitWithNoInMethodEvidence -- B2 zero-evidence spot check: EXPECTED the honest "DML on unresolved SObject type" marker, NO trigger children',
+    bIndex,
+    { classLower: 'vtxunitofworknarrowing', methodLower: 'commitwithnoinmethodevidence' }
+  );
+}
+
 main();
 runAdvOrg();
 runGauntletOrgManagedPackages();
 runProgressiveDepthDemo();
 runRoundADemo();
+runRoundBDemo();

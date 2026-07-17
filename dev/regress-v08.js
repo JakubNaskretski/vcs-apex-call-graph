@@ -15,10 +15,29 @@
 // Method: same technique as dev/regress-callers-v071.js -- run
 // buildCallerTree/buildCalleeTree through the REAL, previously-PUBLISHED
 // engine (extracted from apex-call-graph-0.7.1.vsix, the last release
-// before this v0.8 round) and through the CURRENT (v0.8-dev) engine, using
-// the SAME parser.js (byte-identical between the two -- verified below,
-// parser.js is FROZEN this round) and the SAME file set for each corpus,
-// so the only variable is resolver.js/metascan.js/uitree.js themselves.
+// before this v0.8 round) and through the CURRENT engine, using the SAME
+// parser.js for both (loadIndex below takes a resolverMod parameter but
+// always calls the ONE `parser` required at top of this file -- there has
+// never been a second, old parser.js instance in play here) and the SAME
+// file set for each corpus, so the only variable is
+// resolver.js/metascan.js/uitree.js themselves.
+//
+// v0.11 Round B NOTE: parser.js is IN SCOPE this round for the first time
+// since v0.5 (MethodFacts.locals[].literal / TypeFacts.constants[], both
+// purely additive per the round's CONTRACT). The guard below used to hard-
+// abort on ANY parser.js text delta ("parser.js is FROZEN this round" was
+// true for v0.8/v0.9/v0.10, not v0.11) -- that would make this script
+// permanently unrunnable this round even though nothing it actually
+// EXERCISES has changed: this script never loads a second, old parser.js
+// (see above), so an additive-only parser.js change can't affect anything
+// this diff checks. The precise "parser output is unchanged except the two
+// additive fields" claim is independently proven by the dedicated FileFacts
+// snapshot pin test (test-parser.js), which IS a real byte-for-byte check
+// of the shape this comment used to (incorrectly) delegate to a raw file
+// diff. This script now only WARNS when parser.js has moved, rather than
+// aborting -- the warning is a breadcrumb for the next round that also
+// expects parser.js frozen, not a claim that this script itself re-verifies
+// parser.js's additive-only contract.
 //
 // Edge identity is SITE-level (parent identity, child identity, via, kind,
 // child's site line), same as dev/regress-callers-v071.js, PLUS a header-
@@ -46,8 +65,11 @@ if (!fs.existsSync(OLD_RESOLVER_PATH)) {
 const oldParserPath = path.join(OLD_ROOT, 'parser.js');
 const parserDiffers = fs.existsSync(oldParserPath) && fs.readFileSync(oldParserPath, 'utf8') !== fs.readFileSync(path.join(REPO_ROOT, 'parser.js'), 'utf8');
 if (parserDiffers) {
-  console.error('parser.js differs between v0.7.1 and current tree -- this script assumes a frozen parser.js this round. Aborting.');
-  process.exit(2);
+  // v0.11 Round B: parser.js is explicitly in scope this round (additive
+  // MethodFacts.locals[].literal / TypeFacts.constants[] only) -- see this
+  // file's own header NOTE for why a text delta here no longer aborts the
+  // script. Not an error condition this round; still worth surfacing.
+  console.log('NOTE: parser.js differs from the v0.7.1 baseline (expected this round -- v0.11 Round B\'s additive locals[].literal/TypeFacts.constants[] fields; see test-parser.js\'s FileFacts snapshot pin for the byte-for-byte proof that nothing else moved). Continuing.');
 }
 const oldResolver = require(OLD_RESOLVER_PATH);
 const oldUitreePath = path.join(OLD_ROOT, 'uitree.js');

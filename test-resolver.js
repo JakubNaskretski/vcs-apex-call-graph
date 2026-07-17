@@ -27,6 +27,12 @@ function ty(name, qualified, opts = {}) {
     fields: opts.fields || [],
     properties: opts.properties || [],
     methods: opts.methods || [],
+    // v0.11/B1 PARSER CONTRACT (additive): one entry per static final
+    // String field with a single-literal initializer -- {name, literal}.
+    // A non-final field, or one whose initializer isn't a single literal,
+    // is never represented here at all (both are fixture-authoring
+    // decisions in THIS file, mirroring "the parser never records it").
+    constants: opts.constants || [],
   };
 }
 
@@ -5127,6 +5133,497 @@ function buildV9ChainCallee5() {
     if (refs.some((r) => r.label === 'VfNoControllerPage')) sawNoControllerPage = true;
   }
   assert.strictEqual(sawNoControllerPage, false, 'v0.10/A2: a standardController-only page (no controllerClass, no extensionClasses) has NO edge possible at any level -- the ref is dropped entirely, not just left unresolved at the method level');
+}
+
+// =========================================================================
+// v0.11/B1: literal-flow Type.forName dynamic dispatch -- extends the
+// pre-existing (F4a) single-inline-string-literal-only rule to three
+// additive strictly-verifiable shapes (single-assignment never-reassigned
+// local, static-final-String constant own/cross-class, ternary-of-two-
+// literals), all landing via='dynamic'/approximate:true through the SAME
+// class-lookup rules an inline literal already used (incl. namespace/
+// external handling). Fixture shape mirrors gauntlet-org's GROUND-TRUTH.md
+// v0.11-B1 section (VtxHandlerNames/VtxDynamicFactory/VtxRouterHandler/
+// VtxLegacyHandler/VtxEscalationHandler) 1:1, under the SAME class/method
+// names, so this suite pins the exact scenarios the corpus documents
+// without depending on reading real files or an in-flight parser.js.
+// =========================================================================
+{
+  const VtxHandlerNames = ty('VtxHandlerNames', 'VtxHandlerNames', {
+    // ROUTER: static final String, single-literal init -- the ONE
+    // qualifying constant. LEGACY_HANDLER_NAME (literal init, NOT final)
+    // and COMPUTED_HANDLER_NAME (final, but a method-call init) are BOTH
+    // deliberately absent here -- "the parser never records them" per the
+    // PARSER CONTRACT.
+    constants: [{ name: 'ROUTER', literal: 'VtxRouterHandler' }],
+  });
+  const VtxRouterHandler = ty('VtxRouterHandler', 'VtxRouterHandler', { methods: [] });
+  const VtxLegacyHandler = ty('VtxLegacyHandler', 'VtxLegacyHandler', { methods: [] });
+  const VtxEscalationHandler = ty('VtxEscalationHandler', 'VtxEscalationHandler', { methods: [] });
+
+  const VtxDynamicFactory = ty('VtxDynamicFactory', 'VtxDynamicFactory', {
+    constants: [{ name: 'ESCALATION_HANDLER', literal: 'VtxEscalationHandler' }],
+    methods: [
+      mth('createFromLiteralLocal', {
+        // (a) positive: single-assignment literal local, never reassigned.
+        line: 17,
+        locals: [{ name: 'handlerName', type: 'String', line: 18, literal: 'VtxRouterHandler' }],
+        calls: [cl('dot', 'forName', { receiver: 'Type', argTexts: ['handlerName'], line: 19, lineText: 'Type.forName(handlerName);' })],
+      }),
+      mth('createFromReassignedLocal', {
+        // (a-neg): same literal-initializer shape, but reassigned
+        // somewhere in the method (inside an `if`, syntactically -- the
+        // parser's no-reassignment proof is purely syntactic, not
+        // reachability-sensitive) -- `literal` is unconditionally ABSENT,
+        // regardless of the guard's runtime reachability.
+        line: 31,
+        locals: [{ name: 'handlerName', type: 'String', line: 32 }],
+        calls: [cl('dot', 'forName', { receiver: 'Type', argTexts: ['handlerName'], line: 36, lineText: 'Type.forName(handlerName);' })],
+      }),
+      mth('createFromOwnConstant', {
+        // (b) positive: own-class bare constant reference.
+        line: 45,
+        calls: [cl('dot', 'forName', { receiver: 'Type', argTexts: ['ESCALATION_HANDLER'], line: 46, lineText: 'Type.forName(ESCALATION_HANDLER);' })],
+      }),
+      mth('createFromCrossClassConstant', {
+        // (b) positive: cross-class QUALIFIED constant reference.
+        line: 55,
+        calls: [cl('dot', 'forName', { receiver: 'Type', argTexts: ['VtxHandlerNames.ROUTER'], line: 56, lineText: 'Type.forName(VtxHandlerNames.ROUTER);' })],
+      }),
+      mth('createFromNonFinalCrossClassField', {
+        // (b-neg v1): the field's mutability alone (missing `final`)
+        // disqualifies it -- absent from VtxHandlerNames.constants
+        // entirely, independent of its (real) literal payload.
+        line: 66,
+        calls: [cl('dot', 'forName', { receiver: 'Type', argTexts: ['VtxHandlerNames.LEGACY_HANDLER_NAME'], line: 67, lineText: 'Type.forName(VtxHandlerNames.LEGACY_HANDLER_NAME);' })],
+      }),
+      mth('createFromComputedCrossClassField', {
+        // (b-neg v2): `final`, but a method-call initializer, not a single
+        // literal -- also absent from VtxHandlerNames.constants.
+        line: 78,
+        calls: [cl('dot', 'forName', { receiver: 'Type', argTexts: ['VtxHandlerNames.COMPUTED_HANDLER_NAME'], line: 79, lineText: 'Type.forName(VtxHandlerNames.COMPUTED_HANDLER_NAME);' })],
+      }),
+      mth('createFromTernary', {
+        // (c) positive: ternary of two string literals -> BOTH candidates.
+        line: 87,
+        params: [{ name: 'escalate', type: 'Boolean' }],
+        calls: [
+          cl('dot', 'forName', {
+            receiver: 'Type',
+            argTexts: ["escalate ? 'VtxLegacyHandler' : 'VtxRouterHandler'"],
+            line: 88,
+            lineText: "Type.forName(escalate ? 'VtxLegacyHandler' : 'VtxRouterHandler');",
+          }),
+        ],
+      }),
+      mth('createFromNamespacedLiteral', {
+        // (d) positive: a literal naming a foreign-namespace 2-segment
+        // token falls through to the SAME external-node machinery a
+        // genuine ns.Class(...) call site already uses.
+        line: 100,
+        calls: [cl('dot', 'forName', { receiver: 'Type', argTexts: ["'zenq.Billing'"], line: 101, lineText: "Type.forName('zenq.Billing');" })],
+      }),
+      mth('createFromParam', {
+        // (e) negative: a method PARAMETER never appears in
+        // MethodFacts.locals at all -- no literal is ever recorded.
+        line: 112,
+        params: [{ name: 'handlerName', type: 'String' }],
+        calls: [cl('dot', 'forName', { receiver: 'Type', argTexts: ['handlerName'], line: 113, lineText: 'Type.forName(handlerName);' })],
+      }),
+    ],
+  });
+
+  // Pre-existing GENUINE external Apex call site (mirrors gauntlet-org's
+  // v0.8-A1 VertexLedgerBridge.charge shape) -- sets up the SAME external
+  // node (d)'s literal must attach an additional, DISTINCT site to.
+  const VtxLedgerBridgeProbe = ty('VtxLedgerBridgeProbe', 'VtxLedgerBridgeProbe', {
+    methods: [
+      mth('chargeLedger', {
+        line: 1,
+        calls: [cl('dot', 'charge', { receiver: 'zenq.Billing', argTexts: ['amount'], line: 2, lineText: 'zenq.Billing.charge(amount);' })],
+      }),
+    ],
+  });
+
+  const index = buildSemanticIndex([
+    mkFile(VtxHandlerNames), mkFile(VtxRouterHandler), mkFile(VtxLegacyHandler), mkFile(VtxEscalationHandler),
+    mkFile(VtxDynamicFactory), mkFile(VtxLedgerBridgeProbe),
+  ]);
+
+  // (a) positive.
+  const routerTree = buildCallerTree(index, { classLower: 'vtxrouterhandler', methodLower: '<init>' });
+  const literalLocalCaller = findChild(routerTree.root.children, 'VtxDynamicFactory.createFromLiteralLocal');
+  assert.ok(literalLocalCaller, 'v0.11/B1(a): a single-assignment literal local, never reassigned, must resolve exactly like an inline literal would');
+  assert.strictEqual(literalLocalCaller.via, 'dynamic');
+  assert.strictEqual(literalLocalCaller.approximate, true);
+
+  // (a-neg) negative -- no edge to EITHER the local's original literal
+  // value (VtxRouterHandler) or its reassigned one (VtxLegacyHandler).
+  assert.strictEqual(findChild(routerTree.root.children, 'VtxDynamicFactory.createFromReassignedLocal'), undefined, "v0.11/B1(a-neg): a reassigned local must never resolve to its ORIGINAL literal value (VtxRouterHandler)");
+  const legacyTree = buildCallerTree(index, { classLower: 'vtxlegacyhandler', methodLower: '<init>' });
+  assert.strictEqual(findChild(legacyTree.root.children, 'VtxDynamicFactory.createFromReassignedLocal'), undefined, "v0.11/B1(a-neg): nor to its REASSIGNED value (VtxLegacyHandler) -- the parser's no-reassignment proof is purely syntactic, unconditional");
+
+  // (b) positive: own-class bare constant.
+  const escalationTree = buildCallerTree(index, { classLower: 'vtxescalationhandler', methodLower: '<init>' });
+  const ownConstantCaller = findChild(escalationTree.root.children, 'VtxDynamicFactory.createFromOwnConstant');
+  assert.ok(ownConstantCaller, "v0.11/B1(b): a bare reference to the CALLING class's own static final String constant must resolve");
+  assert.strictEqual(ownConstantCaller.via, 'dynamic');
+  assert.strictEqual(ownConstantCaller.approximate, true);
+
+  // (b) positive: cross-class qualified constant.
+  const crossClassConstantCaller = findChild(routerTree.root.children, 'VtxDynamicFactory.createFromCrossClassConstant');
+  assert.ok(crossClassConstantCaller, "v0.11/B1(b): a QUALIFIED ClassName.CONST reference to a DIFFERENT class's static final String constant must resolve");
+  assert.strictEqual(crossClassConstantCaller.via, 'dynamic');
+  assert.strictEqual(crossClassConstantCaller.approximate, true);
+
+  // (b-neg v1/v2): neither cross-class field ever qualifies, regardless of
+  // their (real, coincidentally class-naming) literal payloads.
+  assert.strictEqual(findChild(legacyTree.root.children, 'VtxDynamicFactory.createFromNonFinalCrossClassField'), undefined, 'v0.11/B1(b-neg v1): a non-final field must never appear in TypeFacts.constants');
+  assert.strictEqual(index.methodCallers.get('vtxcomputedhandler#<init>'), undefined, 'v0.11/B1(b-neg v2): moot regardless -- no VtxComputedHandler class exists anywhere in this fixture set');
+  let sawEitherNegFieldCtorEdge = false;
+  for (const sites of index.methodCallers.values()) {
+    for (const s of sites) {
+      if ((s.callerMethod === 'createFromComputedCrossClassField' || s.callerMethod === 'createFromNonFinalCrossClassField') && s.via === 'dynamic') {
+        sawEitherNegFieldCtorEdge = true;
+      }
+    }
+  }
+  assert.strictEqual(sawEitherNegFieldCtorEdge, false, 'v0.11/B1(b-neg v1/v2): neither cross-class field ever produces ANY dynamic edge, to any target');
+
+  // (c) positive: ONE call site, TWO edges.
+  const ternaryToLegacy = findChild(legacyTree.root.children, 'VtxDynamicFactory.createFromTernary');
+  assert.ok(ternaryToLegacy, "v0.11/B1(c): the ternary's THEN-branch literal (VtxLegacyHandler) must resolve");
+  assert.strictEqual(ternaryToLegacy.via, 'dynamic');
+  assert.strictEqual(ternaryToLegacy.approximate, true);
+  const ternaryToRouter = findChild(routerTree.root.children, 'VtxDynamicFactory.createFromTernary');
+  assert.ok(ternaryToRouter, "v0.11/B1(c): the ternary's ELSE-branch literal (VtxRouterHandler) must ALSO resolve");
+  assert.strictEqual(ternaryToRouter.via, 'dynamic');
+  assert.strictEqual(ternaryToRouter.approximate, true);
+
+  // (d) positive: attaches to the SAME external node the pre-existing
+  // genuine Apex call already created, via='dynamic'/approximate:true --
+  // NOT 'external'/false (that vocabulary is reserved for a genuinely
+  // syntactic ns.Class(...) call expression, per N2).
+  const zenqBilling = index.externals.get('zenq.billing');
+  assert.ok(zenqBilling, "v0.11/B1(d): Type.forName('zenq.Billing') must attach to the SAME external node the pre-existing zenq.Billing.charge(...) call site created");
+  assert.strictEqual(zenqBilling.refCount, 2, 'v0.11/B1(d): ONE new site on the pre-existing node -- 1 (charge) + 1 (createFromNamespacedLiteral) = 2');
+  const billingCallerTree = buildCallerTree(index, { classLower: 'zenq.billing', methodLower: null });
+  const namespacedLiteralCaller = findChild(billingCallerTree.root.children, 'VtxDynamicFactory.createFromNamespacedLiteral');
+  assert.ok(namespacedLiteralCaller, "v0.11/B1(d): the new site must be traceable from the external node's own \"who calls this\" tree");
+  assert.strictEqual(namespacedLiteralCaller.via, 'dynamic');
+  assert.strictEqual(namespacedLiteralCaller.approximate, true);
+  const chargeCaller = findChild(billingCallerTree.root.children, 'VtxLedgerBridgeProbe.chargeLedger');
+  assert.ok(chargeCaller, 'the pre-existing genuine Apex call site must be UNCHANGED, still present alongside the new one');
+  assert.strictEqual(chargeCaller.via, 'external', "v0.11/B1(d): the pre-existing genuine call site must keep via='external'/approximate:false -- B1 must never retroactively relabel it");
+  assert.strictEqual(chargeCaller.approximate, false);
+
+  // (e) negative.
+  assert.strictEqual(findChild(routerTree.root.children, 'VtxDynamicFactory.createFromParam'), undefined, 'v0.11/B1(e): a param-fed arg must never resolve -- it is never a local declaration, regardless of what it might hold at runtime');
+
+  // 4 genuine negatives (a-neg, b-neg v1, b-neg v2, e) -> exactly 4
+  // unresolved sites; the pre-existing external Apex call site must NOT
+  // inflate this count (v0.8/N2's own "namespaced call is no longer
+  // counted as unresolved" convention, unaffected by B1).
+  assert.strictEqual(index.stats.unresolvedSites, 4, 'v0.11/B1: exactly the 4 genuinely-dropped call sites (a-neg, b-neg v1, b-neg v2, e) count as unresolved');
+}
+
+// =========================================================================
+// v0.11/B2: generic-DML narrowing -- when a DML statement's target is a
+// LOCAL variable of generic SObject-collection type, intra-method
+// add/addAll evidence on that SAME variable narrows the DML to real
+// objects, replacing the honest "DML on unresolved SObject type" marker
+// with per-type ~dml edges (approximate:true); zero valid evidence leaves
+// the marker exactly as today. Fixture shape mirrors gauntlet-org's
+// GROUND-TRUTH.md v0.11-B2 section (VtxUnitOfWorkNarrowing +
+// KappaShipmentTrigger, plus a promoted-regression analog of the
+// pre-existing KappaUnitOfWork.commitWork) 1:1.
+// =========================================================================
+{
+  const V11KappaOrderTrigger = ty('V11KappaOrderTrigger', 'V11KappaOrderTrigger', { methods: [mth('(trigger)', { line: 1 })] });
+  const V11KappaOrderTriggerFile = file(PT('V11KappaOrderTrigger'), 'trigger', [V11KappaOrderTrigger], {
+    triggerInfo: { object: 'Kappa_Order__c', events: ['before insert', 'after insert', 'after update'] },
+  });
+  const V11KappaOrderUowTrigger = ty('V11KappaOrderUowTrigger', 'V11KappaOrderUowTrigger', { methods: [mth('(trigger)', { line: 1 })] });
+  const V11KappaOrderUowTriggerFile = file(PT('V11KappaOrderUowTrigger'), 'trigger', [V11KappaOrderUowTrigger], {
+    triggerInfo: { object: 'Kappa_Order__c', events: ['after insert'] },
+  });
+  const KappaShipmentTrigger = ty('KappaShipmentTrigger', 'KappaShipmentTrigger', { methods: [mth('(trigger)', { line: 1 })] });
+  const KappaShipmentTriggerFile = file(PT('KappaShipmentTrigger'), 'trigger', [KappaShipmentTrigger], {
+    triggerInfo: { object: 'Kappa_Shipment__c', events: ['before insert', 'after insert'] },
+  });
+
+  const VtxUnitOfWorkNarrowing = ty('VtxUnitOfWorkNarrowing', 'VtxUnitOfWorkNarrowing', {
+    methods: [
+      mth('commitBothTypes', {
+        // both-types union: TWO add() calls, TWO distinct concrete types.
+        line: 14,
+        locals: [{ name: 'pending', type: 'List<SObject>', line: 15 }],
+        calls: [
+          cl('dot', 'add', { receiver: 'pending', argTexts: ["new Kappa_Order__c(Name = 'ord-1')"], line: 16, lineText: "pending.add(new Kappa_Order__c(Name = 'ord-1'));" }),
+          cl('dot', 'add', { receiver: 'pending', argTexts: ["new Kappa_Shipment__c(Name = 'shp-1')"], line: 17, lineText: "pending.add(new Kappa_Shipment__c(Name = 'shp-1'));" }),
+        ],
+        dml: [dmlFact('insert', 'pending', { line: 18, lineText: 'insert pending;' })],
+      }),
+      mth('commitTypedOrdersViaAddAll', {
+        // addAll-from-a-typed-List<Kappa_Order__c>-local: a simple
+        // identifier evidence arg, resolved via the type env's DECLARED
+        // type, not however it happened to be initialized.
+        line: 25,
+        locals: [
+          { name: 'pending', type: 'List<SObject>', line: 26 },
+          { name: 'typedOrders', type: 'List<Kappa_Order__c>', line: 27 },
+        ],
+        calls: [cl('dot', 'addAll', { receiver: 'pending', argTexts: ['typedOrders'], line: 28, lineText: 'pending.addAll(typedOrders);' })],
+        dml: [dmlFact('insert', 'pending', { line: 29, lineText: 'insert pending;' })],
+      }),
+      mth('commitWithNoInMethodEvidence', {
+        // zero in-method add/addAll evidence -- verb deliberately `update`,
+        // not `insert`, to prove the marker's persistence is DML-verb-
+        // independent.
+        line: 37,
+        locals: [{ name: 'pending', type: 'List<SObject>', line: 38 }],
+        dml: [dmlFact('update', 'pending', { line: 39, lineText: 'update pending;' })],
+      }),
+      mth('commitWithComplexExpressionEvidence', {
+        // a method-call-result add() argument matches NEITHER the
+        // 'new Concrete__c(' pattern NOR a bare identifier -- must NOT
+        // narrow (cross-method return-type inference is out of scope).
+        line: 49,
+        locals: [{ name: 'pending', type: 'List<SObject>', line: 50 }],
+        calls: [cl('dot', 'add', { receiver: 'pending', argTexts: ['locateExistingOrder()'], line: 51, lineText: 'pending.add(locateExistingOrder());' })],
+        dml: [dmlFact('insert', 'pending', { line: 52, lineText: 'insert pending;' })],
+      }),
+    ],
+  });
+
+  // B2-ii: a promoted-regression analog of the real pre-existing
+  // KappaUnitOfWork.commitWork -- its `records` local has ZERO in-method
+  // add/addAll evidence (the real .add() calls live in the SIBLING method
+  // registerNew, out of scope by construction: same-METHOD evidence only).
+  const V11KappaUnitOfWork = ty('V11KappaUnitOfWork', 'V11KappaUnitOfWork', {
+    methods: [
+      mth('commitWork', {
+        line: 1,
+        locals: [{ name: 'records', type: 'List<SObject>', line: 2 }],
+        dml: [dmlFact('insert', 'records', { line: 3, lineText: 'insert records;' })],
+      }),
+      mth('registerNew', {
+        // sibling method -- its OWN add() call on its OWN local must NOT
+        // leak into commitWork's evidence gathering (same-method-only).
+        line: 5,
+        locals: [{ name: 'records', type: 'List<SObject>', line: 6 }],
+        calls: [cl('dot', 'add', { receiver: 'records', argTexts: ["new Kappa_Order__c(Name = 'sibling')"], line: 7, lineText: "records.add(new Kappa_Order__c(Name = 'sibling'));" })],
+      }),
+    ],
+  });
+
+  const index = buildSemanticIndex([
+    mkFile(VtxUnitOfWorkNarrowing), mkFile(V11KappaUnitOfWork),
+    V11KappaOrderTriggerFile, V11KappaOrderUowTriggerFile, KappaShipmentTriggerFile,
+  ]);
+
+  // commitBothTypes: 3 narrowed edges total (2 on Kappa_Order__c's two
+  // triggers, 1 on Kappa_Shipment__c's one trigger), marker gone.
+  const bothTypesTree = buildCalleeTree(index, { classLower: 'vtxunitofworknarrowing', methodLower: 'commitBothTypes' });
+  assert.strictEqual(findChild(bothTypesTree.root.children, 'DML on unresolved SObject type'), undefined, 'v0.11/B2: the honest marker must be REPLACED once narrowing evidence exists');
+  const orderTriggerChild = findChild(bothTypesTree.root.children, 'V11KappaOrderTrigger');
+  assert.ok(orderTriggerChild, 'v0.11/B2: commitBothTypes narrows to Kappa_Order__c -> V11KappaOrderTrigger (before insert, after insert -- matches)');
+  assert.strictEqual(orderTriggerChild.via, 'dml');
+  assert.strictEqual(orderTriggerChild.approximate, true, "v0.11/B2: narrowed edges stay via='dml' (the trigger genuinely fires) but ARE approximate (the object identity is an inference)");
+  const orderUowTriggerChild = findChild(bothTypesTree.root.children, 'V11KappaOrderUowTrigger');
+  assert.ok(orderUowTriggerChild, 'v0.11/B2: commitBothTypes ALSO narrows to Kappa_Order__c -> V11KappaOrderUowTrigger (after insert -- matches)');
+  assert.strictEqual(orderUowTriggerChild.approximate, true);
+  const shipmentTriggerChild = findChild(bothTypesTree.root.children, 'KappaShipmentTrigger');
+  assert.ok(shipmentTriggerChild, 'v0.11/B2: commitBothTypes ALSO narrows to Kappa_Shipment__c -> KappaShipmentTrigger (before insert, after insert -- matches)');
+  assert.strictEqual(shipmentTriggerChild.approximate, true);
+  // B2 only touches DML/trigger narrowing -- it does NOT change ordinary
+  // call resolution of the two evidence-gathering .add(...) calls
+  // themselves (neither is a real method on any indexed class), so the
+  // pre-existing "N unresolved sites" aggregate leaf still legitimately
+  // co-occurs alongside the narrowed trigger edges -- asserted explicitly
+  // here so this isn't mistaken for an overlooked side effect.
+  const bothTypesUnresolved = findChild(bothTypesTree.root.children, '2 unresolved sites');
+  assert.ok(bothTypesUnresolved, 'the 2 .add(...) calls stay unresolved as ORDINARY calls -- B2 narrows the DML/trigger relationship, not method-call resolution');
+  assert.strictEqual(bothTypesTree.root.children.length, 4, 'exactly 3 narrowed trigger edges + 1 aggregated unresolved-calls leaf, nothing else');
+
+  // Same 3 edges, symmetric caller-direction check (who calls each trigger).
+  const orderTriggerCallerTree = buildCallerTree(index, { classLower: 'v11kappaordertrigger', methodLower: null });
+  const bothTypesAsOrderCaller = findChild(orderTriggerCallerTree.root.children, 'VtxUnitOfWorkNarrowing.commitBothTypes');
+  assert.ok(bothTypesAsOrderCaller, 'v0.11/B2: caller-direction symmetry -- V11KappaOrderTrigger must list commitBothTypes as a (narrowed) caller');
+  assert.strictEqual(bothTypesAsOrderCaller.via, 'dml');
+  assert.strictEqual(bothTypesAsOrderCaller.approximate, true);
+  const shipmentTriggerCallerTree = buildCallerTree(index, { classLower: 'kappashipmenttrigger', methodLower: null });
+  const bothTypesAsShipmentCaller = findChild(shipmentTriggerCallerTree.root.children, 'VtxUnitOfWorkNarrowing.commitBothTypes');
+  assert.ok(bothTypesAsShipmentCaller, "v0.11/B2: KappaShipmentTrigger's FIRST-EVER DML/trigger linkage in this fixture set");
+  assert.strictEqual(bothTypesAsShipmentCaller.approximate, true);
+
+  // commitTypedOrdersViaAddAll: narrows via the addAll-of-a-typed-local
+  // shape -> Kappa_Order__c's 2 triggers, marker gone.
+  const addAllTree = buildCalleeTree(index, { classLower: 'vtxunitofworknarrowing', methodLower: 'commitTypedOrdersViaAddAll' });
+  assert.strictEqual(findChild(addAllTree.root.children, 'DML on unresolved SObject type'), undefined, 'v0.11/B2: addAll-of-a-typed-List<Concrete__c> local must ALSO narrow (not just inline new Concrete__c(...))');
+  const addAllOrderTrigger = findChild(addAllTree.root.children, 'V11KappaOrderTrigger');
+  assert.ok(addAllOrderTrigger);
+  assert.strictEqual(addAllOrderTrigger.approximate, true);
+  const addAllOrderUowTrigger = findChild(addAllTree.root.children, 'V11KappaOrderUowTrigger');
+  assert.ok(addAllOrderUowTrigger);
+  assert.strictEqual(findChild(addAllTree.root.children, 'KappaShipmentTrigger'), undefined, 'must NOT ALSO narrow to Kappa_Shipment__c -- only Kappa_Order__c evidence exists in this method');
+  assert.ok(findChild(addAllTree.root.children, '1 unresolved site'), 'the addAll(...) call itself stays unresolved as an ORDINARY call, same reasoning as commitBothTypes');
+  assert.strictEqual(addAllTree.root.children.length, 3, 'exactly 2 narrowed trigger edges + 1 unresolved-call leaf, nothing else');
+
+  // commitWithNoInMethodEvidence: zero evidence -> marker stays exactly as
+  // today, DML-verb-independent (this one is `update`, not `insert`).
+  const noEvidenceTree = buildCalleeTree(index, { classLower: 'vtxunitofworknarrowing', methodLower: 'commitWithNoInMethodEvidence' });
+  const noEvidenceMarker = findChild(noEvidenceTree.root.children, 'DML on unresolved SObject type');
+  assert.ok(noEvidenceMarker, 'v0.11/B2: zero add/addAll evidence anywhere in the method -- the honest marker must stay exactly as pre-B2');
+  assert.strictEqual(noEvidenceMarker.via, 'dml-unresolved');
+  assert.strictEqual(noEvidenceMarker.approximate, true);
+  assert.strictEqual(findChild(noEvidenceTree.root.children, 'V11KappaOrderTrigger'), undefined);
+  assert.strictEqual(findChild(noEvidenceTree.root.children, 'KappaShipmentTrigger'), undefined);
+
+  // commitWithComplexExpressionEvidence: the one candidate piece of
+  // "evidence" doesn't qualify (a method-call-result argument) -> marker
+  // stays, zero narrowed edges -- must NOT infer from the callee's return
+  // type (explicitly out of scope).
+  const complexExprTree = buildCalleeTree(index, { classLower: 'vtxunitofworknarrowing', methodLower: 'commitWithComplexExpressionEvidence' });
+  assert.ok(findChild(complexExprTree.root.children, 'DML on unresolved SObject type'), 'v0.11/B2: a method-call-result add() argument must NOT count as narrowing evidence');
+  assert.strictEqual(findChild(complexExprTree.root.children, 'V11KappaOrderTrigger'), undefined, 'must NOT narrow to Kappa_Order__c even though locateExistingOrder() happens to RETURN that type -- cross-method inference is out of scope');
+  assert.strictEqual(complexExprTree.root.children.length, 2, 'the honest marker + 1 unresolved-call leaf (the add(locateExistingOrder()) call itself, an ordinary unresolved call) -- nothing narrowed');
+
+  // B2-ii promoted regression: real pre-existing-shaped commitWork, zero
+  // in-method evidence (the real add() lives in the sibling registerNew)
+  // -> marker stays, proving the zero-evidence path against non-fixture-
+  // purpose-built code too.
+  const commitWorkTree = buildCalleeTree(index, { classLower: 'v11kappaunitofwork', methodLower: 'commitWork' });
+  const commitWorkMarker = findChild(commitWorkTree.root.children, 'DML on unresolved SObject type');
+  assert.ok(commitWorkMarker, 'v0.11/B2-ii: commitWork keeps the honest marker -- its own add() calls live in a DIFFERENT method, out of scope by construction');
+  assert.strictEqual(commitWorkMarker.approximate, true);
+  assert.strictEqual(findChild(commitWorkTree.root.children, 'V11KappaOrderTrigger'), undefined, "sibling method registerNew's evidence must never leak into commitWork's own narrowing");
+}
+
+// =========================================================================
+// v0.11 Round B BUG FIX #1: TERNARY_LITERAL_RE (now matchTernaryStringLiterals)
+// was too permissive -- its old regex could match a ternary-of-two-literals
+// NESTED INSIDE an unrelated wrapping call expression. Type.forName's real
+// argument here is `someWrapper(...)`, a call expression whose return value
+// is arbitrary and unknown at parse time -- per the B1 contract this must
+// stay unresolved, exactly like any other non-literal expression would.
+// Repro mirrors the confirmed defect verbatim.
+// =========================================================================
+{
+  const Bug1FooHandler = ty('Bug1FooHandler', 'Bug1FooHandler', { methods: [] });
+  const Bug1BarHandler = ty('Bug1BarHandler', 'Bug1BarHandler', { methods: [] });
+  const Bug1Caller = ty('Bug1Caller', 'Bug1Caller', {
+    methods: [
+      mth('go2', {
+        line: 1,
+        params: [{ name: 'x', type: 'Boolean' }],
+        calls: [
+          cl('dot', 'forName', {
+            receiver: 'Type',
+            argTexts: ["someWrapper(x ? 'Bug1FooHandler' : 'Bug1BarHandler')"],
+            line: 2,
+            lineText: "Type t = Type.forName(someWrapper(x ? 'Bug1FooHandler' : 'Bug1BarHandler'));",
+          }),
+        ],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(Bug1FooHandler), mkFile(Bug1BarHandler), mkFile(Bug1Caller)]);
+  const tree = buildCalleeTree(index, { classLower: 'bug1caller', methodLower: 'go2' });
+  assert.strictEqual(findChild(tree.root.children, 'Bug1FooHandler.<init>'), undefined, "BUG FIX regression: a ternary NESTED inside a wrapping call expression (someWrapper(x ? 'A' : 'B')) must NOT produce a dynamic ctor edge for the THEN branch");
+  assert.strictEqual(findChild(tree.root.children, 'Bug1BarHandler.<init>'), undefined, 'BUG FIX regression: ...nor the ELSE branch -- the ternary is not Type.forName\'s actual argument, the wrapping call expression is');
+  assert.strictEqual(tree.root.children.length, 0, 'no callee-tree children at all -- the call-expression argument produces zero edges, exactly like any other non-literal expression');
+  assert.strictEqual(index.stats.unresolvedSites, 1, 'the call-expression argument must instead count as an ordinary genuinely-dropped/unresolved site (H4), same as any other non-literal expression');
+}
+
+// =========================================================================
+// v0.11 Round B BUG FIX #2: tryNarrowGenericDml ignored source-code
+// position -- add()/addAll() evidence written AFTER the DML statement
+// still narrowed the edge, even though the collection is provably EMPTY
+// at the moment the real insert/update/etc. actually runs. Repro mirrors
+// the confirmed defect verbatim (evidence call textually after the DML
+// statement's own line).
+// =========================================================================
+{
+  const Bug2OrderTrigger = ty('Bug2OrderTrigger', 'Bug2OrderTrigger', { methods: [mth('(trigger)', { line: 1 })] });
+  const Bug2OrderTriggerFile = file(PT('Bug2OrderTrigger'), 'trigger', [Bug2OrderTrigger], {
+    triggerInfo: { object: 'Bug2_Order__c', events: ['after insert'] },
+  });
+  const Bug2PostDmlEvidence = ty('Bug2PostDmlEvidence', 'Bug2PostDmlEvidence', {
+    methods: [
+      mth('commitThenAdd', {
+        line: 1,
+        locals: [{ name: 'pending', type: 'List<SObject>', line: 2 }],
+        // BUG repro: the DML statement runs FIRST (line 3); the add() call
+        // -- the only candidate evidence in this method -- comes AFTER it
+        // (line 4). At the moment `insert pending;` actually executes,
+        // `pending` is provably empty, so this can never describe real
+        // narrowing evidence.
+        dml: [dmlFact('insert', 'pending', { line: 3, lineText: 'insert pending;' })],
+        calls: [cl('dot', 'add', { receiver: 'pending', argTexts: ["new Bug2_Order__c(Name = 'late')"], line: 4, lineText: "pending.add(new Bug2_Order__c(Name = 'late'));" })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(Bug2PostDmlEvidence), Bug2OrderTriggerFile]);
+  const tree = buildCalleeTree(index, { classLower: 'bug2postdmlevidence', methodLower: 'commitThenAdd' });
+  assert.strictEqual(findChild(tree.root.children, 'Bug2OrderTrigger'), undefined, 'BUG FIX regression: add() evidence written AFTER the DML statement must NOT narrow the edge -- the collection is provably empty at real insert time');
+  const marker = findChild(tree.root.children, 'DML on unresolved SObject type');
+  assert.ok(marker, 'BUG FIX regression: with the only candidate evidence disqualified by position, the honest unresolved marker must stay exactly as it would with zero evidence at all');
+  assert.strictEqual(marker.via, 'dml-unresolved');
+  assert.strictEqual(marker.approximate, true);
+}
+
+// =========================================================================
+// v0.11 Round B BUG FIX #3: the B1(b) dotted 'ClassName.CONST' branch called
+// plain resolveType() directly, bypassing the SAME classBuckets/
+// resolveDuplicateBucket ambiguity machinery ordinary static dispatch
+// (resolveDotOther rule 5) already uses for a duplicated class name --
+// silently picking an arbitrary, parse-order-dependent single candidate
+// instead of failing safely or fanning out via='ambiguous'. Fixture shape
+// mirrors the pre-existing B3 ambiguous-fan-out contrast test above (W7Dup2
+// duplicated ONLY across pkgB/pkgC, caller in pkgA -- neither same-package
+// nor default-package preference can disambiguate, so genuine ambiguity is
+// reachable).
+// =========================================================================
+{
+  const Bug3HandlerB = ty('Bug3Handler', 'Bug3Handler', { constants: [{ name: 'NAME', literal: 'Bug3FromB' }], methods: [mth('run', { line: 1, isStatic: true })] });
+  const Bug3HandlerC = ty('Bug3Handler', 'Bug3Handler', { constants: [{ name: 'NAME', literal: 'Bug3FromC' }], methods: [mth('run', { line: 1, isStatic: true })] });
+  const Bug3FromB = ty('Bug3FromB', 'Bug3FromB', { methods: [] });
+  const Bug3FromC = ty('Bug3FromC', 'Bug3FromC', { methods: [] });
+  const Bug3AmbigCaller = ty('Bug3AmbigCaller', 'Bug3AmbigCaller', {
+    methods: [
+      mth('go', { line: 1, calls: [cl('dot', 'forName', { receiver: 'Type', argTexts: ['Bug3Handler.NAME'], line: 1, lineText: 'Type.forName(Bug3Handler.NAME);' })] }),
+      mth('goOrdinary', { line: 2, calls: [cl('dot', 'run', { receiver: 'Bug3Handler', line: 2, lineText: 'Bug3Handler.run();' })] }),
+    ],
+  });
+  const facts = [
+    file('/ws/pkgB/classes/Bug3Handler.cls', 'class', [Bug3HandlerB]),
+    file('/ws/pkgC/classes/Bug3Handler.cls', 'class', [Bug3HandlerC]),
+    file('/ws/pkgB/classes/Bug3FromB.cls', 'class', [Bug3FromB]),
+    file('/ws/pkgC/classes/Bug3FromC.cls', 'class', [Bug3FromC]),
+    file('/ws/pkgA/classes/Bug3AmbigCaller.cls', 'class', [Bug3AmbigCaller]),
+  ];
+  const index = buildSemanticIndex(facts, { packageOf: w7PackageOf, defaultPackage: W7_DEFAULT_PACKAGE });
+  assert.strictEqual(index.stats.duplicateNames, 1, 'sanity: Bug3Handler must actually be an ambiguous duplicate in this fixture (same shape B3 already relies on)');
+
+  const calleeTree = buildCalleeTree(index, { classLower: 'bug3ambigcaller', methodLower: 'go' });
+  const dynTargets = calleeTree.root.children.map((c) => c.label).sort();
+  assert.deepStrictEqual(dynTargets, ['Bug3FromB.<init>', 'Bug3FromC.<init>'], "BUG FIX regression: Type.forName(Bug3Handler.NAME) must fan out to BOTH ambiguous candidates' OWN literal values (FromB from pkgB's Handler, FromC from pkgC's), never an arbitrary parse-order-dependent single pick");
+  for (const c of calleeTree.root.children) {
+    assert.strictEqual(c.via, 'ambiguous', "BUG FIX regression: each fanned-out edge must be via='ambiguous' -- 'dynamic' would look identical to an honest, unambiguous single-candidate resolution and hide the guess");
+    assert.strictEqual(c.approximate, true);
+  }
+
+  // Contrast: ordinary Bug3Handler.run() dispatch, from the SAME caller, on
+  // the SAME ambiguous class, must fan out identically -- proving B1(b) is
+  // now consistent with pre-existing dispatch instead of secretly using a
+  // different (unsafe) resolution path.
+  const ordinaryTree = buildCalleeTree(index, { classLower: 'bug3ambigcaller', methodLower: 'goOrdinary' });
+  assert.strictEqual(ordinaryTree.root.children.length, 2, 'ordinary Bug3Handler.run() dispatch also fans out to both ambiguous candidates, matching B1(b)\'s new shape');
+  for (const c of ordinaryTree.root.children) {
+    assert.strictEqual(c.label, 'Bug3Handler.run');
+    assert.strictEqual(c.via, 'ambiguous');
+  }
 }
 
 console.log('test-resolver.js: all assertions passed.');

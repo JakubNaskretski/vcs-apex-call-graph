@@ -756,6 +756,75 @@ addFile('classes/V10VfExtController.cls', [
   '}',
 ].join('\n'));
 
+// =========================================================================
+// v0.11/B1 e2e fixture: literal-flow Type.forName dynamic dispatch, through
+// the REAL parser (not test-resolver.js's synthetic MethodFacts fixtures --
+// this proves parser.js's additive locals[].literal/TypeFacts.constants
+// contract and resolver.js's consumption of it actually meet in the middle
+// on real Apex source text). Cross-class constant story: V11ConstHolder
+// declares a static final String constant with a single-literal
+// initializer; V11DynamicFactory.spawn() references it QUALIFIED
+// (V11ConstHolder.TARGET_CLASS) inside Type.forName(...) -- the (b)
+// cross-class-constant sub-shape. The exhaustive per-sub-shape matrix (incl.
+// every negative case) is already pinned against the real gauntlet-org
+// corpus (dev/gauntlet/run.js) and synthetically in test-resolver.js; this
+// fixture's only job is the end-to-end parse->resolve seam.
+// =========================================================================
+addFile('classes/V11DynamicTarget.cls', [
+  'public class V11DynamicTarget {',
+  '  public void run() { System.debug(\'dynamic target ran\'); }',
+  '}',
+].join('\n'));
+addFile('classes/V11ConstHolder.cls', [
+  'public class V11ConstHolder {',
+  '  public static final String TARGET_CLASS = \'V11DynamicTarget\';',
+  '}',
+].join('\n'));
+addFile('classes/V11DynamicFactory.cls', [
+  'public class V11DynamicFactory {',
+  '  public Object spawn() {',
+  '    Type handlerType = Type.forName(V11ConstHolder.TARGET_CLASS);',
+  '    if (handlerType == null) {',
+  '      return null;',
+  '    }',
+  '    return handlerType.newInstance();',
+  '  }',
+  '}',
+].join('\n'));
+
+// =========================================================================
+// v0.11/B2 e2e fixture: generic-DML narrowing, through the REAL parser.
+// `V11UnitOfWork.commitBoth()` declares `pending` as a LOCAL `List<SObject>`
+// and calls `.add(new Concrete__c(...))` TWICE on it, for two DIFFERENT
+// concrete objects -- the union of that intra-method evidence must narrow
+// the DML to BOTH objects, replacing the honest "DML on unresolved SObject
+// type" marker with narrowed ~dml trigger edges to both. V11WidgetA__c/
+// V11WidgetB__c are new-to-this-fixture-set fictional custom objects (no
+// pre-existing trigger/DML ground truth elsewhere in this file), each with
+// their own trigger, so this is a genuinely first-time DML/trigger
+// linkage for both -- zero regression risk to any pre-existing target.
+// =========================================================================
+addFile('triggers/V11WidgetATrigger.trigger', [
+  'trigger V11WidgetATrigger on V11WidgetA__c (before insert, after insert) {',
+  '  System.debug(\'widget a trigger fired\');',
+  '}',
+].join('\n'));
+addFile('triggers/V11WidgetBTrigger.trigger', [
+  'trigger V11WidgetBTrigger on V11WidgetB__c (before insert, after insert) {',
+  '  System.debug(\'widget b trigger fired\');',
+  '}',
+].join('\n'));
+addFile('classes/V11UnitOfWork.cls', [
+  'public class V11UnitOfWork {',
+  '  public void commitBoth() {',
+  '    List<SObject> pending = new List<SObject>();',
+  '    pending.add(new V11WidgetA__c(Name = \'a\'));',
+  '    pending.add(new V11WidgetB__c(Name = \'b\'));',
+  '    insert pending;',
+  '  }',
+  '}',
+].join('\n'));
+
 // Sanity: no fixture should crash parseFile, and exactly the one deliberate
 // syntax error should carry parseError.
 for (const f of files) {
@@ -1359,11 +1428,21 @@ function findChild(tree, label) {
   // a namespaced call). The reference is NOT silently dropped, though: it
   // now surfaces via the NEW externalRefs/externalNamespaces half of this
   // same header line (N5) instead of the plain unresolved-count sentence.
-  assert.strictEqual(tree.stats.unresolvedSites, 1, 'sanity: this corpus has exactly 1 real unresolved call site elsewhere (see resolver.js contract -- global to the index); zenq.Ns071Target.run() moved to externalRefs under v0.8');
+  // v0.11/B2: V11UnitOfWork.commitBoth()'s TWO `pending.add(new
+  // Concrete__c(...))` calls are ordinary DOT calls on a `List<SObject>`-
+  // typed local -- `List` is not a locally declared class, so each of
+  // these stays an ORDINARY unresolved call site (B2 narrows the DML
+  // STATEMENT's own trigger linkage, never the .add()/.addAll() method
+  // dispatch itself -- exactly the same "stays unresolved as an ordinary
+  // call" invariant the pre-existing KappaUnitOfWork.commitWork fixture
+  // already established for this shape, per test-resolver.js's own B2
+  // suite). This is a genuine, expected +2 (not a regression to guard
+  // against), pinning the count at 1 -> 3 for this round.
+  assert.strictEqual(tree.stats.unresolvedSites, 3, 'sanity: this corpus has exactly 3 real unresolved call sites elsewhere (see resolver.js contract -- global to the index); zenq.Ns071Target.run() moved to externalRefs under v0.8, +2 for v0.11/B2\'s V11UnitOfWork.commitBoth() add() calls (ordinary dispatch, unaffected by DML narrowing)');
   assert.strictEqual(tree.stats.externalRefs, 1, 'v0.8/N5: zenq.Ns071Target.run() is the corpus\'s one managed-package (external) reference');
   assert.deepStrictEqual(tree.stats.externalNamespaces, ['zenq'], 'v0.8/N5: externalNamespaces lists the one namespace this corpus references');
   assert.strictEqual(headerLines.length, 2, 'note + the workspace-wide unresolved/managed-package line');
-  assert.strictEqual(headerLines[1], '1 unresolved · 1 managed-package ref (zenq).', 'v0.8/N5: header now shows BOTH counts on one line once externalRefs > 0, per uitree.js shapeHeaderLines');
+  assert.strictEqual(headerLines[1], '3 unresolved · 1 managed-package ref (zenq).', 'v0.8/N5: header now shows BOTH counts on one line once externalRefs > 0, per uitree.js shapeHeaderLines');
 }
 
 // --- v0.7.1/R1 e2e (superseded by v0.8/N1/N2, see below): namespaced-----
@@ -2020,6 +2099,57 @@ const v08Index = resolver.buildSemanticIndex(v08Files);
   assert.ok(pageCaller, 'e2e/v0.10-A2: V10VfActionPage\'s action="{!runAction}" binding must attach a method-level VF caller edge to V10VfExtController.runAction');
   assert.strictEqual(pageCaller.sites.length, 1, 'e2e/v0.10-A2: exactly one action-binding site');
   assert.strictEqual(pageCaller.sites[0].line, 2, 'e2e/v0.10-A2: site line matches the apex:commandButton\'s own source line');
+}
+
+// =========================================================================
+// v0.11/B1 e2e: literal-flow Type.forName dynamic dispatch, full pipeline
+// (see the V11DynamicTarget/V11ConstHolder/V11DynamicFactory fixtures
+// above). V11DynamicFactory.spawn() references the cross-class constant
+// V11ConstHolder.TARGET_CLASS (a static final String, single-literal
+// initializer, parsed from REAL source through parser.js's additive
+// TypeFacts.constants contract) inside Type.forName(...) -- the resolver
+// must resolve this exactly like a pre-existing inline string literal
+// would: via='dynamic', approximate:true, edge to V11DynamicTarget.<init>.
+// =========================================================================
+{
+  const tree = callers('v11dynamictarget', '<init>');
+  const caller = findChild(tree, 'V11DynamicFactory.spawn');
+  assert.ok(caller, 'e2e/v0.11-B1: Type.forName(V11ConstHolder.TARGET_CLASS) (cross-class constant, real-parsed) must resolve to V11DynamicTarget.<init>');
+  assert.strictEqual(caller.via, 'dynamic', `e2e/v0.11-B1: expected via=dynamic, got ${caller && caller.via}`);
+  assert.strictEqual(caller.approximate, true, 'e2e/v0.11-B1: a literal-flow dynamic-dispatch edge is approximate (an inference over which literal reaches the call site), not a syntactic certainty');
+}
+
+// =========================================================================
+// v0.11/B2 e2e: generic-DML narrowing, full pipeline (see the
+// V11WidgetATrigger/V11WidgetBTrigger/V11UnitOfWork fixtures above).
+// V11UnitOfWork.commitBoth() DMLs a LOCAL List<SObject> populated via TWO
+// `.add(new Concrete__c(...))` calls for two different concrete objects --
+// the union of that real-parsed intra-method evidence must narrow the DML
+// to BOTH objects (replacing the honest "DML on unresolved SObject type"
+// marker with narrowed ~dml trigger edges to both), not just the first one
+// encountered.
+// =========================================================================
+{
+  const tree = callees('v11unitofwork', 'commitboth');
+  const marker = findChild(tree, 'DML on unresolved SObject type');
+  assert.strictEqual(marker, undefined, 'e2e/v0.11-B2: the honest marker must be REPLACED once real-parsed narrowing evidence exists for BOTH add() calls');
+
+  const widgetATrigger = tree.root.children.find((c) => c.kind === 'trigger' && c.label === 'V11WidgetATrigger');
+  assert.ok(widgetATrigger, 'e2e/v0.11-B2: commitBoth must narrow to V11WidgetA__c -> V11WidgetATrigger (before insert, after insert -- matches)');
+  assert.strictEqual(widgetATrigger.via, 'dml', "e2e/v0.11-B2: narrowed edges stay via='dml' (the trigger genuinely fires)");
+  assert.strictEqual(widgetATrigger.approximate, true, 'e2e/v0.11-B2: narrowed edges ARE approximate (the object identity is an inference, not a certainty)');
+
+  const widgetBTrigger = tree.root.children.find((c) => c.kind === 'trigger' && c.label === 'V11WidgetBTrigger');
+  assert.ok(widgetBTrigger, 'e2e/v0.11-B2: commitBoth must ALSO narrow to V11WidgetB__c -> V11WidgetBTrigger -- the UNION of both add() calls, not just the first');
+  assert.strictEqual(widgetBTrigger.via, 'dml');
+  assert.strictEqual(widgetBTrigger.approximate, true);
+
+  // Caller-direction symmetry: both triggers must list commitBoth as a
+  // (narrowed) caller, mirroring the callee-direction edges above.
+  const widgetACallerTree = callers('v11widgetatrigger', null);
+  assert.ok(findChild(widgetACallerTree, 'V11UnitOfWork.commitBoth'), 'e2e/v0.11-B2: caller-direction symmetry -- V11WidgetATrigger must list commitBoth as a caller');
+  const widgetBCallerTree = callers('v11widgetbtrigger', null);
+  assert.ok(findChild(widgetBCallerTree, 'V11UnitOfWork.commitBoth'), 'e2e/v0.11-B2: caller-direction symmetry -- V11WidgetBTrigger must list commitBoth as a caller');
 }
 
 console.log('apex-trace end-to-end self-check: all assertions passed');

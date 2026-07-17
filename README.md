@@ -13,18 +13,13 @@ example fixture corpus — real parser → resolver → tree-shaping output, not
 hand-illustrated mockup:
 
 ```
-=== RawMaterialsPriceUpdateService.updateRawMaterialsPrice ===
-121 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).
-RawMaterialsPriceUpdateService.updateRawMaterialsPrice
-  RawMaterialsPriceUpdateBatch.execute  [Batchable · static]
-      L13: RawMaterialsPriceUpdateService.updateRawMaterialsPrice(new Map<Id, RawMaterial__c>(scope));
-      -> rawMaterials: new Map<Id, RawMaterial__c>(scope)
-    RawMaterialsPriceUpdateSchedulable.execute  [Schedulable · async]
-        L7: Database.executeBatch(new RawMaterialsPriceUpdateBatch());
-        -> new RawMaterialsPriceUpdateBatch()
-      RawMaterialsPriceUpdateSchedulable.scheduleNightlyJob  [async · ◉ root]
-          L21: System.schedule(JOB_NAME, CRON_EXP, new RawMaterialsPriceUpdateSchedulable());
-          -> JOB_NAME, CRON_EXP, new RawMaterialsPriceUpdateSchedulable()
+=== VertexRepriceBatch.execute ===
+36 unresolved · 17 managed-package refs (kwx, zenq).
+stats: nodes=2 unique=1 unresolved=36 capped=false
+VertexRepriceBatch.execute  [Batchable]
+  VertexNightlyAdjustmentJob.execute  [Schedulable · async · ◉ root]
+      L3: Database.executeBatch(new VertexRepriceBatch());
+      -> new VertexRepriceBatch()
 ```
 
 Every call site shows its source line **and** (when present) the overload signature
@@ -112,36 +107,78 @@ dumping hundreds of nodes at once; expand only the branches you actually care ab
 The transcript below is pasted **verbatim** from `node dev/smoke.js`:
 
 ```
-=== ProductTriggerService.handleBeforeUpdate -- STEP 1: initialDepth=2 (collapsed) ===
-121 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).
-stats: nodes=4 unique=3 unresolved=121 capped=false frontierNodes=2
-ProductTriggerService.handleBeforeUpdate
-  ProductTrigger  [trigger on Product2 (before update) · static]
-      L3: ProductTriggerService.handleBeforeUpdate(Trigger.new, Trigger.oldMap);
-      -> newProducts: Trigger.new, oldProducts: Trigger.oldMap
-    ProductAdditionalCostTriggerService.recalculateMarginsOnProduct  [dml · +2]
-        L45: update productsToUpdate;
-        -> productsToUpdate
+=== AcmeOrderTriggerHandler.handle -- STEP 1: initialDepth=2 (collapsed) ===
+72 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).
+stats: nodes=10 unique=9 unresolved=72 capped=false frontierNodes=2
+AcmeOrderTriggerHandler.handle
+  AcmeOrderTrigger  [trigger on Acme_Order__c (before insert, before update, after insert, after update) · typed]
+      L9: handler.handle(
+      -> newOrders: Trigger.new, oldMap: Trigger.oldMap, isBefore: Trigger.isBefore, isAfter: Trigger.isAfter, isInsert: Trigger.isInsert, isUpdate: Trigger.isUpdate
+    AcmeDiscountApprovalInvocable.execute  [@InvocableMethod (Flow) · dml · ◉ root]
+        L30: update ord;
+        -> ord
+    AcmeFulfillmentDmlService.insertOrders  [dml · ◉ root]
+        L15: insert orders;
+        -> orders
+    AcmeFulfillmentDmlService.insertOrdersViaDatabase  [dml · ◉ root]
+        L75: Database.insert(orders, false);
+        -> orders, false
+    AcmeFulfillmentDmlService.mergeOrders  [dml · ◉ root]
+        L63: merge masterOrder duplicateOrder;
+        -> masterOrder
+    AcmeFulfillmentDmlService.updateSingleOrder  [dml · ◉ root]
+        L29: update order;
+        -> order
+    AcmeFulfillmentDmlService.upsertOrders  [dml · ◉ root]
+        L49: upsert orders;
+        -> orders
+    AcmeOrderService.recalculatePricing  [dml · +2]
+        L39: update ord;
+        -> ord
       +2 more callers…
-    ProductPackagingMaterialTriggerService.recalculateMarginsOnProduct  [dml · +2]
-        L39: update productsToUpdate;
-        -> productsToUpdate
+    AcmeOrderUtil.markApproved  [dml · +2]
+        L22: update ord;
+        -> ord
       +2 more callers…
 
 -- after clicking the first +2 --
 
-=== ProductTriggerService.handleBeforeUpdate -- STEP 2: after expanding ONE frontier click ===
-stats: nodes=6 unique=5 unresolved=121 capped=false frontierNodes=3
-ProductTriggerService.handleBeforeUpdate
-  ProductTrigger  [trigger on Product2 (before update) · static]
-    ProductAdditionalCostTriggerService.recalculateMarginsOnProduct  [dml]
-        L45: update productsToUpdate;
-        -> productsToUpdate
-      ProductAdditionalCostTriggerService.executeAfterDelete  [this · +1]
-        +1 more callers…
-      ProductAdditionalCostTriggerService.executeAfterInsert  [this · +1]
-        +1 more callers…
-    ProductPackagingMaterialTriggerService.recalculateMarginsOnProduct  [dml · +2]
+=== AcmeOrderTriggerHandler.handle -- STEP 2: after expanding ONE frontier click ===
+stats: nodes=12 unique=10 unresolved=72 capped=false frontierNodes=1
+AcmeOrderTriggerHandler.handle
+  AcmeOrderTrigger  [trigger on Acme_Order__c (before insert, before update, after insert, after update) · typed]
+      L9: handler.handle(
+      -> newOrders: Trigger.new, oldMap: Trigger.oldMap, isBefore: Trigger.isBefore, isAfter: Trigger.isAfter, isInsert: Trigger.isInsert, isUpdate: Trigger.isUpdate
+    AcmeDiscountApprovalInvocable.execute  [@InvocableMethod (Flow) · dml · ◉ root]
+        L30: update ord;
+        -> ord
+    AcmeFulfillmentDmlService.insertOrders  [dml · ◉ root]
+        L15: insert orders;
+        -> orders
+    AcmeFulfillmentDmlService.insertOrdersViaDatabase  [dml · ◉ root]
+        L75: Database.insert(orders, false);
+        -> orders, false
+    AcmeFulfillmentDmlService.mergeOrders  [dml · ◉ root]
+        L63: merge masterOrder duplicateOrder;
+        -> masterOrder
+    AcmeFulfillmentDmlService.updateSingleOrder  [dml · ◉ root]
+        L29: update order;
+        -> order
+    AcmeFulfillmentDmlService.upsertOrders  [dml · ◉ root]
+        L49: upsert orders;
+        -> orders
+    AcmeOrderService.recalculatePricing  [dml]
+        L39: update ord;
+        -> ord
+      AcmeDiscountApprovalInvocable.execute  [@InvocableMethod (Flow) · static · ↪ seen elsewhere]
+          L31: AcmeOrderService.recalculatePricing(req.quoteId);
+          -> orderId: req.quoteId
+      AcmeOrderRestResource.handleGet  [@HttpX (REST) · static · ◉ root]
+          L13: AcmeOrderService.recalculatePricing(orderId); NovaBillingUtil.auditPricingSync(orderId); // v0.7: ambiguous cross-package fixture
+          -> orderId: orderId
+    AcmeOrderUtil.markApproved  [dml · +2]
+        L22: update ord;
+        -> ord
       +2 more callers…
 ```
 
@@ -290,18 +327,41 @@ What it can never show:
   other compound expression (`{!a && b}`, `{!IF(x,y,z)}`) is skipped, not attempted.
   `value="{!prop}"` bindings are out of scope entirely (property/accessor
   territory, not an action) — never extracted, regardless of shape.
-- `Type.forName`/`Type.newInstance()` with a non-literal argument (including a
-  `Type`-typed local/field, however it's named — the check is by declared type, not
-  identifier text) is not traced: no constructor edge, and never a guessed one.
+- `Type.forName(...)`/`Type.newInstance()` resolves through four strictly-verifiable
+  literal-flow shapes, all `~ dynamic`: an inline string literal, a local variable
+  declared with a single string-literal initializer and never reassigned anywhere else
+  in the method, a `static final String` constant with a literal initializer
+  (referenced bare in its own class or qualified as `ClassName.CONST` cross-class), and
+  a ternary of two string literals (edges to **both** candidates). Everything else is
+  not traced — no constructor edge, and never a guessed one: a method **parameter**
+  (never a local declaration, regardless of what it might hold at runtime), a local
+  that's reassigned *anywhere* in the method (the no-reassignment proof is purely
+  syntactic, not reachability-sensitive — a reassignment inside a never-taken branch
+  still disqualifies it), a non-`final` or non-literal-initializer field (never
+  recorded as a constant in the first place), string concatenation, or any other
+  computed/non-literal argument (including a `Type`-typed local/field, however it's
+  named — the check is by declared type, not identifier text). Cross-method literal
+  flow (a called method's return value, a field set by a different method) is out of
+  scope.
+- Generic-typed DML (a `List<SObject>`/`SObject`-typed **local** variable) narrows to
+  real objects when the SAME method also calls `.add(...)`/`.addAll(...)` on that same
+  local with evidence resolvable to a concrete type — a `new Concrete__c(...)`
+  construction, or a simple identifier whose own declared type is a concrete
+  SObject/SObject-collection. Each type found narrows to its own trigger/record-flow
+  linkage, `~ dml` (approximate — the object identity is an inference, not a syntactic
+  certainty); the union of every type discovered across all evidence calls fans out
+  together. What still doesn't narrow: evidence in a **different** method (a param, a
+  field, another method's return type — cross-method flow is out of scope), or an
+  `.add(...)` argument that's itself a computed/method-call expression rather than a
+  construction or a simple identifier. Zero in-method evidence leaves the honest `DML
+  on unresolved SObject type` marker exactly as before, with no trigger/flow linkage
+  attempted.
 - A 2-segment call (`Foo.bar()`) into an unknown class is never distinguished from a
   2-segment call into an actual namespace — see [Managed packages](#managed-packages)
   above for the 3-segment shapes that *are* modeled, and why 2-segment calls
   deliberately aren't.
-- DML→trigger edges assume the trigger fires (validation rules and exceptions can
-  prevent it at runtime). A DML statement whose target can't be narrowed to a
-  concrete SObject type (e.g. a generic `List<SObject>`/`SObject`-typed variable
-  threaded through a `Map`) surfaces as an honest `DML on unresolved SObject type`
-  leaf instead of silently vanishing — no trigger/flow linkage is attempted for it.
+- DML→trigger edges (narrowed or not) assume the trigger fires — validation rules and
+  exceptions can prevent it at runtime.
 - A single trace caps at 2000 nodes; a trace that hits the cap is marked and stops
   expanding fairly across branches rather than silently truncating one of them —
   the specific node whose own further expansion was cut carries the marker (never

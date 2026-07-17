@@ -203,7 +203,15 @@ const ORIENTATION_KEY = 'apexCallGraph.orientation';
 // always fails this tiebreak once after a restart -- safe (forces exactly
 // one reparse per file, never a false cache hit), but the full perf win
 // needs a matching cachestore.js update.
-const ENGINE_CACHE_VERSION = 6;
+// v0.11.0 (Round B) adds MethodFacts.locals[].literal (optional; single-
+// assignment string-literal locals, B1) and TypeFacts.constants[] (static
+// final String fields with a literal initializer, B1) -- a cached FileFacts
+// from the v0.6 engine is missing both additive fields, so this goes 6 -> 7
+// for this round. resolver.js's own B1/B2 changes (dynamic-dispatch literal
+// candidates, narrowed generic-DML edges) consume these new parser fields
+// but don't themselves change FileFacts/MetaRef shape, so they ride along
+// on this same bump rather than needing one of their own.
+const ENGINE_CACHE_VERSION = 7;
 
 // Debounce window between the end of a scan and the on-disk cache write --
 // avoids a redundant write-per-scan burst if the user retriggers a trace
