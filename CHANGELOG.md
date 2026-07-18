@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.1
+
+- Fixed the Marketplace/sidebar icon rendering at a quarter of its canvas (the
+  artwork now fills the tile properly).
+
+
 ## 0.12.0
 
 The Entry Points view — every way into your org, in one list.
