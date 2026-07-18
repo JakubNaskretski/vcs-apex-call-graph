@@ -3553,6 +3553,16 @@ function buildSemanticIndex(factsList, opts) {
     // passed as a function (see packageMetadataDiscovered's own header
     // note above).
     packageMetadataDiscovered,
+    // v0.12/C1: exposed (previously an internal-only closure var, see the
+    // opts.defaultPackage header note above) so a post-build query-time
+    // function -- buildEntryCatalog, a top-level function outside this
+    // closure -- can apply the exact same "only when != default package"
+    // rule the Entry Point Catalog contract calls for, without needing its
+    // own opts parameter (buildEntryCatalog(index) takes only the built
+    // index, matching every other post-build query function in this file).
+    // Purely additive: nothing before this round ever read
+    // index.defaultPackage, so no existing code path is touched.
+    defaultPackage,
   };
 }
 
@@ -5514,12 +5524,362 @@ function suggestTargets(index) {
   return out;
 }
 
+// =========================================================================
+// v0.12/C1: buildEntryCatalog(index) -- "a browsable index of every way into
+// the org," built PURELY by re-reading structures this file already
+// computes (MethodMeta.entries/ClassMeta.entries, triggerInfo,
+// metaCallers/externalMetaRefs, the '.apex' anonymous pseudo-type). No new
+// Apex/Flow analysis is performed here -- see the per-branch notes below for
+// exactly which existing field each Entry's data comes from.
+//
+// Group = { kind, label, entries:[Entry] }, one Group per kind, ALWAYS in
+// this fixed display order (even when a kind has zero entries -- a stable,
+// fully-enumerated key set is easier for a UI/test to consume than one whose
+// shape varies with workspace contents):
+const ENTRY_KIND_ORDER = ['trigger', 'aura', 'invocable', 'rest', 'soap', 'async', 'email', 'platform', 'flow', 'anonymous'];
+
+// v0.12/C2 note: matches uitree.js's own ENTRY_CATALOG_KIND_FALLBACK_LABEL
+// verbatim (that table only ever renders when a Group arrives with a falsy
+// label at all -- see its own header comment -- but since this file always
+// supplies one, keeping the two wordings identical avoids two subtly
+// different "what does this kind mean" labels existing in the product).
+const ENTRY_KIND_GROUP_LABEL = {
+  trigger: 'Triggers',
+  aura: 'Aura / LWC (@AuraEnabled)',
+  invocable: 'Invocable Actions',
+  rest: 'REST Endpoints',
+  soap: 'SOAP Web Services',
+  async: 'Async (Batch / Queueable / Schedulable / @future)',
+  email: 'Email Handlers',
+  platform: 'Platform Hooks',
+  flow: 'Flows',
+  anonymous: 'Anonymous Scripts',
+};
+
+// computeAnnotationEntries()/F5_ENTRY_RULES/BQS_LABEL above are this file's
+// ONLY producers of a method-level entries[] string (besides the trigger and
+// G4 anonymous-script labels, both handled by their own dedicated branches
+// below, and besides isTest exclusion, applied uniformly). This is the
+// verbatim-label -> catalog-kind map for every one of them.
+const ENTRY_LABEL_TO_KIND = {
+  '@AuraEnabled (LWC/Aura)': 'aura',
+  '@InvocableMethod (Flow)': 'invocable',
+  '@HttpX (REST)': 'rest',
+  '@future (async)': 'async',
+  'webservice (SOAP API)': 'soap',
+  'Batchable': 'async',
+  'Queueable': 'async',
+  'Schedulable': 'async',
+  'InboundEmailHandler (Email Service)': 'email',
+  'InstallHandler (package install)': 'platform',
+  'UninstallHandler (package uninstall)': 'platform',
+  'RegistrationHandler (SSO)': 'platform',
+  'Comparable (invoked by sort)': 'platform',
+  'Finalizer (async)': 'platform',
+};
+
+// C1 CONTRACT: rest detail is "the @HttpX verb(s)" -- the literal annotation
+// text (e.g. '@HttpGet'), NOT the generic '@HttpX (REST)' badge label
+// computeAnnotationEntries() already produced (that label is what routes the
+// method to kind:'rest' in the first place; the verb itself has to be
+// recovered separately from the method's own raw annotations -- see
+// restDetailFor below). parser.js hands annotations back bare/lowercased/
+// no-'@' (its own frozen contract, see its header note), so this is the
+// canonical-case display form for each of resolver.js's own HTTP_ANNOTATIONS
+// set, defined once here rather than re-deriving it per call.
+const HTTP_VERB_DISPLAY = {
+  httpget: '@HttpGet',
+  httppost: '@HttpPost',
+  httpput: '@HttpPut',
+  httpdelete: '@HttpDelete',
+  httppatch: '@HttpPatch',
+};
+
+// cm.methods (ClassMeta) only ever retained the DERIVED entries[] labels,
+// not the method's raw annotations -- but cm.typeFacts (the original
+// TypeFacts this ClassMeta was built from, kept around for exactly this
+// kind of "need the raw fact back" case, see buildClassMeta's own
+// `typeFacts: tf` field) still has them. Matched by (name, line) rather than
+// array position/name-only, since overloads share a name and ctors were
+// already merged out of cm.methods entirely.
+function restDetailFor(cm, mm) {
+  const rawMethods = (cm && cm.typeFacts && cm.typeFacts.methods) || [];
+  const rawMf = rawMethods.find((m) => !m.isCtor && m.name === mm.name && (m.line || 0) === (mm.line || 0));
+  const anns = rawMf ? (rawMf.annotations || []).map(annBare) : [];
+  const verbs = [];
+  for (const a of anns) {
+    if (HTTP_ANNOTATIONS.has(a) && HTTP_VERB_DISPLAY[a] && !verbs.includes(HTTP_VERB_DISPLAY[a])) verbs.push(HTTP_VERB_DISPLAY[a]);
+  }
+  // Defensive fallback only -- computeAnnotationEntries() already guarantees
+  // at least one HTTP_ANNOTATIONS match before '@HttpX (REST)' is ever
+  // pushed, so `verbs` is never actually empty for a real catalog entry.
+  return verbs.length ? verbs.join(', ') : '@HttpX';
+}
+
+// metascan.js (frozen) only ever emits a MetaRef for a Flow file that has at
+// least one apex <actionCalls> block -- a Screen/Autolaunched Flow with zero
+// such blocks (e.g. UI-only, or every action non-Apex) produces NOTHING at
+// all today, so it's otherwise invisible to this index (confirmed against
+// real fixtures in both gauntlet-org and adv-org). Per the GOAL text
+// ("every distinct flow file seen by metascan") this catalog still has to
+// list it. Since resolver.js has no fs access and metascan.js/extension.js
+// are out of THIS round's scope, this is read from an OPTIONAL, purely
+// additive new index field -- index.flowFilePaths: string[] -- the raw
+// '.flow-meta.xml' paths seen during the metadata scan, regardless of
+// content. It is NOT populated by any code in this file today (attachMetaCallers
+// is unchanged); a future extension.js round is expected to set
+// `index.flowFilePaths = <every .flow-meta.xml path from its own meta scan>`
+// before calling buildEntryCatalog, mirroring how it already sets
+// opts.packageOf/opts.defaultPackage for buildSemanticIndex. Absent (today's
+// real production index), this just yields zero extra flow entries beyond
+// what metaCallers/externalMetaRefs already carry -- never throws, never
+// double-counts (see collectFlowEntries's own dedupe-by-label note).
+//
+// This mirrors metascan.js's own (frozen) stemOf() -- strip directory, strip
+// the compound '.flow-meta.xml' extension -- reproduced here (not imported;
+// metascan.js exports no such helper) because it is pure filename text
+// manipulation, not Apex/Flow semantic analysis.
+function flowStemOf(rawPath) {
+  const s = String(rawPath || '');
+  const slash = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+  const base = slash === -1 ? s : s.slice(slash + 1);
+  if (/\.flow-meta\.xml$/i.test(base)) return base.replace(/\.flow-meta\.xml$/i, '');
+  const dot = base.lastIndexOf('.');
+  return dot > 0 ? base.slice(0, dot) : base;
+}
+
+// Gathers every distinct Flow (by label/API name) this index knows about --
+// from metaCallers (locally-attached refs) AND externalMetaRefs (a Flow
+// whose apex action targets a managed-package class still IS a real local
+// Flow file, just one whose action happens to resolve external -- see
+// v0.8/N1(c)) -- plus, additively, index.flowFilePaths (see flowStemOf's
+// header note). One Entry per distinct label; when several actionCalls
+// refs share a label (a flow with multiple apex actions), the lowest-line
+// ref is used for path/line (arbitrary but deterministic -- every ref
+// sharing a label was stamped from the SAME file's SAME <start> block, so
+// flowObject/flowTriggerType never differ across them). Detail: the
+// GOAL-text-ruled fallback ('screen or autolaunched') whenever no
+// start-trigger info was extracted (covers real Screen Flows, record-
+// agnostic Autolaunched Flows, AND Scheduled-Path Flows alike -- metascan's
+// own <start> extraction cannot tell these apart, and this catalog performs
+// no new analysis to do so either), otherwise '<flowTriggerType> on
+// <flowObject>' (covers both record-triggered and platform-event-triggered
+// shapes, which both carry that same field pair).
+function collectFlowEntries(index, addEntry) {
+  const refs = [];
+  const metaCallers = index && index.metaCallers instanceof Map ? index.metaCallers : new Map();
+  for (const list of metaCallers.values()) {
+    for (const r of list || []) if (r && r.kind === 'flow') refs.push(r);
+  }
+  const externalMetaRefs = index && index.externalMetaRefs instanceof Map ? index.externalMetaRefs : new Map();
+  for (const list of externalMetaRefs.values()) {
+    for (const r of list || []) if (r && r.kind === 'flow') refs.push(r);
+  }
+
+  const byLabel = new Map();
+  for (const r of refs) {
+    if (!r || typeof r.label !== 'string' || !r.label) continue;
+    if (!byLabel.has(r.label)) byLabel.set(r.label, []);
+    byLabel.get(r.label).push(r);
+  }
+
+  const seenLabels = new Set();
+  for (const [label, list] of byLabel) {
+    let best = list[0];
+    for (const r of list) {
+      if ((r.line || 0) < (best.line || 0)) best = r;
+    }
+    // v0.12/C1 fix (integrator pass): the C1 contract's Entry.detail comment
+    // enumerates the platform-event flow shape as the LITERAL, human-
+    // readable 'platform event on <Object>' string (lowercase, spaced) --
+    // NOT the generic '<triggerType> on <Object>' pattern, which would
+    // otherwise render the raw metascan.js constant verbatim as
+    // 'PlatformEvent on <Object>' (see PLATFORM_EVENT_TRIGGER_TYPE in
+    // metascan.js / the lc(...)==='platformevent' check buildMetaChildren
+    // already uses to detect this same shape). Confirmed against adv-org's
+    // MANIFEST.md 'Entry catalog' section, whose 'Additional flow details'
+    // list documents `AcmeNoteEventFlow` -> `platform event on
+    // Acme_Note__e` verbatim -- every OTHER record-triggered shape in that
+    // same list (RecordAfterSave/RecordBeforeSave/etc.) DOES use the raw
+    // triggerType text unchanged, so only this one shape needed a special
+    // case.
+    const detail = !best.flowObject
+      ? 'screen or autolaunched'
+      : lc(best.flowTriggerType) === 'platformevent'
+        ? `platform event on ${best.flowObject}`
+        : best.flowTriggerType
+          ? `${best.flowTriggerType} on ${best.flowObject}`
+          : 'screen or autolaunched';
+    addEntry('flow', `flow:${label}`, {
+      label,
+      className: null,
+      methodLower: null,
+      path: best.path || '',
+      line: best.line || 0,
+      detail,
+      package: null, // metadata-sourced nodes carry no package identity anywhere else in this engine either (see buildMetaChildren)
+    });
+    seenLabels.add(label);
+  }
+
+  const flowFilePaths = Array.isArray(index && index.flowFilePaths) ? index.flowFilePaths : [];
+  for (const p of flowFilePaths) {
+    if (typeof p !== 'string' || !p) continue;
+    const label = flowStemOf(p);
+    if (!label || seenLabels.has(label)) continue;
+    seenLabels.add(label);
+    addEntry('flow', `flow:${label}`, {
+      label,
+      className: null,
+      methodLower: null,
+      path: p,
+      line: 0,
+      detail: 'screen or autolaunched',
+      package: null,
+    });
+  }
+}
+
+function buildEntryCatalog(index) {
+  const groupsByKind = new Map(ENTRY_KIND_ORDER.map((k) => [k, new Map()])); // kind -> dedupeKey -> Entry
+  const packageLabelsSeen = new Set();
+  let excludedTestEntries = 0;
+  const defaultPackage = index && index.defaultPackage != null ? index.defaultPackage : null;
+
+  // C1 CONTRACT: "package|null, only when != default package". cm.package
+  // is already null whenever opts.packageOf was inactive/didn't cover the
+  // file (see buildClassMeta's own header note) -- this only additionally
+  // nulls out the ONE package that's actually the workspace default, so a
+  // method living in the default package never shows a redundant badge.
+  function packageFor(pkgLabel) {
+    if (pkgLabel == null) return null;
+    if (defaultPackage != null && pkgLabel === defaultPackage) return null;
+    return pkgLabel;
+  }
+
+  function addEntry(kind, dedupeKey, entry) {
+    const m = groupsByKind.get(kind);
+    if (!m || m.has(dedupeKey)) return; // C1 CONTRACT: dedupe within kind -- first (pass-A registration order) wins, matching this file's existing first-parsed-wins convention
+    m.set(dedupeKey, entry);
+    if (entry.package != null) packageLabelsSeen.add(entry.package);
+  }
+
+  // A method whose entries[] carries a real catalog-kind label but whose
+  // owning class/method is isTest is EXCLUDED (C1 CONTRACT), counted once
+  // per (label that would have mapped to a kind) -- not once per method --
+  // so a dual-annotation isTest method still counts as 2, matching how a
+  // non-excluded dual-annotation method produces 2 real Entries.
+  function processMethodEntries(cm, mm) {
+    if (!mm || !Array.isArray(mm.entries) || !mm.entries.length) return;
+    const nameLower = lc(mm.name);
+    // Constructors are never entry points (already entries:[] by
+    // construction -- see buildClassMeta); accessor scopes are call-graph
+    // SOURCES only, same MUST-FIX #5 suppression suggestTargets() already
+    // applies -- defensive here too, since entries[] should never actually
+    // be populated for either shape.
+    if (nameLower === '<init>' || nameLower === '(init)' || nameLower.startsWith('(get ') || nameLower.startsWith('(set ')) return;
+    for (const label of mm.entries) {
+      const kind = ENTRY_LABEL_TO_KIND[label];
+      if (!kind) continue; // not an entry-annotation label this catalog recognizes (defensive; every real label is mapped above)
+      if (mm.isTest) {
+        excludedTestEntries++;
+        continue;
+      }
+      let detail;
+      if (label === '@future (async)') detail = '@future'; // C1 CONTRACT: bare '@future', not the internal ' (async)'-suffixed label
+      else if (label === '@HttpX (REST)') detail = restDetailFor(cm, mm);
+      else detail = label; // Batchable/Queueable/Schedulable and every 'others' kind: the entry annotation label verbatim, per contract
+      addEntry(kind, `${cm.qualified}#${nameLower}`, {
+        label: `${cm.name}.${mm.name}`,
+        className: cm.qualified,
+        methodLower: nameLower,
+        path: cm.path,
+        line: mm.line || 0,
+        detail,
+        package: packageFor(cm.package != null ? cm.package : null),
+      });
+    }
+  }
+
+  const classes = index && index.classes instanceof Map ? index.classes : new Map();
+  for (const cm of classes.values()) {
+    if (!cm) continue;
+    if (cm.kind === 'trigger') {
+      const mm = (cm.methods || []).find((m) => m.name === '(trigger)');
+      // Only a '(trigger)' method that ALREADY carries the trigger entry
+      // label (buildClassMeta only pushes it when file.triggerInfo was
+      // present -- see its own header note) counts; this is the existing
+      // structure's own gate, re-read rather than re-derived.
+      if (!mm || !mm.entries || !mm.entries.some((e) => typeof e === 'string' && e.indexOf('trigger on ') === 0)) continue;
+      if (mm.isTest) {
+        excludedTestEntries++;
+        continue;
+      }
+      const ti = cm.triggerInfo || {};
+      const events = Array.isArray(ti.events) ? ti.events : [];
+      addEntry('trigger', `${cm.qualified}#(trigger)`, {
+        label: cm.name,
+        className: cm.qualified,
+        methodLower: '(trigger)',
+        path: cm.path,
+        line: mm.line || 0,
+        detail: `on ${ti.object || ''} (${events.join(', ')})`,
+        package: packageFor(cm.package != null ? cm.package : null),
+      });
+      continue;
+    }
+    if (cm.kind === 'anonymous') {
+      const mm = (cm.methods || []).find((m) => m.name === '(anonymous)');
+      if (!mm || !mm.entries || !mm.entries.includes('Anonymous Apex script')) continue;
+      if (mm.isTest) {
+        excludedTestEntries++;
+        continue;
+      }
+      addEntry('anonymous', `${cm.qualified}#(anonymous)`, {
+        label: cm.name,
+        className: cm.qualified,
+        methodLower: '(anonymous)',
+        path: cm.path,
+        line: mm.line || 0,
+        detail: 'Anonymous Apex script',
+        package: packageFor(cm.package != null ? cm.package : null),
+      });
+      continue;
+    }
+    for (const mm of cm.methods || []) processMethodEntries(cm, mm);
+  }
+
+  collectFlowEntries(index, addEntry);
+
+  const groups = ENTRY_KIND_ORDER.map((kind) => {
+    const entries = Array.from(groupsByKind.get(kind).values());
+    entries.sort((a, b) => a.label.localeCompare(b.label)); // C1 CONTRACT: stable sort by label
+    return { kind, label: ENTRY_KIND_GROUP_LABEL[kind], entries };
+  });
+
+  const byKind = {};
+  let total = 0;
+  for (const g of groups) {
+    byKind[g.kind] = g.entries.length;
+    total += g.entries.length;
+  }
+  const packages = Array.from(packageLabelsSeen).sort((a, b) => a.localeCompare(b));
+
+  return {
+    groups,
+    stats: { total, byKind, packages, excludedTestEntries },
+  };
+}
+
 module.exports = {
   buildSemanticIndex,
   buildCallerTree,
   buildCalleeTree,
   suggestTargets,
   attachMetaCallers,
+  // v0.12/C1: Entry Point Catalog -- see buildEntryCatalog's own header
+  // comment for the full contract.
+  buildEntryCatalog,
   // v0.10/A3: exported for direct unit-level pinning of the clamp math
   // itself (test-resolver.js) -- every OTHER export above is exercised only
   // behaviorally; clampInt is a pure, easily-isolated function, and the

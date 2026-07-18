@@ -24,6 +24,11 @@ const {
   frontierMethodKey,
   frontierBadge,
   shapeLoadMoreChild,
+  entryCatalogTarget,
+  shapeEntryCatalogEntry,
+  shapeEntryCatalogGroup,
+  shapeEntryCatalog,
+  shapeEntryCatalogHeaderLine,
 } = require('./uitree');
 
 // --- labelForNode: approximate '~' prefix ---
@@ -1867,5 +1872,249 @@ assert.strictEqual(mFrontierTFKids[0].label, 'Deep2.caller');
 assert.strictEqual(mFrontierTFKids[0].children.length, 2, 'target-first: Deep2.caller\'s own site row (L12: MidD.go();) plus the synthetic load-more child -- its (unexpanded) real CALLER children array is empty, but sites are unaffected');
 assert(mFrontierTFKids[0].children.some((c) => c.label === 'L12: MidD.go();'), "Deep2.caller's own outgoing call site still renders normally");
 assert.strictEqual(mFrontierTFKids[0].children.filter((c) => c.loadMore).length, 1, 'and exactly one synthetic load-more child among them');
+
+// =========================================================================
+// v0.12.0 / C2 (Entry-Point Catalog): shapeEntryCatalog and friends. Built
+// against the frozen "=== CONTRACT: resolver.js === C1" shape only --
+// resolver.js's real buildEntryCatalog may still be in flight this round
+// (see uitree.js's own header note above shapeEntryCatalog), so every
+// fixture below is a hand-built stub Catalog/Group/Entry, never a call into
+// resolver.js itself.
+// =========================================================================
+
+// --- entryCatalogTarget: generic className+methodLower derivation ---
+assert.deepStrictEqual(
+  entryCatalogTarget({ label: 'OrderService.processOrder', className: 'OrderService', methodLower: 'processorder' }),
+  { classLower: 'orderservice', methodLower: 'processorder' },
+  'classLower is the lowercased className; methodLower passes through as-is'
+);
+assert.deepStrictEqual(
+  entryCatalogTarget({ label: 'AcmeOrderTrigger', className: 'AcmeOrderTrigger', methodLower: '(trigger)' }),
+  { classLower: 'acmeordertrigger', methodLower: '(trigger)' },
+  "the '(trigger)' pseudo-method convention resolves generically, no kind-specific branch needed"
+);
+assert.deepStrictEqual(
+  entryCatalogTarget({ label: 'adhoc-recalc.apex', className: 'adhoc-recalc', methodLower: '(anonymous)' }),
+  { classLower: 'adhoc-recalc', methodLower: '(anonymous)' },
+  "the '(anonymous)' pseudo-method convention resolves generically too"
+);
+assert.strictEqual(
+  entryCatalogTarget({ label: 'Screen_Intake', className: null, methodLower: null }),
+  null,
+  'a flow entry (className/methodLower both null per the C1 contract) has no traceable target'
+);
+assert.strictEqual(entryCatalogTarget({ label: 'X', className: 'X', methodLower: null }), null, 'methodLower alone missing is still no target');
+assert.strictEqual(entryCatalogTarget({ label: 'X', className: null, methodLower: 'foo' }), null, 'className alone missing is still no target');
+assert.strictEqual(entryCatalogTarget(null), null, 'defensive: a null entry never throws');
+assert.strictEqual(entryCatalogTarget(undefined), null, 'defensive: an undefined entry never throws');
+
+// --- shapeEntryCatalogEntry: trigger kind ---
+const triggerEntry = {
+  label: 'AcmeOrderTrigger',
+  className: 'AcmeOrderTrigger',
+  methodLower: '(trigger)',
+  path: '/ws/triggers/AcmeOrderTrigger.trigger',
+  line: 1,
+  detail: 'on Order (before insert, after update)',
+  package: null,
+};
+const triggerUi = shapeEntryCatalogEntry('trigger', triggerEntry);
+assert.strictEqual(triggerUi.label, 'AcmeOrderTrigger');
+assert.strictEqual(triggerUi.description, 'on Order (before insert, after update)', 'no package badge when Entry.package is null');
+assert.strictEqual(triggerUi.iconId, 'zap', 'trigger entries reuse the SAME icon as trigger nodes in the caller/callee tree');
+assert.deepStrictEqual(triggerUi.jump, { path: '/ws/triggers/AcmeOrderTrigger.trigger', line: 1, col: 0 });
+assert.strictEqual(triggerUi.collapsible, false);
+assert.strictEqual(triggerUi.isGroup, false);
+assert.strictEqual(triggerUi.kind, 'trigger');
+assert.deepStrictEqual(triggerUi.entryTarget, { classLower: 'acmeordertrigger', methodLower: '(trigger)' });
+assert(triggerUi.tooltip.includes('/ws/triggers/AcmeOrderTrigger.trigger:1'), 'tooltip leads with path:line');
+assert(triggerUi.tooltip.includes('on Order (before insert, after update)'), 'tooltip includes the full detail line');
+assert(triggerUi.tooltip.includes('Apex trigger'), 'tooltip includes the kind glossary line');
+
+// --- shapeEntryCatalogEntry: package badge rendering ---
+const restEntry = {
+  label: 'AcmeOrderApi.getOrder',
+  className: 'AcmeOrderApi',
+  methodLower: 'getorder',
+  path: '/ws/classes/AcmeOrderApi.cls',
+  line: 12,
+  detail: 'GET',
+  package: 'nova-billing',
+};
+const restUi = shapeEntryCatalogEntry('rest', restEntry);
+assert.strictEqual(restUi.description, 'GET · (nova-billing)', 'detail and package badge join with the same " · " separator used elsewhere in this file');
+assert.strictEqual(restUi.iconId, 'globe');
+assert.deepStrictEqual(restUi.entryTarget, { classLower: 'acmeorderapi', methodLower: 'getorder' });
+assert(restUi.tooltip.includes('(nova-billing) —'), 'tooltip explains the package badge using the SAME MARKER_GLOSSARY.package wording as the caller/callee tree');
+
+// --- shapeEntryCatalogEntry: flow kind -- no target, null className/methodLower ---
+const flowEntry = {
+  label: 'Screen_Intake',
+  className: null,
+  methodLower: null,
+  path: '/ws/flows/Screen_Intake.flow-meta.xml',
+  line: 0,
+  detail: 'screen',
+  package: null,
+};
+const flowUi = shapeEntryCatalogEntry('flow', flowEntry);
+assert.strictEqual(flowUi.entryTarget, null, 'flow entries never carry a traceable Apex target per the C1 contract');
+assert.strictEqual(flowUi.iconId, 'symbol-event', 'flow entries reuse the SAME icon as flow nodes in the caller/callee tree');
+assert.strictEqual(flowUi.jump, null, 'line 0 is not a valid jump target -- no jump command wired');
+
+// --- shapeEntryCatalogEntry: anonymous kind ---
+const anonEntry = {
+  label: 'adhoc-recalc.apex',
+  className: 'adhoc-recalc',
+  methodLower: '(anonymous)',
+  path: '/ws/scripts/adhoc-recalc.apex',
+  line: 1,
+  detail: 'anonymous script',
+  package: null,
+};
+const anonUi = shapeEntryCatalogEntry('anonymous', anonEntry);
+assert.strictEqual(anonUi.iconId, 'terminal', 'anonymous entries reuse the SAME icon as anonymous-script nodes in the caller/callee tree');
+assert.deepStrictEqual(anonUi.entryTarget, { classLower: 'adhoc-recalc', methodLower: '(anonymous)' });
+
+// --- shapeEntryCatalogEntry: missing/undefined fields never throw ---
+assert.doesNotThrow(() => shapeEntryCatalogEntry('async', {}));
+const blankUi = shapeEntryCatalogEntry('async', {});
+assert.strictEqual(blankUi.label, '');
+assert.strictEqual(blankUi.description, '');
+assert.strictEqual(blankUi.jump, null);
+assert.strictEqual(blankUi.entryTarget, null);
+
+// --- shapeEntryCatalogGroup: expanded-by-default kinds (trigger, flow) ---
+const triggerGroup = shapeEntryCatalogGroup({ kind: 'trigger', label: 'Triggers', entries: [triggerEntry] });
+assert.strictEqual(triggerGroup.label, 'Triggers');
+assert.strictEqual(triggerGroup.description, '1', 'group description is the entry count');
+assert.strictEqual(triggerGroup.collapsible, true);
+assert.strictEqual(triggerGroup.expanded, true, 'trigger groups start expanded');
+assert.strictEqual(triggerGroup.isGroup, true);
+assert.strictEqual(triggerGroup.children.length, 1);
+assert.strictEqual(triggerGroup.children[0].label, 'AcmeOrderTrigger');
+
+const flowGroup = shapeEntryCatalogGroup({ kind: 'flow', label: 'Flows', entries: [flowEntry] });
+assert.strictEqual(flowGroup.expanded, true, 'flow groups start expanded');
+
+// --- shapeEntryCatalogGroup: every other kind starts collapsed ---
+for (const kind of ['aura', 'invocable', 'rest', 'soap', 'async', 'email', 'platform', 'anonymous']) {
+  const g = shapeEntryCatalogGroup({ kind, label: kind, entries: [{ label: 'X', className: 'X', methodLower: 'y', path: 'p', line: 1, detail: null, package: null }] });
+  assert.strictEqual(g.expanded, false, `${kind} groups start collapsed`);
+  assert.strictEqual(g.collapsible, true, `${kind} groups with entries are still collapsible`);
+}
+
+// --- shapeEntryCatalogGroup: an empty group is not collapsible at all ---
+const emptyGroup = shapeEntryCatalogGroup({ kind: 'soap', label: 'SOAP Web Services', entries: [] });
+assert.strictEqual(emptyGroup.description, '0');
+assert.strictEqual(emptyGroup.collapsible, false, 'nothing to expand into');
+assert.strictEqual(emptyGroup.expanded, false);
+assert.deepStrictEqual(emptyGroup.children, []);
+
+// --- shapeEntryCatalogGroup: label fallback when resolver.js hands back a falsy label ---
+const unlabeledGroup = shapeEntryCatalogGroup({ kind: 'invocable', label: '', entries: [] });
+assert.strictEqual(unlabeledGroup.label, 'Invocable Actions', 'falls back to the kind-keyed default label rather than rendering blank');
+
+// --- shapeEntryCatalogGroup: entry order is TRUSTED, never re-sorted here (resolver.js's job per the C1 contract's "stable sort by label") ---
+const outOfOrderEntries = [
+  { label: 'Zeta.run', className: 'Zeta', methodLower: 'run', path: 'p', line: 1, detail: null, package: null },
+  { label: 'Alpha.run', className: 'Alpha', methodLower: 'run', path: 'p', line: 1, detail: null, package: null },
+];
+const unsortedGroup = shapeEntryCatalogGroup({ kind: 'async', label: 'Async', entries: outOfOrderEntries });
+assert.deepStrictEqual(unsortedGroup.children.map((c) => c.label), ['Zeta.run', 'Alpha.run'], 'shapeEntryCatalogGroup preserves resolver.js\'s given order verbatim');
+
+// --- shapeEntryCatalog: full 10-kind catalog, exact contract display order preserved ---
+const KIND_ORDER = ['trigger', 'aura', 'invocable', 'rest', 'soap', 'async', 'email', 'platform', 'flow', 'anonymous'];
+function stubEntry(label, className, methodLower, detail, pkg) {
+  return { label, className, methodLower, path: `/ws/${label}`, line: 3, detail, package: pkg || null };
+}
+const fullCatalog = {
+  groups: KIND_ORDER.map((kind) => ({
+    kind,
+    label: kind + '-group',
+    entries: [stubEntry(`${kind}.entry`, kind === 'flow' ? null : 'Cls' + kind, kind === 'flow' ? null : 'm' + kind, 'detail:' + kind)],
+  })),
+  stats: {
+    total: KIND_ORDER.length,
+    byKind: Object.fromEntries(KIND_ORDER.map((k) => [k, 1])),
+    packages: [],
+  },
+};
+const fullShaped = shapeEntryCatalog(fullCatalog);
+assert.strictEqual(fullShaped.length, 10);
+assert.deepStrictEqual(fullShaped.map((g) => g.kind), KIND_ORDER, 'shapeEntryCatalog trusts and preserves catalog.groups order -- it never reorders by kind itself');
+assert.strictEqual(fullShaped[8].kind, 'flow');
+assert.strictEqual(fullShaped[8].children[0].entryTarget, null, 'the flow group entry in a full catalog still has no target');
+assert.strictEqual(fullShaped[0].expanded, true, 'trigger (index 0) expanded');
+assert.strictEqual(fullShaped[8].expanded, true, 'flow (index 8) expanded');
+assert.strictEqual(fullShaped[1].expanded, false, 'aura (index 1) collapsed');
+
+// --- shapeEntryCatalog: defensive against a malformed/absent catalog ---
+assert.deepStrictEqual(shapeEntryCatalog(null), []);
+assert.deepStrictEqual(shapeEntryCatalog(undefined), []);
+assert.deepStrictEqual(shapeEntryCatalog({}), [], 'no groups array at all');
+assert.deepStrictEqual(shapeEntryCatalog({ groups: 'not-an-array' }), []);
+
+// --- shapeEntryCatalog: determinism -- same input, same (deep-equal) output across repeated calls ---
+const shapedOnce = shapeEntryCatalog(fullCatalog);
+const shapedTwice = shapeEntryCatalog(fullCatalog);
+assert.deepStrictEqual(shapedOnce, shapedTwice, 'shapeEntryCatalog is a pure function of its input');
+
+// --- shapeEntryCatalog: dual-annotation method (documented: one Entry per matching KIND,
+// so the SAME className/methodLower legitimately appears in two different groups) ---
+const dualCatalog = {
+  groups: [
+    { kind: 'trigger', label: 'Triggers', entries: [] },
+    { kind: 'aura', label: 'Aura / LWC', entries: [stubEntry('OrderService.recalc', 'OrderService', 'recalc', '@AuraEnabled')] },
+    { kind: 'invocable', label: 'Invocable Actions', entries: [] },
+    { kind: 'rest', label: 'REST Endpoints', entries: [] },
+    { kind: 'soap', label: 'SOAP Web Services', entries: [] },
+    { kind: 'async', label: 'Async', entries: [stubEntry('OrderService.recalc', 'OrderService', 'recalc', '@future')] },
+    { kind: 'email', label: 'Email Handlers', entries: [] },
+    { kind: 'platform', label: 'Platform Hooks', entries: [] },
+    { kind: 'flow', label: 'Flows', entries: [] },
+    { kind: 'anonymous', label: 'Anonymous Scripts', entries: [] },
+  ],
+  stats: { total: 2, byKind: { aura: 1, async: 1 }, packages: [] },
+};
+const dualShaped = shapeEntryCatalog(dualCatalog);
+const auraEntryUi = dualShaped.find((g) => g.kind === 'aura').children[0];
+const asyncEntryUi = dualShaped.find((g) => g.kind === 'async').children[0];
+assert.strictEqual(auraEntryUi.label, 'OrderService.recalc');
+assert.strictEqual(asyncEntryUi.label, 'OrderService.recalc');
+assert.deepStrictEqual(auraEntryUi.entryTarget, asyncEntryUi.entryTarget, 'both entries resolve to the identical Apex target -- same method, two independent catalog rows');
+assert.notStrictEqual(auraEntryUi, asyncEntryUi, 'but they remain two distinct UiNode objects, one per kind group');
+
+// --- shapeEntryCatalogHeaderLine ---
+assert.strictEqual(
+  shapeEntryCatalogHeaderLine({ stats: { total: 42, byKind: { trigger: 3, flow: 5 }, packages: [] } }),
+  '42 entry points across 2 kinds'
+);
+assert.strictEqual(
+  shapeEntryCatalogHeaderLine({ stats: { total: 1, byKind: { trigger: 1 }, packages: [] } }),
+  '1 entry point across 1 kind',
+  'singular total and singular kind count'
+);
+assert.strictEqual(
+  shapeEntryCatalogHeaderLine({ stats: { total: 10, byKind: { trigger: 10 }, excludedTestEntries: 1, packages: [] } }),
+  '10 entry points across 1 kind · 1 test-class entry excluded'
+);
+assert.strictEqual(
+  shapeEntryCatalogHeaderLine({ stats: { total: 10, byKind: { trigger: 10 }, excludedTestEntries: 4, packages: [] } }),
+  '10 entry points across 1 kind · 4 test-class entries excluded',
+  'plural excluded-entries wording'
+);
+assert.strictEqual(
+  shapeEntryCatalogHeaderLine({ stats: { total: 10, byKind: { trigger: 10 }, excludedTestEntries: 0, packages: [] } }),
+  '10 entry points across 1 kind',
+  'zero excludedTestEntries is omitted entirely, not rendered as "0 excluded"'
+);
+assert.strictEqual(
+  shapeEntryCatalogHeaderLine({ stats: { total: 10, byKind: { trigger: 10 }, packages: ['nova-billing', 'nova-core'] } }),
+  '10 entry points across 1 kind · packages: nova-billing, nova-core'
+);
+assert.strictEqual(shapeEntryCatalogHeaderLine(null), '', 'defensive: null catalog never throws');
+assert.strictEqual(shapeEntryCatalogHeaderLine({}), '', 'defensive: no stats at all');
+assert.strictEqual(shapeEntryCatalogHeaderLine({ stats: {} }), '', 'defensive: stats present but no total');
 
 console.log('apex-trace uitree self-check: all assertions passed');

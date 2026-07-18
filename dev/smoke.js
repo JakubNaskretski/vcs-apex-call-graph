@@ -1042,9 +1042,75 @@ function runRoundBDemo() {
   );
 }
 
+// v0.12.0 / C1+C2: ENTRY CATALOG -- builds resolver.buildEntryCatalog(index)
+// against the REAL gauntlet-org corpus (same walkGauntletOrg() walk +
+// buildSemanticIndex/attachMetaCallers pipeline runGauntletOrgManagedPackages
+// above already uses, rebuilt fresh here rather than sharing that function's
+// local gIndex, which is not exported past its own scope), wires
+// index.flowFilePaths from the SAME metaOut listing extension.js's real
+// scanAndBuildIndex() derives it from (every '.flow-meta.xml' path this
+// walk saw, regardless of whether it produced a MetaRef), and prints the
+// per-kind counts + a handful of representative entries -- the dev-tool
+// mirror of GROUND-TRUTH.md's "## Entry catalog (v0.12)" section (23 total:
+// 6 trigger + 5 aura + 2 invocable + 0 rest + 0 soap + 9 async + 0 email +
+// 0 platform + 1 flow + 0 anonymous, 0 excludedTestEntries).
+function runEntryCatalogDemo() {
+  console.log('\n\n########################################################');
+  console.log('# ENTRY CATALOG (v0.12.0, gauntlet-org)');
+  console.log('########################################################');
+
+  const apexOut = [];
+  const metaOut = [];
+  walkGauntletOrg(GAUNTLET_ORG_ROOT, apexOut, metaOut);
+  let ownNamespace = null;
+  try {
+    const sfdxProject = JSON.parse(fs.readFileSync(path.join(GAUNTLET_ORG_PROJECT_ROOT, 'sfdx-project.json'), 'utf8'));
+    ownNamespace = typeof sfdxProject.namespace === 'string' && sfdxProject.namespace.trim() ? sfdxProject.namespace.trim() : null;
+  } catch (e) { /* no sfdx-project.json -> ownNamespace stays null */ }
+
+  const t0 = Date.now();
+  const ecFactsList = apexOut.map((p) => parser.parseFile({ path: p, text: fs.readFileSync(p, 'utf8') }));
+  const ecIndex = resolver.buildSemanticIndex(ecFactsList, { ownNamespace });
+  const ecMetaRefs = [];
+  for (const f of metaOut) {
+    const text = fs.readFileSync(f, 'utf8');
+    for (const ref of metascan.parseMetaFile({ path: f, text })) { ref.path = f; ecMetaRefs.push(ref); }
+  }
+  const ecStrippedRefs = ownNamespace && typeof metascan.stripOwnNamespace === 'function'
+    ? metascan.stripOwnNamespace(ecMetaRefs, ownNamespace)
+    : ecMetaRefs;
+  resolver.attachMetaCallers(ecIndex, ecStrippedRefs);
+  // v0.12.0 / C1 seam (see extension.js's scanAndBuildIndex): every
+  // '.flow-meta.xml' path the metadata walk saw, mirroring production.
+  ecIndex.flowFilePaths = metaOut.filter((p) => /\.flow-meta\.xml$/i.test(p));
+
+  if (typeof resolver.buildEntryCatalog !== 'function') {
+    console.log('resolver.buildEntryCatalog is not exported by this build -- skipping (C1 not landed yet).');
+    return;
+  }
+  const catalog = resolver.buildEntryCatalog(ecIndex);
+  const t1 = Date.now();
+
+  console.log(`Catalog build: ${t1 - t0}ms (perf bar: < 50ms; read-only walk over an already-built index).`);
+  console.log('stats:', JSON.stringify(catalog.stats));
+  console.log('\nPer-kind counts (expect: trigger 6, aura 5, invocable 2, rest 0, soap 0, async 9, email 0, platform 0, flow 1, anonymous 0, total 23, excludedTestEntries 0):');
+  for (const g of catalog.groups) {
+    console.log(`  ${g.kind.padEnd(10)} ${String(g.entries.length).padStart(2)}  (${g.label})`);
+  }
+
+  console.log('\nA few representative entries (label -- detail [package]):');
+  for (const g of catalog.groups) {
+    for (const e of g.entries.slice(0, 3)) {
+      const pkg = e.package ? ` [${e.package}]` : '';
+      console.log(`  [${g.kind}] ${e.label} -- ${e.detail}${pkg}  (${e.path}:${e.line})`);
+    }
+  }
+}
+
 main();
 runAdvOrg();
 runGauntletOrgManagedPackages();
 runProgressiveDepthDemo();
 runRoundADemo();
 runRoundBDemo();
+runEntryCatalogDemo();

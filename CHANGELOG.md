@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.12.0
+
+The Entry Points view — every way into your org, in one list.
+
+- New **"Apex Call Graph: Entry Points"** section in the Explorer sidebar: a
+  browsable catalog of everything the platform (or a user) can invoke —
+  triggers (with object + events), `@AuraEnabled`, `@InvocableMethod`,
+  REST/SOAP endpoints, async jobs (Batchable `start`/`execute`/`finish`,
+  Queueable, Schedulable, `@future`), Email Services, install/auth handlers,
+  Flows (with their trigger type and object), and Anonymous Apex scripts.
+- Each entry click-jumps to its declaration and offers an inline
+  **"What Does This Call?"** action — start a forward trace straight from the
+  entry point. Grouped with counts, package labels where relevant, test
+  classes excluded.
+- Built as a pure read over the existing index (about 1 ms) — no change to any
+  trace output, verified byte-identical.
+
+
 ## 0.11.0
 
 Dynamic dispatch through constants, and smarter generic DML.

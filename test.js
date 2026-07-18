@@ -2152,4 +2152,367 @@ const v08Index = resolver.buildSemanticIndex(v08Files);
   assert.ok(findChild(widgetBCallerTree, 'V11UnitOfWork.commitBoth'), 'e2e/v0.11-B2: caller-direction symmetry -- V11WidgetBTrigger must list commitBoth as a caller');
 }
 
+// =========================================================================
+// v0.12.0 / C1+C2 e2e: Entry-Point Catalog, real parser.js + metascan.js +
+// resolver.js pipeline (not test-resolver.js's synthetic MethodFacts
+// fixtures -- this proves annotation text/trigger-clause/Flow-XML source
+// actually parses into the right Entry shape end to end, and that
+// resolver.buildEntryCatalog + uitree.shapeEntryCatalog meet in the
+// middle). Deliberately an ISOLATED index (own factsList/buildSemanticIndex
+// call, own '/ws/ec2e/...' path prefix) rather than the giant shared
+// `index` above -- a small, hand-curated "fixture subset" (one entry per
+// catalog kind, not an exhaustive replay of every kind combination; that
+// exhaustive matrix already lives in test-resolver.js's EC fixture) whose
+// FULL catalog output this diffs byte-for-byte against a hand-written
+// ground-truth object below.
+//
+// Two of this fixture's shapes are DELIBERATE spot checks against the real
+// gauntlet-org corpus's documented '## Entry catalog (v0.12)' ground truth
+// (example-data/gauntlet-org/GROUND-TRUTH.md), reproduced here as real
+// source text so the SAME rulings are pinned through the real parser, not
+// just resolver.js's synthetic fixtures:
+//   - EC2ETrigger declares '(after update, after insert)' in that literal,
+//     non-alphabetical order -- GROUND-TRUTH.md's ruling 3 ("Trigger
+//     event-list order is source order, not sorted"), the same shape as
+//     the real corpus's VertexOrderTrigger.
+//   - EC2EBatchJob (Database.Batchable<SObject>) must contribute THREE
+//     async entries (start/execute/finish), not one -- GROUND-TRUTH.md's
+//     ruling 2 ("Batchable's start/finish count as async entries"), the
+//     same shape as the real corpus's VertexFollowupBatch/VertexRepriceBatch.
+// =========================================================================
+{
+  const ec2eFiles = [];
+  function ec2eAddFile(relPath, text) {
+    ec2eFiles.push(parser.parseFile({ path: `/ws/ec2e/${relPath}`, text }));
+  }
+
+  ec2eAddFile('misc/triggers/EC2ETrigger.trigger', [
+    'trigger EC2ETrigger on EC2E_Order__c (after update, after insert) {',
+    "  System.debug('ec2e trigger');",
+    '}',
+  ].join('\n'));
+
+  ec2eAddFile('misc/classes/EC2EAuraService.cls', [
+    'public class EC2EAuraService {',
+    '  @AuraEnabled',
+    "  public static String getData() { return 'data'; }",
+    '}',
+  ].join('\n'));
+
+  ec2eAddFile('misc/classes/EC2EInvocable.cls', [
+    'public class EC2EInvocable {',
+    '  @InvocableMethod',
+    "  public static void run() { System.debug('run'); }",
+    '}',
+  ].join('\n'));
+
+  ec2eAddFile('misc/classes/EC2ERestResource.cls', [
+    "@RestResource(urlMapping='/ec2e/*')",
+    'global with sharing class EC2ERestResource {',
+    '  @HttpGet',
+    "  global static void handleGet() { System.debug('get'); }",
+    '  @HttpPost',
+    "  global static void handlePost() { System.debug('post'); }",
+    '}',
+  ].join('\n'));
+
+  // Batchable -- gauntlet-org ground-truth spot check (ruling 2): all 3
+  // interface methods must become async entries, not just execute().
+  ec2eAddFile('misc/classes/EC2EBatchJob.cls', [
+    'global class EC2EBatchJob implements Database.Batchable<SObject> {',
+    '  global Database.QueryLocator start(Database.BatchableContext bc) { return null; }',
+    '  global void execute(Database.BatchableContext bc, List<SObject> scope) { }',
+    '  global void finish(Database.BatchableContext bc) { }',
+    '}',
+  ].join('\n'));
+
+  ec2eAddFile('misc/classes/EC2EEmailHandler.cls', [
+    'global class EC2EEmailHandler implements Messaging.InboundEmailHandler {',
+    '  global Messaging.InboundEmailResult handleInboundEmail(Messaging.InboundEmail email, Messaging.InboundEnvelope env) {',
+    '    return new Messaging.InboundEmailResult();',
+    '  }',
+    '}',
+  ].join('\n'));
+
+  ec2eAddFile('misc/classes/EC2EComparableThing.cls', [
+    'public class EC2EComparableThing implements Comparable {',
+    '  public Integer compareTo(Object other) { return 0; }',
+    '}',
+  ].join('\n'));
+
+  // isTest exclusion: an @AuraEnabled method inside an @isTest class must
+  // NOT appear in the aura group, and must count once in
+  // stats.excludedTestEntries.
+  ec2eAddFile('misc/classes/EC2ETestClass.cls', [
+    '@isTest',
+    'public class EC2ETestClass {',
+    '  @AuraEnabled',
+    "  public static String getTestData() { return 'test'; }",
+    '}',
+  ].join('\n'));
+
+  // Package labels: same-shaped @InvocableMethod class in the workspace
+  // DEFAULT package (must render package:null, per the C1 contract's "only
+  // when != default package" rule) vs. a NON-default package (must render
+  // its real label).
+  ec2eAddFile('pkgDefault/classes/EC2EDefaultClass.cls', [
+    'public class EC2EDefaultClass {',
+    '  @InvocableMethod',
+    "  public static void run() { System.debug('default pkg run'); }",
+    '}',
+  ].join('\n'));
+  ec2eAddFile('pkgOther/classes/EC2EPkgClass.cls', [
+    'public class EC2EPkgClass {',
+    '  @InvocableMethod',
+    "  public static void run() { System.debug('other pkg run'); }",
+    '}',
+  ].join('\n'));
+
+  ec2eAddFile('misc/scripts/EC2EScript.apex', [
+    "System.debug('ec2e anon script');",
+  ].join('\n'));
+
+  function ec2ePackageOf(fsPath) {
+    if (fsPath.indexOf('/ws/ec2e/pkgDefault/') === 0) return 'DefaultPkg';
+    if (fsPath.indexOf('/ws/ec2e/pkgOther/') === 0) return 'OtherPkg';
+    return null;
+  }
+
+  for (const f of ec2eFiles) {
+    assert.ok(!f.parseError, `e2e/entry-catalog fixture must parse cleanly: ${f.path}: ${f.parseError}`);
+  }
+
+  const ec2eIndex = resolver.buildSemanticIndex(ec2eFiles, { packageOf: ec2ePackageOf, defaultPackage: 'DefaultPkg' });
+
+  // Flow: record-triggered, has a real apex <actionCalls> block, run
+  // through the real metascan.js extractor (not a synthetic MetaRef).
+  const ec2eOrderFlowFile = {
+    path: '/ws/ec2e/misc/flows/EC2EOrderFlow.flow-meta.xml',
+    text: [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+      '  <start>',
+      '    <object>EC2E_Order__c</object>',
+      '    <triggerType>RecordAfterSave</triggerType>',
+      '    <recordTriggerType>Update</recordTriggerType>',
+      '  </start>',
+      '  <actionCalls>',
+      '    <actionName>EC2EInvocable</actionName>',
+      '    <actionType>apex</actionType>',
+      '  </actionCalls>',
+      '</Flow>',
+    ].join('\n'),
+  };
+  resolver.attachMetaCallers(ec2eIndex, metascan.parseMetaFile(ec2eOrderFlowFile).map((ref) => Object.assign(ref, { path: ec2eOrderFlowFile.path })));
+
+  // Flow: platform-event triggered, has a real apex <actionCalls> block --
+  // e2e proof (real metascan.js <start> extraction, not a hand-built
+  // MetaRef) that the platform-event detail string is the CONTRACT's
+  // literal 'platform event on <Object>' (lowercase), matching adv-org's
+  // MANIFEST.md 'Entry catalog' ground truth for AcmeNoteEventFlow.
+  const ec2eNotifyFlowFile = {
+    path: '/ws/ec2e/misc/flows/EC2ENotifyFlow.flow-meta.xml',
+    text: [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+      '  <start>',
+      '    <triggerType>PlatformEvent</triggerType>',
+      '    <object>EC2E_Notify__e</object>',
+      '  </start>',
+      '  <actionCalls>',
+      '    <actionName>EC2EInvocable</actionName>',
+      '    <actionType>apex</actionType>',
+      '  </actionCalls>',
+      '</Flow>',
+    ].join('\n'),
+  };
+  resolver.attachMetaCallers(ec2eIndex, metascan.parseMetaFile(ec2eNotifyFlowFile).map((ref) => Object.assign(ref, { path: ec2eNotifyFlowFile.path })));
+
+  // v0.12.0 / C1 seam: index.flowFilePaths, wired the same way
+  // extension.js's real scanAndBuildIndex() wires it (every '.flow-meta.xml'
+  // path the metadata walk saw) -- EC2EOrderFlow.flow-meta.xml is ALREADY
+  // covered by a ref above (must not duplicate/override); EC2EZeroActionFlow
+  // has no apex action at all and is otherwise completely invisible to this
+  // index, so it only appears in the catalog through this field.
+  ec2eIndex.flowFilePaths = [
+    '/ws/ec2e/misc/flows/EC2EOrderFlow.flow-meta.xml',
+    '/ws/ec2e/misc/flows/EC2EZeroActionFlow.flow-meta.xml',
+  ];
+
+  const ec2eCatalog = resolver.buildEntryCatalog(ec2eIndex);
+
+  // --- determinism: two calls over the same index must deep-equal ---------
+  assert.deepStrictEqual(ec2eCatalog, resolver.buildEntryCatalog(ec2eIndex), 'e2e/entry-catalog: buildEntryCatalog must be deterministic across calls');
+
+  // --- FULL catalog deep-diff against the hand-written ground truth -------
+  const ec2eExpected = {
+    groups: [
+      {
+        kind: 'trigger',
+        label: 'Triggers',
+        entries: [
+          {
+            label: 'EC2ETrigger', className: 'EC2ETrigger', methodLower: '(trigger)',
+            path: '/ws/ec2e/misc/triggers/EC2ETrigger.trigger', line: 1,
+            detail: 'on EC2E_Order__c (after update, after insert)', package: null,
+          },
+        ],
+      },
+      {
+        kind: 'aura',
+        label: 'Aura / LWC (@AuraEnabled)',
+        entries: [
+          {
+            label: 'EC2EAuraService.getData', className: 'EC2EAuraService', methodLower: 'getdata',
+            path: '/ws/ec2e/misc/classes/EC2EAuraService.cls', line: 3,
+            detail: '@AuraEnabled (LWC/Aura)', package: null,
+          },
+        ],
+      },
+      {
+        kind: 'invocable',
+        label: 'Invocable Actions',
+        entries: [
+          {
+            label: 'EC2EDefaultClass.run', className: 'EC2EDefaultClass', methodLower: 'run',
+            path: '/ws/ec2e/pkgDefault/classes/EC2EDefaultClass.cls', line: 3,
+            detail: '@InvocableMethod (Flow)', package: null,
+          },
+          {
+            label: 'EC2EInvocable.run', className: 'EC2EInvocable', methodLower: 'run',
+            path: '/ws/ec2e/misc/classes/EC2EInvocable.cls', line: 3,
+            detail: '@InvocableMethod (Flow)', package: null,
+          },
+          {
+            label: 'EC2EPkgClass.run', className: 'EC2EPkgClass', methodLower: 'run',
+            path: '/ws/ec2e/pkgOther/classes/EC2EPkgClass.cls', line: 3,
+            detail: '@InvocableMethod (Flow)', package: 'OtherPkg',
+          },
+        ],
+      },
+      {
+        kind: 'rest',
+        label: 'REST Endpoints',
+        entries: [
+          {
+            label: 'EC2ERestResource.handleGet', className: 'EC2ERestResource', methodLower: 'handleget',
+            path: '/ws/ec2e/misc/classes/EC2ERestResource.cls', line: 4,
+            detail: '@HttpGet', package: null,
+          },
+          {
+            label: 'EC2ERestResource.handlePost', className: 'EC2ERestResource', methodLower: 'handlepost',
+            path: '/ws/ec2e/misc/classes/EC2ERestResource.cls', line: 6,
+            detail: '@HttpPost', package: null,
+          },
+        ],
+      },
+      { kind: 'soap', label: 'SOAP Web Services', entries: [] },
+      {
+        kind: 'async',
+        label: 'Async (Batch / Queueable / Schedulable / @future)',
+        entries: [
+          {
+            label: 'EC2EBatchJob.execute', className: 'EC2EBatchJob', methodLower: 'execute',
+            path: '/ws/ec2e/misc/classes/EC2EBatchJob.cls', line: 3,
+            detail: 'Batchable', package: null,
+          },
+          {
+            label: 'EC2EBatchJob.finish', className: 'EC2EBatchJob', methodLower: 'finish',
+            path: '/ws/ec2e/misc/classes/EC2EBatchJob.cls', line: 4,
+            detail: 'Batchable', package: null,
+          },
+          {
+            label: 'EC2EBatchJob.start', className: 'EC2EBatchJob', methodLower: 'start',
+            path: '/ws/ec2e/misc/classes/EC2EBatchJob.cls', line: 2,
+            detail: 'Batchable', package: null,
+          },
+        ],
+      },
+      {
+        kind: 'email',
+        label: 'Email Handlers',
+        entries: [
+          {
+            label: 'EC2EEmailHandler.handleInboundEmail', className: 'EC2EEmailHandler', methodLower: 'handleinboundemail',
+            path: '/ws/ec2e/misc/classes/EC2EEmailHandler.cls', line: 2,
+            detail: 'InboundEmailHandler (Email Service)', package: null,
+          },
+        ],
+      },
+      {
+        kind: 'platform',
+        label: 'Platform Hooks',
+        entries: [
+          {
+            label: 'EC2EComparableThing.compareTo', className: 'EC2EComparableThing', methodLower: 'compareto',
+            path: '/ws/ec2e/misc/classes/EC2EComparableThing.cls', line: 2,
+            detail: 'Comparable (invoked by sort)', package: null,
+          },
+        ],
+      },
+      {
+        kind: 'flow',
+        label: 'Flows',
+        entries: [
+          {
+            label: 'EC2ENotifyFlow', className: null, methodLower: null,
+            path: '/ws/ec2e/misc/flows/EC2ENotifyFlow.flow-meta.xml', line: 8,
+            detail: 'platform event on EC2E_Notify__e', package: null,
+          },
+          {
+            label: 'EC2EOrderFlow', className: null, methodLower: null,
+            path: '/ws/ec2e/misc/flows/EC2EOrderFlow.flow-meta.xml', line: 9,
+            detail: 'RecordAfterSave on EC2E_Order__c', package: null,
+          },
+          {
+            label: 'EC2EZeroActionFlow', className: null, methodLower: null,
+            path: '/ws/ec2e/misc/flows/EC2EZeroActionFlow.flow-meta.xml', line: 0,
+            detail: 'screen or autolaunched', package: null,
+          },
+        ],
+      },
+      {
+        kind: 'anonymous',
+        label: 'Anonymous Scripts',
+        entries: [
+          {
+            label: 'EC2EScript', className: 'EC2EScript', methodLower: '(anonymous)',
+            path: '/ws/ec2e/misc/scripts/EC2EScript.apex', line: 1,
+            detail: 'Anonymous Apex script', package: null,
+          },
+        ],
+      },
+    ],
+    stats: {
+      total: 16,
+      byKind: { trigger: 1, aura: 1, invocable: 3, rest: 2, soap: 0, async: 3, email: 1, platform: 1, flow: 3, anonymous: 1 },
+      packages: ['OtherPkg'],
+      excludedTestEntries: 1,
+    },
+  };
+  assert.deepStrictEqual(ec2eCatalog, ec2eExpected, 'e2e/entry-catalog: FULL catalog must deep-equal the hand-written ground truth for this fixture subset');
+
+  // --- uitree.js seam: shapeEntryCatalog over the REAL catalog -----------
+  const ec2eShaped = uitree.shapeEntryCatalog(ec2eCatalog);
+  assert.strictEqual(ec2eShaped.length, 10, 'e2e: shapeEntryCatalog produces exactly the 10 fixed-order kind groups');
+  assert.deepStrictEqual(ec2eShaped.map((g) => g.kind), ['trigger', 'aura', 'invocable', 'rest', 'soap', 'async', 'email', 'platform', 'flow', 'anonymous']);
+  const ec2eTriggerGroup = ec2eShaped[0];
+  assert.strictEqual(ec2eTriggerGroup.expanded, true, 'e2e: trigger group renders pre-expanded');
+  assert.strictEqual(ec2eTriggerGroup.children[0].label, 'EC2ETrigger');
+  assert.deepStrictEqual(ec2eTriggerGroup.children[0].entryTarget, { classLower: 'ec2etrigger', methodLower: '(trigger)' }, "e2e: trigger entry's target uses the '(trigger)' pseudo-method convention");
+  const ec2eFlowGroup = ec2eShaped.find((g) => g.kind === 'flow');
+  assert.strictEqual(ec2eFlowGroup.expanded, true, 'e2e: flow group renders pre-expanded');
+  const ec2eZeroActionUi = ec2eFlowGroup.children.find((c) => c.label === 'EC2EZeroActionFlow');
+  assert.strictEqual(ec2eZeroActionUi.entryTarget, null, 'e2e: a flow entry never carries a traceable Apex target');
+  assert.strictEqual(ec2eZeroActionUi.jump, null, 'e2e: line 0 (flowFilePaths-only entry) is not a valid jump target');
+  const ec2eAsyncGroup = ec2eShaped.find((g) => g.kind === 'async');
+  assert.strictEqual(ec2eAsyncGroup.expanded, false, 'e2e: non-trigger/flow groups render collapsed by default');
+
+  assert.strictEqual(
+    uitree.shapeEntryCatalogHeaderLine(ec2eCatalog),
+    '16 entry points across 10 kinds · 1 test-class entry excluded · packages: OtherPkg',
+    'e2e: header line summarizes total/kinds/excluded/packages'
+  );
+}
+
 console.log('apex-trace end-to-end self-check: all assertions passed');

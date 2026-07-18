@@ -7,7 +7,7 @@
 // must-cover behaviors from the task brief (see the section markers below).
 
 const assert = require('assert');
-const { buildSemanticIndex, buildCallerTree, buildCalleeTree, suggestTargets, attachMetaCallers, clampInt } = require('./resolver');
+const { buildSemanticIndex, buildCallerTree, buildCalleeTree, suggestTargets, attachMetaCallers, buildEntryCatalog, clampInt } = require('./resolver');
 
 // ---- fixture builders (mirror the frozen contract's field names exactly) --
 
@@ -5624,6 +5624,443 @@ function buildV9ChainCallee5() {
     assert.strictEqual(c.label, 'Bug3Handler.run');
     assert.strictEqual(c.via, 'ambiguous');
   }
+}
+
+// =========================================================================
+// v0.12/C1: buildEntryCatalog(index) -- Entry Point Catalog
+//
+// Self-contained fixture workspace ('EC' prefix), covering: every one of
+// the 10 catalog kinds, the dual-annotation case (one method, two catalog
+// kinds), isTest exclusion (counted per label, not per method), dedupe
+// (two same-qualified-name classes across packages sharing one entry-
+// annotated method identity collapse to ONE entry), package labels (both
+// the default-package-nulls-out rule and a real non-default label),
+// stable sort-by-label within a kind, the fixed 10-kind group order, the
+// REST multi-verb join format (explicitly flagged as untested-by-either-
+// corpus, so pinned here), and determinism (deep-equal across two calls).
+// =========================================================================
+
+function ecPackageOf(fsPath) {
+  const m = /\/ws\/ec\/(pkgA|pkgB|pkgC)\//.exec(fsPath || '');
+  return m ? m[1] : null;
+}
+const EC_DEFAULT_PACKAGE = 'pkgA';
+const ECP = (pkg, name) => `/ws/ec/${pkg}/classes/${name}.cls`;
+
+// ---- trigger ------------------------------------------------------------
+const ECOrderTriggerType = ty('ECOrderTrigger', 'ECOrderTrigger', {
+  methods: [mth('(trigger)', { line: 1 })],
+});
+const ECOrderTriggerFile = file('/ws/ec/triggers/ECOrderTrigger.trigger', 'trigger', [ECOrderTriggerType], {
+  // declaration order must survive verbatim into detail (not alphabetized).
+  triggerInfo: { object: 'EC_Order__c', events: ['after update', 'after insert'] },
+});
+
+// ---- aura -----------------------------------------------------------------
+const ECAuraSvc = ty('ECAuraSvc', 'ECAuraSvc', {
+  methods: [mth('getData', { line: 1, annotations: ['auraenabled'] })],
+});
+
+// ---- invocable (one default-package, one non-default-package) -----------
+const ECInvocableAction = ty('ECInvocableAction', 'ECInvocableAction', {
+  methods: [mth('run', { line: 1, annotations: ['invocablemethod'] })],
+});
+const ECPkgDefaultClass = ty('ECPkgDefaultClass', 'ECPkgDefaultClass', {
+  methods: [mth('run', { line: 1, annotations: ['invocablemethod'] })],
+});
+const ECPkgOtherClass = ty('ECPkgOtherClass', 'ECPkgOtherClass', {
+  methods: [mth('run', { line: 1, annotations: ['invocablemethod'] })],
+});
+
+// ---- rest: two single-verb methods + one dual-verb method (join-format
+// pin -- neither real corpus has a >1-HTTP-verb method) ---------------------
+const ECRestResource = ty('ECRestResource', 'ECRestResource', {
+  methods: [
+    mth('handleGet', { line: 1, annotations: ['httpget'] }),
+    mth('handlePost', { line: 2, annotations: ['httppost'] }),
+    // Declaration order (httppost before httpget) deliberately non-
+    // alphabetical, to prove the join preserves source order rather than
+    // sorting the verbs.
+    mth('handleBoth', { line: 3, annotations: ['httppost', 'httpget'] }),
+  ],
+});
+
+// ---- soap -----------------------------------------------------------------
+const ECSoapSvc = ty('ECSoapSvc', 'ECSoapSvc', {
+  methods: [mth('doWork', { line: 1, modifiers: ['webservice'] })],
+});
+
+// ---- async: Batchable (3 entries from 1 class), Queueable, Schedulable,
+// @future -------------------------------------------------------------------
+const ECBatchJob = ty('ECBatchJob', 'ECBatchJob', {
+  implementsTypes: ['Database.Batchable<sObject>'],
+  methods: [
+    mth('start', { line: 1, params: [{ name: 'bc', type: 'Database.BatchableContext' }] }),
+    mth('execute', { line: 2, params: [{ name: 'bc', type: 'Database.BatchableContext' }, { name: 'scope', type: 'List<SObject>' }] }),
+    mth('finish', { line: 3, params: [{ name: 'bc', type: 'Database.BatchableContext' }] }),
+  ],
+});
+const ECQueueableJob = ty('ECQueueableJob', 'ECQueueableJob', {
+  implementsTypes: ['Queueable'],
+  methods: [mth('execute', { line: 1, params: [{ name: 'ctx', type: 'QueueableContext' }] })],
+});
+const ECScheduledJob = ty('ECScheduledJob', 'ECScheduledJob', {
+  implementsTypes: ['Schedulable'],
+  methods: [mth('execute', { line: 1, params: [{ name: 'ctx', type: 'SchedulableContext' }] })],
+});
+const ECFutureSvc = ty('ECFutureSvc', 'ECFutureSvc', {
+  methods: [mth('doAsync', { line: 1, isStatic: true, annotations: ['future'] })],
+});
+
+// ---- dual-annotation: ONE method, TWO different catalog kinds ------------
+const ECDualKind = ty('ECDualKind', 'ECDualKind', {
+  methods: [mth('doBoth', { line: 1, isStatic: true, annotations: ['auraenabled', 'future'] })],
+});
+
+// ---- isTest exclusion: a dual-annotation method inside an @isTest class,
+// so the excluded count must be 2 (one per label), not 1 (per method) ------
+const ECTestDualClass = ty('ECTestDualClass', 'ECTestDualClass', {
+  annotations: ['istest'],
+  methods: [mth('doBothTest', { line: 1, isStatic: true, annotations: ['auraenabled', 'future'] })],
+});
+
+// ---- email / platform -----------------------------------------------------
+const ECEmailHandler = ty('ECEmailHandler', 'ECEmailHandler', {
+  implementsTypes: ['Messaging.InboundEmailHandler'],
+  methods: [mth('handleInboundEmail', { line: 1, params: [{ name: 'email', type: 'Messaging.InboundEmail' }, { name: 'env', type: 'Messaging.InboundEnvelope' }] })],
+});
+const ECInstallHandler = ty('ECInstallHandler', 'ECInstallHandler', {
+  implementsTypes: ['InstallHandler'],
+  methods: [mth('onInstall', { line: 1, params: [{ name: 'ctx', type: 'InstallContext' }] })],
+});
+const ECUninstallSvc = ty('ECUninstallSvc', 'ECUninstallSvc', {
+  implementsTypes: ['UninstallHandler'],
+  methods: [mth('onUninstall', { line: 1, params: [{ name: 'ctx', type: 'UninstallContext' }] })],
+});
+const ECRegHandler = ty('ECRegHandler', 'ECRegHandler', {
+  implementsTypes: ['Auth.RegistrationHandler'],
+  methods: [
+    mth('createUser', { line: 1, params: [{ name: 'a', type: 'Id' }, { name: 'b', type: 'Auth.UserData' }] }),
+    mth('updateUser', { line: 2, params: [{ name: 'a', type: 'Id' }, { name: 'b', type: 'Id' }, { name: 'c', type: 'Auth.UserData' }] }),
+  ],
+});
+const ECComparableThing = ty('ECComparableThing', 'ECComparableThing', {
+  implementsTypes: ['Comparable'],
+  methods: [mth('compareTo', { line: 1, params: [{ name: 'other', type: 'Object' }] })],
+});
+const ECFinalizerThing = ty('ECFinalizerThing', 'ECFinalizerThing', {
+  implementsTypes: ['System.Finalizer'],
+  methods: [mth('execute', { line: 1, params: [{ name: 'ctx', type: 'System.FinalizerContext' }] })],
+});
+
+// ---- constructors are never entries (sanity) -------------------------------
+const ECCtorOnly = ty('ECCtorOnly', 'ECCtorOnly', {
+  methods: [mth('ECCtorOnly', { isCtor: true, line: 1 })],
+});
+
+// ---- dedupe across packages: SAME qualified name, SAME entry-annotated
+// method, registered in pkgB then pkgC -- must collapse to ONE aura entry,
+// attributed to the FIRST-registered (pkgB) candidate. ----------------------
+const ECDupAuraB = ty('ECDupAura', 'ECDupAura', { methods: [mth('run', { line: 1, annotations: ['auraenabled'] })] });
+const ECDupAuraC = ty('ECDupAura', 'ECDupAura', { methods: [mth('run', { line: 1, annotations: ['auraenabled'] })] });
+const ecDupAuraBFile = file(ECP('pkgB', 'ECDupAura'), 'class', [ECDupAuraB]);
+const ecDupAuraCFile = file(ECP('pkgC', 'ECDupAura'), 'class', [ECDupAuraC]);
+
+const ecPkgDefaultFile = file(ECP('pkgA', 'ECPkgDefaultClass'), 'class', [ECPkgDefaultClass]);
+const ecPkgOtherFile = file(ECP('pkgB', 'ECPkgOtherClass'), 'class', [ECPkgOtherClass]);
+
+// ---- anonymous --------------------------------------------------------
+const ECScriptType = ty('ECScript', 'ECScript', {
+  methods: [mth('(anonymous)', { line: 1, entries: ['Anonymous Apex script'] })],
+});
+const ecScriptFile = file('/ws/ec/scripts/ECScript.apex', 'anonymous', [ECScriptType]);
+
+const ecEntryCatalogFacts = [
+  ECOrderTriggerFile,
+  mkFile(ECAuraSvc),
+  mkFile(ECInvocableAction),
+  mkFile(ECRestResource),
+  mkFile(ECSoapSvc),
+  mkFile(ECBatchJob),
+  mkFile(ECQueueableJob),
+  mkFile(ECScheduledJob),
+  mkFile(ECFutureSvc),
+  mkFile(ECDualKind),
+  mkFile(ECTestDualClass),
+  mkFile(ECEmailHandler),
+  mkFile(ECInstallHandler),
+  mkFile(ECUninstallSvc),
+  mkFile(ECRegHandler),
+  mkFile(ECComparableThing),
+  mkFile(ECFinalizerThing),
+  mkFile(ECCtorOnly),
+  ecDupAuraBFile,
+  ecDupAuraCFile,
+  ecPkgDefaultFile,
+  ecPkgOtherFile,
+  ecScriptFile,
+];
+
+const ecIndex = buildSemanticIndex(ecEntryCatalogFacts, { packageOf: ecPackageOf, defaultPackage: EC_DEFAULT_PACKAGE });
+
+// ---- flow refs: record-triggered (2 actions, must pick the LOWER line),
+// platform-event, screen/autolaunched-with-a-ref (no start info), and one
+// externally-attached action (namespaced dotted fold-in, same detection
+// shape v0.8/N1(c) already established) ------------------------------------
+const ecFlowRefs = [
+  {
+    kind: 'flow', label: 'ECOrderFlow', className: 'ECFlowAction1', methodName: 'run',
+    flowObject: 'EC_Order__c', flowRecordTriggerType: 'CreateAndUpdate', flowTriggerType: 'RecordAfterSave',
+    path: '/ws/ec/flows/ECOrderFlow.flow-meta.xml', line: 5, lineText: '<actionName>ECFlowAction1.run</actionName>',
+  },
+  {
+    kind: 'flow', label: 'ECOrderFlow', className: 'ECFlowAction2', methodName: 'run',
+    flowObject: 'EC_Order__c', flowRecordTriggerType: 'CreateAndUpdate', flowTriggerType: 'RecordAfterSave',
+    path: '/ws/ec/flows/ECOrderFlow.flow-meta.xml', line: 2, lineText: '<actionName>ECFlowAction2.run</actionName>',
+  },
+  {
+    kind: 'flow', label: 'ECEventFlow', className: 'ECEventAction', methodName: null,
+    flowObject: 'EC_Notify__e', flowRecordTriggerType: null, flowTriggerType: 'PlatformEvent',
+    path: '/ws/ec/flows/ECEventFlow.flow-meta.xml', line: 1, lineText: '<actionName>ECEventAction</actionName>',
+  },
+  {
+    kind: 'flow', label: 'ECScreenFlow', className: 'ECScreenAction', methodName: 'run',
+    flowObject: null, flowRecordTriggerType: null, flowTriggerType: null,
+    path: '/ws/ec/flows/ECScreenFlow.flow-meta.xml', line: 1, lineText: '<actionName>ECScreenAction.run</actionName>',
+  },
+  {
+    // dotted fold-in ('zenq.ECExternalHandler.run') -> external node, same
+    // detection shape as the existing v0.8/N1(c) flow fixture.
+    kind: 'flow', label: 'ECExternalActionFlow', className: 'zenq', methodName: 'ECExternalHandler.run',
+    flowObject: 'EC_External__c', flowRecordTriggerType: 'Create', flowTriggerType: 'RecordBeforeSave',
+    path: '/ws/ec/flows/ECExternalActionFlow.flow-meta.xml', line: 3, lineText: '<actionName>zenq.ECExternalHandler.run</actionName>',
+  },
+];
+attachMetaCallers(ecIndex, ecFlowRefs);
+
+// Raw flow-file paths (v0.12/C1 extension point -- see buildEntryCatalog's
+// own header note in resolver.js): ECOrderFlow.flow-meta.xml is ALREADY
+// covered by a ref above (must NOT duplicate or override its real detail);
+// ECZeroActionFlow.flow-meta.xml has no apex actionCalls at all and is
+// otherwise completely invisible to this index.
+ecIndex.flowFilePaths = [
+  '/ws/ec/flows/ECOrderFlow.flow-meta.xml',
+  '/ws/ec/flows/ECZeroActionFlow.flow-meta.xml',
+];
+
+const ecCatalog = buildEntryCatalog(ecIndex);
+
+// ---- fixed 10-kind group order, always fully enumerated -------------------
+{
+  const kinds = ecCatalog.groups.map((g) => g.kind);
+  assert.deepStrictEqual(kinds, ['trigger', 'aura', 'invocable', 'rest', 'soap', 'async', 'email', 'platform', 'flow', 'anonymous'], 'C1: groups must appear in exactly the contract-specified kind order, every kind present even when (soap/email here are non-empty, but the ORDER itself must never depend on data)');
+}
+
+function findEntry(catalog, kind, label) {
+  const g = catalog.groups.find((x) => x.kind === kind);
+  return g && g.entries.find((e) => e.label === label);
+}
+function entryLabels(catalog, kind) {
+  const g = catalog.groups.find((x) => x.kind === kind);
+  return g ? g.entries.map((e) => e.label) : [];
+}
+
+// ---- trigger ----------------------------------------------------------
+{
+  const e = findEntry(ecCatalog, 'trigger', 'ECOrderTrigger');
+  assert.ok(e, 'trigger entry must be present');
+  assert.strictEqual(e.detail, 'on EC_Order__c (after update, after insert)', 'trigger detail must be "on <Object> (<events>)" in SOURCE declaration order, not alphabetized');
+  assert.strictEqual(e.className, 'ECOrderTrigger');
+  assert.strictEqual(e.methodLower, '(trigger)');
+  assert.strictEqual(e.package, null);
+}
+
+// ---- aura (plain + dual-annotation + dedupe-collapsed) ---------------------
+{
+  assert.deepStrictEqual(entryLabels(ecCatalog, 'aura'), ['ECAuraSvc.getData', 'ECDualKind.doBoth', 'ECDupAura.run'], 'aura group: 3 entries (plain + dual-kind + dedupe-collapsed), sorted by label');
+  const plain = findEntry(ecCatalog, 'aura', 'ECAuraSvc.getData');
+  assert.strictEqual(plain.detail, '@AuraEnabled (LWC/Aura)', "'others' kind: detail is the entry annotation label verbatim");
+  const dup = findEntry(ecCatalog, 'aura', 'ECDupAura.run');
+  assert.strictEqual(dup.path, ecDupAuraBFile.path, 'dedupe: the FIRST-registered (pkgB) candidate wins, matching this file\'s existing first-parsed-wins convention');
+  assert.strictEqual(dup.package, 'pkgB', 'dedupe: the surviving candidate\'s OWN package is reported');
+}
+
+// ---- invocable (default-package nulls out, non-default reports) -----------
+{
+  assert.deepStrictEqual(entryLabels(ecCatalog, 'invocable'), ['ECInvocableAction.run', 'ECPkgDefaultClass.run', 'ECPkgOtherClass.run']);
+  const defaultPkgEntry = findEntry(ecCatalog, 'invocable', 'ECPkgDefaultClass.run');
+  assert.strictEqual(defaultPkgEntry.package, null, 'package|null: a candidate living in the WORKSPACE DEFAULT package must report null, not the default label itself');
+  const otherPkgEntry = findEntry(ecCatalog, 'invocable', 'ECPkgOtherClass.run');
+  assert.strictEqual(otherPkgEntry.package, 'pkgB', 'a candidate in a real non-default package must report that package label');
+  const noPkgEntry = findEntry(ecCatalog, 'invocable', 'ECInvocableAction.run');
+  assert.strictEqual(noPkgEntry.package, null, 'a file outside every known package directory reports null (no package metadata at all)');
+}
+
+// ---- rest: single verbs + the untested-by-corpus multi-verb join format ---
+{
+  assert.deepStrictEqual(entryLabels(ecCatalog, 'rest'), ['ECRestResource.handleBoth', 'ECRestResource.handleGet', 'ECRestResource.handlePost']);
+  assert.strictEqual(findEntry(ecCatalog, 'rest', 'ECRestResource.handleGet').detail, '@HttpGet', 'rest detail is the literal @HttpX verb text, not the generic "@HttpX (REST)" badge label');
+  assert.strictEqual(findEntry(ecCatalog, 'rest', 'ECRestResource.handlePost').detail, '@HttpPost');
+  assert.strictEqual(findEntry(ecCatalog, 'rest', 'ECRestResource.handleBoth').detail, '@HttpPost, @HttpGet', 'multi-verb join: SOURCE declaration order, not alphabetized -- this exact shape is untested by either real corpus, pinned here');
+}
+
+// ---- soap ---------------------------------------------------------------
+{
+  const e = findEntry(ecCatalog, 'soap', 'ECSoapSvc.doWork');
+  assert.ok(e);
+  assert.strictEqual(e.detail, 'webservice (SOAP API)');
+}
+
+// ---- async: Batchable contributes 3 entries from ONE class, plus
+// Queueable/Schedulable/@future (incl. the dual-kind method's @future half,
+// stripped of its internal ' (async)' suffix) -------------------------------
+{
+  assert.deepStrictEqual(entryLabels(ecCatalog, 'async'), [
+    'ECBatchJob.execute', 'ECBatchJob.finish', 'ECBatchJob.start',
+    'ECDualKind.doBoth', 'ECFutureSvc.doAsync', 'ECQueueableJob.execute', 'ECScheduledJob.execute',
+  ], 'async group: Batchable = 3 entries (start/execute/finish) from ONE class, per F5\'s own "whole 3-method interface" comment');
+  for (const label of ['ECBatchJob.start', 'ECBatchJob.execute', 'ECBatchJob.finish']) {
+    assert.strictEqual(findEntry(ecCatalog, 'async', label).detail, 'Batchable');
+  }
+  assert.strictEqual(findEntry(ecCatalog, 'async', 'ECQueueableJob.execute').detail, 'Queueable');
+  assert.strictEqual(findEntry(ecCatalog, 'async', 'ECScheduledJob.execute').detail, 'Schedulable');
+  assert.strictEqual(findEntry(ecCatalog, 'async', 'ECFutureSvc.doAsync').detail, '@future', "@future detail is the bare string '@future', NOT the engine's internal '@future (async)' label");
+  assert.strictEqual(findEntry(ecCatalog, 'async', 'ECDualKind.doBoth').detail, '@future');
+}
+
+// ---- dual-annotation: the SAME method appears once per matching kind ------
+{
+  const auraHalf = findEntry(ecCatalog, 'aura', 'ECDualKind.doBoth');
+  const asyncHalf = findEntry(ecCatalog, 'async', 'ECDualKind.doBoth');
+  assert.ok(auraHalf && asyncHalf, 'a method with two entry annotations must appear ONCE PER matching kind (one aura entry + one async entry), never merged into one, never dropped');
+  assert.strictEqual(auraHalf.className, asyncHalf.className);
+  assert.strictEqual(auraHalf.methodLower, asyncHalf.methodLower);
+  assert.strictEqual(auraHalf.line, asyncHalf.line);
+}
+
+// ---- isTest exclusion: counted per LABEL, not per method -------------------
+{
+  assert.strictEqual(findEntry(ecCatalog, 'aura', 'ECTestDualClass.doBothTest'), undefined, 'an @isTest class\'s entry-annotated method must be excluded from the catalog entirely');
+  assert.strictEqual(findEntry(ecCatalog, 'async', 'ECTestDualClass.doBothTest'), undefined);
+  assert.strictEqual(ecCatalog.stats.excludedTestEntries, 2, 'excludedTestEntries counts once PER excluded catalog-kind label -- the dual-annotation isTest method contributes 2, not 1');
+}
+
+// ---- email / platform -------------------------------------------------
+{
+  assert.strictEqual(findEntry(ecCatalog, 'email', 'ECEmailHandler.handleInboundEmail').detail, 'InboundEmailHandler (Email Service)');
+  assert.deepStrictEqual(entryLabels(ecCatalog, 'platform'), [
+    'ECComparableThing.compareTo', 'ECFinalizerThing.execute', 'ECInstallHandler.onInstall',
+    'ECRegHandler.createUser', 'ECRegHandler.updateUser', 'ECUninstallSvc.onUninstall',
+  ], 'platform group folds all 5 F5 sub-interfaces (RegistrationHandler contributing 2 methods) into one kind, sorted by label');
+}
+
+// ---- constructors are never entries (sanity) -------------------------------
+{
+  for (const g of ecCatalog.groups) {
+    assert.ok(!g.entries.some((e) => e.className === 'ECCtorOnly'), 'a class with only a constructor must contribute ZERO catalog entries in any kind');
+  }
+}
+
+// ---- flow: record-triggered (multi-ref min-line pick), platform-event,
+// screen/autolaunched-with-a-ref, externally-attached action, and a
+// zero-actionCall flow file visible ONLY via index.flowFilePaths ------------
+{
+  const flowLabels = entryLabels(ecCatalog, 'flow').slice().sort();
+  assert.deepStrictEqual(flowLabels, ['ECEventFlow', 'ECExternalActionFlow', 'ECOrderFlow', 'ECScreenFlow', 'ECZeroActionFlow'].slice().sort(), 'flow group: every distinct flow file seen -- ref-derived (local + external) AND the zero-actionCall file, deduped by label, ECOrderFlow counted once despite 2 actions + a flowFilePaths mention');
+
+  const orderFlow = findEntry(ecCatalog, 'flow', 'ECOrderFlow');
+  assert.strictEqual(orderFlow.detail, 'RecordAfterSave on EC_Order__c', "flow detail is '<flowTriggerType> on <flowObject>' when start info is known");
+  assert.strictEqual(orderFlow.line, 2, 'multi-ref flow: the LOWER line among all actionCalls sharing this label is used');
+  assert.strictEqual(orderFlow.className, null, 'flow entries never carry a className -- flows are not Apex types');
+  assert.strictEqual(orderFlow.methodLower, null);
+
+  // Integrator pass (v0.12/C1 fix): the C1 contract's Entry.detail comment
+  // pins the platform-event shape as the LITERAL 'platform event on
+  // <Object>' string (lowercase, spaced), distinct from the generic
+  // '<triggerType> on <Object>' pattern used for genuine record-triggered
+  // types -- confirmed against adv-org's MANIFEST.md 'Entry catalog'
+  // section ('Additional flow details': `AcmeNoteEventFlow` ->
+  // `platform event on Acme_Note__e`, verbatim). The previous assertion
+  // here ('PlatformEvent on EC_Notify__e', the raw metascan.js constant
+  // formatted through the generic pattern) was itself the bug this fixture
+  // caught -- see resolver.js's collectFlowEntries for the fix.
+  const eventFlow = findEntry(ecCatalog, 'flow', 'ECEventFlow');
+  assert.strictEqual(eventFlow.detail, 'platform event on EC_Notify__e', "platform-event flow: the CONTRACT's literal 'platform event on <Object>' string, not the raw flowTriggerType constant");
+
+  const screenFlow = findEntry(ecCatalog, 'flow', 'ECScreenFlow');
+  assert.strictEqual(screenFlow.detail, 'screen or autolaunched', 'a flow WITH an apex action ref but no <start> object/triggerType falls back to the GOAL-ruled combined string, not the finer 3-way split the CONTRACT comment describes');
+
+  const externalFlow = findEntry(ecCatalog, 'flow', 'ECExternalActionFlow');
+  assert.ok(externalFlow, "a flow whose only apex action targets a MANAGED-PACKAGE class (externalMetaRefs, not metaCallers) must still appear -- it's still a real local flow file");
+  assert.strictEqual(externalFlow.detail, 'RecordBeforeSave on EC_External__c');
+
+  const zeroActionFlow = findEntry(ecCatalog, 'flow', 'ECZeroActionFlow');
+  assert.ok(zeroActionFlow, "GOAL ruling: 'every distinct flow file seen' includes files with ZERO apex actionCalls, sourced from index.flowFilePaths since metascan's own ref list is silent for them");
+  assert.strictEqual(zeroActionFlow.detail, 'screen or autolaunched');
+  assert.strictEqual(zeroActionFlow.line, 0);
+}
+
+// ---- anonymous --------------------------------------------------------
+{
+  const e = findEntry(ecCatalog, 'anonymous', 'ECScript');
+  assert.ok(e, "anonymous entry label is the SCRIPT NAME alone ('ECScript'), never 'ECScript.(anonymous)'");
+  assert.strictEqual(e.detail, 'Anonymous Apex script');
+  assert.strictEqual(e.methodLower, '(anonymous)');
+}
+
+// ---- stats: total/byKind/packages are all internally consistent -----------
+{
+  let sumByKind = 0;
+  for (const k of Object.keys(ecCatalog.stats.byKind)) sumByKind += ecCatalog.stats.byKind[k];
+  assert.strictEqual(sumByKind, ecCatalog.stats.total, 'stats.total must equal the sum of stats.byKind');
+  let sumGroups = 0;
+  for (const g of ecCatalog.groups) sumGroups += g.entries.length;
+  assert.strictEqual(sumGroups, ecCatalog.stats.total, 'stats.total must equal the sum of every group\'s entries.length');
+  assert.strictEqual(ecCatalog.stats.byKind.trigger, 1);
+  assert.strictEqual(ecCatalog.stats.byKind.aura, 3);
+  assert.strictEqual(ecCatalog.stats.byKind.invocable, 3);
+  assert.strictEqual(ecCatalog.stats.byKind.rest, 3);
+  assert.strictEqual(ecCatalog.stats.byKind.soap, 1);
+  assert.strictEqual(ecCatalog.stats.byKind.async, 7);
+  assert.strictEqual(ecCatalog.stats.byKind.email, 1);
+  assert.strictEqual(ecCatalog.stats.byKind.platform, 6);
+  assert.strictEqual(ecCatalog.stats.byKind.flow, 5);
+  assert.strictEqual(ecCatalog.stats.byKind.anonymous, 1);
+  assert.deepStrictEqual(ecCatalog.stats.packages, ['pkgB'], 'stats.packages: distinct non-default package labels actually present in the FINAL (post-dedupe) catalog, sorted');
+}
+
+// ---- determinism: the SAME index, built/queried twice, must be byte-
+// identical (no Set/Map iteration-order leakage, no Date.now()-style noise) -
+{
+  const ecCatalogAgain = buildEntryCatalog(ecIndex);
+  assert.deepStrictEqual(ecCatalog, ecCatalogAgain, 'C1 CONTRACT: deterministic output -- calling buildEntryCatalog(index) twice on the same index must be deep-equal');
+  const ecIndex2 = buildSemanticIndex(ecEntryCatalogFacts, { packageOf: ecPackageOf, defaultPackage: EC_DEFAULT_PACKAGE });
+  attachMetaCallers(ecIndex2, ecFlowRefs);
+  ecIndex2.flowFilePaths = ecIndex.flowFilePaths;
+  const ecCatalogFromFreshBuild = buildEntryCatalog(ecIndex2);
+  assert.deepStrictEqual(ecCatalog, ecCatalogFromFreshBuild, 'determinism must also hold across a completely FRESH index built from the same fixture facts, not just a memoized re-call');
+}
+
+// ---- empty workspace: every kind still present, all zero -------------------
+{
+  const emptyCatalog = buildEntryCatalog(buildSemanticIndex([]));
+  assert.deepStrictEqual(emptyCatalog.groups.map((g) => g.kind), ['trigger', 'aura', 'invocable', 'rest', 'soap', 'async', 'email', 'platform', 'flow', 'anonymous']);
+  for (const g of emptyCatalog.groups) assert.deepStrictEqual(g.entries, []);
+  assert.strictEqual(emptyCatalog.stats.total, 0);
+  assert.deepStrictEqual(emptyCatalog.stats.packages, []);
+  assert.strictEqual(emptyCatalog.stats.excludedTestEntries, 0);
+  for (const k of Object.keys(emptyCatalog.stats.byKind)) assert.strictEqual(emptyCatalog.stats.byKind[k], 0);
+}
+
+// ---- defensive: buildEntryCatalog must never throw on a malformed/
+// undefined index (mirrors this file's existing house style for every
+// other post-build query function). -----------------------------------
+{
+  assert.doesNotThrow(() => buildEntryCatalog(undefined));
+  assert.doesNotThrow(() => buildEntryCatalog(null));
+  assert.doesNotThrow(() => buildEntryCatalog({}));
+  const shell = buildEntryCatalog({});
+  assert.strictEqual(shell.stats.total, 0);
 }
 
 console.log('test-resolver.js: all assertions passed.');

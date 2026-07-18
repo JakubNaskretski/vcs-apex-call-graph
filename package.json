@@ -2,7 +2,7 @@
   "name": "apex-call-graph",
   "displayName": "Apex Call Graph",
   "description": "Trace who calls an Apex class or method — with the arguments at every call site — up to trigger/LWC/Flow/API entry points. Traces Flow, LWC, Aura and OmniScript callers too. Offline static analysis: real Apex parser, no org connection, no language server.",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "publisher": "Skrety",
   "license": "MIT",
   "icon": "plugin-icon.png",
@@ -56,6 +56,12 @@
         "title": "Show Path Map",
         "category": "Apex Call Graph",
         "icon": "$(map)"
+      },
+      {
+        "command": "apexTrace.showEntryCatalog",
+        "title": "Show Entry Points",
+        "category": "Apex Call Graph",
+        "icon": "$(refresh)"
       }
     ],
     "menus": {
@@ -91,6 +97,18 @@
           "command": "apexTrace.toggleOrientation",
           "group": "navigation",
           "when": "view == apexTraceView && apexTrace.hasResults && apexTrace.direction == 'callers'"
+        },
+        {
+          "command": "apexTrace.showEntryCatalog",
+          "group": "navigation",
+          "when": "view == apexTraceEntriesView"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "apexTrace.traceCallees",
+          "group": "inline",
+          "when": "view == apexTraceEntriesView && viewItem == apexTraceEntryCatalogEntry"
         }
       ]
     },
@@ -100,6 +118,11 @@
           "id": "apexTraceView",
           "name": "Apex Call Graph: Callers",
           "contextualTitle": "Apex Call Graph"
+        },
+        {
+          "id": "apexTraceEntriesView",
+          "name": "Apex Call Graph: Entry Points",
+          "contextualTitle": "Apex Call Graph"
         }
       ]
     },
@@ -107,6 +130,10 @@
       {
         "view": "apexTraceView",
         "contents": "Trace who calls an Apex class or method, or what it calls out to.\n[Who Calls This?](command:apexTrace.traceCallers)\n[What Does This Call?](command:apexTrace.traceCallees)\n[Open Path Map](command:apexTrace.showPathMap)"
+      },
+      {
+        "view": "apexTraceEntriesView",
+        "contents": "Scan the workspace to list every entry point.\n[Show Entry Points](command:apexTrace.showEntryCatalog)"
       }
     ],
     "configuration": {

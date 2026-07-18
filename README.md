@@ -38,6 +38,9 @@ calls, chains deeper than 12 segments), instead of staying silent about it.
    target in the other direction.
 3. Run **Apex Call Graph: Show Path Map** for the same trace as an interactive graph
    instead of a tree.
+4. Not sure where to start? Run **Apex Call Graph: Show Entry Points** for a browsable
+   index of every trigger, `@AuraEnabled`/`@InvocableMethod`/REST/SOAP method, async job,
+   Flow, and anonymous script in the workspace — see [Entry Points view](#entry-points-view).
 
 ## Both directions
 
@@ -229,6 +232,28 @@ from the node body, so clicking it expands in place while clicking the body stil
 jumps to source — and expanding preserves your current pan/zoom position instead of
 re-fitting the view. Fully offline webview, no external resources.
 
+## Entry Points view
+
+**Apex Call Graph: Show Entry Points** scans the workspace and lists every way into
+the org in a second Explorer view — a browsable index built from the same data the
+call-graph engine already computes, not a new kind of analysis. Entries are grouped by
+kind (**Triggers**, **Aura / LWC**, **Invocable Actions**, **REST Endpoints**, **SOAP
+Web Services**, **Async** — Batchable/Queueable/Schedulable/`@future`, **Email
+Handlers**, **Platform Hooks** — install/uninstall/SSO/`Comparable`/`Finalizer`,
+**Flows**, **Anonymous Scripts**), with a count next to each group and a totals line
+(`N entry points across M kinds`) at the top. Triggers and Flows start expanded — the
+two kinds most useful for "how does this org get entered" at a glance — every other
+group starts collapsed. `@isTest` classes are excluded from the catalog entirely (a
+separate count in the header says how many).
+
+Click any entry to jump to its source. Every entry also carries an inline **What Does
+This Call?** action — the same forward-trace command the main view uses — so you can go
+straight from "here's an entry point" to "here's everything it reaches" without
+re-resolving a target by hand. (A Flow entry runs this only when the Flow's engine data
+gives it a traceable Apex target; otherwise it's a no-op with an explanatory toast — a
+Flow itself isn't an Apex class/method the tracer can target.) The view title's refresh
+button re-runs the scan, reusing the same caches a normal trace does.
+
 ## The transaction story
 
 Traces don't stop at method boundaries: a `update shipments;` statement (or
@@ -394,6 +419,7 @@ workspace-folder set; deleting them just forces a cold re-parse next run.
 | `Apex Call Graph: What Does This Call?` | Editor context menu (`.cls`/`.trigger`), command palette |
 | `Apex Call Graph: Switch Trace Direction` | View title button — re-runs the last target the other way |
 | `Apex Call Graph: Show Path Map` | Editor context menu, view title button, command palette |
+| `Apex Call Graph: Show Entry Points` | Entry Points view title button, view welcome link, command palette |
 
 ## Reference: how edges are resolved
 

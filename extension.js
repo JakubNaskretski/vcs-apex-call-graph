@@ -117,6 +117,13 @@ const {
   // node's identity string.
   shapeNode,
   frontierMethodKey,
+  // v0.12.0 / C2: Entry-Point Catalog shaping surface (uitree.js's own
+  // section header above shapeEntryCatalog documents the full contract) --
+  // used only by the entry-catalog view wiring below (EntryCatalogProvider/
+  // toEntryCatalogTreeItem/apexTrace.showEntryCatalog), never by the
+  // pre-existing caller/callee trace path above.
+  shapeEntryCatalog,
+  shapeEntryCatalogHeaderLine,
 } = require('./uitree');
 const { renderPathMapHtml, buildPathMapData } = require('./pathmap');
 
@@ -281,6 +288,36 @@ class TraceProvider {
   }
 }
 
+// v0.12.0 / C2: the Entry-Point Catalog's own TreeDataProvider, backing the
+// second Explorer view ('apexTraceEntriesView', see activate() below). A
+// flat two-level tree (kind group -> entries, uitree.js's
+// shapeEntryCatalog output) rather than a recursive call tree, so this is
+// deliberately simpler than TraceProvider above -- no traceId/progressive-
+// depth bookkeeping, since an entry-catalog "trace" is just "the last scan
+// this command ran", always fully materialized (a catalog is small and flat
+// by construction -- one row per entry point, not a branching call graph).
+class EntryCatalogProvider {
+  constructor() {
+    this._emitter = new vscode.EventEmitter();
+    this.onDidChangeTreeData = this._emitter.event;
+    this._roots = []; // UiNode[] (group nodes)
+  }
+
+  setRoots(uiNodes) {
+    this._roots = uiNodes || [];
+    this._emitter.fire();
+  }
+
+  getTreeItem(el) {
+    return el;
+  }
+
+  getChildren(el) {
+    if (!el) return this._roots.map((n) => toEntryCatalogTreeItem(n));
+    return el._uiChildren || [];
+  }
+}
+
 // UiNode.jump.line is still 1-based (uitree.js is pure and never touches
 // vscode types — see its header comment); vscode.Position/Range are
 // 0-based, so the conversion happens right here, at the boundary.
@@ -334,6 +371,57 @@ function openCommand(fsPath, line, col) {
     title: 'Open',
     arguments: [vscode.Uri.file(fsPath), { selection: new vscode.Range(line, col, line, col) }],
   };
+}
+
+// v0.12.0 / C2: uitree.js's shapeEntryCatalog UiNode -> vscode.TreeItem, the
+// entry-catalog view's own counterpart to toTreeItem above. Deliberately
+// separate (not a mode of toTreeItem) since entry-catalog UiNodes carry
+// fields toTreeItem's caller/callee tree never produces (isGroup/expanded/
+// entryTarget, see uitree.js's header note above shapeEntryCatalog) and
+// have none of toTreeItem's traceId/load-more machinery to thread through.
+//
+// Two custom (non-vscode-API) properties are stashed directly on the
+// TreeItem, same idiom toTreeItem already uses for `_traceId`/`_uiChildren`
+// above: `_entryTarget` ({classLower, methodLower}|null) and `_entryLabel`
+// (the entry's own display label, for a no-target toast's wording) -- both
+// read back by apexTrace.traceCallees' inline-action branch (registered in
+// activate() below) when this item is passed to it as the `view/item/
+// context` inline action's argument. Only ever set on an ENTRY leaf
+// (uiNode.isGroup false); a group TreeItem carries neither property at all,
+// which is exactly what that branch's `Object.prototype.hasOwnProperty`
+// check relies on to tell "this call came from an entry-catalog inline
+// action" apart from every pre-existing invocation of that same command
+// (palette, editor context menu, the main view's title-bar button) -- none
+// of which ever pass a TreeItem argument, so `item` is undefined there and
+// the check is false by construction, leaving that command's original
+// behavior byte-identical.
+function toEntryCatalogTreeItem(uiNode) {
+  const collapsibleState = uiNode.isGroup
+    ? (uiNode.collapsible
+        ? (uiNode.expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed)
+        : vscode.TreeItemCollapsibleState.None)
+    : vscode.TreeItemCollapsibleState.None;
+  const it = new vscode.TreeItem(uiNode.label, collapsibleState);
+  it.description = uiNode.description;
+  if (uiNode.tooltip) it.tooltip = uiNode.tooltip;
+  if (uiNode.iconId) it.iconPath = new vscode.ThemeIcon(uiNode.iconId);
+  const kids = (uiNode.children || []).map((n) => toEntryCatalogTreeItem(n));
+  it._uiChildren = kids;
+  if (!uiNode.isGroup) {
+    // contextValue is what package.json's "view/item/context" `when` clause
+    // (viewItem == apexTraceEntryCatalogEntry) matches against, so the
+    // inline "What Does This Call?" action renders on entry rows only,
+    // never on a kind-group header row.
+    it.contextValue = 'apexTraceEntryCatalogEntry';
+    it._entryTarget = uiNode.entryTarget || null;
+    it._entryLabel = uiNode.label;
+    if (uiNode.jump) {
+      const line = Math.max(0, (uiNode.jump.line || 1) - 1);
+      const col = Math.max(0, uiNode.jump.col || 0);
+      it.command = openCommand(uiNode.jump.path, line, col);
+    }
+  }
+  return it;
 }
 
 // v0.9 / P2: appends `extraGlobs` (apexCallGraph.excludeGlobs) onto a
@@ -1145,6 +1233,14 @@ async function activate(context) {
   const view = vscode.window.createTreeView('apexTraceView', { treeDataProvider: provider });
   context.subscriptions.push(view);
 
+  // v0.12.0 / C2: the Entry-Point Catalog's own second Explorer view --
+  // always visible (no `when` clause, same as apexTraceView per H8), shows
+  // a viewsWelcome (package.json) until apexTrace.showEntryCatalog is run
+  // at least once this session.
+  const entryCatalogProvider = new EntryCatalogProvider();
+  const entryCatalogView = vscode.window.createTreeView('apexTraceEntriesView', { treeDataProvider: entryCatalogProvider });
+  context.subscriptions.push(entryCatalogView);
+
   // F6: hydrate fileCache/metaFileCache from the previous session's
   // persisted cache before any command can run, so the very first trace in
   // a fresh VS Code window over an unchanged workspace only has to stat
@@ -1275,12 +1371,29 @@ async function activate(context) {
     // failure mode here is the vscode.workspace.fs I/O layer itself, which
     // this still guards defensively since it runs on every trace.
     let metaRefs = [];
+    // v0.12.0 / C1 seam: every '.flow-meta.xml' path this same metadata scan
+    // saw, REGARDLESS of whether metascan.parseMetaFile() emitted any MetaRef
+    // for it (a Screen/Autolaunched Flow with zero apex <actionCalls> emits
+    // nothing at all today -- see resolver.js's buildEntryCatalog / its
+    // collectFlowEntries header note) -- this is the index.flowFilePaths
+    // "future extension.js round" that comment anticipates, landing this
+    // round so the Entry Point Catalog's flow group actually lists every
+    // distinct flow file (not just the ones with an apex action), matching
+    // both corpora's GROUND-TRUTH/MANIFEST 'Entry catalog' sections (e.g.
+    // adv-org's AcmeBackorderResolutionFlow/AcmeNotifyCustomerSubflow/
+    // AcmeQuoteApprovalScreenFlow, none of which have an apex action).
+    // Best-effort same as metaRefs above: stays [] (today's byte-identical
+    // absence) on any scan failure, never blocks the trace.
+    let flowFilePaths = [];
     try {
       const metaScan = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'Apex Call Graph: indexing metadata (LWC/Aura/Flow/OmniScript)…' },
         (progress) => scanMetaFiles(progress, settings.excludeGlobs)
       );
       metaRefs = computeMetaRefs(metaScan.files);
+      flowFilePaths = metaScan.files
+        .filter((f) => f && typeof f.path === 'string' && /\.flow-meta\.xml$/i.test(f.path))
+        .map((f) => f.path);
     } catch (e) {
       // metadata indexing is additive -- never block the Apex-only trace on it.
     }
@@ -1354,6 +1467,12 @@ async function activate(context) {
         : metaRefs;
     const index = resolver.buildSemanticIndex(scan.factsList, { packageOf, defaultPackage, ownNamespace });
     resolver.attachMetaCallers(index, strippedMetaRefs);
+    // v0.12.0 / C1 seam: see flowFilePaths' own declaration above -- purely
+    // additive extra field on the index, read only by
+    // resolver.buildEntryCatalog's collectFlowEntries; every pre-existing
+    // resolver.js code path (buildCallerTree/buildCalleeTree/suggestTargets)
+    // never reads this property, so existing trace output is unaffected.
+    index.flowFilePaths = flowFilePaths;
     return { index, scan, settings };
   }
 
@@ -1571,9 +1690,84 @@ async function activate(context) {
     // resolution (resolveTarget/buildSuggestPicks) with the callers
     // direction per A4; only the resolver call + tree.direction differ,
     // both handled inside traceTarget/computeTrace above.
-    vscode.commands.registerCommand('apexTrace.traceCallees', async () => {
+    //
+    // v0.12.0 / C2: this SAME command id is also wired as the entry-catalog
+    // view's per-entry INLINE action (package.json's "view/item/context",
+    // icon $(call-outgoing) -- the identical title/icon this command
+    // already declares, so reusing the id rather than minting a new command
+    // was the deliberate choice here, not an oversight). When VS Code
+    // invokes a `view/item/context` menu command it passes the clicked
+    // TreeItem as the first argument; every OTHER way this command can fire
+    // (Command Palette, editor context menu, the main view's title-bar
+    // button) never passes any argument at all, so `item` is undefined
+    // there and this branch is a strict no-op for all pre-existing call
+    // sites -- byte-identical behavior, purely additive.
+    // `hasOwnProperty('_entryTarget')` (not just `item`) is the discriminator
+    // rather than a truthy check, since `_entryTarget` is itself legitimately
+    // null for a flow entry (toEntryCatalogTreeItem above stamps it on
+    // every entry leaf, present-but-null included) -- see uitree.js's
+    // entryCatalogTarget doc for why a flow entry never carries a real one.
+    // A null target here is EXACTLY the C2 contract's "flows: run the
+    // callee trace only when the flow has traceable children -- else no-op
+    // toast" case (documented at uitree.js's shapeEntryCatalogEntry: today's
+    // C1 contract never gives a flow entry a target at all, so this is the
+    // no-op branch for every flow entry as of this round).
+    vscode.commands.registerCommand('apexTrace.traceCallees', async (item) => {
+      if (item && Object.prototype.hasOwnProperty.call(item, '_entryTarget')) {
+        if (!item._entryTarget) {
+          vscode.window.showInformationMessage(
+            `Apex Call Graph: "${item._entryLabel || 'this entry'}" has no further Apex callees to trace.`
+          );
+          return;
+        }
+        // Reuses the SAME scanAndBuildIndex()/traceTarget() machinery a
+        // normal callee trace uses (caches reused, all the usual side
+        // effects -- tree-view roots, header, note toast, map-panel
+        // refresh) -- the only difference from computeTrace('callees') is
+        // that the target is already known, so resolveTarget()'s
+        // cursor/QuickPick step is skipped entirely.
+        const built = await scanAndBuildIndex();
+        if (!built) return;
+        const tree = traceTarget(built.index, built.scan, item._entryTarget, 'callees', built.settings);
+        if (tree) await vscode.commands.executeCommand('apexTraceView.focus');
+        return;
+      }
       const tree = await computeTrace('callees');
       if (tree) await vscode.commands.executeCommand('apexTraceView.focus');
+    }),
+    // v0.12.0 / C2: builds the Entry-Point Catalog -- palette command
+    // (category 'Apex Call Graph') AND the entry-catalog view's own
+    // title-bar refresh button (package.json's "view/title", same '+
+    // re-run to refresh' idiom apexTrace.showPathMap already uses for
+    // apexTraceView above) AND the viewsWelcome command link shown before
+    // the view has ever been populated this session.
+    vscode.commands.registerCommand('apexTrace.showEntryCatalog', async () => {
+      const built = await scanAndBuildIndex();
+      if (!built) return;
+      // C1 (resolver.js's buildEntryCatalog) may still be in flight this
+      // round -- same forward-compat `typeof` guard idiom this file already
+      // uses for metascan.stripOwnNamespace (v0.8 N3) and
+      // pathmap.buildPathMapData (v0.9 P2) above, so a resolver.js build
+      // that hasn't landed C1 yet degrades to a clear warning instead of
+      // throwing a TypeError.
+      if (typeof resolver.buildEntryCatalog !== 'function') {
+        vscode.window.showWarningMessage(
+          'Apex Call Graph: the entry-point catalog is not available in this build of resolver.js yet.'
+        );
+        return;
+      }
+      let catalog;
+      try {
+        catalog = resolver.buildEntryCatalog(built.index);
+      } catch (e) {
+        vscode.window.showErrorMessage('Apex Call Graph: failed to build the entry-point catalog.');
+        return;
+      }
+      entryCatalogProvider.setRoots(shapeEntryCatalog(catalog));
+      const headerLine = shapeEntryCatalogHeaderLine(catalog);
+      entryCatalogView.message = headerLine || undefined;
+      entryCatalogView.description = `parsed ${built.scan.parsed}, cached ${built.scan.cached}`;
+      await vscode.commands.executeCommand('apexTraceEntriesView.focus');
     }),
     // v0.7 / A3: apexTraceView title-bar direction-toggle button -- re-runs
     // the LAST resolved target in the OPPOSITE direction, no QuickPick.

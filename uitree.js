@@ -1248,6 +1248,277 @@ function shapeHeaderLines(treeResult, orientation) {
   return lines;
 }
 
+// =========================================================================
+// v0.12.0 / C2 (Entry-Point Catalog): pure shaping of resolver.js's NEW
+// buildEntryCatalog(index) export (C1, may still be in flight this round --
+// this section and its tests in test-uitree.js are written against the
+// documented contract shape only, never against resolver.js's actual
+// source, same "code against the frozen contract" discipline this whole
+// file already follows for TNode/SiteView above). Feeds the SECOND Explorer
+// view ('apexTraceEntriesView', extension.js's job) -- a flat two-level
+// tree (kind group -> entries), NOT a recursive call tree, so this reuses
+// the UiNode shape (label/description/tooltip/iconId/jump/collapsible/
+// children) but adds three fields meaningful ONLY here (extension.js's
+// dedicated toEntryCatalogTreeItem reads them; the ordinary trace-tree
+// toTreeItem/shapeResult path never sees them):
+//   - isGroup: true on a kind-group node, undefined on an entry leaf.
+//   - expanded: boolean, ONLY on a group node -- per the C2 contract every
+//     group starts collapsed except 'trigger' and 'flow' (EXPANDED_KINDS
+//     below); an EMPTY group (zero entries) is additionally rendered
+//     non-collapsible at all (`collapsible: false`) -- nothing to expand,
+//     so no expand arrow -- via collapsible rather than expanded.
+//   - entryTarget: { classLower, methodLower } | null, ONLY on an entry
+//     leaf -- the target extension.js' inline "What Does This Call?" action
+//     hands straight to resolver.buildCalleeTree(index, target, opts),
+//     exactly the same {classLower, methodLower} shape resolveTarget()/
+//     buildSuggestPicks() already produce for the interactive QuickPick
+//     path. Derived generically from Entry.className/methodLower (both
+//     present -> a real Apex target; classLower is the lowercased
+//     className, methodLower passed through as-is since the C1 contract's
+//     Entry.methodLower is already lowercase, matching every existing
+//     pseudo-method convention in this codebase: '(trigger)' for trigger
+//     entries, '(anonymous)' for anonymous-script entries, an ordinary
+//     lowercased method name for everything else). null whenever EITHER is
+//     null -- per the C1 contract text this is flow entries ALWAYS
+//     ("flow: ... className|null, methodLower|null"), since a Flow is not
+//     an Apex class/method buildCalleeTree can target; extension.js's
+//     inline-action handler degrades that case to a no-op toast, per the
+//     C2 contract's "flows: run the callee trace only when the flow has
+//     traceable children -- else no-op toast, documented" text (documented
+//     here: today's C1 contract never gives a flow entry a target at all,
+//     so the "has traceable children" case is a no-op right now for every
+//     entry this file shapes -- if a future resolver.js round ever DOES
+//     attach a real Apex target to some flow entries, this same generic
+//     className+methodLower derivation picks it up automatically, no
+//     uitree.js change needed).
+//
+// Copied verbatim from the frozen "=== CONTRACT: resolver.js ===" C1 text
+// this round:
+//
+//   Catalog = { groups: [Group], stats: { total, byKind: {kind: n}, packages: [labels] } }
+//   Group = { kind, label, entries: [Entry] }
+//     kind in this EXACT display order: trigger, aura, invocable, rest,
+//     soap, async, email, platform, flow, anonymous.
+//   Entry = {
+//     label,               // 'Cls.method' | 'TriggerName' | flow API name | script name
+//     className, methodLower, path, line,
+//     detail,              // trigger: 'on <Object> (<events>)'; rest: the
+//                           // @HttpX verb(s); async: 'Batchable'|
+//                           // 'Queueable'|'Schedulable'|'@future'; flow:
+//                           // '<triggerType> on <Object>' or 'screen'|
+//                           // 'scheduled'|'platform event on <Object>';
+//                           // others: the entry annotation label.
+//     package,             // string|null, only when != the default package.
+//   }
+//   stats.excludedTestEntries -- count of isTest-excluded entries (not part
+//   of any group, workspace-wide).
+// =========================================================================
+
+// v0.12.0 (C2): group kinds that render pre-expanded (TreeItemCollapsible-
+// State.Expanded) the first time the catalog is shown -- triggers and flows
+// are the two kinds a Salesforce developer orienting on "how does the org
+// get entered" most wants to see without an extra click; every other kind
+// starts collapsed. `label`/`invocable`/etc. never appear here.
+const ENTRY_CATALOG_EXPANDED_KINDS = new Set(['trigger', 'flow']);
+
+// v0.12.0 (C2): one icon per Group.kind, in the SAME display order the C1
+// contract pins (trigger, aura, invocable, rest, soap, async, email,
+// platform, flow, anonymous) -- purely so a reader scanning this table can
+// check it against that order at a glance. 'trigger'/'flow'/'anonymous'
+// deliberately reuse ICON_TRIGGER/ICON_FLOW/ICON_ANONYMOUS (declared far
+// above) rather than picking new glyphs, so a trigger/flow/anonymous-script
+// node looks the SAME in this view as it does as a caller/callee-tree node
+// elsewhere in the extension -- one visual vocabulary, not two. The other
+// six kinds have no existing analog in the caller/callee tree (that tree
+// only ever shows a plain 'method' node for an @AuraEnabled/@InvocableMethod
+// /@HttpX/webservice/Batchable-Queueable-Schedulable-or-@future/
+// InboundEmailHandler/platform-hook method -- the entries[] BADGE is what
+// names the annotation there, not a distinct icon), so each gets its own
+// new, semantically-fitting codicon id.
+const ENTRY_CATALOG_ICON_BY_KIND = {
+  trigger: ICON_TRIGGER,
+  aura: 'radio-tower',
+  invocable: 'gear',
+  rest: 'globe',
+  soap: 'server-process',
+  async: 'watch',
+  email: 'mail',
+  platform: 'shield',
+  flow: ICON_FLOW,
+  anonymous: ICON_ANONYMOUS,
+};
+
+// v0.12.0 (C2): one-line "what is this kind" explanation per Group.kind --
+// the glossary/tooltip text the C2 contract asks this file to own (group
+// label wording itself comes verbatim from resolver.js's Group.label, per
+// the contract; this is the ADDITIONAL explanatory line uitree.js adds on
+// top, exactly like VIA_GLOSSARY/MARKER_GLOSSARY do for the caller/callee
+// tree above). Rendered on both the group node's own tooltip and appended
+// to every entry leaf's tooltip within that group (see entryTooltip below).
+const ENTRY_CATALOG_KIND_GLOSSARY = {
+  trigger: 'Apex trigger — fires on DML against a specific object.',
+  aura: '@AuraEnabled method — callable from Aura components and Lightning Web Components.',
+  invocable: '@InvocableMethod method — callable as a Flow or Process Builder action.',
+  rest: '@HttpGet/@HttpPost/@HttpPut/@HttpPatch/@HttpDelete method on an @RestResource class — callable via the REST API.',
+  soap: 'webservice method — callable via the SOAP API.',
+  async: 'Batchable/Queueable/Schedulable execute method or @future method — runs asynchronously, not from a direct call site.',
+  email: 'Apex email service class (implements Messaging.InboundEmailHandler) — invoked when mail arrives at its service address.',
+  platform: 'platform-invoked hook (Install/Uninstall/RegistrationHandler/Comparable/Finalizer) — called by the platform itself, not application code.',
+  flow: 'Flow — screen, record-triggered, scheduled, autolaunched, or platform-event flow found in this workspace.',
+  anonymous: 'anonymous Apex script (.apex) — an ad hoc entry point, e.g. a one-off data-fix script.',
+};
+
+// Fallback display label, used ONLY when a Group arrives with a falsy
+// `label` (defensive -- the C1 contract always supplies one; this just
+// keeps a malformed/partial fixture from rendering a blank tree row instead
+// of throwing, same defensive spirit as this file's other `|| fallback`
+// idioms, e.g. externalNamespace's label-derived fallback).
+const ENTRY_CATALOG_KIND_FALLBACK_LABEL = {
+  trigger: 'Triggers',
+  aura: 'Aura / LWC (@AuraEnabled)',
+  invocable: 'Invocable Actions',
+  rest: 'REST Endpoints',
+  soap: 'SOAP Web Services',
+  async: 'Async (Batch / Queueable / Schedulable / @future)',
+  email: 'Email Handlers',
+  platform: 'Platform Hooks',
+  flow: 'Flows',
+  anonymous: 'Anonymous Scripts',
+};
+
+// v0.12.0 (C2): derives the {classLower, methodLower} extension.js's inline
+// "What Does This Call?" action hands to resolver.buildCalleeTree, or null
+// when this entry carries no traceable Apex target -- see the section
+// header above for the full rationale (generic derivation, not
+// kind-specific: every existing pseudo-method convention -- '(trigger)',
+// '(anonymous)', an ordinary lowercased method name -- already arrives on
+// Entry.methodLower exactly as buildCalleeTree expects it).
+function entryCatalogTarget(entry) {
+  if (!entry || !entry.className || !entry.methodLower) return null;
+  return { classLower: String(entry.className).toLowerCase(), methodLower: entry.methodLower };
+}
+
+// v0.12.0 (C2): entry leaf description badge -- `detail` (the kind-specific
+// one-liner the C1 contract documents, e.g. 'on Account (before insert,
+// after update)') plus a '(pkgLabel)' badge when `package` is present,
+// mirroring packageBadge's own '(...)' formatting elsewhere in this file
+// (deliberately NOT reusing packageBadge() itself -- that function compares
+// against a tree-wide `targetPackage` this flat catalog has no equivalent
+// of; Entry.package is already contract-documented as "only when != the
+// default package", i.e. pre-filtered by resolver.js, so every non-null
+// value here is meant to render).
+function entryCatalogDescription(entry) {
+  const parts = [];
+  if (entry && entry.detail) parts.push(String(entry.detail));
+  if (entry && entry.package) parts.push(`(${entry.package})`);
+  return parts.join(' · ');
+}
+
+// v0.12.0 (C2): entry leaf tooltip -- source location, the detail line
+// again (in full, in case the description badge above got visually
+// truncated by a narrow Explorer pane), the kind glossary line, and the
+// package explainer (reusing MARKER_GLOSSARY.package's exact wording, same
+// glossary line the caller/callee tree's own package badge uses -- one
+// consistent explanation for what a '(pkgLabel)' badge means anywhere in
+// this extension).
+function entryCatalogEntryTooltip(kind, entry) {
+  const lines = [];
+  if (entry && entry.path) {
+    lines.push(typeof entry.line === 'number' && entry.line > 0 ? `${entry.path}:${entry.line}` : entry.path);
+  }
+  if (entry && entry.detail) lines.push(String(entry.detail));
+  if (ENTRY_CATALOG_KIND_GLOSSARY[kind]) lines.push(ENTRY_CATALOG_KIND_GLOSSARY[kind]);
+  if (entry && entry.package) lines.push(`(${entry.package}) — ${MARKER_GLOSSARY.package}`);
+  return lines.join('\n');
+}
+
+// v0.12.0 (C2): shapes ONE Entry into a leaf UiNode. `kind` is threaded in
+// by the caller (shapeEntryCatalogGroup) rather than read off `entry`
+// itself -- Entry per the C1 contract carries no `kind` field of its own,
+// only its enclosing Group does.
+function shapeEntryCatalogEntry(kind, entry) {
+  const hasLine = entry && typeof entry.line === 'number' && entry.line > 0;
+  return {
+    label: (entry && entry.label) || '',
+    description: entryCatalogDescription(entry),
+    tooltip: entryCatalogEntryTooltip(kind, entry),
+    iconId: ENTRY_CATALOG_ICON_BY_KIND[kind] || ICON_ENTRIES,
+    jump: entry && entry.path && hasLine ? { path: entry.path, line: entry.line, col: 0 } : null,
+    collapsible: false,
+    children: [],
+    isGroup: false,
+    kind,
+    entryTarget: entryCatalogTarget(entry),
+  };
+}
+
+// v0.12.0 (C2): shapes ONE Group into a group UiNode whose `children` are
+// its shaped Entry leaves, stable-sorted exactly as resolver.js's C1
+// contract already promises ("stable sort by label" -- this file trusts
+// that ordering and does not re-sort, same "resolver.js is the sorting
+// authority" convention shapeResult already follows for TNode.children
+// above).
+function shapeEntryCatalogGroup(group) {
+  const kind = group && group.kind;
+  const entries = (group && Array.isArray(group.entries)) ? group.entries : [];
+  const children = entries.map((e) => shapeEntryCatalogEntry(kind, e));
+  const hasEntries = children.length > 0;
+  return {
+    label: (group && group.label) || ENTRY_CATALOG_KIND_FALLBACK_LABEL[kind] || kind || '',
+    description: String(children.length),
+    tooltip: ENTRY_CATALOG_KIND_GLOSSARY[kind] || '',
+    iconId: ENTRY_CATALOG_ICON_BY_KIND[kind] || ICON_ENTRIES,
+    jump: null,
+    // Only a group with at least one entry is collapsible at all -- an
+    // empty group (0 entries) renders as a plain, non-expandable row (no
+    // arrow to click into nothing), matching `expanded: false` for it too.
+    collapsible: hasEntries,
+    expanded: hasEntries && ENTRY_CATALOG_EXPANDED_KINDS.has(kind),
+    children,
+    isGroup: true,
+    kind,
+  };
+}
+
+// v0.12.0 (C2): Catalog -> UiNode[] (one root per Group, in the C1
+// contract's fixed kind order -- this file trusts and preserves
+// `catalog.groups`' own order, it never reorders). Defensive against a
+// malformed/absent catalog (e.g. a resolver.js build that hasn't landed C1
+// yet -- extension.js's own `typeof resolver.buildEntryCatalog === 'function'`
+// guard is the first line of defense there, but this stays cheap and safe
+// to call standalone too, same "never throw on a shape it wasn't handed"
+// discipline as shapeResult above).
+function shapeEntryCatalog(catalog) {
+  if (!catalog || !Array.isArray(catalog.groups)) return [];
+  return catalog.groups.map(shapeEntryCatalogGroup);
+}
+
+// v0.12.0 (C2): one-line, human-readable summary of Catalog.stats --
+// extension.js sets this as the entry-catalog view's persistent banner
+// (TreeView.message, the SAME mechanism renderTraceResult already uses for
+// the caller/callee view's header lines above), satisfying the C2
+// contract's "header/first-line shows stats totals". Degrades to '' (never
+// throws) on a missing/malformed `stats`, matching shapeHeaderLines'
+// own graceful-degradation convention for a not-yet-produced field.
+function shapeEntryCatalogHeaderLine(catalog) {
+  const stats = catalog && catalog.stats;
+  if (!stats || typeof stats.total !== 'number') return '';
+  // The total + kind-count facts read as ONE clause ('42 entry points
+  // across 2 kinds'), not two ' · '-separated ones -- everything else
+  // pushed onto `parts` below IS its own ' · '-separated clause.
+  const kindsCount = stats.byKind && typeof stats.byKind === 'object' ? Object.keys(stats.byKind).length : 0;
+  let headline = `${stats.total} entry point${stats.total === 1 ? '' : 's'}`;
+  if (kindsCount > 0) headline += ` across ${kindsCount} kind${kindsCount === 1 ? '' : 's'}`;
+  const parts = [headline];
+  if (typeof stats.excludedTestEntries === 'number' && stats.excludedTestEntries > 0) {
+    parts.push(`${stats.excludedTestEntries} test-class entr${stats.excludedTestEntries === 1 ? 'y' : 'ies'} excluded`);
+  }
+  if (Array.isArray(stats.packages) && stats.packages.length) {
+    parts.push(`packages: ${stats.packages.join(', ')}`);
+  }
+  return parts.join(' · ');
+}
+
 module.exports = {
   iconForNode,
   labelForNode,
@@ -1276,4 +1547,14 @@ module.exports = {
   frontierMethodKey,
   frontierBadge,
   shapeLoadMoreChild,
+  // v0.12.0 (C2): Entry-Point Catalog shaping surface -- see the section
+  // header above shapeEntryCatalog for the full contract. Granular helpers
+  // (shapeEntryCatalogEntry/Group, entryCatalogTarget) exported so
+  // test-uitree.js can unit-test them directly against bare fixtures, same
+  // rationale as externalNamespace/managedBadge/frontierMethodKey above.
+  entryCatalogTarget,
+  shapeEntryCatalogEntry,
+  shapeEntryCatalogGroup,
+  shapeEntryCatalog,
+  shapeEntryCatalogHeaderLine,
 };
