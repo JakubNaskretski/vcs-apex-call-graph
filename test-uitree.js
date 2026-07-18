@@ -2117,4 +2117,115 @@ assert.strictEqual(shapeEntryCatalogHeaderLine(null), '', 'defensive: null catal
 assert.strictEqual(shapeEntryCatalogHeaderLine({}), '', 'defensive: no stats at all');
 assert.strictEqual(shapeEntryCatalogHeaderLine({ stats: {} }), '', 'defensive: stats present but no total');
 
+// =========================================================================
+// v0.13 (S2/S3): flow-to-subflow chains -- rendering + glossary
+// =========================================================================
+// TNode fixtures built by hand (resolver.js's own frozen contract for a
+// via:'subflow' flow node: kind:'flow', approximate:false always -- "a
+// declared reference, not a fan-out guess"). No dependency on the
+// in-flight metascan.js/resolver.js round beyond that documented shape.
+function subflowFlowNode(label, opts = {}) {
+  return {
+    label,
+    kind: 'flow',
+    className: '',
+    methodLower: null,
+    path: `/ws/flows/${label}.flow-meta.xml`,
+    line: opts.line || 1,
+    entries: ['Flow apex action'],
+    isTest: false,
+    via: 'subflow',
+    sites: [],
+    children: opts.children || [],
+    cyclic: !!opts.cyclic,
+    truncated: !!opts.truncated,
+    approximate: false,
+    seenElsewhere: !!opts.seenElsewhere,
+  };
+}
+
+// --- badge + glossary: a plain 'subflow' via node -------------------------
+{
+  const node = subflowFlowNode('S13ParentFlow');
+  const shaped = shapeNode(node);
+  assert(shaped.description.includes('subflow'), "'subflow' via badge must render, exactly like every other via value");
+  assert(!shaped.description.includes('~'), "'subflow' is NEVER approximate -- no '~' prefix/badge");
+  assert.strictEqual(labelForNode(node), 'S13ParentFlow', 'no approximate prefix on the label either');
+  assert(shaped.tooltip.includes('subflow:'), "the tooltip must carry a 'subflow: ...' glossary line, same convention as every other via value (VIA_GLOSSARY)");
+  assert(shaped.tooltip.toLowerCase().includes('<subflows>'), 'the glossary line should name the actual XML element this edge comes from, for a user reading the tooltip');
+}
+
+// --- cyclic subflow node: marker + glossary, zero children ----------------
+{
+  const cyclicNode = subflowFlowNode('S13CycleA', { cyclic: true });
+  const shaped = shapeNode(cyclicNode);
+  assert(shaped.description.includes('↺ cycle'), 'cyclic subflow node gets the same cyclic marker every other kind uses');
+  assert(shaped.tooltip.includes('cycle'), 'cyclic glossary line present');
+  assert.strictEqual(shaped.collapsible, false, 'a cyclic node with zero children/sites renders as a leaf');
+  assert.strictEqual(shaped.children.length, 0);
+}
+
+// --- seenElsewhere subflow node: marker + glossary --------------------------
+{
+  const seenNode = subflowFlowNode('S13GrandParent', { seenElsewhere: true });
+  const shaped = shapeNode(seenNode);
+  assert(shaped.description.includes('↪ seen elsewhere'), 'seenElsewhere subflow node gets the same marker every other kind uses (target-first orientation)');
+  assert(shaped.tooltip.includes('seen elsewhere'), 'seenElsewhere glossary line present');
+  assert.strictEqual(shaped.collapsible, false);
+}
+
+// --- 3-deep chain renders like any chain, both as a shaped node and via
+// shapeResult (the real entry point extension.js calls) -- no special-
+// casing needed for a subflow-via node vs. an ordinary method node. --------
+{
+  const leaf = subflowFlowNode('S13ChainTop'); // terminal: no parent of its own
+  const mid = subflowFlowNode('S13ChainMid', { children: [leaf] });
+  const top = {
+    label: 'S13ChainLeaf',
+    kind: 'flow',
+    className: '',
+    methodLower: null,
+    path: '/ws/flows/S13ChainLeaf.flow-meta.xml',
+    line: 1,
+    entries: ['Flow apex action'],
+    isTest: false,
+    via: 'metadata', // the root of THIS subtree is reached the pre-existing way (flow calls apex)
+    sites: [],
+    children: [mid],
+    cyclic: false,
+    truncated: false,
+    approximate: false,
+  };
+  const root = {
+    label: 'S13ChainRelay.relayLeaf',
+    kind: 'method',
+    className: 'S13ChainRelay',
+    methodLower: 'relayleaf',
+    path: '/ws/classes/S13ChainRelay.cls',
+    line: 2,
+    entries: [],
+    isTest: false,
+    via: null,
+    sites: [],
+    children: [top],
+    cyclic: false,
+    truncated: false,
+    approximate: false,
+  };
+  const shaped = shapeResult({ root, targetLabel: 'S13ChainRelay.relayLeaf', note: null, direction: 'callers' });
+  assert.strictEqual(shaped.length, 1);
+  const shapedRoot = shaped[0];
+  assert.strictEqual(shapedRoot.label, 'S13ChainRelay.relayLeaf');
+  const shapedTop = shapedRoot.children[0];
+  assert.strictEqual(shapedTop.label, 'S13ChainLeaf');
+  assert(shapedTop.description.includes('metadata'));
+  const shapedMid = shapedTop.children[0];
+  assert.strictEqual(shapedMid.label, 'S13ChainMid');
+  assert(shapedMid.description.includes('subflow'), 'level 2 of the chain carries the new subflow via badge');
+  const shapedLeaf = shapedMid.children[0];
+  assert.strictEqual(shapedLeaf.label, 'S13ChainTop');
+  assert(shapedLeaf.description.includes('subflow'), 'level 3 of the chain also carries it -- genuinely recursive rendering, not special-cased to one level');
+  assert.strictEqual(shapedLeaf.collapsible, false, 'the terminal end of the chain (no parent of its own) renders as a leaf');
+}
+
 console.log('apex-trace uitree self-check: all assertions passed');

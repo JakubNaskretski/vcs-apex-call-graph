@@ -218,6 +218,52 @@
 //     never attempted on a file that doesn't look like Visualforce at all,
 //     same all-or-nothing gate the pre-existing class-level scan already used.
 //
+// v0.13 (S1, "flow-to-subflow chains") addition to the MetaRef 'flow' shape,
+// purely additive -- every v0.4-v0.10 field documented above keeps its exact
+// pre-existing meaning:
+//
+//   - kind:'flow' refs gain an always-present `subflows: string[]` field --
+//     the deduped, document-order list of every `<flowName>` value found
+//     inside a `<subflows>...</subflows>` element anywhere in the file
+//     (regardless of what else that element contains or in what order --
+//     see extractFlowSubflows()'s own header note for the exact
+//     nested-element tolerance and dedup rule). Computed ONCE per file
+//     (same "one `<start>` block is a file-level fact, not a per-ref one"
+//     convention F1(b) established for flowObject/flowTriggerType) and
+//     stamped onto EVERY apex-`<actionCalls>` ref this file produces -- a
+//     flow with zero `<subflows>` elements anywhere gets `subflows: []` on
+//     every ref, byte-identical in every OTHER respect to pre-v0.13 output.
+//     A subflow name naming no real flow file anywhere in the workspace is
+//     captured identically to one that does -- metascan has no file index
+//     (per this file's header contract) and never judges resolvability;
+//     that is resolver.js's job (out of scope here), via its own
+//     `stats.unknownSubflowRefs`.
+//   - LOAD-BEARING EXCEPTION: when a flow file has >=1 `<subflows>` element
+//     but ZERO apex `<actionCalls>` blocks of its own (a pure orchestration
+//     node -- e.g. a Screen/Autolaunched Flow whose only job is to launch a
+//     child Flow), the loop that would normally stamp `subflows` onto a ref
+//     never runs, so the fact would otherwise vanish from this file's
+//     output entirely. Per the GOAL text ("every `<subflows>`...
+//     `<flowName>`...`</subflows>` element in *.flow-meta.xml" -- not "every
+//     subflows element attached to an EXISTING apex ref"), extractFlow()
+//     ADDITIONALLY emits exactly ONE synthetic ref in this case: `{
+//     kind:'flow', label, className: null, methodName: null, namespace:
+//     null, subflows, flowObject, flowRecordTriggerType, flowTriggerType,
+//     line, lineText }` -- `line`/`lineText` point at the file's FIRST
+//     `<subflows>` element (best-effort, same convention this file always
+//     uses for element position). `className`/`methodName` are BOTH null on
+//     this one shape only -- every OTHER 'flow' ref, before or after this
+//     amendment, always has a non-null `className` -- which is how a
+//     downstream consumer recognizes "this ref carries no apex target at
+//     all, it exists purely to carry the file's `subflows`/`flowObject`
+//     -family facts". This mirrors, at this file's own layer, the same "a
+//     known file with zero per-ref facts must still be visible somewhere"
+//     problem resolver.js's `index.flowFilePaths` solves downstream for
+//     entry-catalog purposes (see that field's own comment, resolver.js
+//     ~L5725) -- but `subflows` genuinely IS MetaRef-shaped data per this
+//     amendment's own contract (unlike raw file paths), so it is captured
+//     here rather than requiring a second, index-level mechanism.
+//
 // Design notes:
 //
 // - `label` is always the file's stem (its Salesforce API name) — see
@@ -416,9 +462,12 @@ function extractAuraClassLevel(path, text, lineStarts, out) {
 // <actionCalls> blocks with <actionType>apex</actionType>; actionName is
 // either bare (class only, e.g. an @InvocableMethod class name) or dotted
 // (Class.method, e.g. a plain Apex action). Non-apex actionTypes (emailSimple,
-// etc.) and <subflows> blocks are out of scope for this amendment (Flow XML
-// never names a subflow's Apex, if any — that's a flow-to-flow edge, not an
-// Apex one) and are simply not matched.
+// etc.) are not matched here.
+// v0.13 (S1): <subflows> blocks -- a flow-to-flow reference, never an Apex
+// one -- are handled by a SEPARATE extractor (extractFlowSubflows, below)
+// and surface as the new `subflows` field on every 'flow' MetaRef this file
+// produces, not as their own MetaRef kind. See that function's header note
+// and the top-of-file v0.13 contract section for the full shape.
 const ACTION_CALLS_RE = /<actionCalls>([\s\S]*?)<\/actionCalls>/g;
 const ACTION_TYPE_APEX_RE = /<actionType>\s*apex\s*<\/actionType>/i;
 const ACTION_NAME_RE = /<actionName>([^<]+)<\/actionName>/;
@@ -441,6 +490,61 @@ const RECORD_TRIGGERED_TYPES = new Set(['RecordBeforeSave', 'RecordAfterSave', '
 // never <recordTriggerType> (that element only ever appears on the three
 // RecordBefore*/RecordAfterSave shapes above).
 const PLATFORM_EVENT_TRIGGER_TYPE = 'PlatformEvent';
+
+// v0.13 (S1): a Flow's own <subflows> blocks -- each names a CHILD Flow (its
+// <flowName>), never an Apex action. Structurally a repeatable, non-nested
+// top-level block under the Flow root, same shape <actionCalls> already has
+// (a real Flow never nests one <subflows> inside another), so the same
+// non-greedy "capture up to the next closing tag" approach applies. The
+// element order/contents AROUND <flowName> vary across real Flow Builder
+// output -- name/label/locationX/locationY are always present, but
+// <connector> (present unless the subflow is a dead-end/terminal branch) and
+// <inputAssignments> (present only when the subflow has input variables
+// mapped) each independently may or may not appear, in either order relative
+// to <flowName> -- SUBFLOWS_FLOWNAME_RE is searched against just the
+// captured block text, so it finds <flowName> regardless of what else
+// surrounds it or in which order (see extractFlowSubflows below).
+const SUBFLOWS_RE = /<subflows>([\s\S]*?)<\/subflows>/g;
+const SUBFLOWS_FLOWNAME_RE = /<flowName>([^<]+)<\/flowName>/;
+const SUBFLOWS_OPEN_TAG = '<subflows>';
+
+// v0.13 (S1): collects every <subflows><flowName> value in the file, in
+// document order, deduped by exact (post-trim) string equality -- a Flow
+// Builder canvas can legitimately call the SAME subflow from two different
+// elements (e.g. two branches of a Decision both routing to the same child
+// Flow); that must surface as ONE edge, not two. Dedup is case-SENSITIVE and
+// does no other normalization at all: metascan has no file index (per this
+// file's header contract) and never decides whether two differently-cased
+// names refer to the same real Flow file -- matching a subflow name to a
+// known flow file by stem, case-insensitively, is resolver.js's job (out of
+// scope here). A malformed/placeholder <subflows> block with no <flowName>
+// at all inside it is tolerated (skipped, never throws), same posture every
+// other extractor in this file already takes.
+// Also returns `firstIdx`, the text index of the FIRST valid <flowName>
+// match found -- used by extractFlow (below) to place the file's synthetic
+// zero-actionCalls ref, when one is needed; see that branch's own header
+// note for why it exists.
+function extractFlowSubflows(text) {
+  const names = [];
+  const seen = new Set();
+  let firstIdx = -1;
+  SUBFLOWS_RE.lastIndex = 0;
+  let bm;
+  while ((bm = SUBFLOWS_RE.exec(text))) {
+    const block = bm[1];
+    const nameMatch = SUBFLOWS_FLOWNAME_RE.exec(block);
+    if (!nameMatch) continue;
+    const flowName = nameMatch[1].trim();
+    if (!flowName) continue;
+    if (firstIdx === -1) {
+      firstIdx = bm.index + SUBFLOWS_OPEN_TAG.length + nameMatch.index;
+    }
+    if (seen.has(flowName)) continue;
+    seen.add(flowName);
+    names.push(flowName);
+  }
+  return { subflows: names, firstIdx };
+}
 
 function extractFlowStart(text) {
   const startMatch = FLOW_START_RE.exec(text);
@@ -473,6 +577,13 @@ function extractFlowStart(text) {
 function extractFlow(path, text, lineStarts, out) {
   const label = stemOf(path);
   const start = extractFlowStart(text);
+  // v0.13 (S1): computed once per file, same file-level-fact convention
+  // extractFlowStart already established for <start> -- stamped onto every
+  // apex-actionCalls ref below, and (see the zero-actionCalls branch at the
+  // end of this function) preserved even when the file produces no such ref
+  // at all.
+  const { subflows, firstIdx } = extractFlowSubflows(text);
+  const refCountBefore = out.length;
   ACTION_CALLS_RE.lastIndex = 0;
   let bm;
   while ((bm = ACTION_CALLS_RE.exec(text))) {
@@ -511,6 +622,30 @@ function extractFlow(path, text, lineStarts, out) {
     ref.flowObject = start.flowObject;
     ref.flowRecordTriggerType = start.flowRecordTriggerType;
     ref.flowTriggerType = start.flowTriggerType;
+    // v0.13 (S1): each ref gets its OWN copy of the subflows list -- never a
+    // shared mutable array a caller could accidentally corrupt for a sibling
+    // ref -- same posture this file already takes for extensionClasses (A2).
+    ref.subflows = subflows.slice();
+    out.push(ref);
+  }
+
+  // v0.13 (S1) -- LOAD-BEARING: a flow with >=1 <subflows> reference but
+  // ZERO apex <actionCalls> blocks of its own (a pure orchestration node --
+  // e.g. a Screen/Autolaunched Flow whose only job is to launch a child
+  // Flow) would otherwise vanish from this file's output entirely: the loop
+  // above never runs its body for such a file, so `out` gains nothing and
+  // the file's outgoing subflow edge has nowhere to attach. Per the GOAL
+  // text ("every <subflows>...<flowName>...</subflows> element in
+  // *.flow-meta.xml" -- not "every subflows element attached to an EXISTING
+  // apex ref"), emit ONE synthetic 'flow' MetaRef in exactly this case --
+  // see the top-of-file v0.13 contract note for the full shape rationale.
+  if (subflows.length && out.length === refCountBefore) {
+    const ref = makeRef('flow', label, null, null, text, lineStarts, firstIdx);
+    ref.namespace = null;
+    ref.flowObject = start.flowObject;
+    ref.flowRecordTriggerType = start.flowRecordTriggerType;
+    ref.flowTriggerType = start.flowTriggerType;
+    ref.subflows = subflows.slice();
     out.push(ref);
   }
 }

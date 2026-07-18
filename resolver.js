@@ -3996,6 +3996,7 @@ function catchMatchesException(index, catchEntry, tracingExceptionLower) {
 }
 
 function buildCallerTree(index, target, opts) {
+  finalizeFlowSubflowRefs(index); // v0.13/S2 -- see its own header note
   const maxDepth = clampInt(opts && opts.maxDepth, 1, MAX_DEPTH_CLAMP, DEFAULT_MAX_DEPTH); // v0.10/A3
   const maxNodes = clampInt(opts && opts.maxNodes, 1, MAX_NODES_CLAMP, DEFAULT_MAX_NODES); // v0.10/A3
   const { initialDepth, userExpandedKeys } = normalizeProgressiveOpts(opts, maxDepth); // P1
@@ -4152,7 +4153,7 @@ function buildCallerTree(index, target, opts) {
   // attachMetaCallers(), as TERMINAL children alongside the Apex ones.
   const metaRefs = isTrigger ? [] : metaLevelPairs(index, classLower, methodLower);
   if (metaRefs.length && ctx.nodeCount < ctx.maxNodes) {
-    const metaChildren = buildMetaChildren(index, metaRefs);
+    const metaChildren = buildMetaChildren(index, metaRefs, ctx);
     ctx.nodeCount += countTNodes(metaChildren);
     root.children = root.children.concat(metaChildren).sort(sortTNodes);
   } else if (metaRefs.length) {
@@ -4225,7 +4226,7 @@ function buildExternalCallerTree(index, key, ext, opts) {
   // ones (an LWC/Flow/CMDT reference has no callers of its own to walk).
   const metaRefs = (index.externalMetaRefs instanceof Map ? index.externalMetaRefs.get(key) : null) || [];
   if (metaRefs.length && ctx.nodeCount < ctx.maxNodes) {
-    const metaChildren = buildMetaChildren(index, metaRefs);
+    const metaChildren = buildMetaChildren(index, metaRefs, ctx);
     ctx.nodeCount += countTNodes(metaChildren);
     root.children = root.children.concat(metaChildren).sort(sortTNodes);
   } else if (metaRefs.length) {
@@ -4264,6 +4265,7 @@ function buildExternalCallerTree(index, key, ext, opts) {
 // (new code, since there is nothing to fork there either -- forward tracing
 // invented these relationships).
 function buildCalleeTree(index, target, opts) {
+  finalizeFlowSubflowRefs(index); // v0.13/S2 -- see its own header note
   const maxDepth = clampInt(opts && opts.maxDepth, 1, MAX_DEPTH_CLAMP, DEFAULT_MAX_DEPTH); // v0.10/A3
   const maxNodes = clampInt(opts && opts.maxNodes, 1, MAX_NODES_CLAMP, DEFAULT_MAX_NODES); // v0.10/A3
   const { initialDepth, userExpandedKeys } = normalizeProgressiveOpts(opts, maxDepth); // P1
@@ -4438,12 +4440,26 @@ function indexSitesByCallerKey(sitesByObject) {
   return out;
 }
 
-// A1/A4: builds ONE terminal, non-expanding TNode for a flow reached via a
-// DML or EventBus.publish site -- mirrors buildFlowChildren's reverse-
-// direction node shape (kind:'flow') but for the OPPOSITE relationship
-// (this IS the flow being reached, not a caller list under it).
-function makeCalleeFlowNode(flow, via, siteEntry) {
-  return {
+// A1/A4: builds ONE TNode for a flow reached via a DML or EventBus.publish
+// site -- mirrors buildFlowChildren's reverse-direction node shape
+// (kind:'flow') but for the OPPOSITE relationship (this IS the flow being
+// reached, not a caller list under it).
+//
+// v0.13/S2: pre-v0.13 this node was UNCONDITIONALLY truncated:true/
+// children:[] -- "terminal in this direction" (A2). It is no longer
+// hardcoded that way: when index/ctx are supplied (every real caller as of
+// this round) and the flow has its own SUBFLOW children (index.flowGraph),
+// those are walked forward here too (buildFlowCalleeChildren,
+// includeApexTargets:false -- see that function's own call site note just
+// below for the [SPEC-OPEN] reasoning on why this ONE node deliberately
+// does NOT also expose its own direct apex actions, unlike a proper
+// subflow-reached node one level down). A flow with zero subflow children
+// (the pre-v0.13 norm for every existing fixture) is completely unaffected:
+// `children` stays `[]` and `truncated` stays `true`, byte-identical to
+// before. `index`/`ctx` are optional (3rd/4th args) purely so this
+// function's pre-v0.13 unit-tested shape (2-arg call) still works.
+function makeCalleeFlowNode(flow, via, siteEntry, index, ctx) {
+  const node = {
     label: flow.label,
     kind: 'flow',
     className: '',
@@ -4464,7 +4480,7 @@ function makeCalleeFlowNode(flow, via, siteEntry) {
     }],
     children: [],
     cyclic: false,
-    truncated: true, // A2: "record-triggered flow node... terminal in this direction"
+    truncated: true, // A2: pre-v0.13 default, preserved when there's nothing new to walk (see header note)
     // v0.11/B2: true only when the underlying DML site itself was a
     // narrowed-generic-DML edge (siteEntry.approximate -- see
     // recordDmlSite's own note); a 'publish' siteEntry (from
@@ -4473,6 +4489,35 @@ function makeCalleeFlowNode(flow, via, siteEntry) {
     approximate: siteEntry.approximate === true,
     seenElsewhere: false,
   };
+  if (index && ctx) {
+    const flowLower = lc(flow.label);
+    const g = index.flowGraph instanceof Map ? index.flowGraph.get(flowLower) : null;
+    if (g && g.children && g.children.length) {
+      const cycleKey = `flow:${flowLower}`;
+      if (ctx.expandedKeys.has(cycleKey)) {
+        // Same flow reached via a second DML/publish site elsewhere in this
+        // same forward trace -- DAG memoization applies exactly like an
+        // ordinary method node's second occurrence. `truncated` is
+        // explicitly flipped to false here (overriding this node's own
+        // pre-v0.13 default a few lines up) to match the general
+        // seenElsewhere convention every other node kind in this engine
+        // uses (buildOneChildNode/buildOneFlowNode never combine
+        // seenElsewhere with truncated:true -- 'truncated' means
+        // specifically "a depth/node-count cap was hit", which is not what
+        // happened here; leaving the pre-v0.13 default would misleadingly
+        // co-imply "cap reached" on a node that was actually just deduped).
+        node.seenElsewhere = true;
+        node.truncated = false;
+      } else {
+        ctx.expandedKeys.add(cycleKey);
+        ctx.uniqueKeys.add(cycleKey);
+        const budget = { used: 0, limit: Math.max(0, ctx.maxNodes - ctx.nodeCount) };
+        node.truncated = false;
+        node.children = buildFlowCalleeChildren(index, flowLower, new Set([cycleKey]), ctx, node, budget, false);
+      }
+    }
+  }
+  return node;
 }
 
 // class-level target (methodLower null) -- union of extras across every
@@ -4510,7 +4555,7 @@ function appendCalleeExtrasForMethod(index, node, classLower, methodLower, ctx) 
       if (!flow.flowRecordTriggerType) continue; // platform-event flow -- handled by the publish branch below
       const matchOps = flowOpsForRecordTriggerType(flow.flowRecordTriggerType);
       if (!matchOps.includes(entry.op)) continue;
-      extras.push(makeCalleeFlowNode(flow, 'dml', entry));
+      extras.push(makeCalleeFlowNode(flow, 'dml', entry, index, ctx));
     }
   }
 
@@ -4524,7 +4569,7 @@ function appendCalleeExtrasForMethod(index, node, classLower, methodLower, ctx) 
     const flowRefs = (index.flowRefsByObject && index.flowRefsByObject.get(objectLower)) || [];
     for (const flow of flowRefs) {
       if (lc(flow.flowTriggerType) !== 'platformevent') continue;
-      extras.push(makeCalleeFlowNode(flow, 'publish', entry));
+      extras.push(makeCalleeFlowNode(flow, 'publish', entry, index, ctx));
     }
   }
 
@@ -4639,7 +4684,14 @@ function appendCalleeExtrasForMethod(index, node, classLower, methodLower, ctx) 
       node.truncated = true; // v0.7.1/R5: same node-specific truncation honesty as buildChildrenLevel's cap
       break;
     }
-    ctx.nodeCount++;
+    // v0.13/S2: every pre-v0.13 extra shape is a genuine leaf (extra.children
+    // is always []), so countTNodes(extra.children) was always 0 and this is
+    // byte-identical to the old `ctx.nodeCount++` for every one of them. A
+    // flow extra can now carry a real subflow-chain subtree underneath it
+    // (see makeCalleeFlowNode) whose nodes were never otherwise folded into
+    // ctx.nodeCount -- this reconciles it once, exactly like the root-level
+    // metaRefs fold-in's own `ctx.nodeCount += countTNodes(metaChildren)`.
+    ctx.nodeCount += 1 + countTNodes(extra.children);
     node.children.push(extra);
   }
 }
@@ -4707,7 +4759,15 @@ function metaEntryLabel(kind) {
 // triggered instead of record-triggered, and its children are EventBus
 // publish sites on that object instead of DML sites (see
 // buildPublishChildrenForFlow).
-function buildMetaChildren(index, metaRefs) {
+// v0.13/S2: `ctx` (optional, 3rd arg) is the SAME shared build context
+// buildCallerTree/buildExternalCallerTree already thread through the rest of
+// their walk -- needed here so a flow node's NEW subflow-PARENT children
+// (buildFlowParentChildren) share the exact same cycle-guard/DAG-
+// memoization/maxNodes-cap bookkeeping every other node in the tree uses.
+// Omitted (every pre-v0.13 caller/test), this function's behavior is
+// byte-identical to before: no ctx means no subflow expansion is attempted,
+// so a plain flowObject-less flow keeps its pre-v0.13 empty `children`.
+function buildMetaChildren(index, metaRefs, ctx) {
   const groups = new Map();
   for (const ref of metaRefs || []) {
     if (!ref) continue;
@@ -4732,7 +4792,7 @@ function buildMetaChildren(index, metaRefs) {
       const matchOps = flowOpsForRecordTriggerType(first.flowRecordTriggerType);
       children = buildFlowChildren(index, lc(first.flowObject), 'dml', matchOps);
     }
-    out.push({
+    const node = {
       label: first.label,
       kind: first.kind,
       className: '',
@@ -4755,7 +4815,35 @@ function buildMetaChildren(index, metaRefs) {
       cyclic: false,
       truncated: false,
       approximate: false,
-    });
+      seenElsewhere: false,
+    };
+    // v0.13/S2: this flow's own PARENT flows (the flows that invoke it as a
+    // subflow), via='subflow' -- alongside (not replacing) the DML/publish
+    // children just computed above. Requires `ctx` (see this function's own
+    // header note); a flow with zero parents (index.flowGraph has no entry,
+    // or an empty parents[]) is completely unaffected -- `node.children`
+    // stays exactly what it already was, byte-identical to pre-v0.13.
+    if (first.kind === 'flow' && ctx) {
+      const flowLower = lc(first.label);
+      const cycleKey = `flow:${flowLower}`;
+      ctx.uniqueKeys.add(cycleKey);
+      if (ctx.expandedKeys.has(cycleKey)) {
+        // Structurally shouldn't happen for a root-level metaRefs fold-in
+        // (metaRefs are already grouped by distinct (kind,label) above, and
+        // nothing else registers a 'flow:' key before this point in a fresh
+        // buildCallerTree/buildExternalCallerTree call) -- guarded
+        // defensively anyway, same seenElsewhere convention every other
+        // flow-chain node uses.
+        node.seenElsewhere = true;
+      } else {
+        ctx.expandedKeys.add(cycleKey);
+        const ancestorPath = new Set([cycleKey]);
+        const budget = { used: 0, limit: Math.max(0, ctx.maxNodes - ctx.nodeCount) };
+        const subflowChildren = buildFlowParentChildren(index, flowLower, ancestorPath, ctx, node, budget);
+        node.children = node.children.concat(subflowChildren);
+      }
+    }
+    out.push(node);
   }
   return out;
 }
@@ -4821,6 +4909,181 @@ function buildFlowChildren(index, objectLower, via, matchOps) {
     });
   }
   out.sort(sortTNodes);
+  return out;
+}
+
+// =========================================================================
+// v0.13/S2: flow-to-subflow chain recursion (both directions)
+// =========================================================================
+// Cycle-guard/DAG-memoization/maxNodes-cap semantics mirror buildOneChildNode/
+// buildChildrenLevel EXACTLY ("apply to flow nodes exactly like methods" per
+// the GOAL text), keyed by 'flow:'+flowLower (a namespace disjoint from the
+// 'classLower#methodLower' keys ordinary Apex nodes use, so the two schemes
+// share one ancestorPath Set / ctx.expandedKeys Map safely without collision
+// risk). Unlike ordinary Apex nodes, flow-chain recursion is NOT bounded by
+// ctx.maxDepth -- the GOAL text lists "DAG memoization + seenElsewhere +
+// maxNodes cap" as the flow-node contract, deliberately omitting maxDepth;
+// a flow chain's own bound is cycle-guard + the shared node-count cap below.
+//
+// `budget` ({used, limit}) is a per-fold-in-call soft cap used ONLY to stop
+// runaway construction early (checked against the REMAINING ctx.maxNodes
+// headroom at the moment this fold-in started) -- it never writes
+// ctx.nodeCount directly. The caller (buildMetaChildren's flow branch /
+// makeCalleeFlowNode) reconciles ctx.nodeCount ONCE, via countTNodes over the
+// finished subtree, exactly like the pre-existing metaRefs fold-in already
+// does for its own (non-flow-chain) children -- this avoids double-counting
+// the same nodes once via `budget` and again via that post-hoc countTNodes
+// call.
+function buildOneFlowNode(index, flowLower, ancestorPath, ctx, direction, budget) {
+  const info = (index.flowInfo instanceof Map ? index.flowInfo.get(flowLower) : null) || { label: flowLower, path: '', line: 0 };
+  const cycleKey = `flow:${flowLower}`;
+  const node = {
+    label: info.label, kind: 'flow', className: '', methodLower: null,
+    path: info.path || '', line: info.line || 0,
+    entries: [metaEntryLabel('flow')], isTest: false,
+    // v0.13/S2 CONTRACT: via='subflow', approximate:false -- "a declared
+    // reference, not a fan-out guess" (GOAL text, verbatim).
+    via: 'subflow', sites: [], children: [],
+    cyclic: false, truncated: false, approximate: false, seenElsewhere: false,
+  };
+  ctx.uniqueKeys.add(cycleKey);
+  if (ancestorPath.has(cycleKey)) {
+    node.cyclic = true;
+    return node;
+  }
+  if (ctx.expandedKeys.has(cycleKey)) {
+    node.seenElsewhere = true;
+    return node;
+  }
+  ctx.expandedKeys.add(cycleKey);
+  // v0.13/S2 CAP FIX: this node's own budget unit is consumed HERE, BEFORE
+  // recursing into its own children -- not by the caller (buildFlowParentChildren/
+  // buildFlowCalleeChildren) after this call returns. A depth-first recursive
+  // call only returns once its ENTIRE subtree is built, so incrementing
+  // `budget.used` only on return would never let a long NON-branching chain
+  // (one parent/child per level, e.g. this round's 3-deep-chain fixture
+  // extended further) observe its own accumulated depth mid-descent -- only
+  // BRANCHING (multiple parents/children at the same level) would ever see
+  // an updated count. Incrementing here means every level of a pure linear
+  // chain re-checks the SAME shared `budget` object one level further along,
+  // so a long chain is bounded by maxNodes exactly like a wide fan-out is.
+  budget.used++;
+  const nextPath = new Set(ancestorPath);
+  nextPath.add(cycleKey);
+  if (direction === 'caller') {
+    // "alongside (not replacing) any pre-existing DML/publish children,
+    // which stay attached to whichever flow owns the <start> block that
+    // produced them" -- identical gating to buildMetaChildren's own
+    // flowObject/flowTriggerType branch above, just re-run per ancestor
+    // flow instead of only at the metaRef root.
+    let dmlChildren = [];
+    if (info.flowObject && lc(info.flowTriggerType) === 'platformevent') {
+      dmlChildren = buildFlowChildren(index, lc(info.flowObject), 'publish', null);
+    } else if (info.flowObject && info.flowRecordTriggerType) {
+      dmlChildren = buildFlowChildren(index, lc(info.flowObject), 'dml', flowOpsForRecordTriggerType(info.flowRecordTriggerType));
+    }
+    budget.used += countTNodes(dmlChildren);
+    const subflowChildren = buildFlowParentChildren(index, flowLower, nextPath, ctx, node, budget);
+    node.children = dmlChildren.concat(subflowChildren);
+  } else {
+    // Callee direction: a proper subflow node (reached via a 'subflow'
+    // edge, unlike the DML/publish-reached root -- see makeCalleeFlowNode's
+    // own note on the [SPEC-OPEN] asymmetry) exposes its OWN apex actions
+    // per the GOAL text ("each subflow expanding to its own apex
+    // actions/DML/subflows"), in addition to its own further subflows.
+    node.children = buildFlowCalleeChildren(index, flowLower, nextPath, ctx, node, budget, true);
+  }
+  return node;
+}
+
+// Caller direction: builds one TNode per PARENT flow of flowLower (the
+// flows that invoke it as a subflow), via='subflow'. Mirrors
+// buildChildrenLevel's own maxNodes-cap-with-ownerNode-truncation pattern,
+// scoped to `budget` instead of ctx.nodeCount directly (see the header note
+// above this section for why).
+function buildFlowParentChildren(index, flowLower, ancestorPath, ctx, ownerNode, budget) {
+  const g = index.flowGraph instanceof Map ? index.flowGraph.get(flowLower) : null;
+  const parents = g ? g.parents : [];
+  const out = [];
+  for (const parentLower of parents) {
+    if (budget.used >= budget.limit) {
+      ctx.capped = true;
+      if (ownerNode) ownerNode.truncated = true;
+      break;
+    }
+    // buildOneFlowNode consumes its OWN budget unit internally (see its own
+    // header note) -- no `budget.used++` needed here.
+    out.push(buildOneFlowNode(index, parentLower, ancestorPath, ctx, 'caller', budget));
+  }
+  out.sort(sortTNodes);
+  return out;
+}
+
+// Terminal TNode for one of a flow's own outgoing apex-action targets
+// (index.flowApexTargets) -- "the subflow's own apex action, forward-visible
+// for the first time" per this round's GROUND-TRUTH. via='metadata' (this IS
+// the same "flow declares a reference to this apex method" relationship
+// buildMetaChildren already renders in the reverse direction, just walked
+// forward here) -- deliberately NOT a new via value; the only new via this
+// round introduces is 'subflow', for flow-to-flow edges specifically.
+function buildFlowApexTargetNode(index, target) {
+  const ccm = index.classes.get(target.classLower);
+  const mm = ccm && target.methodLower ? ccm.methods.find((m) => lc(m.name) === target.methodLower) : null;
+  const label = ccm
+    ? (target.methodLower ? `${ccm.name}.${mm ? mm.name : target.methodLower}` : ccm.name)
+    : target.classLower;
+  return {
+    label,
+    kind: target.methodLower ? 'method' : 'class',
+    className: ccm ? ccm.qualified : target.classLower,
+    methodLower: target.methodLower || null,
+    path: ccm ? ccm.path : '',
+    line: mm ? mm.line : 0,
+    entries: mm ? mm.entries : (ccm ? ccm.entries : []),
+    isTest: mm ? mm.isTest : !!(ccm && ccm.isTest),
+    via: 'metadata',
+    sites: [],
+    children: [],
+    // Terminal by design, same convention buildMetaChildren's own flow node
+    // and the DML/publish flow-fanout nodes already use for a metadata-
+    // declared (not syntactic-call) edge: this round's forward tracing
+    // stops AT the apex action -- what THAT method itself calls is a
+    // separate ordinary trace, not part of this flow-chain walk.
+    cyclic: false, truncated: true, approximate: false, seenElsewhere: false,
+  };
+}
+
+// Callee direction: builds a flow node's forward children -- its own
+// apex-action targets (only when `includeApexTargets`, see makeCalleeFlowNode's
+// [SPEC-OPEN] note on why the DML/publish-reached root flow node does NOT get
+// this) plus its own SUBFLOW children (always, via buildOneFlowNode
+// recursion), in that order.
+function buildFlowCalleeChildren(index, flowLower, ancestorPath, ctx, ownerNode, budget, includeApexTargets) {
+  const out = [];
+  if (includeApexTargets) {
+    const targets = (index.flowApexTargets instanceof Map ? index.flowApexTargets.get(flowLower) : null) || [];
+    for (const t of targets) {
+      if (budget.used >= budget.limit) {
+        ctx.capped = true;
+        if (ownerNode) ownerNode.truncated = true;
+        return out;
+      }
+      out.push(buildFlowApexTargetNode(index, t));
+      budget.used++;
+    }
+  }
+  const g = index.flowGraph instanceof Map ? index.flowGraph.get(flowLower) : null;
+  const childFlows = g ? g.children : [];
+  for (const childLower of childFlows) {
+    if (budget.used >= budget.limit) {
+      ctx.capped = true;
+      if (ownerNode) ownerNode.truncated = true;
+      return out;
+    }
+    // buildOneFlowNode consumes its OWN budget unit internally (see its own
+    // header note) -- no `budget.used++` needed here.
+    out.push(buildOneFlowNode(index, childLower, ancestorPath, ctx, 'callee', budget));
+  }
   return out;
 }
 
@@ -5100,12 +5363,151 @@ function attachMetaCallers(index, metaRefs) {
   index.flowRefsByObject = flowRefsByObject;
   index._seenFlowKeys = seenFlowKeys;
 
+  // v0.13/S2: flow-to-subflow chains -----------------------------------
+  // index.flowInfo: Map<flowLower, {label, path, line, flowObject,
+  //   flowTriggerType, flowRecordTriggerType}> -- one entry per distinct
+  //   flow label metascan has ever seen (accumulated across
+  //   attachMetaCallers calls, same "later calls append" contract as
+  //   metaCallers/metaMethodCallers above). Built from EVERY flow-kind ref
+  //   regardless of whether it carries className/methodName -- this is the
+  //   file-driven registration a flow with zero apex actionCalls (e.g. a
+  //   subflow-only flow, or a flow whose ONLY <subflows> element is what
+  //   makes it interesting) needs in order to be "known" at all; mirrors
+  //   collectFlowEntries' own index.flowFilePaths file-driven fallback
+  //   (resolver.js's pre-existing v0.12 precedent) rather than the
+  //   per-actionCalls-ref-only convention flowObject/flowTriggerType used
+  //   pre-v0.13 -- see this round's GROUND-TRUTH "load-bearing stress case"
+  //   note for exactly why a per-ref-only convention here would silently
+  //   lose an apex-less flow's own outgoing subflow reference. The
+  //   lowest-line ref's fields win when several refs share a label (same
+  //   "best" convention collectFlowEntries already uses).
+  // index.flowGraph: Map<flowLower, {parents: string[], children: string[]}>
+  //   -- built ONLY between two flows metascan actually saw (registered in
+  //   flowInfo, from THIS call or an earlier one) -- a <subflows> reference
+  //   naming an unknown flow is counted (stats.unknownSubflowRefs) but NEVER
+  //   creates a flowGraph entry or a fabricated node for that name. Resolved
+  //   in a second pass (pendingSubflowRefs below) since a subflow's own ref
+  //   may appear later in this SAME metaRefs array than its parent's.
+  // index.flowApexTargets: Map<flowLower, [{classLower, methodLower|null}]>
+  //   -- the REVERSE of metaCallers/metaMethodCallers, indexed by flow
+  //   instead of by class: "what apex does THIS flow call" -- forward/callee
+  //   subflow expansion has no other way to ask that question. Own-namespace
+  //   (or namespace-less) targets only, mirroring metaCallers' local-only
+  //   registration just above; an external target's forward edge is out of
+  //   this round's scope.
+  const flowInfo = index.flowInfo instanceof Map ? index.flowInfo : new Map();
+  const flowGraph = index.flowGraph instanceof Map ? index.flowGraph : new Map();
+  const flowApexTargets = index.flowApexTargets instanceof Map ? index.flowApexTargets : new Map();
+  const pendingSubflowRefsThisCall = [];
+
+  function getOrCreateFlowGraphNode(flowLower) {
+    let g = flowGraph.get(flowLower);
+    if (!g) {
+      g = { parents: [], children: [] };
+      flowGraph.set(flowLower, g);
+    }
+    return g;
+  }
+
+  for (const ref of metaRefs || []) {
+    if (!ref || ref.kind !== 'flow' || typeof ref.label !== 'string' || !ref.label) continue;
+    const flowLower = lc(ref.label);
+    const existing = flowInfo.get(flowLower);
+    if (!existing || (ref.line || 0) < (existing.line || 0)) {
+      flowInfo.set(flowLower, {
+        label: ref.label,
+        path: ref.path || (existing && existing.path) || '',
+        line: ref.line || 0,
+        flowObject: ref.flowObject || (existing && existing.flowObject) || null,
+        flowTriggerType: ref.flowTriggerType || (existing && existing.flowTriggerType) || null,
+        flowRecordTriggerType: ref.flowRecordTriggerType || (existing && existing.flowRecordTriggerType) || null,
+      });
+    }
+
+    // This flow's own outgoing apex-action target(s) -- the reverse lookup
+    // flowApexTargets exists for. Own-namespace/no-namespace only (see
+    // header note above).
+    if (ref.className) {
+      const detected2 = detectMetaRefNamespace(ref, ownNamespaceLower);
+      if (!detected2 || detected2.isOwn) {
+        const targetClassLower = lc(detected2 && detected2.isOwn ? detected2.className : ref.className);
+        const list = flowApexTargets.get(flowLower) || [];
+        if (!flowApexTargets.has(flowLower)) flowApexTargets.set(flowLower, list);
+        const pushIfNew = (methodLower) => {
+          if (!list.some((t) => t.classLower === targetClassLower && t.methodLower === methodLower)) {
+            list.push({ classLower: targetClassLower, methodLower });
+          }
+        };
+        if (ref.methodName) {
+          pushIfNew(lc(detected2 && detected2.isOwn ? detected2.methodName : ref.methodName));
+        } else {
+          // Mirrors the class-level-plus-sole-invocable-method dual
+          // registration metaCallers/metaMethodCallers already do above.
+          pushIfNew(null);
+          const soleInvocable = findSoleInvocableMethod(index, targetClassLower);
+          if (soleInvocable) pushIfNew(lc(soleInvocable));
+        }
+      }
+    }
+
+    // <subflows> references this flow file declared -- resolved in a
+    // second pass below (once every ref in THIS call has registered its
+    // own label into flowInfo).
+    const subflows = Array.isArray(ref.subflows) ? ref.subflows : [];
+    for (const rawName of subflows) {
+      if (typeof rawName !== 'string' || !rawName) continue;
+      pendingSubflowRefsThisCall.push({ parentLower: flowLower, childLower: lc(rawName) });
+    }
+  }
+
+  // v0.13/S2 ORDERING NOTE: extension.js's real pipeline sets
+  // index.flowFilePaths AFTER calling attachMetaCallers (see that field's
+  // own v0.12 header note -- it exists specifically so a flow with ZERO
+  // metascan refs of ANY kind still gets entry-catalog identity). A subflow
+  // reference naming such a flow (a pure orchestration leaf: no apex
+  // actionCalls of its OWN and no <subflows> of its OWN either, so even S1's
+  // bare-ref exception never fires for it -- e.g. adv-org's
+  // AcmeNotifyCustomerSubflow, whose only action is a non-apex emailSimple)
+  // is therefore UNRESOLVABLE from flowInfo alone at this exact moment, even
+  // though it names a perfectly real flow file. Rather than mis-count it as
+  // unknown, an unresolved pending ref is deferred (index._pendingSubflowRefs,
+  // accumulated across calls) and finalized lazily -- see
+  // finalizeFlowSubflowRefs()'s own header note just below -- by
+  // buildCallerTree/buildCalleeTree/buildEntryCatalog, all three of which
+  // only ever run after the full scan-and-attach sequence (incl. the
+  // flowFilePaths assignment) has completed. A ref that resolves immediately
+  // (the common case -- the referenced flow already has its own metaRef,
+  // e.g. this round's whole gauntlet-org corpus) is wired into flowGraph
+  // right here, with zero deferral.
+  const pendingSubflowRefs = Array.isArray(index._pendingSubflowRefs) ? index._pendingSubflowRefs : [];
+  for (const { parentLower, childLower } of pendingSubflowRefsThisCall) {
+    if (flowInfo.has(childLower)) {
+      const parentNode = getOrCreateFlowGraphNode(parentLower);
+      const childNode = getOrCreateFlowGraphNode(childLower);
+      if (!parentNode.children.includes(childLower)) parentNode.children.push(childLower);
+      if (!childNode.parents.includes(parentLower)) childNode.parents.push(parentLower);
+    } else {
+      pendingSubflowRefs.push({ parentLower, childLower });
+    }
+  }
+
+  index.flowInfo = flowInfo;
+  index.flowGraph = flowGraph;
+  index.flowApexTargets = flowApexTargets;
+  index._pendingSubflowRefs = pendingSubflowRefs;
+
   // v0.7.1/M2: accumulate across repeat calls (this function is documented
   // as safe to call multiple times / with refs from multiple scans, "later
   // calls append, they don't replace") -- same additive posture as
   // metaCallers/metaMethodCallers above, not a per-call overwrite.
   index.stats = index.stats || {};
   index.stats.metaUnresolved = (index.stats.metaUnresolved || 0) + metaUnresolvedCount;
+  // v0.13/S2: stats.unknownSubflowRefs itself is finalized lazily (see
+  // finalizeFlowSubflowRefs) -- initialized to 0 here only if this is the
+  // very first attachMetaCallers call this index has ever seen, otherwise
+  // left exactly as-is (never reset to 0 on a later call, matching every
+  // other stats field's additive-across-calls convention).
+  index.stats.unknownSubflowRefs = index.stats.unknownSubflowRefs || 0;
   // v0.8/N5: externalRefs/externalNamespaces are RECOMPUTED (not
   // accumulated) from `externals`' current, now-possibly-larger contents --
   // see computeExternalStats's own header note on why a derived value here
@@ -5114,6 +5516,72 @@ function attachMetaCallers(index, metaRefs) {
   Object.assign(index.stats, computeExternalStats(externals));
 
   return index;
+}
+
+// v0.13/S2: decisively resolves whatever is still sitting in
+// index._pendingSubflowRefs (see attachMetaCallers' own "ORDERING NOTE" just
+// above for exactly why a ref can be left pending) into either a REAL
+// flowGraph edge or a final stats.unknownSubflowRefs increment -- never
+// both, never neither, and never counted twice (each pending entry is
+// removed from the list the moment it's decided). Idempotent/cheap to call
+// on every entry into buildCallerTree/buildCalleeTree/buildEntryCatalog:
+// once index._pendingSubflowRefs is empty (the overwhelmingly common case --
+// every reference this round's own gauntlet-org corpus declares resolves
+// immediately inside attachMetaCallers itself), every subsequent call is an
+// instant no-op.
+//
+// Folds index.flowFilePaths (if present at THIS moment -- by real-pipeline
+// convention it always is, by the time any of the three callers above first
+// run) into index.flowInfo as synthetic bare entries for any flow FILE that
+// produced zero metascan refs of ANY kind (mirrors collectFlowEntries' own
+// identical fallback, one level earlier, so flowGraph resolution sees the
+// exact same "known flow" universe the entry catalog does).
+function finalizeFlowSubflowRefs(index) {
+  if (!index) return;
+  const pending = Array.isArray(index._pendingSubflowRefs) ? index._pendingSubflowRefs : [];
+  if (!pending.length) return;
+
+  const flowInfo = index.flowInfo instanceof Map ? index.flowInfo : (index.flowInfo = new Map());
+  const flowGraph = index.flowGraph instanceof Map ? index.flowGraph : (index.flowGraph = new Map());
+
+  const flowFilePaths = Array.isArray(index.flowFilePaths) ? index.flowFilePaths : [];
+  for (const p of flowFilePaths) {
+    if (typeof p !== 'string' || !p) continue;
+    const label = flowStemOf(p);
+    if (!label) continue;
+    const flowLower = lc(label);
+    if (!flowInfo.has(flowLower)) {
+      flowInfo.set(flowLower, { label, path: p, line: 0, flowObject: null, flowTriggerType: null, flowRecordTriggerType: null });
+    }
+  }
+
+  function getOrCreateFlowGraphNode(flowLower) {
+    let g = flowGraph.get(flowLower);
+    if (!g) {
+      g = { parents: [], children: [] };
+      flowGraph.set(flowLower, g);
+    }
+    return g;
+  }
+
+  let unknownDelta = 0;
+  for (const { parentLower, childLower } of pending) {
+    // "matched to other flows by stem, case-insensitive" -- a subflow name
+    // matching NO known flow (flowInfo, now folded with flowFilePaths above)
+    // is counted, never fabricated as a node.
+    if (!flowInfo.has(childLower)) {
+      unknownDelta++;
+      continue;
+    }
+    const parentNode = getOrCreateFlowGraphNode(parentLower);
+    const childNode = getOrCreateFlowGraphNode(childLower);
+    if (!parentNode.children.includes(childLower)) parentNode.children.push(childLower);
+    if (!childNode.parents.includes(parentLower)) childNode.parents.push(parentLower);
+  }
+
+  index._pendingSubflowRefs = [];
+  index.stats = index.stats || {};
+  index.stats.unknownSubflowRefs = (index.stats.unknownSubflowRefs || 0) + unknownDelta;
 }
 
 // Returns the method name of the sole @InvocableMethod-annotated method on
@@ -5665,6 +6133,30 @@ function flowStemOf(rawPath) {
 // no new analysis to do so either), otherwise '<flowTriggerType> on
 // <flowObject>' (covers both record-triggered and platform-event-triggered
 // shapes, which both carry that same field pair).
+// v0.13/S2: additive detail-suffix for a flow that is ONLY ever referenced
+// as a subflow of other flows -- "no <start> trigger info (hasStartInfo
+// false -- the pre-existing 'screen or autolaunched' fallback branch) AND at
+// least one parent" (GOAL text, verbatim). Returns '' (no suffix) otherwise,
+// so `detail + subflowSuffixFor(...)` is always safe to concatenate.
+// Multiple-parent format is UNSPECIFIED by the GOAL text and untested by
+// either reference corpus (documented gap, GROUND-TRUTH's own "not covered"
+// note) -- ", "-joined canonical labels (flowInfo's own display casing,
+// falling back to the raw lowercased key if a parent was somehow never
+// registered into flowInfo) is a deterministic, readable choice for that
+// unexercised case.
+function subflowSuffixFor(index, label, hasStartInfo) {
+  if (hasStartInfo) return '';
+  const g = index && index.flowGraph instanceof Map ? index.flowGraph.get(lc(label)) : null;
+  const parents = g && Array.isArray(g.parents) ? g.parents : [];
+  if (!parents.length) return '';
+  const flowInfo = index && index.flowInfo instanceof Map ? index.flowInfo : new Map();
+  const parentLabels = parents.map((p) => {
+    const info = flowInfo.get(p);
+    return info && info.label ? info.label : p;
+  });
+  return ` (subflow of ${parentLabels.join(', ')})`;
+}
+
 function collectFlowEntries(index, addEntry) {
   const refs = [];
   const metaCallers = index && index.metaCallers instanceof Map ? index.metaCallers : new Map();
@@ -5703,13 +6195,17 @@ function collectFlowEntries(index, addEntry) {
     // same list (RecordAfterSave/RecordBeforeSave/etc.) DOES use the raw
     // triggerType text unchanged, so only this one shape needed a special
     // case.
-    const detail = !best.flowObject
+    const baseDetail = !best.flowObject
       ? 'screen or autolaunched'
       : lc(best.flowTriggerType) === 'platformevent'
         ? `platform event on ${best.flowObject}`
         : best.flowTriggerType
           ? `${best.flowTriggerType} on ${best.flowObject}`
           : 'screen or autolaunched';
+    // v0.13/S2: additive suffix only -- see subflowSuffixFor's own header
+    // note. `!best.flowObject` is the exact same "no <start> trigger info"
+    // condition baseDetail's own fallback branch above just used.
+    const detail = baseDetail + subflowSuffixFor(index, label, !!best.flowObject);
     addEntry('flow', `flow:${label}`, {
       label,
       className: null,
@@ -5728,19 +6224,62 @@ function collectFlowEntries(index, addEntry) {
     const label = flowStemOf(p);
     if (!label || seenLabels.has(label)) continue;
     seenLabels.add(label);
+    // v0.13/S2: this loop's flows never carry <start> info at all (no ref
+    // survived to tell us -- see this loop's own header note on WHY a flow
+    // lands here), so hasStartInfo is unconditionally false -- the same
+    // additive suffix rule applies.
     addEntry('flow', `flow:${label}`, {
       label,
       className: null,
       methodLower: null,
       path: p,
       line: 0,
-      detail: 'screen or autolaunched',
+      detail: 'screen or autolaunched' + subflowSuffixFor(index, label, false),
+      package: null,
+    });
+  }
+
+  // v0.13/S2: index.flowInfo (built by attachMetaCallers, see its own header
+  // note) is a THIRD, independent fallback -- it registers a flow's label
+  // from ANY flow-kind ref it ever saw, including the bare/synthetic
+  // (className:null) ref metascan.js's S1 amendment emits for a flow that
+  // has >=1 <subflows> element but ZERO apex actionCalls of its own (a
+  // subflow-only orchestration node -- e.g. this round's `Vtx_FlowChainTop`
+  // fixture). That shape never reaches metaCallers/externalMetaRefs at all
+  // (attachMetaCallers' own local-attach loop skips any ref with no
+  // className), so without this fallback such a flow would be invisible
+  // here unless the CALLER separately populated index.flowFilePaths (the
+  // pre-existing v0.12 mechanism, which solves the identical problem but
+  // depends on extension.js remembering to set it before calling this
+  // function). flowInfo also carries real flowObject/flowTriggerType/
+  // flowRecordTriggerType for this shape (S1 stamps those onto the
+  // synthetic ref too), so the SAME rich detail computation the byLabel
+  // loop above uses applies here, not just the bare fallback string.
+  const flowInfoMap = index && index.flowInfo instanceof Map ? index.flowInfo : new Map();
+  for (const [, info] of flowInfoMap) {
+    if (!info || typeof info.label !== 'string' || !info.label || seenLabels.has(info.label)) continue;
+    seenLabels.add(info.label);
+    const baseDetail = !info.flowObject
+      ? 'screen or autolaunched'
+      : lc(info.flowTriggerType) === 'platformevent'
+        ? `platform event on ${info.flowObject}`
+        : info.flowTriggerType
+          ? `${info.flowTriggerType} on ${info.flowObject}`
+          : 'screen or autolaunched';
+    addEntry('flow', `flow:${info.label}`, {
+      label: info.label,
+      className: null,
+      methodLower: null,
+      path: info.path || '',
+      line: info.line || 0,
+      detail: baseDetail + subflowSuffixFor(index, info.label, !!info.flowObject),
       package: null,
     });
   }
 }
 
 function buildEntryCatalog(index) {
+  finalizeFlowSubflowRefs(index); // v0.13/S2 -- see its own header note
   const groupsByKind = new Map(ENTRY_KIND_ORDER.map((k) => [k, new Map()])); // kind -> dedupeKey -> Entry
   const packageLabelsSeen = new Set();
   let excludedTestEntries = 0;

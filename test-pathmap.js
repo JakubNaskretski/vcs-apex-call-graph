@@ -1675,4 +1675,86 @@ assert.deepStrictEqual(preserveTransformOnUpdate({ scale: 'not-a-number' }), { s
 assert.deepStrictEqual(preserveTransformOnUpdate({ scale: 0.2, panX: 0, panY: 0 }), { scale: 0.2, panX: 0, panY: 0 }, 'falsy-but-valid numbers (0, MIN_SCALE) are preserved, not treated as missing');
 passCount += 5;
 
+// =========================================================================
+// v0.13 (S2/S3): flow-to-subflow chains -- legend + map rendering
+// =========================================================================
+
+// --- legend entry present (S3 contract: "'subflow' via label ... legend
+// entry"). Checked by rendering a minimal TreeResult and grepping the
+// document, same convention every other legend-content assertion in this
+// file uses (the legend text lives in a module-level HTML string, but this
+// file's own contract is "assert against renderPathMapHtml's OUTPUT", not
+// against pathmap.js internals). ------------------------------------------
+{
+  const legendFixture = { root: baseNode({ label: 'Legend.Probe' }), targetLabel: 'Legend.Probe', note: null };
+  const legendHtml = renderPathMapHtml(legendFixture, { legendOpen: true });
+  check(legendHtml.includes('<span class="k">subflow</span>'), 'legend must document the new "subflow" via label');
+  check(/subflow.*&lt;subflows&gt;/.test(legendHtml) || legendHtml.includes('&lt;subflows&gt;'), 'legend text should name the actual <subflows> XML element for a user reading it');
+}
+
+// --- accentKind: a subflow-via node is still kind:'flow' -- same metadata
+// accent every other flow node (record-triggered, DML-fanout, etc.) already
+// gets; no new accent/kind needed for this via value. -----------------------
+{
+  check(
+    accentKind({ kind: 'flow', via: 'subflow', entries: ['Flow apex action'], isTest: false }) === 'metadata',
+    'a subflow-reached flow node keeps the metadata accent -- only the via badge is new, not a new node kind'
+  );
+}
+
+// --- full 3-deep subflow chain renders through buildPathMapData/
+// renderPathMapHtml exactly like any other chain: right node count, right
+// via on each edge, both orientations (default callers-style layout here;
+// the mirrored/callees layout is already exercised generically elsewhere in
+// this file and this via value participates in that same generic code path,
+// see layoutTree's own header note -- no special-casing exists to test). --
+{
+  const chainTop = baseNode({ label: 'S13ChainTop', kind: 'flow', via: 'subflow', entries: ['Flow apex action'], path: '/ws/flows/S13ChainTop.flow-meta.xml' });
+  const chainMid = baseNode({ label: 'S13ChainMid', kind: 'flow', via: 'subflow', entries: ['Flow apex action'], path: '/ws/flows/S13ChainMid.flow-meta.xml', children: [chainTop] });
+  const chainLeaf = baseNode({ label: 'S13ChainLeaf', kind: 'flow', via: 'metadata', entries: ['Flow apex action'], path: '/ws/flows/S13ChainLeaf.flow-meta.xml', children: [chainMid] });
+  const chainRoot = baseNode({ label: 'S13ChainRelay.relayLeaf', className: 'S13ChainRelay', methodLower: 'relayleaf', path: '/ws/S13ChainRelay.cls', children: [chainLeaf] });
+  const chainFixture = { root: chainRoot, targetLabel: 'S13ChainRelay.relayLeaf', note: null, direction: 'callers' };
+
+  const data = buildPathMapData(chainFixture);
+  check(data.nodes.length === 4, 'root + 3-deep chain = 4 nodes');
+  check(data.edges.length === 3, '3 edges connecting them (one per child->parent TNode relationship)');
+  // Both node.via and edge.via are read straight off each TNode's own `via`
+  // field (shapeNodeForData/shapeEdgeForData) -- no subflow-specific code
+  // path exists in pathmap.js, so this is a plain structural check, same as
+  // every other kind/via value already exercised in this file.
+  const byLabel = new Map(data.nodes.map((n) => [n.label, n]));
+  check(byLabel.get('S13ChainLeaf').accent === 'metadata', 'flow kind keeps its metadata accent regardless of via');
+  check(byLabel.get('S13ChainMid').accent === 'metadata');
+  check(byLabel.get('S13ChainTop').accent === 'metadata');
+  check(byLabel.get('S13ChainLeaf').via === 'metadata', 'the pre-existing metadata edge (flow calls apex) is unaffected');
+  check(byLabel.get('S13ChainMid').via === 'subflow', 'NEW v0.13: the parent-flow edge carries via=subflow on the node itself');
+  check(byLabel.get('S13ChainTop').via === 'subflow', 'the chain genuinely recurses -- level 3 carries it too');
+  const edgesByChildLabel = new Map(data.edges.map((e) => [data.nodes.find((n) => n.id === e.from).label, e]));
+  check(edgesByChildLabel.get('S13ChainMid').via === 'subflow', 'the edge record mirrors the node-level via, same duplication every other via value already has');
+  check(edgesByChildLabel.get('S13ChainTop').via === 'subflow');
+  check(edgesByChildLabel.get('S13ChainLeaf').via === 'metadata');
+
+  // renderPathMapHtml itself must not throw and must embed the SAME data
+  // (mirrors this file's own "buildPathMapData is byte-identical to the
+  // embedded blob" invariant, re-checked here for a subflow-chain shape
+  // specifically).
+  const html = renderPathMapHtml(chainFixture);
+  check(html.includes('<!doctype html>') || html.includes('<meta charset'), 'renders a full document without throwing');
+  assert.deepStrictEqual(extractData(html), data, 'the embedded DATA blob matches buildPathMapData(chainFixture) exactly for a subflow chain, same as every other fixture in this file');
+  passCount += 1;
+}
+
+// --- cyclic subflow node renders with the pre-existing cyclic marker/accent
+// -- no new visual treatment needed, same generic cyclic handling every
+// other kind already gets. --------------------------------------------------
+{
+  const cyclicChild = baseNode({ label: 'S13CycleA', kind: 'flow', via: 'subflow', entries: ['Flow apex action'], cyclic: true, path: '/ws/flows/S13CycleA.flow-meta.xml' });
+  const cyclicMid = baseNode({ label: 'S13CycleB', kind: 'flow', via: 'subflow', entries: ['Flow apex action'], path: '/ws/flows/S13CycleB.flow-meta.xml', children: [cyclicChild] });
+  const cyclicRoot = baseNode({ label: 'S13CycleHelper.pingA', className: 'S13CycleHelper', methodLower: 'pinga', path: '/ws/S13CycleHelper.cls', children: [cyclicMid] });
+  const data = buildPathMapData({ root: cyclicRoot, targetLabel: 'S13CycleHelper.pingA', note: null, direction: 'callers' });
+  const byLabel = new Map(data.nodes.map((n) => [n.label, n]));
+  check(byLabel.get('S13CycleA').cyclic === true, 'the cyclic flag survives into the data blob unchanged for a subflow node');
+  check(byLabel.get('S13CycleA').via === 'subflow', 'a cyclic node still carries its own subflow via correctly, not clobbered by the cyclic flag');
+}
+
 console.log('apex-trace pathmap self-check: ' + passCount + ' assertions passed');

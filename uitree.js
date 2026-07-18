@@ -56,6 +56,14 @@
 //                   // forward (callees) direction -- still no special-
 //                   // casing needed here, since a terminal TNode simply
 //                   // arrives with an empty `children` array either way.
+//                   // v0.13 (S2/S3): that A2 terminality is no longer
+//                   // absolute -- a 'flow' node's children may now ALSO be
+//                   // its own subflow chain (via:'subflow', both
+//                   // directions: parent flows when tracing callers, child
+//                   // flows when tracing callees), recursing arbitrarily
+//                   // deep (cycle-guarded). Same "renders whatever children
+//                   // it is given generically" posture applies -- no
+//                   // special-casing needed here for this either.
 //     className, path, line,   // line = decl line for jump
 //     package,      // string|null|undefined (v0.7 B3): the sfdx package
 //                    // label (packageDirectories' `package` name, or the
@@ -88,7 +96,12 @@
 //                               // a reference into managed-package code --
 //                               // NOT approximate, per N2's precedence rule
 //                               // 3: a genuine namespace match is exact, not
-//                               // a guess) -- this file renders whatever
+//                               // a guess)|'subflow' (v0.13 S2/S3: a declared
+//                               // <subflows> reference between two Flow
+//                               // files -- NOT approximate, a declared
+//                               // reference, same "genuine, not a guess"
+//                               // posture as 'external'/'publish' above) --
+//                               // this file renders whatever
 //                               // string it is given verbatim as a badge, so
 //                               // new via values need no code change here,
 //                               // only in the legend-equivalent docs a human
@@ -626,6 +639,15 @@ const VIA_GLOSSARY = {
   // TNode.via field doc above), so this via never co-occurs with the '~'
   // marker glossary line.
   external: 'managed package code — source not analyzable',
+  // v0.13 (S2/S3): flow-to-flow subflow chains -- a declared `<subflows>`
+  // reference between two Flow files metascan actually saw (never a
+  // fan-out guess, unlike interface/unique-name/dynamic/etc. above), so
+  // this via is deliberately absent from resolver.js's APPROX_VIA set and
+  // never co-occurs with the '~' marker line, same posture as 'publish'/
+  // 'throws'/'external' just above. In the callers direction it's the
+  // flow's own PARENT flow (the parent invokes it as a subflow); in the
+  // callees direction it's the flow's own SUBFLOW (it invokes the child).
+  subflow: 'a declared <subflows> reference between two Flow files — not an Apex call, a parent/child flow-orchestration edge',
 };
 
 const MARKER_GLOSSARY = {

@@ -512,6 +512,44 @@ addFile('classes/PubStoryFlowInvocable.cls', [
 ].join('\n'));
 
 // =========================================================================
+// v0.13.0 SUBFLOW-STORY: end-to-end, real parser+metascan+resolver pipeline,
+// mirroring the same "DML launcher -> record-triggered parent flow -> its
+// subflow -> the subflow's own apex action" shape GROUND-TRUTH.md's
+// gauntlet-org corpus fixture uses (Vtx_WidgetLifecycleFlow /
+// Vtx_WidgetLifecycleNotifySubflow), reproduced here in miniature so the
+// full both-directions story is pinned even without the real corpus, PLUS
+// a standalone mutual-cycle pair (V13CycleFlowA <-> V13CycleFlowB). See the
+// "v0.13.0 SUBFLOW-STORY" assertion block near the end of this file.
+// =========================================================================
+addFile('classes/V13FlowLauncher.cls', [
+  'public class V13FlowLauncher {',
+  '  public static void createWidget(String n) {',
+  '    insert new V13Flow_Widget__c(Name = n);',
+  '  }',
+  '}',
+].join('\n'));
+addFile('classes/V13FlowParentApex.cls', [
+  'public class V13FlowParentApex {',
+  '  public static void logCreated(Id widgetId) { System.debug(widgetId); }',
+  '}',
+].join('\n'));
+addFile('classes/V13FlowSubflowApex.cls', [
+  'public class V13FlowSubflowApex {',
+  '  public static void notifyTeam(Id widgetId) { System.debug(widgetId); }',
+  '}',
+].join('\n'));
+addFile('classes/V13CycleApexA.cls', [
+  'public class V13CycleApexA {',
+  '  public static void pingA(Id r) { System.debug(r); }',
+  '}',
+].join('\n'));
+addFile('classes/V13CycleApexB.cls', [
+  'public class V13CycleApexB {',
+  '  public static void pingB(Id r) { System.debug(r); }',
+  '}',
+].join('\n'));
+
+// =========================================================================
 // v0.6.0 fixtures (integrator phase): H1 seenElsewhere dedup, H2 interface x
 // override composition, H4 zero-caller note -- each exercised through the
 // REAL parser -> resolver pipeline (not synthetic TNode/ClassMeta fixtures
@@ -912,6 +950,101 @@ const pubStoryFlowFile = {
 };
 const pubStoryFlowMetaRefs = metascan.parseMetaFile(pubStoryFlowFile).map((ref) => Object.assign(ref, { path: pubStoryFlowFile.path }));
 resolver.attachMetaCallers(index, pubStoryFlowMetaRefs);
+
+// v0.13.0 SUBFLOW-STORY leg 1: the record-triggered PARENT flow -- own
+// <start> (matches V13FlowLauncher.createWidget's insert), own apex action
+// (V13FlowParentApex.logCreated, present only so this flow has >=1
+// actionCalls ref of its own -- same convention gauntlet-org's
+// Vtx_WidgetLifecycleFlow uses), PLUS a <subflows> reference to the child
+// flow below. attachMetaCallers is safe to call multiple times / with refs
+// from different files (documented contract) -- each flow file here gets
+// its own call, exactly like the LWC/Flow legs above.
+const v13ParentFlowFile = {
+  path: '/ws/force-app/main/default/flows/V13ParentFlow.flow-meta.xml',
+  text: [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '  <start>',
+    '    <object>V13Flow_Widget__c</object>',
+    '    <triggerType>RecordAfterSave</triggerType>',
+    '    <recordTriggerType>Create</recordTriggerType>',
+    '  </start>',
+    '  <actionCalls>',
+    '    <actionName>V13FlowParentApex.logCreated</actionName>',
+    '    <actionType>apex</actionType>',
+    '  </actionCalls>',
+    '  <subflows>',
+    '    <name>Notify_Team</name>',
+    '    <label>Notify Team</label>',
+    '    <locationX>100</locationX>',
+    '    <locationY>100</locationY>',
+    '    <flowName>V13ChildSubflow</flowName>',
+    '  </subflows>',
+    '</Flow>',
+  ].join('\n'),
+};
+const v13ParentFlowMetaRefs = metascan.parseMetaFile(v13ParentFlowFile).map((ref) => Object.assign(ref, { path: v13ParentFlowFile.path }));
+resolver.attachMetaCallers(index, v13ParentFlowMetaRefs);
+
+// v0.13.0 SUBFLOW-STORY leg 2: the CHILD subflow -- its only actionCalls is
+// its own apex action (V13FlowSubflowApex.notifyTeam), no <start> trigger
+// info of its own (reached only as a subflow, same shape gauntlet-org's
+// Vtx_WidgetLifecycleNotifySubflow uses).
+const v13ChildSubflowFile = {
+  path: '/ws/force-app/main/default/flows/V13ChildSubflow.flow-meta.xml',
+  text: [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '  <actionCalls>',
+    '    <actionName>V13FlowSubflowApex.notifyTeam</actionName>',
+    '    <actionType>apex</actionType>',
+    '  </actionCalls>',
+    '</Flow>',
+  ].join('\n'),
+};
+const v13ChildSubflowMetaRefs = metascan.parseMetaFile(v13ChildSubflowFile).map((ref) => Object.assign(ref, { path: v13ChildSubflowFile.path }));
+resolver.attachMetaCallers(index, v13ChildSubflowMetaRefs);
+
+// v0.13.0 SUBFLOW-STORY leg 3: a standalone MUTUAL cycle (A's <subflows>
+// names B, B's <subflows> names A) -- must flag cyclic:true on the second
+// re-occurrence and never hang, independent of the launcher/DML story above.
+const v13CycleFlowAFile = {
+  path: '/ws/force-app/main/default/flows/V13CycleFlowA.flow-meta.xml',
+  text: [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '  <actionCalls>',
+    '    <actionName>V13CycleApexA.pingA</actionName>',
+    '    <actionType>apex</actionType>',
+    '  </actionCalls>',
+    '  <subflows>',
+    '    <name>Call_B</name>',
+    '    <flowName>V13CycleFlowB</flowName>',
+    '  </subflows>',
+    '</Flow>',
+  ].join('\n'),
+};
+const v13CycleFlowAMetaRefs = metascan.parseMetaFile(v13CycleFlowAFile).map((ref) => Object.assign(ref, { path: v13CycleFlowAFile.path }));
+resolver.attachMetaCallers(index, v13CycleFlowAMetaRefs);
+
+const v13CycleFlowBFile = {
+  path: '/ws/force-app/main/default/flows/V13CycleFlowB.flow-meta.xml',
+  text: [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '  <actionCalls>',
+    '    <actionName>V13CycleApexB.pingB</actionName>',
+    '    <actionType>apex</actionType>',
+    '  </actionCalls>',
+    '  <subflows>',
+    '    <name>Call_A</name>',
+    '    <flowName>V13CycleFlowA</flowName>',
+    '  </subflows>',
+    '</Flow>',
+  ].join('\n'),
+};
+const v13CycleFlowBMetaRefs = metascan.parseMetaFile(v13CycleFlowBFile).map((ref) => Object.assign(ref, { path: v13CycleFlowBFile.path }));
+resolver.attachMetaCallers(index, v13CycleFlowBMetaRefs);
 
 // v0.10/A2 e2e: a real Visualforce .page file, run through the real
 // metascan.js action="{!method}" extraction, attached via the real
@@ -1339,6 +1472,96 @@ function findChild(tree, label) {
     assert.strictEqual(c.approximate, false);
     assert.deepStrictEqual(c.children, [], 'flow-publish children are themselves terminal');
   }
+}
+
+// =========================================================================
+// v0.13.0 SUBFLOW-STORY: end-to-end assertions, node by node -- see the
+// fixture blocks near the top of this file (classes) and just above (the
+// 4 flow files) for the shape of this story. Mirrors GROUND-TRUTH.md's
+// gauntlet-org req-1/req-4 targets in miniature, PLUS a standalone cycle.
+// =========================================================================
+{
+  // --- CALLER direction: apex <- subflow <- parent flow <- DML launcher ---
+  // (req-1: "apex <- subflow <- parent <- launcher")
+  const tree = callers('v13flowsubflowapex', 'notifyteam');
+
+  const subflowMetaChild = tree.root.children.find((c) => c.kind === 'flow');
+  assert.ok(subflowMetaChild, 'V13FlowSubflowApex.notifyTeam should surface V13ChildSubflow as a flow metadata caller (pre-existing F1(b)-style mechanism, unaffected by v0.13)');
+  assert.strictEqual(subflowMetaChild.via, 'metadata');
+  assert.strictEqual(subflowMetaChild.label, 'V13ChildSubflow');
+
+  // The NEW v0.13 edge: the subflow's own PARENT flow, via='subflow',
+  // approximate:false (a declared reference, not a fan-out guess).
+  const parentFlowChild = subflowMetaChild.children.find((c) => c.kind === 'flow');
+  assert.ok(parentFlowChild, 'v0.13 [MUST]: V13ChildSubflow should surface V13ParentFlow as a caller, via the new subflow edge');
+  assert.strictEqual(parentFlowChild.via, 'subflow', 'v0.13 [MUST]: the parent-flow edge must be via=subflow');
+  assert.strictEqual(parentFlowChild.approximate, false, "v0.13 [MUST]: via='subflow' is a declared reference, never approximate");
+  assert.strictEqual(parentFlowChild.label, 'V13ParentFlow');
+  assert.strictEqual(parentFlowChild.cyclic, false);
+
+  // Pre-existing F1(b) DML->flow-children mechanism, now reachable one hop
+  // deeper thanks to the new subflow edge -- the DML launcher itself.
+  const launcherChild = parentFlowChild.children.find((c) => c.label === 'V13FlowLauncher.createWidget');
+  assert.ok(launcherChild, 'v0.13 [MUST]: V13ParentFlow should carry V13FlowLauncher.createWidget as a DML child (its own <start> matches the insert)');
+  assert.strictEqual(launcherChild.via, 'dml');
+  assert.strictEqual(launcherChild.kind, 'method');
+
+  // --- CALLEE direction: DML -> parent flow -> subflow -> subflow's apex --
+  // (req-4: "DML -> parent flow -> subflow -> apex action")
+  const calleeTree = callees('v13flowlauncher', 'createwidget');
+  const dmlFlowChild = calleeTree.root.children.find((c) => c.kind === 'flow');
+  assert.ok(dmlFlowChild, 'V13FlowLauncher.createWidget should surface V13ParentFlow as a via=dml callee (pre-existing A1 fan-out)');
+  assert.strictEqual(dmlFlowChild.via, 'dml');
+  assert.strictEqual(dmlFlowChild.label, 'V13ParentFlow');
+
+  // NEW v0.13: this flow node's children are no longer forced empty --
+  // its own <subflows> list is walked forward.
+  const subflowCalleeChild = dmlFlowChild.children.find((c) => c.kind === 'flow');
+  assert.ok(subflowCalleeChild, 'v0.13 [MUST]: V13ParentFlow (reached via dml) should forward-expose V13ChildSubflow as a subflow child');
+  assert.strictEqual(subflowCalleeChild.via, 'subflow');
+  assert.strictEqual(subflowCalleeChild.approximate, false);
+  assert.strictEqual(subflowCalleeChild.label, 'V13ChildSubflow');
+
+  // The subflow's own apex action, forward-visible for the first time.
+  const apexTargetChild = subflowCalleeChild.children.find((c) => c.label === 'V13FlowSubflowApex.notifyTeam');
+  assert.ok(apexTargetChild, "v0.13 [MUST]: V13ChildSubflow's own apex action (notifyTeam) must be forward-visible as a child, per the GOAL text \"each subflow expanding to its own apex actions/DML/subflows\"");
+  assert.strictEqual(apexTargetChild.via, 'metadata');
+  assert.deepStrictEqual(apexTargetChild.children, [], 'the forward-exposed apex action is terminal -- what IT calls is a separate ordinary trace');
+
+  // --- Cycle case: mutual subflow reference must flag cyclic, never hang --
+  const cycleTreeA = callers('v13cycleapexa', 'pinga');
+  const cycleMetaA = cycleTreeA.root.children.find((c) => c.kind === 'flow');
+  assert.ok(cycleMetaA, 'V13CycleApexA.pingA should surface V13CycleFlowA as a flow metadata caller');
+  assert.strictEqual(cycleMetaA.label, 'V13CycleFlowA');
+  const cycleSubflowB = cycleMetaA.children.find((c) => c.kind === 'flow');
+  assert.ok(cycleSubflowB, 'v0.13 [MUST]: V13CycleFlowA should surface V13CycleFlowB as a subflow-edge parent');
+  assert.strictEqual(cycleSubflowB.via, 'subflow');
+  assert.strictEqual(cycleSubflowB.label, 'V13CycleFlowB');
+  assert.strictEqual(cycleSubflowB.cyclic, false, 'the FIRST occurrence of the cycle pair is not itself cyclic');
+  const cycleBackToA = cycleSubflowB.children.find((c) => c.kind === 'flow');
+  assert.ok(cycleBackToA, 'v0.13 [MUST]: V13CycleFlowB should surface V13CycleFlowA again, closing the mutual cycle');
+  assert.strictEqual(cycleBackToA.via, 'subflow');
+  assert.strictEqual(cycleBackToA.label, 'V13CycleFlowA');
+  assert.strictEqual(cycleBackToA.cyclic, true, 'v0.13 [MUST]: the SECOND occurrence of V13CycleFlowA must carry cyclic:true');
+  assert.deepStrictEqual(cycleBackToA.children, [], 'v0.13 [MUST]: recursion stops the instant the ancestor-path key repeats -- zero children, no hang');
+
+  // Mirror image starting from pingB, same shape.
+  const cycleTreeB = callers('v13cycleapexb', 'pingb');
+  const cycleMetaB = cycleTreeB.root.children.find((c) => c.kind === 'flow');
+  assert.ok(cycleMetaB, 'V13CycleApexB.pingB should surface V13CycleFlowB as a flow metadata caller');
+  const cycleSubflowA = cycleMetaB.children.find((c) => c.kind === 'flow');
+  assert.ok(cycleSubflowA, 'V13CycleFlowB should surface V13CycleFlowA as a subflow-edge parent (mirror)');
+  assert.strictEqual(cycleSubflowA.label, 'V13CycleFlowA');
+  assert.strictEqual(cycleSubflowA.cyclic, false);
+  const cycleBackToB = cycleSubflowA.children.find((c) => c.kind === 'flow');
+  assert.ok(cycleBackToB, 'V13CycleFlowA should surface V13CycleFlowB again, closing the mutual cycle (mirror)');
+  assert.strictEqual(cycleBackToB.label, 'V13CycleFlowB');
+  assert.strictEqual(cycleBackToB.cyclic, true, 'mirror: the SECOND occurrence must carry cyclic:true');
+  assert.deepStrictEqual(cycleBackToB.children, [], 'mirror: zero children on the cyclic node');
+
+  // Neither cycle trace produced an unknown-subflow-ref count bump -- both
+  // names in this pair resolve to real, known flows.
+  assert.strictEqual(index.stats.unknownSubflowRefs, 0, 'v0.13.0 SUBFLOW-STORY fixtures name no unresolvable subflow -- unknownSubflowRefs stays 0');
 }
 
 // =========================================================================

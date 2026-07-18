@@ -6063,4 +6063,422 @@ function entryLabels(catalog, kind) {
   assert.strictEqual(shell.stats.total, 0);
 }
 
+// =========================================================================
+// v0.13/S2: flow-to-subflow chains
+// =========================================================================
+// MetaRef.subflows is STUBBED by hand here, per the round's own contract
+// (this file must not depend on the in-flight metascan.js implementation) --
+// the shape below (subflows: string[], always present on a flow ref;
+// className/methodName BOTH null on a "bare" ref that carries no apex
+// action of its own) is documented in resolver.js's own attachMetaCallers
+// header comment.
+function flowRef13(label, opts = {}) {
+  return {
+    kind: 'flow',
+    label,
+    className: opts.className !== undefined ? opts.className : null,
+    methodName: opts.methodName !== undefined ? opts.methodName : null,
+    flowObject: opts.flowObject || null,
+    flowRecordTriggerType: opts.flowRecordTriggerType || null,
+    flowTriggerType: opts.flowTriggerType || null,
+    path: `flows/${label}.flow-meta.xml`,
+    line: opts.line || 1,
+    lineText: opts.lineText || '',
+    subflows: opts.subflows || [],
+  };
+}
+
+const S13Anchor = ty('S13Anchor', 'S13Anchor', {
+  methods: [
+    mth('createWidget', {
+      line: 1,
+      locals: [{ name: 'w', type: 'S13_Widget__c', line: 1 }],
+      dml: [dmlFact('insert', 'w', { line: 2, lineText: 'insert w;' })],
+    }),
+    // Second, independent DML launcher on the SAME object/op -- exists
+    // purely to prove DAG memoization (seenElsewhere) fires on a SECOND
+    // occurrence of the same DML-reached flow node in the callee direction,
+    // exactly like an ordinary method node's second occurrence would.
+    mth('createWidgetAgain', {
+      line: 8,
+      locals: [{ name: 'w2', type: 'S13_Widget__c', line: 8 }],
+      dml: [dmlFact('insert', 'w2', { line: 9, lineText: 'insert w2;' })],
+    }),
+    mth('createBoth', {
+      line: 5,
+      calls: [
+        cl('bare', 'createWidget', { line: 6, lineText: 'createWidget();' }),
+        cl('bare', 'createWidgetAgain', { line: 7, lineText: 'createWidgetAgain();' }),
+      ],
+    }),
+    // The parent flow's own direct apex action -- present only so
+    // S13WidgetLifecycleFlow has >=1 apex actionCalls of its own (mirrors
+    // the gauntlet-org corpus's VtxFlowWidgetDmlSource.logWidgetCreated).
+    mth('logWidgetCreated', { line: 3 }),
+    // The SUBFLOW's own apex action -- the req-1/req-4 anchor.
+    mth('notifyTeam', { line: 4 }),
+  ],
+});
+const S13ChainRelay = ty('S13ChainRelay', 'S13ChainRelay', {
+  methods: [mth('relayMid', { line: 1 }), mth('relayLeaf', { line: 2 })],
+});
+const S13CycleHelper = ty('S13CycleHelper', 'S13CycleHelper', {
+  methods: [mth('pingA', { line: 1 }), mth('pingB', { line: 2 })],
+});
+const S13SharedApex = ty('S13SharedApex', 'S13SharedApex', {
+  methods: [mth('sharedAction', { line: 1 })],
+});
+const S13CapAnchor = ty('S13CapAnchor', 'S13CapAnchor', {
+  methods: [mth('capRun', { line: 1 })],
+});
+
+const index13 = buildSemanticIndex([
+  mkFile(S13Anchor),
+  mkFile(S13ChainRelay),
+  mkFile(S13CycleHelper),
+  mkFile(S13SharedApex),
+  mkFile(S13CapAnchor),
+]);
+
+const metaRefs13 = [
+  // ---- Widget lifecycle: req-1 (callers: apex <- subflow <- parent flow <-
+  // launcher) + req-4 (callees: DML -> parent flow -> subflow -> subflow's
+  // apex action) + the unknown-subflow-ref negative (Call_Ghost_Followup-
+  // style second <subflows> element naming a nonexistent flow), all in one
+  // fixture, mirroring gauntlet-org's Vtx_WidgetLifecycleFlow pair exactly. --
+  flowRef13('S13WidgetLifecycleFlow', {
+    className: 'S13Anchor', methodName: 'logWidgetCreated',
+    flowObject: 'S13_Widget__c', flowRecordTriggerType: 'Create', flowTriggerType: 'RecordAfterSave',
+    subflows: ['S13WidgetNotifySubflow', 'S13GhostFlow'],
+  }),
+  flowRef13('S13WidgetNotifySubflow', { className: 'S13Anchor', methodName: 'notifyTeam' }),
+
+  // ---- 3-deep chain: S13ChainTop is deliberately APEX-LESS (bare ref, no
+  // className/methodName) -- the load-bearing stress case proving a flow's
+  // own subflows are captured file-wide, not only when a MetaRef already
+  // exists for an apex actionCalls block on that same file. ----------------
+  flowRef13('S13ChainTop', { subflows: ['S13ChainMid'] }),
+  flowRef13('S13ChainMid', { className: 'S13ChainRelay', methodName: 'relayMid', subflows: ['S13ChainLeaf'] }),
+  flowRef13('S13ChainLeaf', { className: 'S13ChainRelay', methodName: 'relayLeaf' }),
+
+  // ---- mutual cycle: A's <subflows> names B, B's names A. -----------------
+  flowRef13('S13CycleA', { className: 'S13CycleHelper', methodName: 'pingA', subflows: ['S13CycleB'] }),
+  flowRef13('S13CycleB', { className: 'S13CycleHelper', methodName: 'pingB', subflows: ['S13CycleA'] }),
+
+  // ---- diamond (seenElsewhere on shared subflow): S13Shared has TWO
+  // parents (S13ParentOne, S13ParentTwo), which in turn share ONE common
+  // grandparent -- tracing S13Shared's own apex action up must show
+  // S13GrandParent ONCE fully expanded (under whichever parent sorts first
+  // alphabetically) and ONCE as a seenElsewhere reference (under the other).
+  flowRef13('S13Shared', { className: 'S13SharedApex', methodName: 'sharedAction' }),
+  flowRef13('S13ParentOne', { subflows: ['S13Shared'] }),
+  flowRef13('S13ParentTwo', { subflows: ['S13Shared'] }),
+  flowRef13('S13GrandParent', { subflows: ['S13ParentOne', 'S13ParentTwo'] }),
+
+  // ---- cap interplay: a 6-level linear (non-branching) PARENT chain --
+  // S13CapF0 (apex target) <- S13CapF1 <- S13CapF2 <- S13CapF3 <- S13CapF4 <-
+  // S13CapF5. Deliberately non-branching: a naive "only check the budget
+  // between SIBLINGS" implementation would never cap a pure linear chain at
+  // all (see resolver.js's own buildOneFlowNode header note on exactly this
+  // bug) -- this fixture exists specifically to catch that.
+  flowRef13('S13CapF0', { className: 'S13CapAnchor', methodName: 'capRun' }),
+  flowRef13('S13CapF1', { subflows: ['S13CapF0'] }),
+  flowRef13('S13CapF2', { subflows: ['S13CapF1'] }),
+  flowRef13('S13CapF3', { subflows: ['S13CapF2'] }),
+  flowRef13('S13CapF4', { subflows: ['S13CapF3'] }),
+  flowRef13('S13CapF5', { subflows: ['S13CapF4'] }),
+
+  // ---- deferred resolution: S13OrchestratorFlow's <subflows> names
+  // S13LeafOnlyFlow, a flow with ZERO metaRefs of ANY kind (no apex
+  // actionCalls of its own AND no <subflows> of its own either, so even the
+  // bare-ref exception never fires for it -- mirrors adv-org's real
+  // AcmeNotifyCustomerSubflow, whose only action is a non-apex emailSimple).
+  // Resolvable ONLY once index.flowFilePaths is populated (see
+  // finalizeFlowSubflowRefs's own header note) -- deliberately NOT resolved
+  // yet at the point attachMetaCallers returns, below.
+  flowRef13('S13OrchestratorFlow', { subflows: ['S13LeafOnlyFlow'] }),
+];
+attachMetaCallers(index13, metaRefs13);
+
+// ---- flowGraph: built by attachMetaCallers itself, immediately, for every
+// edge resolvable from metaRefs13 alone (the overwhelmingly common case). ---
+{
+  assert.deepStrictEqual(index13.flowGraph.get('s13widgetlifecycleflow'), { parents: [], children: ['s13widgetnotifysubflow'] });
+  assert.deepStrictEqual(index13.flowGraph.get('s13widgetnotifysubflow'), { parents: ['s13widgetlifecycleflow'], children: [] });
+  assert.deepStrictEqual(index13.flowGraph.get('s13chaintop'), { parents: [], children: ['s13chainmid'] });
+  assert.deepStrictEqual(index13.flowGraph.get('s13chainmid'), { parents: ['s13chaintop'], children: ['s13chainleaf'] });
+  assert.deepStrictEqual(index13.flowGraph.get('s13chainleaf'), { parents: ['s13chainmid'], children: [] });
+  assert.deepStrictEqual(index13.flowGraph.get('s13cyclea'), { parents: ['s13cycleb'], children: ['s13cycleb'] });
+  assert.deepStrictEqual(index13.flowGraph.get('s13cycleb'), { parents: ['s13cyclea'], children: ['s13cyclea'] });
+  // Not yet resolvable: the child (S13LeafOnlyFlow) has no metaRef at all
+  // yet, so this edge is still pending, NOT a fabricated flowGraph entry and
+  // NOT yet counted unknown either.
+  assert.strictEqual(index13.flowGraph.has('s13leafonlyflow'), false, 'unresolvable-so-far subflow ref must never fabricate a flowGraph node');
+  assert.ok(Array.isArray(index13._pendingSubflowRefs), 'unresolved subflow refs are deferred, not dropped');
+  assert.ok(
+    index13._pendingSubflowRefs.some((p) => p.parentLower === 's13orchestratorflow' && p.childLower === 's13leafonlyflow'),
+    'the deferred S13OrchestratorFlow -> S13LeafOnlyFlow ref is pending'
+  );
+  assert.ok(
+    index13._pendingSubflowRefs.some((p) => p.parentLower === 's13widgetlifecycleflow' && p.childLower === 's13ghostflow'),
+    'the genuinely-unknown S13GhostFlow ref is ALSO pending (not yet decided) until a consumer finalizes it'
+  );
+  assert.strictEqual(index13.stats.unknownSubflowRefs, 0, 'nothing is decided unknown until finalizeFlowSubflowRefs runs (lazily, inside buildCallerTree/buildCalleeTree/buildEntryCatalog)');
+}
+
+// v0.13 ORDERING: extension.js's real pipeline sets index.flowFilePaths
+// AFTER attachMetaCallers -- reproduced here exactly, so the deferred
+// S13OrchestratorFlow -> S13LeafOnlyFlow edge is only resolvable from this
+// point forward.
+index13.flowFilePaths = ['flows/S13LeafOnlyFlow.flow-meta.xml'];
+
+// ---- req-1 / caller direction: apex <- subflow <- parent flow <- launcher --
+{
+  const tree = buildCallerTree(index13, { classLower: 's13anchor', methodLower: 'notifyteam' });
+  const subflowNode = findChild(tree.root.children, 'S13WidgetNotifySubflow');
+  assert.ok(subflowNode, 'expected the subflow (S13WidgetNotifySubflow) as a metadata caller of its own apex action');
+  assert.strictEqual(subflowNode.via, 'metadata');
+  assert.strictEqual(subflowNode.kind, 'flow');
+  const parentFlowNode = findChild(subflowNode.children, 'S13WidgetLifecycleFlow');
+  assert.ok(parentFlowNode, 'NEW v0.13 edge: the subflow node must show its own PARENT flow as a child');
+  assert.strictEqual(parentFlowNode.via, 'subflow', "the new edge's via must be exactly 'subflow'");
+  assert.strictEqual(parentFlowNode.approximate, false, "'subflow' is a declared reference, never approximate");
+  assert.strictEqual(parentFlowNode.cyclic, false);
+  assert.strictEqual(parentFlowNode.seenElsewhere, false);
+  const launcherLabels = labelsOf(parentFlowNode.children);
+  assert.ok(launcherLabels.includes('S13Anchor.createWidget'), 'the parent flow\'s own pre-existing DML-launcher children (F1(b)) must still be reachable one hop deeper, unchanged');
+  const launcherNode = findChild(parentFlowNode.children, 'S13Anchor.createWidget');
+  assert.strictEqual(launcherNode.via, 'dml');
+  assert.deepStrictEqual(launcherNode.children, [], 'flow-DML launcher children stay terminal, exactly like pre-v0.13 F1(b)');
+}
+
+// ---- 3-deep chain, both directions (req-2) -------------------------------
+{
+  const treeLeaf = buildCallerTree(index13, { classLower: 's13chainrelay', methodLower: 'relayleaf' });
+  const leafFlow = findChild(treeLeaf.root.children, 'S13ChainLeaf');
+  assert.ok(leafFlow && leafFlow.via === 'metadata');
+  const midFlow = findChild(leafFlow.children, 'S13ChainMid');
+  assert.ok(midFlow && midFlow.via === 'subflow', '3-deep chain, level 2: ChainMid is ChainLeaf\'s parent');
+  const topFlow = findChild(midFlow.children, 'S13ChainTop');
+  assert.ok(topFlow && topFlow.via === 'subflow', '3-deep chain, level 3: ChainTop (apex-less) is ChainMid\'s parent');
+  assert.deepStrictEqual(topFlow.children, [], 'ChainTop has no parent of its own (nobody subflows it) -- chain terminates here, not hardcoded to any fixed depth');
+  assert.strictEqual(topFlow.cyclic, false);
+  assert.strictEqual(topFlow.truncated, false);
+
+  // Cross-check: relayMid's OWN caller-tree is 2-deep, not hardcoded to 3 --
+  // it genuinely recurses per-node rather than always emitting exactly 3
+  // levels regardless of target.
+  const treeMid = buildCallerTree(index13, { classLower: 's13chainrelay', methodLower: 'relaymid' });
+  const midFlow2 = findChild(treeMid.root.children, 'S13ChainMid');
+  assert.ok(midFlow2 && midFlow2.via === 'metadata');
+  const topFlow2 = findChild(midFlow2.children, 'S13ChainTop');
+  assert.ok(topFlow2 && topFlow2.via === 'subflow');
+  assert.deepStrictEqual(topFlow2.children, []);
+}
+
+// ---- req-3: mutual cycle -- must flag cyclic, never hang -----------------
+{
+  const treeA = buildCallerTree(index13, { classLower: 's13cyclehelper', methodLower: 'pinga' });
+  const cycleAFlow = findChild(treeA.root.children, 'S13CycleA');
+  assert.ok(cycleAFlow && cycleAFlow.via === 'metadata');
+  const cycleBFlow = findChild(cycleAFlow.children, 'S13CycleB');
+  assert.ok(cycleBFlow && cycleBFlow.via === 'subflow');
+  const cycleAAgain = findChild(cycleBFlow.children, 'S13CycleA');
+  assert.ok(cycleAAgain, 'the cycle must close back onto S13CycleA');
+  assert.strictEqual(cycleAAgain.cyclic, true, 'the ancestor-path mechanism (key "flow:"+lower) must flag the repeat as cyclic');
+  assert.deepStrictEqual(cycleAAgain.children, [], 'recursion stops the instant the cycle is detected -- zero children, not one more hop first');
+  assert.strictEqual(cycleAAgain.seenElsewhere, false, 'cyclic wins over seenElsewhere on an ancestor-path hit, same H1 rule the pure-Apex/DML cycles already use');
+
+  // Mirror image starting from pingB.
+  const treeB = buildCallerTree(index13, { classLower: 's13cyclehelper', methodLower: 'pingb' });
+  const cycleBFlowRoot = findChild(treeB.root.children, 'S13CycleB');
+  const cycleAFlowChild = findChild(cycleBFlowRoot.children, 'S13CycleA');
+  const cycleBAgain = findChild(cycleAFlowChild.children, 'S13CycleB');
+  assert.strictEqual(cycleBAgain.cyclic, true);
+  assert.deepStrictEqual(cycleBAgain.children, []);
+}
+
+// ---- seenElsewhere on a shared subflow (diamond) --------------------------
+{
+  const tree = buildCallerTree(index13, { classLower: 's13sharedapex', methodLower: 'sharedaction' });
+  const sharedFlow = findChild(tree.root.children, 'S13Shared');
+  assert.ok(sharedFlow && sharedFlow.via === 'metadata');
+  assert.strictEqual(sharedFlow.children.length, 2, 'S13Shared has TWO parents -- both must appear as children');
+  const parentOne = findChild(sharedFlow.children, 'S13ParentOne');
+  const parentTwo = findChild(sharedFlow.children, 'S13ParentTwo');
+  assert.ok(parentOne && parentTwo);
+  assert.strictEqual(parentOne.via, 'subflow');
+  assert.strictEqual(parentTwo.via, 'subflow');
+  const grandUnderOne = findChild(parentOne.children, 'S13GrandParent');
+  const grandUnderTwo = findChild(parentTwo.children, 'S13GrandParent');
+  assert.ok(grandUnderOne && grandUnderTwo, 'S13GrandParent is the common parent of BOTH S13ParentOne and S13ParentTwo -- it must appear under both');
+  // Exactly one of the two occurrences is the FULL expansion; the other is
+  // the seenElsewhere reference -- never both, never neither.
+  const flags = [grandUnderOne.seenElsewhere, grandUnderTwo.seenElsewhere];
+  assert.strictEqual(flags.filter(Boolean).length, 1, 'exactly one S13GrandParent occurrence must be flagged seenElsewhere');
+  const seenElsewhereOne = grandUnderOne.seenElsewhere ? grandUnderOne : grandUnderTwo;
+  const fullOne = grandUnderOne.seenElsewhere ? grandUnderTwo : grandUnderOne;
+  assert.deepStrictEqual(seenElsewhereOne.children, [], 'the seenElsewhere occurrence renders with its subtree collapsed to []');
+  assert.strictEqual(seenElsewhereOne.cyclic, false, 'seenElsewhere on a DIAMOND (not a real cycle) must not also flag cyclic');
+  assert.strictEqual(seenElsewhereOne.truncated, false, "seenElsewhere alone must not also imply truncated (that flag means 'a cap was hit', not 'deduped')");
+  assert.strictEqual(fullOne.seenElsewhere, false);
+}
+
+// ---- cap interplay: a long, NON-BRANCHING linear chain must still be
+// bounded by maxNodes -- a naive "check the budget only between sibling
+// iterations" implementation would never cap a chain with exactly one
+// parent per level (see resolver.js's own buildOneFlowNode header note). ---
+{
+  const tree = buildCallerTree(index13, { classLower: 's13capanchor', methodLower: 'caprun' }, { maxNodes: 3 });
+  assert.strictEqual(tree.stats.capped, true, 'a 6-level linear parent chain against maxNodes:3 must trip the cap');
+  const f0 = findChild(tree.root.children, 'S13CapF0');
+  assert.ok(f0 && f0.via === 'metadata');
+  const f1 = findChild(f0.children, 'S13CapF1');
+  assert.ok(f1 && f1.via === 'subflow');
+  const f2 = findChild(f1.children, 'S13CapF2');
+  assert.ok(f2, 'the cap must still allow the walk to reach exactly as far as the budget allows');
+  assert.strictEqual(f2.truncated, true, 'the SPECIFIC node whose own further expansion was cut off gets truncated:true');
+  assert.deepStrictEqual(f2.children, [], 'nothing beyond the cap is shown');
+  assert.strictEqual(findChild(f0.children, 'S13CapF3'), undefined, 'F3/F4/F5 must never appear anywhere in this capped tree');
+}
+
+// ---- req-4 / callee direction: DML -> parent flow -> subflow -> subflow's
+// apex action ---------------------------------------------------------------
+{
+  const tree = buildCalleeTree(index13, { classLower: 's13anchor', methodLower: 'createwidget' });
+  const parentFlow = findChild(tree.root.children, 'S13WidgetLifecycleFlow');
+  assert.ok(parentFlow, 'dml->flow: pre-existing A1 fan-out, unaffected');
+  assert.strictEqual(parentFlow.via, 'dml');
+  const subflowChild = findChild(parentFlow.children, 'S13WidgetNotifySubflow');
+  assert.ok(subflowChild, "NEW v0.13: makeCalleeFlowNode's children are no longer forced empty -- this flow's own <subflows> list is walked forward");
+  assert.strictEqual(subflowChild.via, 'subflow');
+  assert.strictEqual(subflowChild.approximate, false);
+  const apexAction = findChild(subflowChild.children, 'S13Anchor.notifyTeam');
+  assert.ok(apexAction, "the subflow's own apex action must be forward-visible, per the GOAL text \"each subflow expanding to its own apex actions/DML/subflows\"");
+  assert.strictEqual(apexAction.kind, 'method');
+  assert.strictEqual(apexAction.via, 'metadata');
+  assert.strictEqual(apexAction.truncated, true, 'forward tracing stops AT the apex action -- what it itself calls is a separate ordinary trace');
+  assert.deepStrictEqual(apexAction.children, []);
+
+  // [SPEC-OPEN] (documented choice, not a ground-truth-pinned requirement):
+  // the DML-reached parent flow itself is NOT also expanded to show its own
+  // direct apex action (logWidgetCreated) as a sibling of the subflow child
+  // -- only a node reached VIA a 'subflow' edge gets that treatment. Locked
+  // in as a regression pin so a future change to this choice is deliberate.
+  assert.strictEqual(findChild(parentFlow.children, 'S13Anchor.logWidgetCreated'), undefined, 'the DML-root flow node does not ALSO forward-expose its own apex action (documented [SPEC-OPEN] choice)');
+  assert.strictEqual(parentFlow.children.length, 1, 'the DML-root flow node has exactly one child: its subflow');
+}
+
+// ---- bonus: DAG memoization (seenElsewhere) also applies in the CALLEE
+// direction -- the SAME flow reached via two DIFFERENT DML sites elsewhere
+// in one forward trace must dedupe exactly like an ordinary method node. ---
+{
+  const tree = buildCalleeTree(index13, { classLower: 's13anchor', methodLower: 'createboth' });
+  const firstCall = findChild(tree.root.children, 'S13Anchor.createWidget');
+  const secondCall = findChild(tree.root.children, 'S13Anchor.createWidgetAgain');
+  assert.ok(firstCall && secondCall, 'both DML launchers must appear as ordinary forward callees of createBoth');
+  const firstFlow = findChild(firstCall.children, 'S13WidgetLifecycleFlow');
+  const secondFlow = findChild(secondCall.children, 'S13WidgetLifecycleFlow');
+  assert.ok(firstFlow && secondFlow, 'the SAME flow is reached from both DML sites');
+  assert.strictEqual(firstFlow.seenElsewhere, false, 'the FIRST occurrence (processed first, per source order) is the full expansion');
+  assert.ok(findChild(firstFlow.children, 'S13WidgetNotifySubflow'), 'the first occurrence shows its real subflow children');
+  assert.strictEqual(secondFlow.seenElsewhere, true, 'the SECOND occurrence must be deduped');
+  assert.deepStrictEqual(secondFlow.children, [], 'a seenElsewhere flow node renders with children collapsed to []');
+  assert.strictEqual(secondFlow.truncated, false, "seenElsewhere alone must not ALSO imply truncated (that flag means 'a cap was hit', not 'deduped') -- even though this exact node kind defaults truncated:true when it has no subflow data at all");
+  assert.strictEqual(secondFlow.cyclic, false);
+}
+
+// ---- unknown-subflow-ref negative: counted, never fabricated as a node ---
+{
+  // Neither S13GhostFlow nor S13LeafOnlyFlow have been finalized yet purely
+  // by virtue of the tree-building calls above having ALREADY triggered
+  // finalizeFlowSubflowRefs (buildCallerTree/buildCalleeTree both call it) --
+  // by this point in the file, both pending refs are already decided.
+  assert.strictEqual(index13.stats.unknownSubflowRefs, 1, 'exactly one genuinely-unknown ref (S13GhostFlow) -- S13LeafOnlyFlow resolved via flowFilePaths, not counted');
+  assert.strictEqual(index13.flowGraph.has('s13nonexistentghostflow'), false);
+  assert.strictEqual(index13.flowGraph.has('s13ghostflow'), false, 'no flowGraph entry is ever fabricated for an unknown subflow name');
+  assert.deepStrictEqual(index13.flowGraph.get('s13widgetlifecycleflow').children, ['s13widgetnotifysubflow'], 'the ghost reference contributes to the stat and NOTHING else -- exactly 1 real child, not 2');
+  // The deferred-but-real edge (via flowFilePaths) DID resolve, though --
+  // proves finalizeFlowSubflowRefs correctly distinguishes "not yet known"
+  // from "genuinely unknown".
+  assert.deepStrictEqual(index13.flowGraph.get('s13orchestratorflow'), { parents: [], children: ['s13leafonlyflow'] });
+  assert.deepStrictEqual(index13.flowGraph.get('s13leafonlyflow'), { parents: ['s13orchestratorflow'], children: [] });
+
+  // A trace never shows a node with the unknown label, anywhere.
+  function findLabelDeep(node, label) {
+    if (!node) return false;
+    if (node.label === label) return true;
+    return (node.children || []).some((c) => findLabelDeep(c, label));
+  }
+  const widgetTree = buildCallerTree(index13, { classLower: 's13anchor', methodLower: 'notifyteam' });
+  assert.strictEqual(findLabelDeep(widgetTree.root, 'S13GhostFlow'), false);
+}
+
+// ---- entry catalog delta (v0.13): the 'subflow of <parent>' detail suffix -
+{
+  const cat = buildEntryCatalog(index13);
+  const flowGroup = cat.groups.find((g) => g.kind === 'flow');
+  const byLabel = new Map(flowGroup.entries.map((e) => [e.label, e]));
+
+  assert.strictEqual(
+    byLabel.get('S13WidgetLifecycleFlow').detail,
+    'RecordAfterSave on S13_Widget__c',
+    'record-triggered -- has its own <start> trigger info, so the subflow-suffix rule never applies regardless of parents'
+  );
+  assert.strictEqual(
+    byLabel.get('S13WidgetNotifySubflow').detail,
+    'screen or autolaunched (subflow of S13WidgetLifecycleFlow)',
+    'fallback shape + exactly 1 parent -> suffix applies'
+  );
+  assert.strictEqual(
+    byLabel.get('S13ChainTop').detail,
+    'screen or autolaunched',
+    'fallback shape but ZERO parents (nobody subflows it) -> no suffix, unchanged fallback'
+  );
+  assert.strictEqual(byLabel.get('S13ChainMid').detail, 'screen or autolaunched (subflow of S13ChainTop)');
+  assert.strictEqual(byLabel.get('S13ChainLeaf').detail, 'screen or autolaunched (subflow of S13ChainMid)');
+  assert.strictEqual(
+    byLabel.get('S13CycleA').detail,
+    'screen or autolaunched (subflow of S13CycleB)',
+    'the cycle does not confuse the suffix -- it only ever names its OWN direct parent, never walks the cycle'
+  );
+  assert.strictEqual(byLabel.get('S13CycleB').detail, 'screen or autolaunched (subflow of S13CycleA)');
+  // The deferred-resolution flow gets its suffix too, once flowFilePaths
+  // made it resolvable.
+  assert.strictEqual(byLabel.get('S13LeafOnlyFlow').detail, 'screen or autolaunched (subflow of S13OrchestratorFlow)');
+  assert.strictEqual(byLabel.get('S13OrchestratorFlow').detail, 'screen or autolaunched');
+
+  // Multiple-parent format is documented as UNSPECIFIED by the GOAL text
+  // (neither reference corpus has a >1-parent flow) -- only a light,
+  // non-prescriptive smoke check that it degrades sanely (both parent names
+  // present, never a crash) rather than pinning an exact separator.
+  const sharedDetail = byLabel.get('S13Shared').detail;
+  assert.ok(sharedDetail.includes('S13ParentOne') && sharedDetail.includes('S13ParentTwo'), 'multi-parent suffix must mention every parent, exact format unspecified');
+
+  // Counts unchanged elsewhere -- v0.13 additions are ALL new 'flow' entries
+  // (no trigger/aura/invocable/etc. surface on any of these plain classes).
+  assert.strictEqual(cat.stats.byKind.trigger, 0);
+  assert.strictEqual(cat.stats.byKind.invocable, 0);
+  assert.strictEqual(cat.stats.excludedTestEntries, 0);
+}
+
+// ---- regression: a flow with NO flowGraph data at all (no parents, no
+// children -- e.g. every pre-v0.13 fixture elsewhere in this file, like
+// V4OrderUpdateFlow/W7AccountFlow/AcmeMetaScreenFlow above) is completely
+// unaffected -- byte-identical shape to before this round. -----------------
+{
+  const plainFlowRef = {
+    kind: 'flow', label: 'S13PlainFlow', className: 'S13SharedApex', methodName: 'sharedAction',
+    flowObject: null, flowRecordTriggerType: null, flowTriggerType: null,
+    path: 'flows/S13PlainFlow.flow-meta.xml', line: 1, lineText: '', subflows: [],
+  };
+  const plainIndex = buildSemanticIndex([mkFile(S13SharedApex)]);
+  attachMetaCallers(plainIndex, [plainFlowRef]);
+  const tree = buildCallerTree(plainIndex, { classLower: 's13sharedapex', methodLower: 'sharedaction' });
+  const flowNode = findChild(tree.root.children, 'S13PlainFlow');
+  assert.ok(flowNode);
+  assert.deepStrictEqual(flowNode.children, [], 'a flow with zero flowGraph parents keeps empty children, unchanged');
+  assert.strictEqual(flowNode.truncated, false);
+}
+
 console.log('test-resolver.js: all assertions passed.');

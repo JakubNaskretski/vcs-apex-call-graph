@@ -1863,6 +1863,333 @@ function refsOf(kind, refs) {
 console.log('metascan.js inline-fixture self-check: all assertions passed');
 
 // ===========================================================================
+// v0.13 (S1) — Flow <subflows> extraction: the `subflows` field on 'flow'
+// MetaRefs, stamped file-wide onto every apex-actionCalls ref, plus the
+// zero-actionCalls synthetic-ref exception (see metascan.js's top-of-file
+// v0.13 contract note and extractFlowSubflows()'s own header note for the
+// full rationale).
+// ===========================================================================
+
+// 60. Basic extraction: one apex actionCalls ref + one <subflows> block ->
+//     subflows: [<flowName>] stamped onto the sole ref.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <name>Recalc</name>',
+    '        <actionName>AcmeOrderService.recalculatePricing</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '    <subflows>',
+    '        <name>Notify_Customer</name>',
+    '        <flowName>AcmeChildFlow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeParentFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1, 'a <subflows> block does not add its own ref -- it is a field on the existing one');
+  assert.deepStrictEqual(refs[0].subflows, ['AcmeChildFlow']);
+}
+
+// 60a. Multiple distinct <subflows> blocks -> both names present, in document
+//      order.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <actionName>AcmeOrderInvocable</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '    <subflows>',
+    '        <name>First</name>',
+    '        <flowName>AcmeFirstChildFlow</flowName>',
+    '    </subflows>',
+    '    <subflows>',
+    '        <name>Second</name>',
+    '        <flowName>AcmeSecondChildFlow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeMultiSubflow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.deepStrictEqual(refs[0].subflows, ['AcmeFirstChildFlow', 'AcmeSecondChildFlow'], 'document order preserved');
+}
+
+// 60b. Two <subflows> blocks naming the SAME child Flow (two branches routing
+//      to one shared subflow) -> deduped to a single entry.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <actionName>AcmeOrderInvocable</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '    <subflows>',
+    '        <name>BranchA</name>',
+    '        <flowName>AcmeDupeFlow</flowName>',
+    '    </subflows>',
+    '    <subflows>',
+    '        <name>BranchB</name>',
+    '        <flowName>AcmeDupeFlow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeDupeSubflow.flow-meta.xml', text });
+  assert.deepStrictEqual(refs[0].subflows, ['AcmeDupeFlow'], 'exact-duplicate flowName must be deduped to one entry');
+}
+
+// 60c. Dedup is case-SENSITIVE (documented design decision -- metascan never
+//      normalizes case; matching a subflow name to a real flow file by stem,
+//      case-insensitively, is resolver.js's job): two differently-cased
+//      names are NOT deduped, both survive.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <actionName>AcmeOrderInvocable</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '    <subflows>',
+    '        <name>BranchA</name>',
+    '        <flowName>AcmeCaseFlow</flowName>',
+    '    </subflows>',
+    '    <subflows>',
+    '        <name>BranchB</name>',
+    '        <flowName>acmecaseflow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeCaseSubflow.flow-meta.xml', text });
+  assert.deepStrictEqual(
+    refs[0].subflows,
+    ['AcmeCaseFlow', 'acmecaseflow'],
+    'dedup is exact-string/case-sensitive -- differently-cased names are distinct entries here'
+  );
+}
+
+// 60d. Nested-element tolerance: three real-world <subflows> shapes in one
+//      file -- (1) <connector> BEFORE and <inputAssignments> AFTER <flowName>,
+//      (2) <inputAssignments> only (no connector), (3) bare (neither) --
+//      <flowName> must be found regardless of what surrounds it or in what
+//      order (matches the exact shapes gauntlet-org's real v0.13 fixtures use
+//      -- see GROUND-TRUTH.md's "Nested-element tolerance" note).
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <actionName>AcmeOrderInvocable</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '    <subflows>',
+    '        <name>CallA</name>',
+    '        <label>Call A</label>',
+    '        <locationX>0</locationX>',
+    '        <locationY>150</locationY>',
+    '        <connector>',
+    '            <targetReference>CallB</targetReference>',
+    '        </connector>',
+    '        <flowName>AcmeChildA</flowName>',
+    '        <inputAssignments>',
+    '            <name>recordId</name>',
+    '            <value><elementReference>varId</elementReference></value>',
+    '        </inputAssignments>',
+    '    </subflows>',
+    '    <subflows>',
+    '        <name>CallB</name>',
+    '        <label>Call B</label>',
+    '        <flowName>AcmeChildB</flowName>',
+    '        <inputAssignments>',
+    '            <name>recordId</name>',
+    '            <value><elementReference>varId</elementReference></value>',
+    '        </inputAssignments>',
+    '    </subflows>',
+    '    <subflows>',
+    '        <name>CallC</name>',
+    '        <label>Call C</label>',
+    '        <flowName>AcmeChildC</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeNestedSubflow.flow-meta.xml', text });
+  assert.deepStrictEqual(
+    refs[0].subflows,
+    ['AcmeChildA', 'AcmeChildB', 'AcmeChildC'],
+    'v0.13: <flowName> must be found regardless of connector/inputAssignments presence or order'
+  );
+}
+
+// 60e. Malformed/placeholder <subflows> block with no <flowName> at all is
+//      tolerated (skipped, never throws), same posture every other extractor
+//      in this file already takes.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <actionName>AcmeOrderInvocable</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '    <subflows>',
+    '        <name>Placeholder</name>',
+    '        <label>Not Yet Wired</label>',
+    '    </subflows>',
+    '    <subflows>',
+    '        <name>RealOne</name>',
+    '        <flowName>AcmeRealChildFlow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  assert.doesNotThrow(() => parseMetaFile({ path: 'flows/AcmeMalformedSubflow.flow-meta.xml', text }));
+  const refs = parseMetaFile({ path: 'flows/AcmeMalformedSubflow.flow-meta.xml', text });
+  assert.deepStrictEqual(refs[0].subflows, ['AcmeRealChildFlow'], 'the flowName-less block contributes nothing');
+}
+
+// 60f. A flow with zero <subflows> blocks anywhere gets subflows: [] on its
+//      ref -- explicit regression check alongside the pre-existing tests
+//      #14/#16 above, which predate this field.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <actionName>AcmeOrderInvocable</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeNoSubflow.flow-meta.xml', text });
+  assert.deepStrictEqual(refs[0].subflows, []);
+}
+
+// 60g. Multiple apex actionCalls refs in the same file all carry an IDENTICAL
+//      subflows list -- and each ref owns its OWN copy (mutating one must not
+//      affect a sibling), same "never hand out data a caller could
+//      accidentally corrupt for a sibling ref" posture v0.10-A2 established
+//      for extensionClasses (test #58).
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <actionName>AcmeFirstInvocable</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '    <actionCalls>',
+    '        <actionName>AcmeSecondService.doWork</actionName>',
+    '        <actionType>apex</actionType>',
+    '    </actionCalls>',
+    '    <subflows>',
+    '        <name>Notify</name>',
+    '        <flowName>AcmeSharedChildFlow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeMultiActionSubflow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 2);
+  assert.deepStrictEqual(refs[0].subflows, ['AcmeSharedChildFlow']);
+  assert.deepStrictEqual(refs[1].subflows, ['AcmeSharedChildFlow']);
+  refs[0].subflows.push('Mutated');
+  assert.deepStrictEqual(refs[1].subflows, ['AcmeSharedChildFlow'], 'sibling ref must own its own array, unaffected by the mutation above');
+}
+
+// 60h. LOAD-BEARING stress case: a flow with >=1 <subflows> reference but
+//      ZERO apex <actionCalls> blocks of its own must NOT vanish -- exactly
+//      one synthetic ref (className/methodName both null) carries the
+//      subflows fact. Mirrors the real gauntlet-org Vtx_FlowChainTop fixture
+//      (GROUND-TRUTH.md's "Load-bearing stress case" note) exactly: an
+//      autolaunched flow whose <start> has no record-trigger info, whose
+//      ONLY content is a <subflows> element.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <connector><targetReference>Call_Chain_Mid</targetReference></connector>',
+    '    </start>',
+    '    <subflows>',
+    '        <name>Call_Chain_Mid</name>',
+    '        <flowName>AcmeChainMidFlow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeChainTopFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1, 'v0.13 LOAD-BEARING: a zero-apex flow with a <subflows> element must still surface');
+  assert.strictEqual(refs[0].kind, 'flow');
+  assert.strictEqual(refs[0].label, 'AcmeChainTopFlow');
+  assert.strictEqual(refs[0].className, null, 'synthetic ref carries no apex target -- className is null');
+  assert.strictEqual(refs[0].methodName, null);
+  assert.strictEqual(refs[0].namespace, null);
+  assert.deepStrictEqual(refs[0].subflows, ['AcmeChainMidFlow']);
+  assert.strictEqual(refs[0].flowObject, null, 'this flow has no record-trigger info at all');
+  assert.strictEqual(refs[0].flowRecordTriggerType, null);
+  assert.strictEqual(refs[0].flowTriggerType, null);
+  assert.strictEqual(refs[0].line, 7, 'line points at the <flowName> element -- the only concrete fact this ref carries');
+}
+
+// 60i. A flow with ZERO apex actionCalls AND ZERO subflows produces nothing
+//      at all -- unchanged, pre-existing behavior (a pure Screen/Decision-only
+//      flow with no apex and no subflow children).
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <connector><targetReference>Foo</targetReference></connector>',
+    '    </start>',
+    '</Flow>',
+  ]);
+  assert.deepStrictEqual(parseMetaFile({ path: 'flows/AcmePureScreenFlow.flow-meta.xml', text }), []);
+}
+
+// 60j. The zero-apex synthetic-ref gate is keyed on APEX refs specifically,
+//      not "any actionCalls block": a non-apex actionType (emailSimple) does
+//      not count, so a flow with only an emailSimple action plus a <subflows>
+//      element still gets the synthetic ref.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <actionCalls>',
+    '        <name>Send_Email</name>',
+    '        <actionName>emailSimple</actionName>',
+    '        <actionType>emailSimple</actionType>',
+    '    </actionCalls>',
+    '    <subflows>',
+    '        <name>Notify</name>',
+    '        <flowName>AcmeEmailThenSubflow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeEmailSubflow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1, 'the emailSimple action never counts as an apex ref -- the synthetic-ref gate still fires');
+  assert.strictEqual(refs[0].className, null);
+  assert.deepStrictEqual(refs[0].subflows, ['AcmeEmailThenSubflow']);
+}
+
+// 60k. The synthetic ref also carries real <start> record-trigger info when
+//      present -- flowObject/flowRecordTriggerType/flowTriggerType are NOT
+//      hardcoded to null on this shape, they come from the same
+//      extractFlowStart() file-level fact every other ref uses.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <connector><targetReference>Notify</targetReference></connector>',
+    '        <object>Acme_Widget__c</object>',
+    '        <recordTriggerType>Create</recordTriggerType>',
+    '        <triggerType>RecordAfterSave</triggerType>',
+    '    </start>',
+    '    <subflows>',
+    '        <name>Notify</name>',
+    '        <flowName>AcmeWidgetNotifySubflow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeWidgetParentFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].flowObject, 'Acme_Widget__c');
+  assert.strictEqual(refs[0].flowRecordTriggerType, 'Create');
+  assert.strictEqual(refs[0].flowTriggerType, 'RecordAfterSave');
+  assert.deepStrictEqual(refs[0].subflows, ['AcmeWidgetNotifySubflow']);
+}
+
+console.log('metascan.js v0.13 subflow-extraction inline self-check: all assertions passed');
+
+// ===========================================================================
 // REAL CORPUS PASS — /Users/agent/work/code/example-data/adv-org (read-only)
 // Asserts the exact refs MANIFEST.md's "UI / metadata callers" ground-truth
 // section promises: LWC class.method pairs, dotted + bare Flow actionNames,
@@ -1999,6 +2326,40 @@ const t0 = Date.now();
     'platform-event <start> has no <recordTriggerType> element'
   );
   assert.strictEqual(noteEventFlow[0].flowTriggerType, 'PlatformEvent', 'G1(b): <start><triggerType> captured verbatim');
+}
+
+// v0.13 (S1): the real adv-org AcmeBackorderResolutionFlow -> AcmeNotifyCustomerSubflow
+// reference -- the historically-invisible flow-to-flow edge this whole round
+// exists to surface. metascan's own contribution: the subflows field on the
+// existing ref (ref COUNT is unchanged -- see the pre-existing assertion
+// above, `backorder.length === 1`).
+{
+  const backorder = parseMetaFile(readCorpus('flows/AcmeBackorderResolutionFlow.flow-meta.xml'));
+  assert.deepStrictEqual(
+    backorder[0].subflows,
+    ['AcmeNotifyCustomerSubflow'],
+    'v0.13: the real AcmeBackorderResolutionFlow -> AcmeNotifyCustomerSubflow subflow reference must be captured'
+  );
+
+  // None of the OTHER adv-org flow fixtures have a <subflows> element at all
+  // (confirmed via corpus grep) -- every one of them must get subflows: []
+  // on its ref(s), byte-identical in every other respect (regression).
+  const quoteApproval = parseMetaFile(readCorpus('flows/AcmeQuoteApprovalScreenFlow.flow-meta.xml'));
+  assert.deepStrictEqual(quoteApproval[0].subflows, []);
+  const orderStatus = parseMetaFile(readCorpus('flows/AcmeOrderStatusRecordTriggeredFlow.flow-meta.xml'));
+  assert.deepStrictEqual(orderStatus[0].subflows, []);
+  const welcomeFlow = parseMetaFile(readCorpus('flows/AcmeOrderCreatedWelcomeFlow.flow-meta.xml'));
+  assert.deepStrictEqual(welcomeFlow[0].subflows, []);
+  const noteEventFlow = parseMetaFile(readCorpus('flows/AcmeNoteEventFlow.flow-meta.xml'));
+  assert.deepStrictEqual(noteEventFlow[0].subflows, []);
+
+  // AcmeNotifyCustomerSubflow itself has zero apex actionCalls AND zero of
+  // its OWN <subflows> elements -- stays [] entirely (regression: the
+  // pre-existing `assert.deepStrictEqual(subflow, [])` above already pins
+  // this; the zero-apex synthetic-ref exception does not fire here because
+  // subflows.length is also 0 for this file).
+  const notifySubflow = parseMetaFile(readCorpus('flows/AcmeNotifyCustomerSubflow.flow-meta.xml'));
+  assert.deepStrictEqual(notifySubflow, [], 'v0.13 regression: no <subflows> element in this file -- must stay []');
 }
 
 // --- Custom Metadata (F4b) ------------------------------------------------
@@ -2389,3 +2750,139 @@ function methodRefsOf(refs) {
 }
 
 console.log('metascan.js v0.10-B gauntlet-org VF regression self-check: all assertions passed (A2: action bindings)');
+
+// ===========================================================================
+// v0.13 (S1) GAUNTLET-ORG REAL-CORPUS PASS -- the 7 new .flow-meta.xml
+// fixtures GROUND-TRUTH.md's "v0.13 subflow chains" section documents:
+// widget-lifecycle pair (own-apex subflow + unknown-subflow-ref negative),
+// 3-deep chain (incl. the LOAD-BEARING apex-less Top), and the mutual A<->B
+// cycle. metascan-only: this file asserts extraction shape (subflows/
+// className/methodName/flowObject-family fields), NOT flowGraph/cyclic
+// flags/entry-catalog details -- those are resolver.js's job (S2, out of
+// scope here).
+// ===========================================================================
+
+// v0.13: Vtx_WidgetLifecycleFlow -- record-triggered parent (Create on
+// Vertex_Widget__c) with its own apex action AND two <subflows> references:
+// a real one (Vtx_WidgetLifecycleNotifySubflow) and the unknown-subflow-ref
+// negative (Vtx_Nonexistent_Ghost_Flow, no such file -- metascan has no file
+// index and extracts it identically to a real one; classifying it as
+// "unknown" is resolver.js's stats.unknownSubflowRefs job, out of scope
+// here).
+{
+  const refs = parseMetaFile(readGauntlet('flows/Vtx_WidgetLifecycleFlow.flow-meta.xml'));
+  assert.strictEqual(refs.length, 1, 'exactly the one apex actionCalls ref (Log_Widget_Created)');
+  assert.ok(
+    findRef(refs, 'VtxFlowWidgetDmlSource', 'logWidgetCreated'),
+    'Vtx_WidgetLifecycleFlow -> VtxFlowWidgetDmlSource.logWidgetCreated'
+  );
+  assert.strictEqual(refs[0].flowObject, 'Vertex_Widget__c');
+  assert.strictEqual(refs[0].flowRecordTriggerType, 'Create');
+  assert.strictEqual(refs[0].flowTriggerType, 'RecordAfterSave');
+  assert.deepStrictEqual(
+    refs[0].subflows,
+    ['Vtx_WidgetLifecycleNotifySubflow', 'Vtx_Nonexistent_Ghost_Flow'],
+    'v0.13: BOTH <subflows> references extracted verbatim, in document order -- metascan does not judge resolvability'
+  );
+}
+
+// v0.13: Vtx_WidgetLifecycleNotifySubflow -- the child/subflow, own apex
+// action (Send_Widget_Notification -> VtxFlowWidgetNotifier.notifyTeam), NO
+// <object>/trigger info of its own (reached only as a subflow), and zero
+// <subflows> of its own.
+{
+  const refs = parseMetaFile(readGauntlet('flows/Vtx_WidgetLifecycleNotifySubflow.flow-meta.xml'));
+  assert.strictEqual(refs.length, 1);
+  assert.ok(
+    findRef(refs, 'VtxFlowWidgetNotifier', 'notifyTeam'),
+    'Vtx_WidgetLifecycleNotifySubflow -> VtxFlowWidgetNotifier.notifyTeam'
+  );
+  assert.strictEqual(refs[0].flowObject, null, 'reached only as a subflow -- no <object>/trigger info of its own');
+  assert.strictEqual(refs[0].flowRecordTriggerType, null);
+  assert.strictEqual(refs[0].flowTriggerType, null);
+  assert.deepStrictEqual(refs[0].subflows, []);
+}
+
+// v0.13 LOAD-BEARING: Vtx_FlowChainTop -- depth-1 of the 3-deep chain,
+// DELIBERATELY apex-less (zero <actionCalls> anywhere in the real file).
+// This is GROUND-TRUTH.md's own named stress case: if S1 had attached
+// `subflows` only onto per-ref objects, this flow's outgoing edge would be
+// silently lost (zero refs from this file at all, on any pre-v0.13 version).
+// A live run showing anything other than exactly 1 synthetic ref here is a
+// strong signal the per-ref-only shortcut was taken instead.
+{
+  const refs = parseMetaFile(readGauntlet('flows/Vtx_FlowChainTop.flow-meta.xml'));
+  assert.strictEqual(refs.length, 1, 'v0.13 LOAD-BEARING: Vtx_FlowChainTop must not vanish despite zero apex actionCalls');
+  assert.strictEqual(refs[0].kind, 'flow');
+  assert.strictEqual(refs[0].label, 'Vtx_FlowChainTop');
+  assert.strictEqual(refs[0].className, null, 'synthetic ref -- no apex target on this file at all');
+  assert.strictEqual(refs[0].methodName, null);
+  assert.deepStrictEqual(refs[0].subflows, ['Vtx_FlowChainMid']);
+  assert.strictEqual(refs[0].flowObject, null, 'plain autolaunched -- no record-trigger info');
+  assert.strictEqual(refs[0].flowRecordTriggerType, null);
+  assert.strictEqual(refs[0].flowTriggerType, null);
+}
+
+// v0.13: Vtx_FlowChainMid -- depth-2, has its own apex action
+// (Relay_Mid_Action -> VtxFlowChainRelay.relayMid) AND a <subflows>
+// reference forward to Leaf (Call_Chain_Leaf -> Vtx_FlowChainLeaf).
+{
+  const refs = parseMetaFile(readGauntlet('flows/Vtx_FlowChainMid.flow-meta.xml'));
+  assert.strictEqual(refs.length, 1);
+  assert.ok(findRef(refs, 'VtxFlowChainRelay', 'relayMid'), 'Vtx_FlowChainMid -> VtxFlowChainRelay.relayMid');
+  assert.deepStrictEqual(refs[0].subflows, ['Vtx_FlowChainLeaf']);
+}
+
+// v0.13: Vtx_FlowChainLeaf -- depth-3, terminal (own apex action, zero
+// subflows of its own).
+{
+  const refs = parseMetaFile(readGauntlet('flows/Vtx_FlowChainLeaf.flow-meta.xml'));
+  assert.strictEqual(refs.length, 1);
+  assert.ok(findRef(refs, 'VtxFlowChainRelay', 'relayLeaf'), 'Vtx_FlowChainLeaf -> VtxFlowChainRelay.relayLeaf');
+  assert.deepStrictEqual(refs[0].subflows, [], 'terminal -- no <subflows> element of its own');
+}
+
+// v0.13: Vtx_FlowCycleA / Vtx_FlowCycleB -- the mutual cycle. Each has its
+// own apex action AND a <subflows> reference naming the OTHER -- metascan
+// extracts each file completely independently (it has no cross-file graph
+// concept at all; detecting/flagging the cycle is resolver.js's flowGraph
+// job, out of scope here), so this only pins that BOTH halves of the raw
+// data are captured correctly, symmetric to each other.
+{
+  const refsA = parseMetaFile(readGauntlet('flows/Vtx_FlowCycleA.flow-meta.xml'));
+  assert.strictEqual(refsA.length, 1);
+  assert.ok(findRef(refsA, 'VtxFlowCycleHelper', 'pingA'), 'Vtx_FlowCycleA -> VtxFlowCycleHelper.pingA');
+  assert.deepStrictEqual(refsA[0].subflows, ['Vtx_FlowCycleB']);
+
+  const refsB = parseMetaFile(readGauntlet('flows/Vtx_FlowCycleB.flow-meta.xml'));
+  assert.strictEqual(refsB.length, 1);
+  assert.ok(findRef(refsB, 'VtxFlowCycleHelper', 'pingB'), 'Vtx_FlowCycleB -> VtxFlowCycleHelper.pingB');
+  assert.deepStrictEqual(refsB[0].subflows, ['Vtx_FlowCycleA']);
+}
+
+// v0.13 regression: the pre-existing Vtx_Namespace_Probe_Flow fixture (v0.8)
+// has no <subflows> element anywhere in it -- must be completely unaffected,
+// subflows: [] on both its pre-existing refs, every other field byte-identical.
+{
+  const refs = parseMetaFile(readGauntlet('flows/Vtx_Namespace_Probe_Flow.flow-meta.xml'));
+  assert.strictEqual(refs.length, 2, 'v0.13 regression: ref count unchanged from the v0.8-B5 pass above');
+  assert.ok(refs.every((r) => Array.isArray(r.subflows) && r.subflows.length === 0), 'no <subflows> element in this file');
+}
+
+// v0.13 tally cross-check: 1 + 1 + 1 (synthetic) + 1 + 1 + 1 + 1 = 7 total
+// refs across the 7 new gauntlet-org flow fixtures (matches the per-file
+// counts asserted individually above -- Vtx_FlowChainTop's is the synthetic
+// one).
+{
+  const total =
+    parseMetaFile(readGauntlet('flows/Vtx_WidgetLifecycleFlow.flow-meta.xml')).length +
+    parseMetaFile(readGauntlet('flows/Vtx_WidgetLifecycleNotifySubflow.flow-meta.xml')).length +
+    parseMetaFile(readGauntlet('flows/Vtx_FlowChainTop.flow-meta.xml')).length +
+    parseMetaFile(readGauntlet('flows/Vtx_FlowChainMid.flow-meta.xml')).length +
+    parseMetaFile(readGauntlet('flows/Vtx_FlowChainLeaf.flow-meta.xml')).length +
+    parseMetaFile(readGauntlet('flows/Vtx_FlowCycleA.flow-meta.xml')).length +
+    parseMetaFile(readGauntlet('flows/Vtx_FlowCycleB.flow-meta.xml')).length;
+  assert.strictEqual(total, 7, 'v0.13: 1 ref per new fixture (incl. the Top synthetic ref) = 7 total');
+}
+
+console.log('metascan.js v0.13 gauntlet-org subflow-chains regression self-check: all assertions passed');

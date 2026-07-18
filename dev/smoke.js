@@ -1107,6 +1107,84 @@ function runEntryCatalogDemo() {
   }
 }
 
+// v0.13.0 / S2: SUBFLOW CHAINS -- brief human-readable spot check against
+// the SAME gauntlet-org corpus (walkGauntletOrg/GAUNTLET_ORG_ROOT, own fresh
+// index, same convention every demo function in this file already follows)
+// of the flow-to-subflow chain fixtures: req-1 (apex <- subflow <- parent
+// flow <- DML launcher, caller direction), req-2 (3-deep chain), req-3
+// (mutual A<->B subflow cycle, must not hang), req-4 (DML -> parent flow ->
+// subflow -> subflow's own apex action, callee direction), plus a raw
+// flowGraph dump and the unknown-subflow-ref negative
+// (Vtx_Nonexistent_Ghost_Flow). Full per-row [MUST] assertions live in
+// dev/gauntlet/run.js's own '## v0.13 SUBFLOW CHAINS' section (mechanically
+// diffed against GROUND-TRUTH.md) -- this is a human-readable spot check,
+// not a substitute for that mechanical diff.
+function runSubflowChainsDemo() {
+  console.log('\n\n########################################################');
+  console.log('# v0.13.0 SUBFLOW CHAINS (gauntlet-org)');
+  console.log('########################################################');
+
+  const apexOut = [];
+  const metaOut = [];
+  walkGauntletOrg(GAUNTLET_ORG_ROOT, apexOut, metaOut);
+  let ownNamespace = null;
+  try {
+    const sfdxProject = JSON.parse(fs.readFileSync(path.join(GAUNTLET_ORG_PROJECT_ROOT, 'sfdx-project.json'), 'utf8'));
+    ownNamespace = typeof sfdxProject.namespace === 'string' && sfdxProject.namespace.trim() ? sfdxProject.namespace.trim() : null;
+  } catch (e) { /* no sfdx-project.json -> ownNamespace stays null */ }
+
+  const sfFactsList = apexOut.map((p) => parser.parseFile({ path: p, text: fs.readFileSync(p, 'utf8') }));
+  const sfIndex = resolver.buildSemanticIndex(sfFactsList, { ownNamespace });
+  const sfMetaRefs = [];
+  for (const f of metaOut) {
+    const text = fs.readFileSync(f, 'utf8');
+    for (const ref of metascan.parseMetaFile({ path: f, text })) { ref.path = f; sfMetaRefs.push(ref); }
+  }
+  const sfStrippedRefs = ownNamespace && typeof metascan.stripOwnNamespace === 'function'
+    ? metascan.stripOwnNamespace(sfMetaRefs, ownNamespace)
+    : sfMetaRefs;
+  resolver.attachMetaCallers(sfIndex, sfStrippedRefs);
+  sfIndex.flowFilePaths = metaOut.filter((p) => /\.flow-meta\.xml$/i.test(p));
+
+  // req-1: apex <- subflow <- parent flow <- DML launcher.
+  printTree(
+    'req-1 VtxFlowWidgetNotifier.notifyTeam -- EXPECTED chain: Vtx_WidgetLifecycleNotifySubflow [flow,metadata] -> Vtx_WidgetLifecycleFlow [flow,subflow NEW v0.13] -> VtxFlowWidgetDmlSource.createWidget [method,dml]',
+    sfIndex,
+    { classLower: 'vtxflowwidgetnotifier', methodLower: 'notifyteam' }
+  );
+
+  // req-2: 3-deep chain.
+  printTree(
+    'req-2 VtxFlowChainRelay.relayLeaf -- EXPECTED 3-deep chain: Vtx_FlowChainLeaf [metadata] -> Vtx_FlowChainMid [subflow] -> Vtx_FlowChainTop [subflow, terminal -- nobody subflows Top]',
+    sfIndex,
+    { classLower: 'vtxflowchainrelay', methodLower: 'relayleaf' }
+  );
+
+  // req-3: mutual cycle, must not hang.
+  printTree(
+    'req-3 VtxFlowCycleHelper.pingA -- EXPECTED: Vtx_FlowCycleA [metadata] -> Vtx_FlowCycleB [subflow] -> Vtx_FlowCycleA [subflow, cyclic:true, 0 children -- must not hang]',
+    sfIndex,
+    { classLower: 'vtxflowcyclehelper', methodLower: 'pinga' }
+  );
+
+  // req-4: DML -> parent flow -> subflow -> subflow's own apex action (callee direction).
+  printCalleeTree(
+    'req-4 VtxFlowWidgetDmlSource.createWidget -- EXPECTED forward chain: Vtx_WidgetLifecycleFlow [flow,dml] -> Vtx_WidgetLifecycleNotifySubflow [flow,subflow NEW v0.13] -> VtxFlowWidgetNotifier.notifyTeam [method,metadata]',
+    sfIndex,
+    { classLower: 'vtxflowwidgetdmlsource', methodLower: 'createwidget' }
+  );
+
+  // Raw flowGraph dump + the unknown-subflow-ref negative. buildCallerTree/
+  // buildCalleeTree above already ran finalizeFlowSubflowRefs (see its own
+  // header note in resolver.js), so sfIndex.flowGraph is fully resolved here.
+  console.log('\nflowGraph (7 new flows + pre-existing Vtx_Namespace_Probe_Flow, unaffected):');
+  const flowGraphKeys = sfIndex.flowGraph instanceof Map ? [...sfIndex.flowGraph.keys()].sort() : [];
+  for (const k of flowGraphKeys) {
+    console.log(`  ${k.padEnd(34)} ${JSON.stringify(sfIndex.flowGraph.get(k))}`);
+  }
+  console.log(`\nstats.unknownSubflowRefs: ${sfIndex.stats.unknownSubflowRefs} (expect 1 -- Vtx_WidgetLifecycleFlow's Call_Ghost_Followup names Vtx_Nonexistent_Ghost_Flow, no such file: counted, no fabricated node)`);
+}
+
 main();
 runAdvOrg();
 runGauntletOrgManagedPackages();
@@ -1114,3 +1192,4 @@ runProgressiveDepthDemo();
 runRoundADemo();
 runRoundBDemo();
 runEntryCatalogDemo();
+runSubflowChainsDemo();

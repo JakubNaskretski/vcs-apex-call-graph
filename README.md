@@ -71,11 +71,15 @@ AcmeNoteEventPublisher.publishNote
       -> new Acme_Note__e(Message__c = message)
 ```
 
-The SAME `EventBus.publish(...)` statement fans out to both the trigger and the Flow
-— a Flow node is always terminal going forward (its own internal actions aren't
-modeled as call-graph children), while a trigger node is not: tracing continues into
-its handler exactly like tracing forward from any other method. The Path Map mirrors
-for this direction too — the target sits on the LEFT, callees flow RIGHT.
+The SAME `EventBus.publish(...)` statement fans out to both the trigger and the Flow.
+Here `AcmeNoteEventFlow` is terminal going forward, but that's this particular Flow's
+own shape (it calls no subflow of its own) — not a hard rule: a Flow node reached this
+way (`via: dml`/`publish`) DOES forward-expand into any Flow it calls as a **subflow**
+(see [Flow-to-flow (subflow) chains](#flow-to-flow-subflow-chains) below), it just
+doesn't happen to have one here. A trigger node is never terminal either way: tracing
+continues into its handler exactly like tracing forward from any other method. The
+Path Map mirrors for this direction too — the target sits on the LEFT, callees flow
+RIGHT.
 
 ## Reading the tree
 
@@ -264,6 +268,30 @@ started the transaction. Record-triggered Flows participate too: a Flow node sho
 the DML sites that launch it as children. Handlers doing DML on their own object are
 flagged as cycles.
 
+### Flow-to-flow (subflow) chains
+
+A Flow calling another Flow (a **subflow**) is a first-class edge (`via: subflow`,
+never approximate — it's a declared reference, not a fan-out guess), in both
+directions:
+
+- **Who Calls This?** on an apex action reached only through a subflow walks: the
+  apex method → its subflow (`metadata`) → that subflow's own **parent** Flow(s)
+  (`subflow`) → recursively up through however many further parents that parent has
+  → whatever DML/`EventBus.publish` site launched the outermost parent, all the way
+  to the entry point.
+- **What Does This Call?** from that same DML/publish site walks the mirror image
+  forward: the launcher → the parent Flow (`dml`/`publish`) → each Flow it calls as a
+  subflow (`subflow`) → recursively into further subflows → each subflow's own apex
+  actions, DML, and further subflows in turn.
+
+Chains recurse to whatever depth the Flows themselves declare (a 2-hop, 3-hop, or
+longer chain all resolve the same way — nothing here is hardcoded to a fixed depth),
+and a mutual reference (Flow A calls B as a subflow, B calls A back) is guarded by the
+same ancestor-path mechanism as any other cycle: the repeat occurrence is flagged
+`↺ cycle` with zero further children, never a hang. A subflow name that matches no
+Flow file in the workspace is tallied internally but never fabricates a node — see
+[Limits](#limits-known-by-design) for the exact accounting.
+
 Also resolved: dispatch maps (`handlerMap.get(key).handle()` through collection
 generics), virtual override fan-out (`~ override`, including through a subclass that
 overrides a method inherited from an interface's direct implementer, AND a bare/`this`
@@ -387,6 +415,18 @@ What it can never show:
   deliberately aren't.
 - DML→trigger edges (narrowed or not) assume the trigger fires — validation rules and
   exceptions can prevent it at runtime.
+- **Flow-to-flow (subflow) chains** ([above](#flow-to-flow-subflow-chains)): a
+  `<subflows>` reference naming a Flow file this workspace doesn't have is tallied
+  internally (never shown as its own UI element yet — no live target to jump to) but
+  never fabricates a node — same "count it, don't guess it" posture as every other
+  unresolved-reference count in this tool. A Flow node reached via `dml`/`publish`
+  (i.e. it's the launched Flow itself, not one of its subflows) forward-exposes its
+  own subflows but, deliberately, not its own direct apex actions — only a Flow
+  reached *as* a subflow forward-exposes its own apex actions. This is an intentional
+  asymmetry, not an oversight: from that root Flow's perspective, "what it calls"
+  already has an ordinary route into the same apex action (trace the action directly,
+  or from the record-trigger/publish site through the trigger's own handler), so the
+  one hop that's genuinely new information is the subflow edge itself.
 - A single trace caps at 2000 nodes; a trace that hits the cap is marked and stops
   expanding fairly across branches rather than silently truncating one of them —
   the specific node whose own further expansion was cut carries the marker (never

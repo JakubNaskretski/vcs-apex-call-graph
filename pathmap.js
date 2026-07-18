@@ -135,6 +135,14 @@
 // special-cased "meta kinds are leaves". Documented explicitly since it's
 // easy to assume otherwise from the A6/A7-era phrasing above.
 //
+// v0.13 (S2/S3) NOTE: a 'flow' node's children can now ALSO be its own
+// subflow chain (via:'subflow', both directions — see resolver.js's own
+// contract and this file's LEGEND_HTML "subflow" row), recursing arbitrarily
+// deep and cycle-guarded (cyclic:true, zero children, same as any other
+// cyclic node this file already renders). Same "walks `children` purely
+// structurally" posture as the F1b note above — no code change was needed
+// here for this either, only the legend text a human reads.
+//
 // SECURITY — every scrap of text here (labels, lineText, argsRendered,
 // paths, via, entries, note, targetLabel) comes straight from the traced
 // workspace's own source code and must be treated as hostile input. The
@@ -1128,7 +1136,7 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="swatch entry"></span><span><span class="k">entry</span>has an entry-point annotation (@AuraEnabled, @InvocableMethod, @future, @HttpX, webservice, Batchable, Queueable, Schedulable)</span></div>
     <div class="legend-row"><span class="swatch test"></span><span><span class="k">test</span>only reachable from test code</span></div>
     <div class="legend-row"><span class="swatch normal"></span><span><span class="k">normal</span>regular method or class</span></div>
-    <div class="legend-row"><span class="swatch metadata"></span><span><span class="k">metadata</span>caller from LWC, Aura, Flow, OmniScript, VF, or Custom Metadata — not Apex source (a Flow node here may still have its own children, e.g. the DML sites on its object — a metadata node is not always a leaf)</span></div>
+    <div class="legend-row"><span class="swatch metadata"></span><span><span class="k">metadata</span>caller from LWC, Aura, Flow, OmniScript, VF, or Custom Metadata — not Apex source (a Flow node here may still have its own children, e.g. the DML sites on its object, or — v0.13 — its own subflow chain; a metadata node is not always a leaf)</span></div>
     <div class="legend-row"><span class="swatch anonymous"></span><span><span class="k">anonymous</span>anonymous Apex script (.apex) — real Apex source, but with no declared class/trigger of its own; always a pure root (nothing calls it)</span></div>
     <div class="legend-row"><span class="swatch exception"></span><span><span class="k">exception</span>(v0.7) a thrown exception's class, reached by tracing forward (What Does This Call?) through a "throw" statement — always terminal</span></div>
     <div class="legend-row"><span class="swatch unresolved"></span><span><span class="k">unresolved</span>(v0.7) one aggregated leaf per method, summarizing every forward call site that couldn't be resolved to an indexed target (dynamic/platform calls, e.g. HttpRequest/System.debug) — always terminal, approximate. Also covers a DML statement whose target couldn't be narrowed to a concrete SObject type (e.g. a generic List&lt;SObject&gt;) — labeled "DML on unresolved SObject type", no trigger/flow linkage possible</span></div>
@@ -1169,6 +1177,7 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="k">unresolved</span>(v0.7.1) marks the aggregated "N unresolved sites" leaf itself — one or more forward call sites in this method couldn't be resolved to an indexed target (approximate)</div>
     <div class="legend-row"><span class="k">dml-unresolved</span>(v0.7.1) a DML statement whose target couldn't be narrowed to a concrete SObject (e.g. a generic List&lt;SObject&gt;/SObject-typed variable) — no trigger or flow linkage could be traced (approximate)</div>
     <div class="legend-row"><span class="k">external</span>(v0.8 N1/N2/N4) a reference into managed-package code (a namespaced method/class call, or a DML target naming a managed object) — NOT approximate, a genuine namespace match (see the "external" accent above)</div>
+    <div class="legend-row"><span class="k">subflow</span>(v0.13) a declared &lt;subflows&gt; reference between two Flow files, never an Apex call — NOT approximate, a declared reference. Who Calls This: the flow's own PARENT flow (the parent invokes it as a subflow), recursing up. What This Calls: the flow's own SUBFLOW (it invokes the child), recursing down into that subflow's own apex actions/further subflows. Cycle-guarded (&#x21BA; on repeat, never hangs)</div>
 `;
 
 // v0.7 (A3): mirrors uitree.js's directionHeaderLine exactly -- see that
