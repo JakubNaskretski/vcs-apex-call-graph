@@ -48,7 +48,7 @@ const { globSync } = (() => {
   };
 })();
 
-const ADV_ORG_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const ADV_ORG_ROOT = 'test-fixtures/adv-org';
 const EXCLUDE_DIRS = new Set(['node_modules', '.sfdx', '.sf', '.git']);
 
 // ---------------------------------------------------------------------------

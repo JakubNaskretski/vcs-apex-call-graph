@@ -10,7 +10,7 @@ const parser = require('../parser.js');
 const resolver = require('../resolver.js');
 const metascan = require('../metascan.js');
 
-const ROOT = '/Users/agent/work/code/example-data/adv-org/force-app/main/default';
+const ROOT = 'test-fixtures/adv-org/force-app/main/default';
 
 function walk(dir, out) {
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {

@@ -266,6 +266,27 @@ const ICON_UNRESOLVED = 'question';
 // entries and must not fall back to the generic ICON_ENTRIES 'plug' glyph.
 const ICON_EXTERNAL = 'package';
 
+// v0.13 (Round 2.5, H2 — rendering half): a 'rollup' pseudo-node -- the
+// approximate-callers/callees GROUPING itself is resolver.js's job
+// (buildChildrenLevel's applyShowUnconfirmed, per the apexCallGraph.
+// showUnconfirmed setting: 'rollup' default | 'hide' | 'expand'); this file
+// only ever RENDERS whatever TNode.kind it is handed, exactly like every
+// other kind above -- 'layers' reads as "several things stacked/grouped
+// together", visually distinct from every icon already used. Checked
+// alongside ICON_EXCEPTION/ICON_UNRESOLVED/ICON_EXTERNAL below (same "the
+// kind alone decides the icon" tier), since a rollup node could in
+// principle carry entries and must not fall back to ICON_ENTRIES.
+const ICON_ROLLUP = 'layers';
+// v0.13 (Round 2.5, H3 — header half): the caller-direction "K unresolved
+// sites elsewhere mention <method>(" info node resolver.js's buildCallerTree
+// now appends as one more child of the traced target (kind:
+// 'unresolved-mentions', label already fully formatted -- see
+// unresolvedMentionsHeaderLine's own doc, ahead of shapeHeaderLines, for how
+// this file reuses that exact label text for the header banner too). Reuses
+// ICON_UNRESOLVED (declared above) rather than a new glyph -- thematically
+// the SAME "unresolved/unconfirmed" family as the pre-existing aggregated
+// 'unresolved' leaf, just scoped to the caller direction instead of callee.
+
 // A7: metadata-caller node icons, one per MetaRef.kind (see resolver.js's
 // buildMetaChildren / metaEntryLabel — these TNode.kind values are
 // 'lwc'|'aura'|'flow'|'omniscript'|'vf'|'cmdt' (v0.4 F4b adds the last one),
@@ -323,6 +344,10 @@ function iconForNode(node) {
   // as exception/unresolved just above -- an external node could in
   // principle carry entries too and must not collapse onto ICON_ENTRIES.
   if (node.kind === 'external') return ICON_EXTERNAL;
+  // v0.13 (Round 2.5, H2/H3): same "the kind alone decides the icon" tier --
+  // see ICON_ROLLUP/the comment just above it for the full rationale.
+  if (node.kind === 'rollup') return ICON_ROLLUP;
+  if (node.kind === 'unresolved-mentions') return ICON_UNRESOLVED;
   if (META_ICON_BY_KIND[node.kind]) return META_ICON_BY_KIND[node.kind];
   if (node.isTest) return ICON_TEST;
   if (node.entries && node.entries.length) return ICON_ENTRIES;
@@ -648,6 +673,19 @@ const VIA_GLOSSARY = {
   // flow's own PARENT flow (the parent invokes it as a subflow); in the
   // callees direction it's the flow's own SUBFLOW (it invokes the child).
   subflow: 'a declared <subflows> reference between two Flow files — not an Apex call, a parent/child flow-orchestration edge',
+  // v0.13 (Round 2.5, H3 — header half): via values on a kind:
+  // 'unresolved-mentions' node's individual mention-site children (see
+  // resolver.js's buildCallerTree -- each mentionChildren entry carries
+  // `via: s.reason || 'unresolved'`, one of resolver.js's own
+  // stats.unresolvedByReason keys). These are NOT edges into the traced
+  // target -- they are call sites elsewhere that merely MENTION its method
+  // name on a receiver H1's arity-gate/attachment-cap rule declined to wire
+  // up -- so each explanation below is written from that "worth a manual
+  // look, not a confirmed caller" angle, distinct from every via above.
+  'unknown-receiver': "a call site using this exact method name, on a receiver whose type couldn't be determined at all — never even reached the unique-name attachment check",
+  'non-literal-dynamic': 'a call site using this exact method name reached only through a non-literal dynamic dispatch (e.g. a computed Type.forName argument) — not literal-flow traceable',
+  'parse-fallback': "a call site in a file that failed to parse — matched by text mention only, in a file this workspace couldn't fully analyze",
+  'name-too-common': "a call site using this exact method name that COULD have attached via unique-name (its argument count matched), but the name attracted more unresolvable-receiver sites workspace-wide than UNIQUE_NAME_MAX allows — attaching all of them would make a framework-common name look like a confirmed caller",
 };
 
 const MARKER_GLOSSARY = {
@@ -676,6 +714,20 @@ const MARKER_GLOSSARY = {
   // that literal badge string in glossaryLinesForNode below, rather than
   // being a single fixed lookup string like the other entries here.
   package: "this node's file lives in a different sfdx package directory than the traced target's",
+  // v0.13 (Round 2.5, H2 — rendering half): explains the GROUPING itself --
+  // distinct from the generic 'approximate' line above (which every rolled-
+  // up MEMBER also carries individually, describing its own edge), this one
+  // is about the collapsed CONTAINER. Keyed off node.kind in
+  // glossaryLinesForNode below, not a via lookup (the rollup node's own
+  // via is null -- see resolver.js's applyShowUnconfirmed).
+  rollup: 'grouped for clarity — every approximate caller/callee of this node is collected here instead of cluttering the list above; expand to inspect each one individually (its own via badge explains exactly how IT was matched)',
+  // v0.13 (Round 2.5, H3 — header half): explains the caller-direction
+  // scoped-mentions info node (kind:'unresolved-mentions') -- keyed off
+  // node.kind, same rationale as 'rollup' just above. Its own via
+  // ('unresolved', or per-child reason via VIA_GLOSSARY) already explains
+  // the INDIVIDUAL sites; this line explains why the group exists at all.
+  unresolvedMentions:
+    "these call sites use this exact method name on a receiver that couldn't be resolved, but were deliberately NOT wired up as confirmed callers (arity mismatch, a name too common workspace-wide to trust, dynamic dispatch, or a parse failure -- see each child's own via badge) — worth a manual look if you suspect one of these really does call this method",
 };
 
 // v0.9 (P1/P3, forward-compat): the frontier glossary line, exact wording
@@ -715,6 +767,11 @@ function glossaryLinesForNode(node, pkgBadge, orientation, direction) {
   const entryFirst = orientation === ORIENTATION_ENTRY_FIRST;
   const lines = [];
   if (node && node.via && VIA_GLOSSARY[node.via]) lines.push(`${node.via}: ${VIA_GLOSSARY[node.via]}`);
+  // v0.13 (Round 2.5, H2/H3): kind-based lines for the two new synthetic
+  // container kinds -- see MARKER_GLOSSARY.rollup/unresolvedMentions' own
+  // comments for why these are keyed off `kind`, not `via`.
+  if (node && node.kind === 'rollup') lines.push(MARKER_GLOSSARY.rollup);
+  if (node && node.kind === 'unresolved-mentions') lines.push(MARKER_GLOSSARY.unresolvedMentions);
   if (entryFirst && node && (node.via || (node.sites && node.sites.length))) {
     lines.push(MARKER_GLOSSARY.entryFirstEdge);
   }
@@ -827,6 +884,20 @@ function shapeLoadMoreChild(node, direction) {
 // own `children` array is always empty (see the field doc: the engine
 // either expands a node's children fully or not at all, never partially),
 // so this is the only source of a non-empty `kids` array for such a node.
+//
+// v0.13 (Round 2.5, H2 — rendering half): the APPROXIMATE ROLLUP grouping
+// itself is resolver.js's job now (buildChildrenLevel's applyShowUnconfirmed,
+// gated by the apexCallGraph.showUnconfirmed setting) -- by the time a TNode
+// reaches this file, its `children` array is ALREADY grouped/hidden/flat per
+// that setting, exactly one more kind of TNode.children shape this file
+// walks purely structurally (same posture as every other resolver.js-side
+// tree shape this file has never needed special-casing for -- flow subflow
+// chains, record-triggered DML children, etc.). This function therefore
+// needs NO changes to walk it: a `kind:'rollup'` pseudo-node is just another
+// child, recursively shaped exactly like any other node (see iconForNode/
+// VIA_GLOSSARY/MARKER_GLOSSARY above for its dedicated icon + glossary
+// lines) -- no partitioning, no mode parameter, nothing extra threaded
+// through the recursion below.
 function shapeNode(node, targetPackage, orientation, direction) {
   const entryFirst = orientation === ORIENTATION_ENTRY_FIRST;
   const uiSites = (node.sites || []).map(shapeSite);
@@ -1085,6 +1156,69 @@ function rerootEntryFirst(root) {
   return roots;
 }
 
+// =========================================================================
+// v0.13 (Round 2.5, H3 — header half): SCOPED HEADERS.
+//
+// Pre-Round-2.5, shapeHeaderLines surfaced three WORKSPACE-GLOBAL counters
+// (stats.unresolvedSites, stats.externalRefs/externalNamespaces, stats.
+// metaUnresolved -- see the v0.6/v0.8/v0.7.1 comments still on
+// shapeHeaderLines below) on every single trace, regardless of which
+// method was actually traced. That is workspace-wide bookkeeping unrelated
+// to the ONE target being looked at right now -- H3 removes it from the
+// per-trace header (stats itself is UNCHANGED: resolver.js keeps computing
+// every one of those fields exactly as before, they simply move to being
+// exclusively an H8 "Scan Stats" output-channel concern, a different file's
+// job this round).
+//
+// In its place, the CALLER direction only gains ONE new, genuinely SCOPED
+// header line: resolver.js's buildCallerTree already computes the "K
+// unresolved sites elsewhere mention <method>( — potential unconfirmed
+// callers" figure ENGINE-SIDE (see resolver.js's own H3 comment, ahead of
+// its `mentionsNode` construction) and renders it as one more ordinary CHILD
+// of the traced target -- `kind: 'unresolved-mentions'`, its own `.label`
+// ALREADY the complete, exact-wording string, its own `.children` the
+// individual mention sites (each a real class/line, via one of resolver.js's
+// unresolvedByReason strings -- see the VIA_GLOSSARY additions above). This
+// file therefore needs NO new TreeResult field and NO new node-shaping
+// function at all: the info node rides through shapeNode/shapeResult like
+// any other child (same "walks children purely structurally" posture this
+// file already has for flow subflow chains, DML children, etc. -- see
+// shapeNode's own comment), picking up its icon/glossary from iconForNode/
+// MARKER_GLOSSARY.unresolvedMentions above with zero extra plumbing.
+//
+// The ONE genuinely new piece of work here is the HEADER BANNER line
+// (TreeView.message, via shapeHeaderLines) -- the tree already shows the
+// info node as a collapsed row, but a header line surfaces the SAME fact
+// without the reader having to scroll past every real caller first. Rather
+// than recomputing that wording a second time (risking it drifting from
+// resolver.js's own string), unresolvedMentionsHeaderLine below simply
+// FINDS the mentionsNode among treeResult.root.children and reuses its
+// `.label` VERBATIM.
+// =========================================================================
+
+// Finds resolver.js's H3 info node (kind:'unresolved-mentions') among the
+// traced target's DIRECT children, or null when absent -- absent covers
+// every pre-Round-2.5 TreeResult (no such kind existed), a callee-direction
+// TreeResult (resolver.js never adds this kind there -- its existing
+// per-method kind:'unresolved' aggregate leaf is "already scoped", per the
+// H3 spec), and a genuine K=0 caller-direction trace (resolver.js's own
+// `if (mentions.length)` guard means the node simply isn't added at all).
+function findUnresolvedMentionsNode(treeResult) {
+  const children = treeResult && treeResult.root && Array.isArray(treeResult.root.children) ? treeResult.root.children : [];
+  return children.find((c) => c && c.kind === 'unresolved-mentions') || null;
+}
+
+// The new scoped header line -- resolver.js's mentionsNode.label VERBATIM
+// (already the complete, exact-wording "K unresolved sites elsewhere
+// mention <method>( — potential unconfirmed callers" string), or null when
+// findUnresolvedMentionsNode finds nothing (see that function's own doc for
+// every case that covers).
+function unresolvedMentionsHeaderLine(treeResult) {
+  if (treeResult && treeResult.direction === 'callees') return null;
+  const node = findUnresolvedMentionsNode(treeResult);
+  return node ? node.label : null;
+}
+
 // treeResult: resolver.js's TreeResult ({ root, targetLabel, note }). Returns
 // a single-element array (the traced target as the sole top-level item, its
 // callers nested underneath) or [] when there's no root to show.
@@ -1111,12 +1245,30 @@ function rerootEntryFirst(root) {
 // having to pass it explicitly. Absent/'callers' -> frontierNoun's own
 // default already reads 'callers', so this is a no-op for every pre-v0.9
 // TreeResult shape.
+//
+// v0.13 (Round 2.5, H2/H3): resolver.js owns grouping and produces both
+// rollup and unresolved-mentions TNodes. In target-first mode they flow
+// through structurally like every other child. Entry-first is the one
+// exception: an unresolved-mentions node is informational, not a caller
+// edge, so feeding it to rerootEntryFirst would fabricate execution paths
+// from each uncertain site into the target. Strip it from the execution
+// tree before re-rooting and append the shaped info node as a separate root
+// instead. Rollup nodes remain in the execution tree because they group
+// real (albeit approximate) edges.
 function shapeResult(treeResult, orientation) {
   if (!treeResult || !treeResult.root) return [];
   const targetPackage = treeResult.root.package || null;
   const direction = treeResult.direction;
   if (effectiveOrientation(treeResult, orientation) === ORIENTATION_ENTRY_FIRST) {
-    return rerootEntryFirst(treeResult.root).map((r) => shapeNode(r, targetPackage, ORIENTATION_ENTRY_FIRST, direction));
+    const mentionNodes = (treeResult.root.children || []).filter((c) => c && c.kind === 'unresolved-mentions');
+    const executionRoot = mentionNodes.length
+      ? { ...treeResult.root, children: (treeResult.root.children || []).filter((c) => !c || c.kind !== 'unresolved-mentions') }
+      : treeResult.root;
+    const roots = rerootEntryFirst(executionRoot).map((r) =>
+      shapeNode(r, targetPackage, ORIENTATION_ENTRY_FIRST, direction)
+    );
+    for (const node of mentionNodes) roots.push(shapeNode(node, targetPackage, undefined, direction));
+    return roots;
   }
   return [shapeNode(treeResult.root, targetPackage, undefined, direction)];
 }
@@ -1133,37 +1285,24 @@ function shapeResult(treeResult, orientation) {
 //   - treeResult.stats.duplicateNames (v0.7 B3: workspace-wide count of
 //                                      class names bucketed across packages)
 //   - treeResult.stats.capped         (H1: buildCallerTree's node cap fired)
-//   - treeResult.stats.unresolvedSites (H4: workspace-wide dropped-call-site
-//                                      count -- nested under stats, matching
-//                                      resolver.js's real buildCallerTree
-//                                      return shape, NOT a top-level
-//                                      TreeResult.unresolvedSites field).
-//   - treeResult.stats.metaUnresolved (v0.7.1 U3/M2 coordination point:
-//                                      workspace-wide count of namespaced
-//                                      metadata refs -- LWC/Aura/Flow/etc.
-//                                      imports -- that attachMetaCallers()
-//                                      could not attach to exactly one local
-//                                      class and therefore dropped rather
-//                                      than mis-pointing at an unrelated
-//                                      same-name local class. Same
-//                                      nested-under-stats / not-yet-produced-
-//                                      by-every-TreeResult shape as
-//                                      unresolvedSites above.)
-//   - treeResult.stats.externalRefs / treeResult.stats.externalNamespaces
-//                                     (v0.8 N5, forward-compat -- resolver.js
-//                                      does not produce either field yet):
-//                                      workspace-wide count of references now
-//                                      modeled as external (managed-package)
-//                                      nodes, and the sorted list of distinct
-//                                      namespaces they belong to. Per N5,
-//                                      these references are REMOVED from
-//                                      unresolvedSites' count, so this file
-//                                      renders ONE combined line ('N
-//                                      unresolved · M managed-package refs
-//                                      (ns1, ns2)') whenever externalRefs > 0,
-//                                      instead of the plain unresolvedSites
-//                                      line -- see the code below for the
-//                                      exact byte-identical-when-absent gate.
+//   - treeResult.root.children        (v0.13 Round 2.5 H3: scanned for
+//                                      resolver.js's kind:'unresolved-
+//                                      mentions' info node -- see the
+//                                      SCOPED HEADERS section above
+//                                      shapeResult for the full contract;
+//                                      NOT a new TreeResult/stats field)
+//
+// v0.13 (Round 2.5, H3) REMOVED: stats.unresolvedSites, stats.externalRefs/
+// externalNamespaces, and stats.metaUnresolved USED to each surface their
+// own workspace-global header line here (see the CHANGELOG/git history for
+// the exact pre-Round-2.5 wording, still pinned as REGRESSION assertions in
+// test-uitree.js proving they no longer fire). Per the H3 spec, a per-trace
+// header has no business reporting workspace-wide totals unrelated to the
+// ONE method being traced -- `stats` itself is untouched (resolver.js keeps
+// computing every one of those fields exactly as before; H8's "Scan Stats"
+// output channel, a different file's job this round, is their only
+// remaining consumer). The one thing that DOES belong in a trace header is
+// the new, genuinely scoped unresolvedMentionsHeaderLine below.
 //
 
 // v0.7 (A3) INTERPRETIVE DECISION on the pinned "callers-direction render is
@@ -1229,44 +1368,12 @@ function shapeHeaderLines(treeResult, orientation) {
     const cappedNoun = (treeResult && treeResult.direction) === 'callees' ? 'callee' : 'caller';
     lines.push(`Result capped -- not every ${cappedNoun} could be expanded.`);
   }
-  const unresolved = stats && stats.unresolvedSites;
-  // v0.8 (N5, forward-compat -- resolver.js does not produce
-  // stats.externalRefs/stats.externalNamespaces yet): per N5's CONTRACT
-  // AMENDMENT text, once references are modeled as external nodes they are
-  // REMOVED from the unresolved tally, and the header "show[s] both: 'N
-  // unresolved · M managed-package refs (zenq, kwx)'". Gated strictly behind
-  // `externalRefs > 0` so a workspace with NO namespaced refs at all (every
-  // pre-v0.8 fixture, and adv-org's whole corpus per the v0.8 REGRESSION
-  // POLICY) takes the untouched `else` branch below and renders the EXACT
-  // pre-v0.8 wording -- this is what keeps that 10-target byte-identical bar
-  // satisfiable by a purely additive change here.
-  const externalRefs = stats && stats.externalRefs;
-  const externalNamespaces = stats && Array.isArray(stats.externalNamespaces) ? stats.externalNamespaces : [];
-  if (typeof externalRefs === 'number' && externalRefs > 0) {
-    const unresolvedPart = typeof unresolved === 'number' ? unresolved : 0;
-    const refWord = externalRefs === 1 ? 'ref' : 'refs';
-    const nsPart = externalNamespaces.length ? ` (${externalNamespaces.join(', ')})` : '';
-    lines.push(`${unresolvedPart} unresolved · ${externalRefs} managed-package ${refWord}${nsPart}.`);
-  } else if (typeof unresolved === 'number' && unresolved > 0) {
-    lines.push(`${unresolved} call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).`);
-  }
-  // v0.7.1 (U3, M2 coordination point): anticipates metascan.js/resolver.js's
-  // planned attachMetaCallers() candidate-count gate -- a namespaced meta
-  // ref (LWC/Aura/Flow/etc. import naming a managed-package Apex method)
-  // that cannot be attached to exactly one local class under its own
-  // namespace is dropped rather than mis-pointed at an unrelated same-name
-  // local class, and counted in this stat instead. Mirrors the
-  // unresolvedSites line immediately above -- same "nested under stats"
-  // shape, same degrade-gracefully-when-absent behavior for every
-  // pre-v0.7.1 TreeResult. INTEGRATION NOTE: 'metaUnresolved' is the exact
-  // field name given in the fix spec; if the resolver/metascan owner lands
-  // it under a different name, update this key to match.
-  const metaUnresolved = stats && stats.metaUnresolved;
-  if (typeof metaUnresolved === 'number' && metaUnresolved > 0) {
-    lines.push(
-      `${metaUnresolved} metadata reference${metaUnresolved === 1 ? '' : 's'} could not be attached (ambiguous or unmatched namespace).`
-    );
-  }
+  // v0.13 (Round 2.5, H3): the ONE new scoped line -- see the SCOPED HEADERS
+  // section ahead of shapeResult above for the full contract/rationale and
+  // unresolvedMentionsHeaderLine's own doc for the exact gating (K > 0,
+  // caller direction only).
+  const mentionsLine = unresolvedMentionsHeaderLine(treeResult);
+  if (mentionsLine) lines.push(mentionsLine);
   return lines;
 }
 
@@ -1535,10 +1642,157 @@ function shapeEntryCatalogHeaderLine(catalog) {
   if (typeof stats.excludedTestEntries === 'number' && stats.excludedTestEntries > 0) {
     parts.push(`${stats.excludedTestEntries} test-class entr${stats.excludedTestEntries === 1 ? 'y' : 'ies'} excluded`);
   }
+  if (typeof stats.unresolvedSites === 'number') {
+    parts.push(`${stats.unresolvedSites} unresolved site${stats.unresolvedSites === 1 ? '' : 's'}`);
+  }
+  if (typeof stats.managedRefs === 'number') {
+    parts.push(`${stats.managedRefs} managed reference${stats.managedRefs === 1 ? '' : 's'}`);
+  }
   if (Array.isArray(stats.packages) && stats.packages.length) {
     parts.push(`packages: ${stats.packages.join(', ')}`);
   }
   return parts.join(' · ');
+}
+
+// =========================================================================
+// v0.14 Impact Analysis: sectioned report -> ordinary UiNode[]
+// =========================================================================
+
+function impactSiteLabel(site) {
+  if (!site) return '';
+  return site.callerMethod ? `${site.callerClass}.${site.callerMethod}` : String(site.callerClass || '');
+}
+
+function shapeImpactSite(site, severity) {
+  const location = site && site.path
+    ? `${site.path}${site.line ? `:${site.line}` : ''}`
+    : '';
+  const details = [];
+  if (location) details.push(location);
+  if (site && site.lineText) details.push(String(site.lineText));
+  if (site && site.overloadSig) details.push(`selected ${site.overloadSig} (${site.overloadPick || 'exact'})`);
+  return {
+    label: impactSiteLabel(site),
+    description: [site && site.via, site && site.overloadPick].filter(Boolean).join(' · '),
+    tooltip: details.join('\n'),
+    iconId: severity === 'break' ? 'error' : 'warning',
+    jump: site && site.path && site.line ? { path: site.path, line: site.line, col: site.col || 0 } : null,
+    collapsible: false,
+    children: [],
+  };
+}
+
+function impactSection(label, children, iconId, expanded) {
+  const rows = Array.isArray(children) ? children : [];
+  return {
+    label,
+    description: String(rows.length),
+    tooltip: `${rows.length} ${label.toLowerCase()} item${rows.length === 1 ? '' : 's'}`,
+    iconId,
+    jump: null,
+    collapsible: rows.length > 0,
+    expanded: rows.length > 0 && expanded !== false,
+    children: rows,
+    isImpactSection: true,
+  };
+}
+
+function shapeImpactContract(report) {
+  const contract = report && report.contract ? report.contract : {};
+  const rows = [];
+  for (const iface of contract.interfaces || []) {
+    const callers = (iface.callers || []).map((site) => shapeImpactSite(site, 'uncertain'));
+    rows.push({
+      label: `${iface.iface}.${iface.overloadSig || iface.method || ''}`,
+      description: `interface · ${callers.length} caller${callers.length === 1 ? '' : 's'}`,
+      tooltip: iface.path ? `${iface.path}${iface.line ? `:${iface.line}` : ''}` : 'Interface contract',
+      iconId: 'symbol-interface',
+      jump: iface.path && iface.line ? { path: iface.path, line: iface.line, col: 0 } : null,
+      collapsible: callers.length > 0,
+      children: callers,
+    });
+  }
+  const overrides = contract.overrides || {};
+  if (overrides.base) {
+    const callers = (overrides.callersOfBase || []).map((site) => shapeImpactSite(site, 'uncertain'));
+    rows.push({
+      label: overrides.base.label,
+      description: `overrides base · ${callers.length} caller${callers.length === 1 ? '' : 's'}`,
+      tooltip: overrides.base.path ? `${overrides.base.path}${overrides.base.line ? `:${overrides.base.line}` : ''}` : 'Overridden base declaration',
+      iconId: 'arrow-up',
+      jump: overrides.base.path && overrides.base.line ? { path: overrides.base.path, line: overrides.base.line, col: 0 } : null,
+      collapsible: callers.length > 0,
+      children: callers,
+    });
+  }
+  for (const override of overrides.overriddenBy || []) {
+    rows.push({
+      label: override.label,
+      description: 'overridden by',
+      tooltip: override.path ? `${override.path}${override.line ? `:${override.line}` : ''}` : 'Overriding declaration',
+      iconId: 'arrow-down',
+      jump: override.path && override.line ? { path: override.path, line: override.line, col: 0 } : null,
+      collapsible: false,
+      children: [],
+    });
+  }
+  return rows;
+}
+
+function shapeImpactMetadata(metadata) {
+  return (metadata || []).map((site) => {
+    const parents = (site.parentFlows || []).map((flow) => ({
+      label: flow.label,
+      description: 'parent flow',
+      tooltip: flow.path ? `${flow.path}${flow.line ? `:${flow.line}` : ''}` : 'Parent flow in the invocation chain',
+      iconId: 'symbol-event',
+      jump: flow.path && flow.line ? { path: flow.path, line: flow.line, col: 0 } : null,
+      collapsible: false,
+      children: [],
+    }));
+    return {
+      label: site.label,
+      description: [site.kind, parents.length ? `${parents.length} parent flow${parents.length === 1 ? '' : 's'}` : null].filter(Boolean).join(' · '),
+      tooltip: site.path ? `${site.path}${site.line ? `:${site.line}` : ''}` : 'Metadata contract surface',
+      iconId: META_ICON_BY_KIND[site.kind] || 'references',
+      jump: site.path && site.line ? { path: site.path, line: site.line, col: 0 } : null,
+      collapsible: parents.length > 0,
+      children: parents,
+    };
+  });
+}
+
+function shapeImpactReport(report) {
+  if (!report || !report.target) return [];
+  const breaks = (report.breaks || []).map((site) => shapeImpactSite(site, 'break'));
+  const mightBreak = (report.mightBreak || []).map((site) => shapeImpactSite(site, 'uncertain'));
+  const contract = shapeImpactContract(report);
+  const metadata = shapeImpactMetadata(report.metadata || []);
+  const otherOverloads = (report.otherOverloads || []).map((overload) => ({
+    label: overload.overloadSig,
+    description: `${overload.callerCount || 0} caller${overload.callerCount === 1 ? '' : 's'}`,
+    tooltip: overload.path ? `${overload.path}${overload.line ? `:${overload.line}` : ''}` : 'Other overload',
+    iconId: 'symbol-method',
+    jump: overload.path && overload.line ? { path: overload.path, line: overload.line, col: 0 } : null,
+    collapsible: false,
+    children: [],
+  }));
+  return [
+    impactSection('BREAKS', breaks, 'error', true),
+    impactSection('MIGHT BREAK', mightBreak, 'warning', true),
+    impactSection('CONTRACT', contract, 'symbol-interface', true),
+    impactSection('METADATA', metadata, 'references', true),
+    impactSection('OTHER OVERLOADS', otherOverloads, 'symbol-method', false),
+  ];
+}
+
+function shapeImpactHeaderLine(report) {
+  const stats = report && report.stats;
+  if (!stats) return '';
+  return `${stats.breaks || 0} direct break${stats.breaks === 1 ? '' : 's'} · `
+    + `${stats.mightBreak || 0} uncertain · `
+    + `${stats.contractSurfaces || 0} contract surface${stats.contractSurfaces === 1 ? '' : 's'} · `
+    + `${stats.metadataSurfaces || 0} metadata surface${stats.metadataSurfaces === 1 ? '' : 's'}`;
 }
 
 module.exports = {
@@ -1579,4 +1833,16 @@ module.exports = {
   shapeEntryCatalogGroup,
   shapeEntryCatalog,
   shapeEntryCatalogHeaderLine,
+  shapeImpactSite,
+  shapeImpactReport,
+  shapeImpactHeaderLine,
+  // v0.13 (Round 2.5, H3 -- header half): SCOPED HEADERS surface, exported
+  // so test-uitree.js can unit-test these directly against bare fixtures,
+  // same rationale as externalNamespace/managedBadge/frontierMethodKey
+  // above. (H2's rollup grouping has no dedicated export here -- it needs
+  // none: resolver.js already produces the grouped tree, and this file
+  // renders it via the ordinary iconForNode/VIA_GLOSSARY/MARKER_GLOSSARY
+  // surface already exported above, same as every other TNode.kind.)
+  findUnresolvedMentionsNode,
+  unresolvedMentionsHeaderLine,
 };

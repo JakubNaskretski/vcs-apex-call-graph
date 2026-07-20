@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>59.0</apiVersion>
+    <areMetricsLoggedToDataCloud>false</areMetricsLoggedToDataCloud>
+    <environments>Default</environments>
+    <interviewLabel>Acme Note Event Flow {!$Flow.CurrentDateTime}</interviewLabel>
+    <label>Acme Note Event Flow</label>
+    <processMetadataValues>
+        <name>BuilderType</name>
+        <value>
+            <stringValue>LightningFlowBuilder</stringValue>
+        </value>
+    </processMetadataValues>
+    <processMetadataValues>
+        <name>CanvasMode</name>
+        <value>
+            <stringValue>AUTO_LAYOUT_CANVAS</stringValue>
+        </value>
+    </processMetadataValues>
+    <processMetadataValues>
+        <name>OriginBuilderType</name>
+        <value>
+            <stringValue>LightningFlowBuilder</stringValue>
+        </value>
+    </processMetadataValues>
+    <processType>AutoLaunchedFlow</processType>
+    <status>Active</status>
+    <start>
+        <locationX>50</locationX>
+        <locationY>0</locationY>
+        <connector>
+            <targetReference>Notify_On_Note_Event</targetReference>
+        </connector>
+        <object>Acme_Note__e</object>
+        <triggerType>PlatformEvent</triggerType>
+    </start>
+    <actionCalls>
+        <name>Notify_On_Note_Event</name>
+        <label>Notify On Note Event</label>
+        <locationX>50</locationX>
+        <locationY>150</locationY>
+        <actionName>AcmeOrderInvocable</actionName>
+        <actionType>apex</actionType>
+        <flowTransactionModel>CurrentTransaction</flowTransactionModel>
+        <inputParameters>
+            <name>orderIds</name>
+            <value>
+                <elementReference>$Record.RelatedOrderId__c</elementReference>
+            </value>
+        </inputParameters>
+        <nameSegment>AcmeOrderInvocable</nameSegment>
+        <offset>0</offset>
+    </actionCalls>
+</Flow>

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>59.0</apiVersion>
+    <label>Vtx Widget Lifecycle Flow</label>
+    <processType>AutoLaunchedFlow</processType>
+    <status>Active</status>
+    <variables>
+        <name>varWidgetId</name>
+        <dataType>String</dataType>
+        <isCollection>false</isCollection>
+        <isInput>false</isInput>
+        <isOutput>false</isOutput>
+    </variables>
+    <start>
+        <locationX>0</locationX>
+        <locationY>0</locationY>
+        <connector>
+            <targetReference>Log_Widget_Created</targetReference>
+        </connector>
+        <object>Vertex_Widget__c</object>
+        <recordTriggerType>Create</recordTriggerType>
+        <triggerType>RecordAfterSave</triggerType>
+    </start>
+    <actionCalls>
+        <name>Log_Widget_Created</name>
+        <label>Log Widget Created</label>
+        <locationX>0</locationX>
+        <locationY>150</locationY>
+        <actionName>VtxFlowWidgetDmlSource.logWidgetCreated</actionName>
+        <actionType>apex</actionType>
+        <connector>
+            <targetReference>Notify_Widget_Team</targetReference>
+        </connector>
+        <flowTransactionModel>CurrentTransaction</flowTransactionModel>
+        <inputParameters>
+            <name>widgetId</name>
+            <value>
+                <elementReference>$Record.Id</elementReference>
+            </value>
+        </inputParameters>
+        <nameSegment>VtxFlowWidgetDmlSource.logWidgetCreated</nameSegment>
+        <offset>0</offset>
+    </actionCalls>
+    <subflows>
+        <name>Notify_Widget_Team</name>
+        <label>Notify Widget Team</label>
+        <locationX>0</locationX>
+        <locationY>300</locationY>
+        <connector>
+            <targetReference>Call_Ghost_Followup</targetReference>
+        </connector>
+        <flowName>Vtx_WidgetLifecycleNotifySubflow</flowName>
+        <inputAssignments>
+            <name>recordId</name>
+            <value>
+                <elementReference>varWidgetId</elementReference>
+            </value>
+        </inputAssignments>
+    </subflows>
+    <subflows>
+        <name>Call_Ghost_Followup</name>
+        <label>Call Ghost Followup</label>
+        <locationX>0</locationX>
+        <locationY>450</locationY>
+        <flowName>Vtx_Nonexistent_Ghost_Flow</flowName>
+    </subflows>
+</Flow>

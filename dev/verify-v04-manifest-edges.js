@@ -16,7 +16,7 @@ const parser = require('../parser');
 const resolver = require('../resolver');
 const metascan = require('../metascan');
 
-const ROOT = '/Users/agent/work/code/example-data/adv-org/force-app/main/default';
+const ROOT = 'test-fixtures/adv-org/force-app/main/default';
 const SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git', '__tests__']);
 
 function walk(dir, apexOut, metaOut) {

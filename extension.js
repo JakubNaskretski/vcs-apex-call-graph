@@ -97,11 +97,22 @@
 
 const vscode = require('vscode');
 const crypto = require('crypto');
+const path = require('path');
 const parser = require('./parser');
 const resolver = require('./resolver');
 const metascan = require('./metascan');
 const cachestore = require('./cachestore');
 const targets = require('./targets');
+// Round 2.5 / H5-H8: pure, vscode-free helpers (single-flight+coalescing,
+// the watcher dirty-set tracker, and the counts-only diagnostics payload
+// shape) -- see scanflow.js's own header for the full contract each export
+// carries; nothing in that file is vscode-aware, which is what makes it
+// independently unit-tested (test-scanflow.js) outside the extension host.
+const scanflow = require('./scanflow');
+// Round 2.5 / H7: pure, vscode-free parse-pool manager (worker_threads),
+// used only for a cold parse of >200 files -- see workerpool.js's own
+// header. Also vscode-free/independently unit-tested (test-workerpool.js).
+const workerpool = require('./workerpool');
 const {
   shapeResult,
   shapeHeaderLines,
@@ -124,6 +135,10 @@ const {
   // pre-existing caller/callee trace path above.
   shapeEntryCatalog,
   shapeEntryCatalogHeaderLine,
+  // v0.14.0: Impact Analysis is rendered in the ordinary call-graph tree,
+  // but uses its own five-section pure shaping surface.
+  shapeImpactReport,
+  shapeImpactHeaderLine,
 } = require('./uitree');
 const { renderPathMapHtml, buildPathMapData } = require('./pathmap');
 
@@ -169,15 +184,29 @@ function readSettings() {
     return Math.min(hi, Math.max(lo, n));
   };
   const rawExcludes = cfg.get('excludeGlobs');
-  const excludeGlobs = Array.isArray(rawExcludes)
-    ? rawExcludes.filter((g) => typeof g === 'string' && g.trim().length > 0)
-    : [];
+  const excludeGlobs = scanflow.normalizeExcludeGlobs(rawExcludes);
+  // H2 (Round 2.5): this file OWNS the package.json contribution point for
+  // apexCallGraph.showUnconfirmed (the approximate-callers/callees rollup
+  // display mode) -- see the task brief's "package.json contributes ONLY:
+  // setting apexCallGraph.showUnconfirmed, command copyDiagnostics" scoping
+  // note. The actual CONSUMPTION of this setting (grouping approximate
+  // children under a collapsed 'rollup' pseudo-node vs hiding vs the old
+  // eager-expand behavior) is resolver.js/uitree.js/pathmap.js's job, a
+  // different phase this round -- this file only reads it through fresh,
+  // validated, same as every other apexCallGraph.* setting, and threads it
+  // through wherever this round's H8 diagnostics payload wants to report
+  // the active mode (see scanAndBuildIndex's `stats.showUnconfirmed` and
+  // logRunStats below). An invalid/legacy value falls back to 'rollup', the
+  // documented default.
+  const rawShowUnconfirmed = cfg.get('showUnconfirmed');
+  const showUnconfirmed = ['rollup', 'hide', 'expand'].includes(rawShowUnconfirmed) ? rawShowUnconfirmed : 'rollup';
   return {
     initialDepth: clampInt(cfg.get('initialDepth'), 1, 8, DEFAULT_INITIAL_DEPTH),
     expandStep: clampInt(cfg.get('expandStep'), 1, 4, DEFAULT_EXPAND_STEP),
     maxDepth: clampInt(cfg.get('maxDepth'), 1, 20, MAX_DEPTH),
     maxNodes: clampInt(cfg.get('maxNodes'), 100, 20000, DEFAULT_MAX_NODES_SETTING),
     excludeGlobs,
+    showUnconfirmed,
   };
 }
 
@@ -220,6 +249,12 @@ const ORIENTATION_KEY = 'apexCallGraph.orientation';
 // on this same bump rather than needing one of their own.
 const ENGINE_CACHE_VERSION = 7;
 
+// H8: the extension's own version, read straight from package.json (a
+// local file this extension ships with, never workspace-derived) -- purely
+// informational, folded into both the Scan Stats output channel and the
+// copyDiagnostics clipboard payload's `extensionVersion` field.
+const EXTENSION_VERSION = require('./package.json').version;
+
 // Debounce window between the end of a scan and the on-disk cache write --
 // avoids a redundant write-per-scan burst if the user retriggers a trace
 // (e.g. Cmd+. spam) before the previous write finished being useful anyway.
@@ -248,6 +283,71 @@ const fileCache = new Map();
 // instead: mtime caching here only ever saves the vscode.workspace.fs.readFile
 // I/O, not the (already fast) text scan.
 const metaFileCache = new Map();
+
+// =========================================================================
+// Round 2.5 / H6: watcher dirty-set state.
+// =========================================================================
+// One shared tracker across BOTH the Apex and metadata scans (scanAndParse
+// and scanMetaFiles each filter its own peek() snapshot down to the paths
+// relevant to their own extensions via APEX_EXT_RE/META_EXT_RE, inline where
+// each uses it) -- a single
+// FileSystemWatcher setup (activate(), below) feeding one tracker is
+// simpler and no less correct than two independent trackers, since the
+// only two things read out of it (dirty/deleted path SETS, and the one
+// fullSweepNeeded latch) are already per-path and per-run, not per-scan-
+// type. Module-level (like fileCache/metaFileCache above) so it survives
+// across command invocations within one extension-host session.
+const dirtyTracker = scanflow.createDirtyTracker();
+
+// The exact set of fsPaths the LAST successful Apex/metadata sweep (full or
+// incremental) actually produced FileFacts/text for -- lets a subsequent
+// EMPTY-dirty-set trace reuse the in-memory factsList/metadata with ZERO
+// findFiles+stat calls (H6's "reuses the in-memory factsList + metadata"),
+// and lets a SMALL-dirty-set trace know which paths besides the dirty ones
+// still belong in the final list. null until the first successful sweep
+// (mirrors dirtyTracker's own fullSweepNeeded-starts-true invariant --
+// there is nothing to reuse before that).
+let lastApexUriSet = null;
+let lastMetaUriSet = null;
+
+const APEX_EXT_RE = /\.(cls|trigger|apex)$/i;
+const META_EXT_RE = /\.(js|cmp|app|xml|json|page|component)$/i;
+
+// H6: the full-sweep path always excludes these via combineExcludePattern's
+// builtin pattern (scanWorkspaceUris/scanMetaWorkspaceUris) -- the
+// INCREMENTAL dirty-set fast path below never calls findFiles at all, so it
+// has no glob-exclude pass of its own to lean on. A watcher event for a
+// path under one of these directories (the FileSystemWatcher globs
+// themselves are not exclude-aware either) must not be allowed to sneak a
+// path the full sweep would have excluded into fileCache/lastApexUriSet.
+// The hard-coded check stays separate from the user-glob matcher below so
+// these directories remain excluded even when no workspace folder can be
+// resolved for a watcher path.
+const HARD_EXCLUDED_DIR_RE = /[\\/](node_modules|\.sfdx|\.sf|\.git|__tests__)[\\/]/;
+function isHardExcludedPath(fsPath) {
+  return HARD_EXCLUDED_DIR_RE.test(fsPath);
+}
+
+// FileSystemWatcher paths are absolute, while vscode.workspace.findFiles
+// evaluates string globs relative to the containing workspace folder. Keep
+// the incremental path consistent with the full sweep by converting to the
+// same relative shape before applying scanflow's pure glob matcher.
+function isUserExcludedPath(fsPath, excludeGlobs) {
+  if (!excludeGlobs || !excludeGlobs.length || !fsPath) return false;
+  const uri = vscode.Uri.file(fsPath);
+  const folder = vscode.workspace.getWorkspaceFolder(uri);
+  if (!folder || !folder.uri || !folder.uri.fsPath) return false;
+  const relativePath = path.relative(folder.uri.fsPath, fsPath);
+  return scanflow.matchesExcludeGlobs(relativePath, excludeGlobs);
+}
+
+// Round 2.5 / H7: only worth spinning up worker_threads once there is
+// meaningfully more cold-parse work than the spin-up overhead of a handful
+// of threads -- see workerpool.js's own header for the size/chunking
+// contract. Below this, the existing single-threaded inline loop stays
+// exactly as fast (no thread spin-up cost at all) as it always was.
+const WORKER_POOL_FILE_THRESHOLD = 200;
+
 
 class TraceProvider {
   constructor() {
@@ -341,7 +441,9 @@ class EntryCatalogProvider {
 function toTreeItem(uiNode, traceId, parent) {
   const it = new vscode.TreeItem(
     uiNode.label,
-    uiNode.collapsible ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+    uiNode.collapsible
+      ? (uiNode.expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed)
+      : vscode.TreeItemCollapsibleState.None
   );
   it.description = uiNode.description;
   if (uiNode.tooltip) it.tooltip = uiNode.tooltip;
@@ -461,24 +563,164 @@ async function scanWorkspaceUris(excludeGlobs) {
 // new), reuses cached FileFacts for everything else, and prunes cache
 // entries for files no longer present. Returns the facts list plus counts
 // for the progress notification.
-async function scanAndParse(progress, excludeGlobs) {
+//
+// Round 2.5 additions (opts, all optional -- omitting `opts` entirely keeps
+// pre-Round-2.5 behavior byte-identical except for the new fields on the
+// return value):
+//   opts.token   (H4): a vscode.CancellationToken. Checked once per loop
+//     iteration (per file); a cancel mid-loop stops scanning immediately --
+//     files already parsed THIS call stay in fileCache (nothing rolls
+//     back), but the stale-cache-eviction pass below is skipped entirely
+//     (see its own comment) and the returned `cancelled: true` tells the
+//     caller (scanAndBuildIndex) to abort before ever building an
+//     index/tree, per H4's "no partial index/tree is rendered" contract.
+//   opts.dirtySnapshot (H6): `{ dirty: Set<fsPath>, deleted: Set<fsPath>,
+//     fullSweepNeeded }`, a NON-destructive dirtyTracker.peek() snapshot (see
+//     dirtyTracker's own header) taken by scanAndBuildIndex before this call.
+//     `fullSweepNeeded` (or no prior successful sweep at all, i.e.
+//     `lastApexUriSet === null`) means "trust nothing, findFiles+stat
+//     everything" -- today's full-sweep behavior, below. Otherwise: an
+//     EMPTY dirty+deleted set skips findFiles+stat ENTIRELY and reassembles
+//     factsList purely from fileCache + the last sweep's own path set (zero
+//     vscode.workspace.fs calls); a small non-empty set only re-stats/
+//     re-parses THOSE paths (filtered to Apex extensions -- the tracker is
+//     shared with the metadata scan, see APEX_EXT_RE/META_EXT_RE above) and
+//     removes deleted ones from both the cache and the tracked path set.
+async function scanAndParse(progress, excludeGlobs, opts) {
+  opts = opts || {};
+  const token = opts.token || null;
+  const dirtySnapshot = opts.dirtySnapshot || null;
+  const isCancelled = () => !!(token && token.isCancellationRequested);
+
+  const useFullSweep = !dirtySnapshot || dirtySnapshot.fullSweepNeeded || !lastApexUriSet;
+
+  // ---- H6 fast paths (only reachable after at least one successful full
+  // sweep has populated lastApexUriSet) --------------------------------
+  if (!useFullSweep) {
+    const dirtyApex = new Set(
+      [...dirtySnapshot.dirty].filter(
+        (p) => APEX_EXT_RE.test(p) && !isHardExcludedPath(p) && !isUserExcludedPath(p, excludeGlobs)
+      )
+    );
+    const deletedApex = new Set([...dirtySnapshot.deleted].filter((p) => APEX_EXT_RE.test(p)));
+
+    if (dirtyApex.size === 0 && deletedApex.size === 0) {
+      // H6: "a subsequent trace with an EMPTY dirty set skips findFiles+stat
+      // entirely and reuses the in-memory factsList" -- zero I/O below.
+      const factsList = [];
+      for (const fsPath of lastApexUriSet) {
+        const entry = fileCache.get(fsPath);
+        if (entry) factsList.push(entry.facts);
+      }
+      return {
+        factsList,
+        parsed: 0,
+        cached: factsList.length,
+        unreadable: 0,
+        total: factsList.length,
+        cancelled: false,
+        sweepKind: 'skipped',
+        timingMs: { glob: 0, stat: 0, parse: 0 },
+        workerStats: null,
+      };
+    }
+
+    // H6: small dirty set -- only re-stat/re-parse those paths.
+    const timingMs = { glob: 0, stat: 0, parse: 0 };
+    for (const fsPath of deletedApex) {
+      fileCache.delete(fsPath);
+      lastApexUriSet.delete(fsPath);
+    }
+    let parsed = 0;
+    let unreadable = 0;
+    const toParse = [];
+    for (const fsPath of dirtyApex) {
+      if (isCancelled()) break;
+      const uri = vscode.Uri.file(fsPath);
+      const tStat0 = Date.now();
+      let stat;
+      try {
+        stat = await vscode.workspace.fs.stat(uri);
+      } catch (e) {
+        timingMs.stat += Date.now() - tStat0;
+        // Watcher fired a change for a path that's gone by the time we get
+        // to it (fast create+delete race) -- treat exactly like a delete.
+        fileCache.delete(fsPath);
+        lastApexUriSet.delete(fsPath);
+        continue;
+      }
+      timingMs.stat += Date.now() - tStat0;
+      const entry = fileCache.get(fsPath);
+      if (entry && entry.mtimeMs === stat.mtime && entry.size === stat.size) {
+        lastApexUriSet.add(fsPath); // e.g. a brand-new path already caught up
+        continue;
+      }
+      toParse.push({ fsPath, stat });
+    }
+    const tParse0 = Date.now();
+    for (const item of toParse) {
+      if (isCancelled()) break;
+      try {
+        const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(item.fsPath));
+        const text = Buffer.from(bytes).toString('utf8');
+        const facts = parser.parseFile({ path: item.fsPath, text }); // contract: never throws
+        fileCache.set(item.fsPath, { mtimeMs: item.stat.mtime, size: item.stat.size, facts });
+        lastApexUriSet.add(item.fsPath);
+        parsed++;
+      } catch (e) {
+        unreadable++;
+        fileCache.delete(item.fsPath);
+        lastApexUriSet.delete(item.fsPath);
+      }
+      if (progress) progress.report({ message: `re-parsed ${parsed} changed file(s)…` });
+    }
+    timingMs.parse = Date.now() - tParse0;
+
+    const factsList = [];
+    for (const fsPath of lastApexUriSet) {
+      const entry = fileCache.get(fsPath);
+      if (entry) factsList.push(entry.facts);
+    }
+    return {
+      factsList,
+      parsed,
+      cached: factsList.length - parsed,
+      unreadable,
+      total: factsList.length,
+      cancelled: isCancelled(),
+      sweepKind: 'incremental',
+      timingMs,
+      workerStats: null,
+    };
+  }
+
+  // ---- full sweep (today's behavior; restructured for H7 pooled cold-
+  // parse + H4 cancellation + H8 phase timing, otherwise unchanged) -------
+  const timingMs = { glob: 0, stat: 0, parse: 0 };
+  const tGlob0 = Date.now();
   const uris = await scanWorkspaceUris(excludeGlobs);
+  timingMs.glob = Date.now() - tGlob0;
+
   const seen = new Set();
   const factsList = [];
-  let parsed = 0;
   let cached = 0;
   let unreadable = 0;
+  const toParse = []; // { fsPath, stat }
 
   for (const uri of uris) {
+    if (isCancelled()) break;
     const fsPath = uri.fsPath;
     seen.add(fsPath);
+    const tStat0 = Date.now();
     let stat;
     try {
       stat = await vscode.workspace.fs.stat(uri);
     } catch (e) {
+      timingMs.stat += Date.now() - tStat0;
       unreadable++;
       continue; // unstattable — skip
     }
+    timingMs.stat += Date.now() - tStat0;
     const entry = fileCache.get(fsPath);
     // H6b: mtimeMs AND size must both match -- mtime resolution on some
     // filesystems is coarse enough that two distinct saves of the same file
@@ -490,30 +732,99 @@ async function scanAndParse(progress, excludeGlobs) {
       factsList.push(entry.facts);
       cached++;
     } else {
-      try {
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        const text = Buffer.from(bytes).toString('utf8');
-        const facts = parser.parseFile({ path: fsPath, text }); // contract: never throws
-        fileCache.set(fsPath, { mtimeMs: stat.mtime, size: stat.size, facts });
-        factsList.push(facts);
-        parsed++;
-      } catch (e) {
-        unreadable++; // file itself unreadable (permissions, race on delete, …)
-        continue;
-      }
+      toParse.push({ fsPath, stat });
     }
     if (progress) {
-      progress.report({ message: `parsed ${parsed}, cached ${cached} of ${uris.length} file(s)…` });
+      progress.report({ message: `stat ${cached + toParse.length} of ${uris.length} file(s)…` });
     }
   }
 
-  // Drop cache entries for files that disappeared (renamed/deleted) so the
-  // index never resurrects stale classes.
-  for (const fsPath of [...fileCache.keys()]) {
-    if (!seen.has(fsPath)) fileCache.delete(fsPath);
+  // H7: read the text for every file needing a (re)parse first, THEN decide
+  // inline-vs-pool once the total is known -- readFile itself always stays
+  // on the main thread (vscode.workspace.fs has no worker-thread-callable
+  // form), only the parser.parseFile CPU work moves to the pool.
+  const tParse0 = Date.now();
+  const readable = []; // { path, text, stat }
+  for (const item of toParse) {
+    if (isCancelled()) break;
+    try {
+      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(item.fsPath));
+      readable.push({ path: item.fsPath, text: Buffer.from(bytes).toString('utf8'), stat: item.stat });
+    } catch (e) {
+      unreadable++; // file itself unreadable (permissions, race on delete, …)
+    }
   }
 
-  return { factsList, parsed, cached, unreadable, total: uris.length };
+  let parsed = 0;
+  let workerStats = null;
+  if (!isCancelled() && readable.length) {
+    if (readable.length > WORKER_POOL_FILE_THRESHOLD) {
+      const pooled = await workerpool.parseFiles(
+        readable.map((r) => ({ path: r.path, text: r.text })),
+        { shouldCancel: isCancelled }
+      );
+      const { facts, stats } = pooled;
+      workerStats = stats;
+      if (pooled.cancelled || isCancelled()) {
+        timingMs.parse = Date.now() - tParse0;
+        return {
+          factsList,
+          parsed: 0,
+          cached,
+          unreadable,
+          total: uris.length,
+          cancelled: true,
+          sweepKind: 'full',
+          timingMs,
+          workerStats,
+        };
+      }
+      for (let i = 0; i < readable.length; i++) {
+        const item = readable[i];
+        fileCache.set(item.path, { mtimeMs: item.stat.mtime, size: item.stat.size, facts: facts[i] });
+        factsList.push(facts[i]);
+        parsed++;
+      }
+      if (progress) {
+        progress.report({ message: `parsed ${parsed} file(s) via worker pool (size ${stats.poolSize})…` });
+      }
+    } else {
+      workerStats = {
+        usedPool: false,
+        poolSize: 0,
+        chunksTotal: 0,
+        chunksViaWorker: 0,
+        chunksInlineFallback: 0,
+        chunksCancelled: 0,
+        workerErrors: 0,
+      };
+      for (const item of readable) {
+        const facts = parser.parseFile({ path: item.path, text: item.text }); // contract: never throws
+        fileCache.set(item.path, { mtimeMs: item.stat.mtime, size: item.stat.size, facts });
+        factsList.push(facts);
+        parsed++;
+        if (progress) {
+          progress.report({ message: `parsed ${parsed}, cached ${cached} of ${uris.length} file(s)…` });
+        }
+      }
+    }
+  }
+  timingMs.parse = Date.now() - tParse0;
+
+  const cancelled = isCancelled();
+  // Drop cache entries for files that disappeared (renamed/deleted) so the
+  // index never resurrects stale classes. H4: skipped entirely on a
+  // cancelled run -- `seen` is only a PARTIAL snapshot of the workspace at
+  // that point, and pruning against a partial snapshot could wrongly evict
+  // still-live files this run simply never got to yet.
+  if (!cancelled) {
+    for (const fsPath of [...fileCache.keys()]) {
+      if (!seen.has(fsPath)) fileCache.delete(fsPath);
+    }
+    lastApexUriSet = new Set(seen); // H6: this sweep's own path set becomes the baseline the next dirty-set check reasons about
+  }
+
+  return { factsList, parsed, cached, unreadable, total: uris.length, cancelled, sweepKind: 'full', timingMs, workerStats };
 }
 
 // A7: workspace globs derived from the adv-org corpus's SFDX layout
@@ -561,7 +872,95 @@ async function scanMetaWorkspaceUris(excludeGlobs) {
 // file into { path, text } pairs -- extraction itself (metascan.js) happens
 // separately in computeMetaRefs, since Aura needs cross-file bundle context
 // that isn't available file-by-file.
-async function scanMetaFiles(progress, excludeGlobs) {
+// Round 2.5: same opts.token (H4)/opts.dirtySnapshot (H6) contract as
+// scanAndParse above -- see that function's own header comment for the
+// full rationale; the two functions are deliberately parallel in shape.
+// No H7 pooling here: metadata extraction is regex-based text scanning
+// (metascan.js), not the CPU-bound recursive-descent parse Apex needs --
+// per this file's own pre-existing A7 header note it already targets
+// "<300ms metascan perf bar" single-threaded, so there is no cold-parse
+// bottleneck here worth a worker pool's spin-up cost.
+async function scanMetaFiles(progress, excludeGlobs, opts) {
+  opts = opts || {};
+  const token = opts.token || null;
+  const dirtySnapshot = opts.dirtySnapshot || null;
+  const isCancelled = () => !!(token && token.isCancellationRequested);
+
+  const useFullSweep = !dirtySnapshot || dirtySnapshot.fullSweepNeeded || !lastMetaUriSet;
+
+  if (!useFullSweep) {
+    const dirtyMeta = new Set(
+      [...dirtySnapshot.dirty].filter(
+        (p) =>
+          META_EXT_RE.test(p) &&
+          !APEX_EXT_RE.test(p) &&
+          !isHardExcludedPath(p) &&
+          !isUserExcludedPath(p, excludeGlobs)
+      )
+    );
+    const deletedMeta = new Set([...dirtySnapshot.deleted].filter((p) => META_EXT_RE.test(p) && !APEX_EXT_RE.test(p)));
+
+    if (dirtyMeta.size === 0 && deletedMeta.size === 0) {
+      const files = [];
+      for (const fsPath of lastMetaUriSet) {
+        const entry = metaFileCache.get(fsPath);
+        if (entry) files.push({ path: fsPath, text: entry.metaText });
+      }
+      return { files, read: 0, cached: files.length, unreadable: 0, total: files.length, cancelled: false, sweepKind: 'skipped' };
+    }
+
+    for (const fsPath of deletedMeta) {
+      metaFileCache.delete(fsPath);
+      lastMetaUriSet.delete(fsPath);
+    }
+    let read = 0;
+    let unreadable = 0;
+    for (const fsPath of dirtyMeta) {
+      if (isCancelled()) break;
+      const uri = vscode.Uri.file(fsPath);
+      let stat;
+      try {
+        stat = await vscode.workspace.fs.stat(uri);
+      } catch (e) {
+        metaFileCache.delete(fsPath);
+        lastMetaUriSet.delete(fsPath);
+        continue;
+      }
+      const entry = metaFileCache.get(fsPath);
+      if (entry && entry.mtimeMs === stat.mtime && entry.size === stat.size) {
+        lastMetaUriSet.add(fsPath);
+        continue;
+      }
+      try {
+        const bytes = await vscode.workspace.fs.readFile(uri);
+        const text = Buffer.from(bytes).toString('utf8');
+        metaFileCache.set(fsPath, { mtimeMs: stat.mtime, size: stat.size, metaText: text });
+        lastMetaUriSet.add(fsPath);
+        read++;
+      } catch (e) {
+        unreadable++;
+        metaFileCache.delete(fsPath);
+        lastMetaUriSet.delete(fsPath);
+      }
+      if (progress) progress.report({ message: `metadata: re-read ${read} changed file(s)…` });
+    }
+
+    const files = [];
+    for (const fsPath of lastMetaUriSet) {
+      const entry = metaFileCache.get(fsPath);
+      if (entry) files.push({ path: fsPath, text: entry.metaText });
+    }
+    return {
+      files,
+      read,
+      cached: files.length - read,
+      unreadable,
+      total: files.length,
+      cancelled: isCancelled(),
+      sweepKind: 'incremental',
+    };
+  }
+
   const uris = await scanMetaWorkspaceUris(excludeGlobs);
   const seen = new Set();
   const files = [];
@@ -570,6 +969,7 @@ async function scanMetaFiles(progress, excludeGlobs) {
   let unreadable = 0;
 
   for (const uri of uris) {
+    if (isCancelled()) break;
     const fsPath = uri.fsPath;
     seen.add(fsPath);
     let stat;
@@ -602,11 +1002,15 @@ async function scanMetaFiles(progress, excludeGlobs) {
     }
   }
 
-  for (const fsPath of [...metaFileCache.keys()]) {
-    if (!seen.has(fsPath)) metaFileCache.delete(fsPath);
+  const cancelled = isCancelled();
+  if (!cancelled) {
+    for (const fsPath of [...metaFileCache.keys()]) {
+      if (!seen.has(fsPath)) metaFileCache.delete(fsPath);
+    }
+    lastMetaUriSet = new Set(seen);
   }
 
-  return { files, read, cached, unreadable, total: uris.length };
+  return { files, read, cached, unreadable, total: uris.length, cancelled, sweepKind: 'full' };
 }
 
 // =========================================================================
@@ -993,11 +1397,11 @@ function guessReceiverType(text, ident) {
 //                QuickPick choice, or the enclosing-method fallback (with an
 //                explicit note shown) when the receiver's type could not be
 //                resolved to a class that actually declares this method.
-async function resolveCursorAmbiguity(index, enclosingCls, word, wordLower, enclosingLower, lineText, editor) {
+async function resolveCursorAmbiguity(index, enclosingCls, word, wordLower, enclosingLower, lineText, documentText) {
   const receiverIdent = findReceiverCallOnLine(lineText, word);
   if (!receiverIdent) return undefined;
 
-  const guessedType = editor ? guessReceiverType(editor.document.getText(), receiverIdent) : null;
+  const guessedType = typeof documentText === 'string' ? guessReceiverType(documentText, receiverIdent) : null;
   const guessedTypeLower = guessedType ? guessedType.toLowerCase() : null;
   let receiverTarget = null;
   if (guessedTypeLower && index.classes.has(guessedTypeLower)) {
@@ -1063,20 +1467,29 @@ function buildSuggestPicks(index) {
 // only ever affects the QuickPick's placeholder wording below (the
 // enclosing-method/known-class fast paths above it stay direction-agnostic,
 // since "which class/method" is exactly the same question either way).
-async function resolveTarget(index, direction) {
-  const editor = vscode.window.activeTextEditor;
-  let word = null;
-  let cursorLineText = null;
-  if (editor) {
-    const range = editor.document.getWordRangeAtPosition(editor.selection.active);
+async function resolveTarget(index, direction, targetContext) {
+  const editor = targetContext ? null : vscode.window.activeTextEditor;
+  const position = targetContext
+    ? targetContext.position
+    : editor
+      ? editor.selection.active
+      : null;
+  let word = targetContext ? targetContext.word : null;
+  let cursorLineText = targetContext ? targetContext.cursorLineText : null;
+  let fileName = targetContext ? targetContext.fileName : null;
+  let documentText = targetContext ? targetContext.documentText : null;
+  if (editor && position) {
+    const range = editor.document.getWordRangeAtPosition(position);
     if (range) word = editor.document.getText(range);
-    cursorLineText = editor.document.lineAt(editor.selection.active.line).text;
+    cursorLineText = editor.document.lineAt(position.line).text;
+    fileName = editor.document.fileName;
+    documentText = editor.document.getText();
   }
   const wordLower = word ? word.toLowerCase() : null;
 
   let enclosingLower = null;
-  if (editor && /\.(cls|trigger)$/i.test(editor.document.fileName)) {
-    const base = editor.document.fileName.split(/[\\/]/).pop().replace(/\.(cls|trigger)$/i, '');
+  if (fileName && /\.(cls|trigger)$/i.test(fileName)) {
+    const base = fileName.split(/[\\/]/).pop().replace(/\.(cls|trigger)$/i, '');
     if (index.classes.has(base.toLowerCase())) enclosingLower = base.toLowerCase();
   }
 
@@ -1084,7 +1497,15 @@ async function resolveTarget(index, direction) {
     const cls = index.classes.get(enclosingLower);
     const hasMethod = (cls.methods || []).some((m) => (m.name || '').toLowerCase() === wordLower);
     if (hasMethod) {
-      const ambiguous = await resolveCursorAmbiguity(index, cls, word, wordLower, enclosingLower, cursorLineText, editor);
+      const ambiguous = await resolveCursorAmbiguity(
+        index,
+        cls,
+        word,
+        wordLower,
+        enclosingLower,
+        cursorLineText,
+        documentText
+      );
       if (ambiguous !== undefined) return ambiguous; // null (cancelled) or a resolved target
       return { classLower: enclosingLower, methodLower: wordLower };
     }
@@ -1099,13 +1520,65 @@ async function resolveTarget(index, direction) {
     vscode.window.showWarningMessage('Apex Call Graph: no traceable classes or methods found.');
     return null;
   }
-  const placeHolder =
-    direction === 'callees' ? 'Trace what calls out from which Apex method or class?' : 'Trace callers of which Apex method or class?';
+  const placeHolder = direction === 'callees'
+    ? 'Trace what calls out from which Apex method or class?'
+    : direction === 'impact'
+      ? 'Analyze the impact of changing which Apex method?'
+      : 'Trace callers of which Apex method or class?';
   const chosen = await vscode.window.showQuickPick(picks, { placeHolder });
   if (!chosen) return null;
   const target = { classLower: chosen.target.classLower, methodLower: chosen.target.methodLower || null };
   if (Object.prototype.hasOwnProperty.call(chosen.target, 'package')) target.package = chosen.target.package;
   return target;
+}
+
+// v0.14 Impact Analysis: resolve one concrete overload after the ordinary
+// cursor/QuickPick target resolver has selected a method family.  A cursor
+// on a declaration line wins without another prompt; all other overloaded
+// targets get an explicit signature picker so the report never silently
+// mixes sibling overloads.
+async function resolveImpactReport(index, target, targetContext) {
+  const initial = resolver.buildImpactReport(index, target);
+  if (!initial) return null;
+  if (!initial.needsOverloadChoice) return initial;
+
+  let overloadSig = null;
+  const editor = targetContext ? null : vscode.window.activeTextEditor;
+  const position = targetContext
+    ? targetContext.position
+    : editor
+      ? editor.selection.active
+      : null;
+  const activeFileName = targetContext ? targetContext.fileName : editor ? editor.document.fileName : null;
+  const cm = index && index.classes instanceof Map ? index.classes.get(target.classLower) : null;
+  if (activeFileName && position && cm && cm.path) {
+    const activePath = String(activeFileName).replace(/\\/g, '/').toLowerCase();
+    const targetPath = String(cm.path).replace(/\\/g, '/').toLowerCase();
+    if (activePath === targetPath) {
+      const declaration = targets.findDeclarationOverload(
+        cm.methods || [],
+        target.methodLower,
+        position.line + 1
+      );
+      if (declaration) overloadSig = declaration.overloadSig;
+    }
+  }
+
+  if (!overloadSig) {
+    const picks = initial.availableOverloads.map((overload) => ({
+      label: overload.overloadSig,
+      description: (overload.params || []).map((p) => p.name).filter(Boolean).join(', '),
+      overloadSig: overload.overloadSig,
+    }));
+    const chosen = await vscode.window.showQuickPick(picks, {
+      placeHolder: `Choose the ${initial.target.label} overload whose signature may change`,
+      matchOnDescription: true,
+    });
+    if (!chosen) return null;
+    overloadSig = chosen.overloadSig;
+  }
+
+  return resolver.buildImpactReport(index, { ...target, overloadSig });
 }
 
 // =========================================================================
@@ -1130,6 +1603,7 @@ function buildTreeForTarget(index, target, dir, settings, expandedKeys) {
     maxNodes: settings.maxNodes,
     initialDepth: settings.initialDepth,
     expandedKeys,
+    showUnconfirmed: settings.showUnconfirmed,
   };
   return dir === 'callees' ? resolver.buildCalleeTree(index, target, opts) : resolver.buildCallerTree(index, target, opts);
 }
@@ -1253,6 +1727,135 @@ async function activate(context) {
     // never let a cache-hydration failure prevent the extension from activating
   }
 
+  // Round 2.5 / H8: one OutputChannel, written to once per completed scan
+  // (see logRunStats below) -- never per-file, so this stays cheap even on
+  // a huge org. Round 2.5 / H5: one shared single-flight/coalescing flow
+  // for every trace-triggering command registered below (see scanflow.js's
+  // own header for the exact join/queue/latest-wins contract).
+  const scanStatsChannel = vscode.window.createOutputChannel('Apex Call Graph: Scan Stats');
+  context.subscriptions.push(scanStatsChannel);
+  const scanFlow = scanflow.createScanFlow();
+  const excludeTracker = scanflow.createExcludeTracker();
+  let pickerRequestNonce = 0;
+
+  // Freeze the editor/position that initiated an interactive command before
+  // it enters scanFlow's queue. Target resolution can happen seconds later,
+  // after the user has moved to another editor; using the live selection at
+  // that point would make both the key and the eventual target dishonest.
+  function captureInteractiveTargetContext(kind) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      return {
+        position: null,
+        key: scanflow.interactiveRequestKey(kind, null, ++pickerRequestNonce),
+      };
+    }
+    const active = editor.selection.active;
+    const position = new vscode.Position(active.line, active.character);
+    const range = editor.document.getWordRangeAtPosition(position);
+    const identity = {
+      uri: editor.document.uri.toString(),
+      version: editor.document.version,
+      line: position.line,
+      character: position.character,
+    };
+    return {
+      position,
+      fileName: editor.document.fileName,
+      word: range ? editor.document.getText(range) : null,
+      cursorLineText: editor.document.lineAt(position.line).text,
+      documentText: editor.document.getText(),
+      key: scanflow.interactiveRequestKey(kind, identity),
+    };
+  }
+
+  // H8: the most recent completed scan's counts-only stats -- what
+  // apexTrace.copyDiagnostics reports if invoked without a fresh trace
+  // (e.g. right after activation, or after a run that ended up cancelled --
+  // scanAndBuildIndex only ever overwrites this on an ACTUAL completed
+  // scan, never on a cancelled one, so a cancel leaves the last good run's
+  // numbers in place rather than blanking them).
+  let lastRunStats = null;
+
+  // H8: one line per completed scan -- files/parsed/reused/workers, ms per
+  // phase, unresolved-by-reason, magnet-suppressed count. Deliberately
+  // counts-only (mirrors buildDiagnosticsPayload's own hard privacy rule)
+  // even though an OutputChannel is lower-stakes than the clipboard --
+  // consistent behavior is simpler to reason about than "the channel can
+  // say more than the clipboard can".
+  function logRunStats(stats) {
+    const f = stats.files;
+    const w = stats.workers;
+    const t = stats.timingMs;
+    const reasonParts = Object.keys(stats.unresolvedByReason || {})
+      .map((k) => `${k}=${stats.unresolvedByReason[k]}`)
+      .join(', ');
+    scanStatsChannel.appendLine(
+      `[${new Date().toISOString()}] sweep=${stats.sweepKind} ` +
+        `files(apex ${f.apexParsed}/${f.apexCached}/${f.apexTotal} parsed/cached/total, unreadable ${f.apexUnreadable}; ` +
+        `meta ${f.metaRead}/${f.metaCached}/${f.metaTotal}) ` +
+        `workers(used=${w.usedPool}, size=${w.poolSize}, chunks=${w.chunksTotal}, viaWorker=${w.chunksViaWorker}, inlineFallback=${w.chunksInlineFallback}, cancelled=${w.chunksCancelled || 0}, errors=${w.workerErrors}) ` +
+        `ms(glob=${t.glob}, stat=${t.stat}, parse=${t.parse}, metascan=${t.metascan}, index=${t.index}, tree=${t.tree}) ` +
+        `unresolvedByReason(${reasonParts || 'none'}) ` +
+        `magnetSuppressed=${stats.magnetSuppressedAttachments} showUnconfirmed=${stats.showUnconfirmed}`
+    );
+  }
+
+  // =========================================================================
+  // Round 2.5 / H6: FileSystemWatcher-fed dirty-set tracking.
+  // =========================================================================
+  // One watcher per glob (vscode.workspace.createFileSystemWatcher takes a
+  // single GlobPattern), covering the same Apex + metadata globs
+  // scanWorkspaceUris/scanMetaWorkspaceUris already scan, PLUS
+  // sfdx-project.json (H6's own "sfdx-project.json changes also dirty the
+  // package map" text) -- see the note below on why that last one needs no
+  // further wiring beyond being watched at all. Every handler is wrapped
+  // defensively: vscode's FileSystemWatcher API has no explicit
+  // "overflow"/error event of its own to subscribe to, so the practical
+  // reading of "watcher failure or overflow -> fall back to full sweep" is
+  // (a) any exception setting up a watcher itself, and (b) any exception
+  // inside a handler -- both latch dirtyTracker.markFullSweepNeeded(),
+  // which makes the NEXT trace do a full, trust-nothing sweep rather than
+  // silently trusting a dirty set this extension can no longer vouch for.
+  try {
+    const watchedGlobs = [
+      '**/*.{cls,trigger,apex}',
+      ...META_GLOBS,
+      '**/sfdx-project.json',
+    ];
+    for (const glob of watchedGlobs) {
+      const watcher = vscode.workspace.createFileSystemWatcher(glob);
+      context.subscriptions.push(watcher);
+      const safely = (fn) => {
+        try {
+          fn();
+        } catch (e) {
+          dirtyTracker.markFullSweepNeeded();
+        }
+      };
+      watcher.onDidChange((uri) => safely(() => dirtyTracker.markChanged(uri.fsPath)));
+      watcher.onDidCreate((uri) => safely(() => dirtyTracker.markCreated(uri.fsPath)));
+      watcher.onDidDelete((uri) => safely(() => dirtyTracker.markDeleted(uri.fsPath)));
+    }
+  } catch (e) {
+    // Watcher setup itself failed (e.g. an exotic/virtual filesystem that
+    // doesn't support file watching at all) -- never trust a dirty set this
+    // extension has no way of keeping accurate; every future trace falls
+    // back to a full sweep instead.
+    dirtyTracker.markWatcherUnavailable();
+  }
+
+  // A workspace-folder add/remove changes the universe searched by
+  // findFiles without guaranteeing any per-file watcher event. Invalidate
+  // the cached Apex/metadata path inventories so the next trace performs a
+  // trust-nothing full sweep. The dirty tracker's generation guard also
+  // preserves an event that arrives while another full sweep is in flight.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(
+      scanflow.createWorkspaceFolderChangeHandler(() => dirtyTracker.markFullSweepNeeded())
+    )
+  );
+
   // H6a: tracks the last RESOLVED TARGET (not the last TreeResult) -- see
   // retraceLastTarget/scanAndBuildIndex below. Keeping only the target and
   // re-deriving the tree from a fresh scan+index every time showPathMap
@@ -1345,7 +1948,22 @@ async function activate(context) {
   // the shared first half of both computeTrace (interactive target
   // resolution) and retraceLastTarget (H6a: re-run for a KNOWN target, no
   // QuickPick). Returns null (having already shown the appropriate warning)
-  // when there is nothing to scan.
+  // when there is nothing to scan, or `{ cancelled: true }` (H4) when the
+  // user cancelled the progress notification mid-scan -- callers must check
+  // for BOTH falsy-null and `.cancelled` before treating the result as a
+  // real `{ index, scan, settings, stats }`.
+  //
+  // Round 2.5 / H4 + H6 + H8: the ENTIRE scan (Apex parse + metadata scan)
+  // now runs under ONE cancellable withProgress call sharing ONE
+  // CancellationToken, instead of two separate non-cancellable ones -- this
+  // is also what makes H5's "cancel cancels the shared scan for all
+  // joiners" true for free: every joiner of this same scanFlow key shares
+  // this exact promise/progress/token triple. `dirtySnapshot` (H6) is taken
+  // ONCE up front (non-destructively -- see dirtyTracker.peek()'s own
+  // header) and fed to both scanAndParse/scanMetaFiles; on a successful
+  // (non-cancelled) run, dirtyTracker.consume() clears exactly the paths
+  // this run accounted for (never a path that arrived mid-scan -- see
+  // consume()'s own header for why that's deliberate).
   async function scanAndBuildIndex() {
     // v0.9 / P2: read the 5 apexCallGraph.* settings ONCE at the top of
     // this scan+index call -- excludeGlobs feeds both scans below;
@@ -1354,49 +1972,139 @@ async function activate(context) {
     // scan itself used (a rare mid-scan settings edit can't produce a
     // mismatched exclude-vs-depth result within one trace operation).
     const settings = readSettings();
-    const scan = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: 'Apex Call Graph: indexing workspace…' },
-      (progress) => scanAndParse(progress, settings.excludeGlobs)
+    // The last path inventory was built under a different exclusion policy.
+    // A clean watcher set cannot describe which previously-included paths
+    // must now disappear (or which previously-excluded paths must appear),
+    // so the next successful scan must rebuild the inventory from findFiles.
+    if (excludeTracker.requiresFullSweep(settings.excludeGlobs)) {
+      dirtyTracker.markFullSweepNeeded();
+    }
+    const dirtySnapshot = dirtyTracker.peek();
+    const phaseMs = { glob: 0, stat: 0, parse: 0, metascan: 0, index: 0, tree: 0 };
+    let workerStats = null;
+    let sweepKind = 'full';
+
+    const result = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'Apex Call Graph: indexing workspace…', cancellable: true },
+      async (progress, token) => {
+        const scan = await scanAndParse(progress, settings.excludeGlobs, { token, dirtySnapshot });
+        phaseMs.glob += scan.timingMs ? scan.timingMs.glob : 0;
+        phaseMs.stat += scan.timingMs ? scan.timingMs.stat : 0;
+        phaseMs.parse += scan.timingMs ? scan.timingMs.parse : 0;
+        workerStats = scan.workerStats || workerStats;
+        sweepKind = scan.sweepKind || sweepKind;
+        if (scan.cancelled || token.isCancellationRequested) {
+          return { cancelled: true, scan };
+        }
+        if (!scan.factsList.length) {
+          return { empty: true, scan };
+        }
+
+        // A7: LWC/Aura/Flow/OmniScript/VF metadata callers. Best-effort and
+        // additive -- a workspace with zero metadata files (or one where the
+        // scan throws for some unexpected reason) still traces Apex-to-Apex
+        // callers exactly as before; metascan.js's own extractors already never
+        // throw per-file (see its header contract), so the only realistic
+        // failure mode here is the vscode.workspace.fs I/O layer itself, which
+        // this still guards defensively since it runs on every trace.
+        let metaRefs = [];
+        // v0.12.0 / C1 seam: every '.flow-meta.xml' path this same metadata scan
+        // saw, REGARDLESS of whether metascan.parseMetaFile() emitted any MetaRef
+        // for it (a Screen/Autolaunched Flow with zero apex <actionCalls> emits
+        // nothing at all today -- see resolver.js's buildEntryCatalog / its
+        // collectFlowEntries header note) -- this is the index.flowFilePaths
+        // "future extension.js round" that comment anticipates, landing this
+        // round so the Entry Point Catalog's flow group actually lists every
+        // distinct flow file (not just the ones with an apex action), matching
+        // both corpora's GROUND-TRUTH/MANIFEST 'Entry catalog' sections (e.g.
+        // adv-org's AcmeBackorderResolutionFlow/AcmeNotifyCustomerSubflow/
+        // AcmeQuoteApprovalScreenFlow, none of which have an apex action).
+        // Best-effort same as metaRefs above: stays [] (today's byte-identical
+        // absence) on any scan failure, never blocks the trace.
+        let flowFilePaths = [];
+        let metaScan = { files: [], read: 0, cached: 0, unreadable: 0, total: 0, cancelled: false, sweepKind: 'full' };
+        try {
+          const tMeta0 = Date.now();
+          metaScan = await scanMetaFiles(progress, settings.excludeGlobs, { token, dirtySnapshot });
+          metaRefs = computeMetaRefs(metaScan.files);
+          flowFilePaths = metaScan.files
+            .filter((f) => f && typeof f.path === 'string' && /\.flow-meta\.xml$/i.test(f.path))
+            .map((f) => f.path);
+          phaseMs.metascan += Date.now() - tMeta0;
+        } catch (e) {
+          // metadata indexing is additive -- never block the Apex-only trace on it.
+        }
+
+        if (metaScan.cancelled || token.isCancellationRequested) {
+          return { cancelled: true, scan };
+        }
+
+        progress.report({ message: 'building semantic index…' });
+
+        // Keep package discovery + semantic indexing inside this SAME
+        // cancellable progress scope. The interrupted implementation built
+        // the index after withProgress had already returned, so its new
+        // resolver shouldCancel guards were unreachable from the UI token.
+        let packageOf = () => null;
+        try {
+          packageOf = await discoverPackageMap();
+        } catch (e) {
+          packageOf = () => null;
+        }
+        if (token.isCancellationRequested) return { cancelled: true, scan };
+
+        const defaultPackage = typeof packageOf.defaultPackage !== 'undefined' && packageOf.defaultPackage != null
+          ? packageOf.defaultPackage
+          : null;
+        const ownNamespace = typeof packageOf.ownNamespace !== 'undefined' && packageOf.ownNamespace != null
+          ? packageOf.ownNamespace
+          : null;
+        const strippedMetaRefs =
+          ownNamespace && typeof metascan.stripOwnNamespace === 'function'
+            ? metascan.stripOwnNamespace(metaRefs, ownNamespace)
+            : metaRefs;
+        const tIndex0 = Date.now();
+        const index = resolver.buildSemanticIndex(scan.factsList, {
+          packageOf,
+          defaultPackage,
+          ownNamespace,
+          shouldCancel: () => token.isCancellationRequested,
+        });
+        if (index.cancelled || token.isCancellationRequested) {
+          phaseMs.index = Date.now() - tIndex0;
+          return { cancelled: true, scan };
+        }
+        resolver.attachMetaCallers(index, strippedMetaRefs);
+        index.flowFilePaths = flowFilePaths;
+        phaseMs.index = Date.now() - tIndex0;
+
+        return { scan, metaScan, index };
+      }
     );
-    if (!scan.factsList.length) {
+
+    if (result.cancelled) {
+      // H4: "already-parsed facts stay cached, no partial index/tree is
+      // rendered" -- return before ANY resolver.js call; the caller
+      // (computeTrace/retraceLastTarget/etc.) shows the "cancelled" status
+      // message and never renders anything for this run.
+      return { cancelled: true };
+    }
+    if (result.empty) {
       vscode.window.showWarningMessage('Apex Call Graph: no .cls/.trigger/.apex files in this workspace.');
       return null;
     }
 
-    // A7: LWC/Aura/Flow/OmniScript/VF metadata callers. Best-effort and
-    // additive -- a workspace with zero metadata files (or one where the
-    // scan throws for some unexpected reason) still traces Apex-to-Apex
-    // callers exactly as before; metascan.js's own extractors already never
-    // throw per-file (see its header contract), so the only realistic
-    // failure mode here is the vscode.workspace.fs I/O layer itself, which
-    // this still guards defensively since it runs on every trace.
-    let metaRefs = [];
-    // v0.12.0 / C1 seam: every '.flow-meta.xml' path this same metadata scan
-    // saw, REGARDLESS of whether metascan.parseMetaFile() emitted any MetaRef
-    // for it (a Screen/Autolaunched Flow with zero apex <actionCalls> emits
-    // nothing at all today -- see resolver.js's buildEntryCatalog / its
-    // collectFlowEntries header note) -- this is the index.flowFilePaths
-    // "future extension.js round" that comment anticipates, landing this
-    // round so the Entry Point Catalog's flow group actually lists every
-    // distinct flow file (not just the ones with an apex action), matching
-    // both corpora's GROUND-TRUTH/MANIFEST 'Entry catalog' sections (e.g.
-    // adv-org's AcmeBackorderResolutionFlow/AcmeNotifyCustomerSubflow/
-    // AcmeQuoteApprovalScreenFlow, none of which have an apex action).
-    // Best-effort same as metaRefs above: stays [] (today's byte-identical
-    // absence) on any scan failure, never blocks the trace.
-    let flowFilePaths = [];
-    try {
-      const metaScan = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'Apex Call Graph: indexing metadata (LWC/Aura/Flow/OmniScript)…' },
-        (progress) => scanMetaFiles(progress, settings.excludeGlobs)
-      );
-      metaRefs = computeMetaRefs(metaScan.files);
-      flowFilePaths = metaScan.files
-        .filter((f) => f && typeof f.path === 'string' && /\.flow-meta\.xml$/i.test(f.path))
-        .map((f) => f.path);
-    } catch (e) {
-      // metadata indexing is additive -- never block the Apex-only trace on it.
-    }
+    const { scan, metaScan, index } = result;
+
+    // H6: only a run that got all the way through without being cancelled
+    // gets to consume the dirty snapshot it was handed -- a cancelled run
+    // may have only partially accounted for those paths (see scanAndParse's
+    // own "skipped entirely on a cancelled run" pruning note), so its
+    // dirty/deleted paths must stay pending for the next attempt instead of
+    // being wrongly marked "handled".
+    dirtyTracker.consume(dirtySnapshot);
+    if (sweepKind === 'full') dirtyTracker.markSweepDone(dirtySnapshot);
+    excludeTracker.commit(settings.excludeGlobs);
 
     // F6: persist the just-updated fileCache/metaFileCache to disk
     // (debounced) regardless of what happens below -- the parse/read work
@@ -1404,76 +2112,46 @@ async function activate(context) {
     // target QuickPick that follows.
     schedulePersistCaches(context);
 
-    // B1: re-discover sfdx-project.json package directories fresh on every
-    // scan (see discoverPackageMap()'s header comment for why this is never
-    // cached) and hand resolver.js a packageOf(fsPath) lookup it can use
-    // for B2's same-package / default-package / ambiguous resolution order.
-    // Best-effort: package discovery is purely additive, so any failure
-    // here just falls back to a packageOf that returns null for everything
-    // (identical to a workspace with no sfdx-project.json at all) rather
-    // than blocking the trace.
-    let packageOf = () => null;
-    try {
-      packageOf = await discoverPackageMap();
-    } catch (e) {
-      packageOf = () => null;
-    }
+    // Package discovery, namespace stripping, and semantic indexing were
+    // completed inside the cancellable withProgress scope above.
 
-    // MUST-FIX #6: wire B2's default-package fallback through -- previously
-    // only `packageOf` was ever passed, so resolveDuplicateBucket()'s rule 2
-    // (resolver.js) was permanently dead code and every default-package
-    // resolution fell through to rule 3 ('ambiguous', approximate=true)
-    // even when exactly one candidate should win unambiguously via='static'.
-    const defaultPackage = typeof packageOf.defaultPackage !== 'undefined' && packageOf.defaultPackage != null
-      ? packageOf.defaultPackage
-      : null;
-    // v0.8 (N3): same attach-and-extract convention as defaultPackage right
-    // above -- discoverPackageMap() already folded the org's own namespace
-    // (sfdx-project.json's `namespace` property) into this SAME packageOf()
-    // call, so no second discovery pass is needed here. null (not the
-    // typeof-undefined case a bare property access on a plain `() => null`
-    // fallback function would produce) for every workspace with no
-    // sfdx-project.json, no `namespace` property, or a discovery failure --
-    // resolver.js's opts contract treats a null/absent opts.ownNamespace as
-    // "nothing to strip", byte-identical to today (see N3's CONTRACT
-    // AMENDMENT text: "Absent/empty namespace property -> no stripping").
-    const ownNamespace = typeof packageOf.ownNamespace !== 'undefined' && packageOf.ownNamespace != null
-      ? packageOf.ownNamespace
-      : null;
-    // v0.8 (N3): metascan.js's own namespace-aware kinds (flow/cmdt/
-    // omniscript, alongside the pre-existing lwc/M1 case) tag a namespaced
-    // MetaRef with `.namespace` but never know the WORKSPACE's own
-    // namespace themselves (metascan.js stays index-free by design) -- per
-    // metascan.js's own `stripOwnNamespace(refs, ownNamespace)` header
-    // contract, THIS file is the one expected to call it, exactly once,
-    // AFTER scanning and BEFORE handing refs to attachMetaCallers(), so a
-    // ref naming this workspace's OWN namespace (e.g. an LWC import of
-    // `vtx.VertexPricingService` in a workspace whose own namespace IS
-    // `vtx`) reads `.namespace: null` by the time attachMetaCallers() sees
-    // it and resolves through the ordinary local-class path instead of
-    // being counted as an unattachable namespaced/managed-package ref --
-    // exactly N3's "references prefixed with the OWN namespace resolve to
-    // LOCAL classes/objects" for the metadata-ref surface. Guarded behind a
-    // typeof check (not a bare call) since metascan.js is owned by a
-    // different phase this round: if that function is absent/renamed,
-    // metaRefs simply passes through unchanged (today's byte-identical
-    // behavior) rather than throwing. A null/absent ownNamespace (the
-    // overwhelmingly common case) already makes stripOwnNamespace() itself
-    // a documented no-op, so this call is inert for every workspace that
-    // doesn't declare its own namespace.
-    const strippedMetaRefs =
-      ownNamespace && typeof metascan.stripOwnNamespace === 'function'
-        ? metascan.stripOwnNamespace(metaRefs, ownNamespace)
-        : metaRefs;
-    const index = resolver.buildSemanticIndex(scan.factsList, { packageOf, defaultPackage, ownNamespace });
-    resolver.attachMetaCallers(index, strippedMetaRefs);
-    // v0.12.0 / C1 seam: see flowFilePaths' own declaration above -- purely
-    // additive extra field on the index, read only by
-    // resolver.buildEntryCatalog's collectFlowEntries; every pre-existing
-    // resolver.js code path (buildCallerTree/buildCalleeTree/suggestTargets)
-    // never reads this property, so existing trace output is unaffected.
-    index.flowFilePaths = flowFilePaths;
-    return { index, scan, settings };
+    // Round 2.5 / H8: counts-only run stats, gathered fresh every scan --
+    // fed to the 'Apex Call Graph: Scan Stats' output channel AND stashed as
+    // `lastRunStats` (see its own declaration above) so apexTrace.
+    // copyDiagnostics has something to report even before a NEW trace runs
+    // again. `index.stats` is read defensively (typeof/duck-typed, same
+    // idiom this file already uses for metascan.stripOwnNamespace/
+    // pathmap.buildPathMapData) since resolver.js's own H1/H2/H3 stats
+    // fields (unresolvedByReason, viaHistogram, magnetSuppressedAttachments)
+    // are a different phase's work this round -- absent today, picked up
+    // automatically the moment that lands, no extension.js change needed.
+    const engineStats = index && typeof index.stats === 'object' && index.stats ? index.stats : {};
+    const stats = {
+      engineCacheVersion: ENGINE_CACHE_VERSION,
+      extensionVersion: EXTENSION_VERSION,
+      files: {
+        apexTotal: scan.total,
+        apexParsed: scan.parsed,
+        apexCached: scan.cached,
+        apexUnreadable: scan.unreadable,
+        metaTotal: (metaScan && metaScan.total) || 0,
+        metaRead: (metaScan && metaScan.read) || 0,
+        metaCached: (metaScan && metaScan.cached) || 0,
+        metaUnreadable: (metaScan && metaScan.unreadable) || 0,
+      },
+      sweepKind,
+      workers: workerStats || { usedPool: false, poolSize: 0, chunksTotal: 0, chunksViaWorker: 0, chunksInlineFallback: 0, chunksCancelled: 0, workerErrors: 0 },
+      timingMs: phaseMs,
+      unresolvedByReason: engineStats.unresolvedByReason || {},
+      viaHistogram: engineStats.viaHistogram || {},
+      magnetSuppressedAttachments: engineStats.magnetSuppressedAttachments || 0,
+      showUnconfirmed: settings.showUnconfirmed,
+      cancelled: false,
+    };
+    lastRunStats = stats;
+    logRunStats(stats);
+
+    return { index, scan, settings, stats };
   }
 
   // Builds the tree for a KNOWN target against an already-built index, and
@@ -1527,10 +2205,21 @@ async function activate(context) {
   // -- "state resets on re-trace/direction" per the CONTRACT AMENDMENT;
   // apexTrace.toggleDirection reaches this via retraceLastTarget, so it
   // gets the same fresh-state treatment for free.
-  function traceTarget(index, scan, target, direction, settings) {
+  // Round 2.5 / H8: `stats` (optional -- the SAME object scanAndBuildIndex
+  // attached to `built.stats`) gets its `timingMs.tree` filled in here and
+  // is re-logged to the Scan Stats channel/lastRunStats, since tree-building
+  // is the one phase that happens AFTER scanAndBuildIndex already returned
+  // (target resolution -- an interactive QuickPick -- sits in between).
+  function traceTarget(index, scan, target, direction, settings, stats) {
     const dir = direction === 'callees' ? 'callees' : 'callers';
     const traceId = newTraceState();
+    const tTree0 = Date.now();
     const tree = buildTreeForTarget(index, target, dir, settings, currentExpandedKeys());
+    if (stats) {
+      stats.timingMs.tree += Date.now() - tTree0;
+      lastRunStats = stats;
+      logRunStats(stats);
+    }
     if (!tree || !tree.root) {
       vscode.window.showWarningMessage('Apex Call Graph: could not resolve that target.');
       return null;
@@ -1539,6 +2228,7 @@ async function activate(context) {
     renderTraceResult(tree, scan, dir, traceId);
     vscode.commands.executeCommand('setContext', 'apexTrace.hasResults', true);
     vscode.commands.executeCommand('setContext', 'apexTrace.direction', dir);
+    vscode.commands.executeCommand('setContext', 'apexTrace.mode', 'trace');
 
     if (tree.note) {
       vscode.window.showInformationMessage(`Apex Call Graph: ${tree.note}`);
@@ -1571,12 +2261,16 @@ async function activate(context) {
   // v0.7 / A3: `direction` defaults to 'callers' (unchanged pre-v0.7
   // behavior) when omitted -- the traceCallers/showPathMap call sites below
   // rely on that default.
-  async function computeTrace(direction) {
+  async function computeTrace(direction, targetContext) {
     const built = await scanAndBuildIndex();
     if (!built) return null;
-    const target = await resolveTarget(built.index, direction);
+    if (built.cancelled) {
+      showScanCancelledMessage();
+      return null;
+    }
+    const target = await resolveTarget(built.index, direction, targetContext);
     if (!target) return null;
-    return traceTarget(built.index, built.scan, target, direction, built.settings);
+    return traceTarget(built.index, built.scan, target, direction, built.settings, built.stats);
   }
 
   // H6a: re-runs scanAndParse + rebuilds the index/tree for the last
@@ -1592,7 +2286,19 @@ async function activate(context) {
     if (!lastTarget) return null;
     const built = await scanAndBuildIndex();
     if (!built) return null;
-    return traceTarget(built.index, built.scan, lastTarget, direction || lastDirection, built.settings);
+    if (built.cancelled) {
+      showScanCancelledMessage();
+      return null;
+    }
+    return traceTarget(built.index, built.scan, lastTarget, direction || lastDirection, built.settings, built.stats);
+  }
+
+  // Round 2.5 / H4: one shared toast for every command that discovers its
+  // scan was cancelled -- "already-parsed facts stay cached, no partial
+  // index/tree is rendered" (nothing here mutates provider/view state; the
+  // tree view is simply left exactly as it was before the cancelled run).
+  function showScanCancelledMessage() {
+    vscode.window.setStatusBarMessage('Apex Call Graph: scan cancelled.', 5000);
   }
 
   // v0.9 / P2: the tree view's half of the progressive-depth contract --
@@ -1683,7 +2389,13 @@ async function activate(context) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('apexTrace.traceCallers', async () => {
-      const tree = await computeTrace('callers');
+      // Round 2.5 / H5: single-flighted -- see scanFlow's own header for the
+      // join/queue/latest-wins contract. Freeze the initiating editor and
+      // cursor so different targets never coalesce under a direction-only
+      // key while indexing is still in flight.
+      const targetContext = captureInteractiveTargetContext('callers');
+      const tree = await scanFlow.request(targetContext.key, () => computeTrace('callers', targetContext));
+      if (tree && tree.superseded) return;
       if (tree) await vscode.commands.executeCommand('apexTraceView.focus');
     }),
     // v0.7 / A3: "What Does This Call?" -- forward tracing. Shares target
@@ -1726,14 +2438,69 @@ async function activate(context) {
         // refresh) -- the only difference from computeTrace('callees') is
         // that the target is already known, so resolveTarget()'s
         // cursor/QuickPick step is skipped entirely.
-        const built = await scanAndBuildIndex();
-        if (!built) return;
-        const tree = traceTarget(built.index, built.scan, item._entryTarget, 'callees', built.settings);
-        if (tree) await vscode.commands.executeCommand('apexTraceView.focus');
+        //
+        // Round 2.5 / H5: single-flighted under a KNOWN-target key -- a
+        // second click on the SAME entry-catalog row while its scan is
+        // still in flight coalesces (no second scan); a click on a
+        // DIFFERENT entry queues (latest wins), same as every other
+        // trace-triggering command below.
+        const key = `known:${item._entryTarget.classLower}#${item._entryTarget.methodLower}:callees`;
+        const result = await scanFlow.request(key, async () => {
+          const built = await scanAndBuildIndex();
+          if (!built) return null;
+          if (built.cancelled) {
+            showScanCancelledMessage();
+            return null;
+          }
+          return traceTarget(built.index, built.scan, item._entryTarget, 'callees', built.settings, built.stats);
+        });
+        if (result && result.superseded) return; // a newer request replaced this one -- nothing to render
+        if (result) await vscode.commands.executeCommand('apexTraceView.focus');
         return;
       }
-      const tree = await computeTrace('callees');
+      const targetContext = captureInteractiveTargetContext('callees');
+      const tree = await scanFlow.request(targetContext.key, () => computeTrace('callees', targetContext));
+      if (tree && tree.superseded) return;
       if (tree) await vscode.commands.executeCommand('apexTraceView.focus');
+    }),
+    // v0.14.0: signature-change Impact Analysis.  It shares the exact same
+    // cancellable scan/index snapshot as traces and the entry catalog, but
+    // renders a dedicated sectioned tree; there is deliberately no Path Map
+    // because this report is a set of risk surfaces rather than a call path.
+    vscode.commands.registerCommand('apexTrace.impactAnalysis', async () => {
+      const targetContext = captureInteractiveTargetContext('impact');
+      const result = await scanFlow.request(targetContext.key, async () => {
+        const built = await scanAndBuildIndex();
+        if (!built) return null;
+        if (built.cancelled) {
+          showScanCancelledMessage();
+          return null;
+        }
+        const target = await resolveTarget(built.index, 'impact', targetContext);
+        if (!target) return null;
+        if (!target.methodLower) {
+          vscode.window.showWarningMessage('Apex Call Graph: Impact Analysis requires a method, not a whole class.');
+          return null;
+        }
+
+        const tImpact0 = Date.now();
+        const report = await resolveImpactReport(built.index, target, targetContext);
+        built.stats.timingMs.tree += Date.now() - tImpact0;
+        lastRunStats = built.stats;
+        logRunStats(built.stats);
+        if (!report || report.needsOverloadChoice) return null;
+
+        const traceId = newTraceState();
+        provider.setRoots(shapeImpactReport(report), traceId);
+        view.description = `impact of ${report.target.label} (parsed ${built.scan.parsed}, cached ${built.scan.cached})`;
+        view.message = shapeImpactHeaderLine(report) || undefined;
+        vscode.commands.executeCommand('setContext', 'apexTrace.hasResults', true);
+        vscode.commands.executeCommand('setContext', 'apexTrace.mode', 'impact');
+        lastRender = null;
+        return report;
+      });
+      if (result && result.superseded) return;
+      if (result) await vscode.commands.executeCommand('apexTraceView.focus');
     }),
     // v0.12.0 / C2: builds the Entry-Point Catalog -- palette command
     // (category 'Apex Call Graph') AND the entry-catalog view's own
@@ -1742,32 +2509,44 @@ async function activate(context) {
     // apexTraceView above) AND the viewsWelcome command link shown before
     // the view has ever been populated this session.
     vscode.commands.registerCommand('apexTrace.showEntryCatalog', async () => {
-      const built = await scanAndBuildIndex();
-      if (!built) return;
-      // C1 (resolver.js's buildEntryCatalog) may still be in flight this
-      // round -- same forward-compat `typeof` guard idiom this file already
-      // uses for metascan.stripOwnNamespace (v0.8 N3) and
-      // pathmap.buildPathMapData (v0.9 P2) above, so a resolver.js build
-      // that hasn't landed C1 yet degrades to a clear warning instead of
-      // throwing a TypeError.
-      if (typeof resolver.buildEntryCatalog !== 'function') {
-        vscode.window.showWarningMessage(
-          'Apex Call Graph: the entry-point catalog is not available in this build of resolver.js yet.'
-        );
-        return;
-      }
-      let catalog;
-      try {
-        catalog = resolver.buildEntryCatalog(built.index);
-      } catch (e) {
-        vscode.window.showErrorMessage('Apex Call Graph: failed to build the entry-point catalog.');
-        return;
-      }
-      entryCatalogProvider.setRoots(shapeEntryCatalog(catalog));
-      const headerLine = shapeEntryCatalogHeaderLine(catalog);
-      entryCatalogView.message = headerLine || undefined;
-      entryCatalogView.description = `parsed ${built.scan.parsed}, cached ${built.scan.cached}`;
-      await vscode.commands.executeCommand('apexTraceEntriesView.focus');
+      // Round 2.5 / H5: single-flighted under a fixed 'catalog' key -- a
+      // repeat click while a catalog build is already in flight coalesces;
+      // any OTHER trace request queues behind it (latest wins), same as
+      // every other command here.
+      const result = await scanFlow.request('catalog', async () => {
+        const built = await scanAndBuildIndex();
+        if (!built) return null;
+        if (built.cancelled) {
+          showScanCancelledMessage();
+          return null;
+        }
+        // C1 (resolver.js's buildEntryCatalog) may still be in flight this
+        // round -- same forward-compat `typeof` guard idiom this file already
+        // uses for metascan.stripOwnNamespace (v0.8 N3) and
+        // pathmap.buildPathMapData (v0.9 P2) above, so a resolver.js build
+        // that hasn't landed C1 yet degrades to a clear warning instead of
+        // throwing a TypeError.
+        if (typeof resolver.buildEntryCatalog !== 'function') {
+          vscode.window.showWarningMessage(
+            'Apex Call Graph: the entry-point catalog is not available in this build of resolver.js yet.'
+          );
+          return null;
+        }
+        let catalog;
+        try {
+          catalog = resolver.buildEntryCatalog(built.index);
+        } catch (e) {
+          vscode.window.showErrorMessage('Apex Call Graph: failed to build the entry-point catalog.');
+          return null;
+        }
+        entryCatalogProvider.setRoots(shapeEntryCatalog(catalog));
+        const headerLine = shapeEntryCatalogHeaderLine(catalog);
+        entryCatalogView.message = headerLine || undefined;
+        entryCatalogView.description = `parsed ${built.scan.parsed}, cached ${built.scan.cached}`;
+        return true;
+      });
+      if (result && result.superseded) return;
+      if (result) await vscode.commands.executeCommand('apexTraceEntriesView.focus');
     }),
     // v0.7 / A3: apexTraceView title-bar direction-toggle button -- re-runs
     // the LAST resolved target in the OPPOSITE direction, no QuickPick.
@@ -1781,7 +2560,10 @@ async function activate(context) {
         return;
       }
       const nextDirection = lastDirection === 'callees' ? 'callers' : 'callees';
-      const tree = await retraceLastTarget(nextDirection);
+      // Round 2.5 / H5: single-flighted under the KNOWN target+direction key.
+      const key = `known:${lastTarget.classLower}#${lastTarget.methodLower}:${nextDirection}`;
+      const tree = await scanFlow.request(key, () => retraceLastTarget(nextDirection));
+      if (tree && tree.superseded) return;
       if (tree) await vscode.commands.executeCommand('apexTraceView.focus');
     }),
     // v0.7.1: apexTraceView title-bar ORIENTATION toggle -- flips the
@@ -1841,8 +2623,42 @@ async function activate(context) {
     vscode.commands.registerCommand('apexTrace.showPathMap', async () => {
       // H6a: prefer re-tracing the last KNOWN target over reusing a
       // possibly-stale cached TreeResult -- see retraceLastTarget's comment.
-      const tree = lastTarget ? await retraceLastTarget() : await computeTrace('callers');
+      // Round 2.5 / H5: single-flighted -- known-target key when there's a
+      // lastTarget to re-trace, else the same editor+selection identity a
+      // traceCallers invocation uses. Requests from the same position still
+      // coalesce; requests from different positions queue independently.
+      const targetContext = lastTarget ? null : captureInteractiveTargetContext('callers');
+      const key = lastTarget
+        ? `known:${lastTarget.classLower}#${lastTarget.methodLower}:${lastDirection}`
+        : targetContext.key;
+      const tree = await scanFlow.request(key, () =>
+        lastTarget ? retraceLastTarget() : computeTrace('callers', targetContext)
+      );
+      if (tree && tree.superseded) return;
       if (tree) showPathMapPanel(tree);
+    }),
+    // Round 2.5 / H8: clipboard JSON containing ONLY numbers/enums -- see
+    // scanflow.js's buildDiagnosticsPayload/assertCountsOnly for the full
+    // contract. `assertCountsOnly` is run as a last-line-of-defense
+    // assertion right before the clipboard write, never trusting
+    // buildDiagnosticsPayload alone for a hard privacy rule -- if it somehow
+    // throws (it shouldn't, given buildDiagnosticsPayload's own coercion),
+    // NOTHING is copied and the user sees an error instead of a silent
+    // partial/wrong copy.
+    vscode.commands.registerCommand('apexTrace.copyDiagnostics', async () => {
+      const payload = scanflow.buildDiagnosticsPayload(lastRunStats || {});
+      try {
+        scanflow.assertCountsOnly(payload);
+      } catch (e) {
+        vscode.window.showErrorMessage('Apex Call Graph: diagnostics payload failed its counts-only check -- nothing was copied.');
+        return;
+      }
+      await vscode.env.clipboard.writeText(JSON.stringify(payload, null, 2));
+      vscode.window.showInformationMessage(
+        lastRunStats
+          ? 'Apex Call Graph: copied diagnostics (counts only) to the clipboard.'
+          : 'Apex Call Graph: copied diagnostics (counts only, no scan has run yet this session) to the clipboard.'
+      );
     })
   );
 }

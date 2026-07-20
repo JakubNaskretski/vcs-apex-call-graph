@@ -1,0 +1,13 @@
+<apex:page controller="VtxOrderHistoryController">
+  <apex:sectionHeader title="Order History" subtitle="Review synced order history"/>
+  <apex:form>
+    <apex:pageBlock title="History" id="historyBlock">
+      <apex:pageBlockButtons>
+        <apex:commandButton value="Export" action="{!exportHistory}"/>
+        <apex:commandLink value="Retry Failed Sync" action="{!retryFailedSync}"/>
+      </apex:pageBlockButtons>
+      <apex:outputText value="{!lastSyncedLabel}"/>
+    </apex:pageBlock>
+    <apex:actionPoller interval="30" action="{!refreshStatus}" reRender="historyBlock"/>
+  </apex:form>
+</apex:page>

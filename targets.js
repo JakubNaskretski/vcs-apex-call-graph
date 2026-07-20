@@ -181,6 +181,24 @@ function managedLabel(rawLabel) {
   return s + MANAGED_SUFFIX;
 }
 
+// v0.14 Impact Analysis: canonical overload text and declaration-line
+// disambiguation kept pure so cursor behavior can be unit-tested without a
+// VS Code host. MethodMeta.line and the incoming cursor line are 1-based.
+function methodSignature(method) {
+  if (!method || typeof method.name !== 'string') return null;
+  return `${method.name}(${(method.params || []).map((p) => p.type || 'Object').join(', ')})`;
+}
+
+function findDeclarationOverload(methods, methodLower, cursorLine) {
+  if (!Array.isArray(methods) || typeof methodLower !== 'string' || !Number.isFinite(cursorLine)) return null;
+  const wanted = methodLower.toLowerCase();
+  const method = methods.find((m) =>
+    m && typeof m.name === 'string' && m.name.toLowerCase() === wanted && Number(m.line) === cursorLine
+  );
+  if (!method) return null;
+  return { method, overloadSig: methodSignature(method) };
+}
+
 function refineTargets(list) {
   if (!Array.isArray(list)) return [];
 
@@ -267,4 +285,4 @@ function refineTargets(list) {
   return out;
 }
 
-module.exports = { refineTargets };
+module.exports = { refineTargets, methodSignature, findDeclarationOverload };

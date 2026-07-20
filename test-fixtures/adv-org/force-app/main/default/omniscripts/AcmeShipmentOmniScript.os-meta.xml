@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OmniScript xmlns="http://soap.sforce.com/2006/04/metadata">
+    <type>Acme</type>
+    <subType>Shipment</subType>
+    <language>English</language>
+    <versionNumber>1</versionNumber>
+    <isActive>true</isActive>
+    <isProcedure>false</isProcedure>
+    <elements>
+        <name>RefreshTrackingAction</name>
+        <elementType>RemoteAction</elementType>
+        <level>1</level>
+        <order>1</order>
+        <remoteClass>AcmeShipmentAuraService</remoteClass>
+        <remoteMethod>refreshTracking</remoteMethod>
+        <remoteTimeout>10000</remoteTimeout>
+        <useContinuation>false</useContinuation>
+        <inputParameters>shipmentId</inputParameters>
+    </elements>
+</OmniScript>

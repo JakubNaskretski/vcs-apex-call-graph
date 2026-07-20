@@ -143,6 +143,17 @@
 // structurally" posture as the F1b note above — no code change was needed
 // here for this either, only the legend text a human reads.
 //
+// v0.13 (Round 2.5, H2 -- rendering half) NOTE: TNode.kind gains 'rollup' --
+// UNLIKE every other kind above, resolver.js NEVER produces this one; it is
+// synthesized ENTIRELY by this file's own groupApproximateChildren
+// (see that function's header comment, ahead of layoutTree) as a pure
+// rendering-layer regroup of a node's approximate children into one
+// collapsed pill, per the apexCallGraph.showUnconfirmed setting. It carries
+// via:null/approximate:false itself (the pill container isn't a guess, its
+// members still are) and renders via a dedicated CSS rule (.node.kind-rollup)
+// and CLIENT_JS_TEXT click-to-expand-in-place behavior, both documented at
+// their own definitions.
+//
 // SECURITY — every scrap of text here (labels, lineText, argsRendered,
 // paths, via, entries, note, targetLabel) comes straight from the traced
 // workspace's own source code and must be treated as hostile input. The
@@ -237,6 +248,13 @@ function accentKind(node) {
   // LEGEND_HTML below), so no separate kind/accent branch is needed here.
   if (node.kind === 'unresolved') return 'unresolved';
   if (node.kind === 'external') return 'external';
+  // v0.13 (Round 2.5, H2 -- rendering half): a synthetic rollup pseudo-node
+  // (see groupApproximateChildren/ROLLUP_LABEL below) -- same "the kind
+  // alone decides the accent" tier as every check above, ahead of entry/
+  // test, since a rollup node never carries entries/isTest of its own but
+  // must still get its own distinct visual treatment (a dashed pill, not a
+  // rectangular accent-bar node -- see the .node.kind-rollup CSS rule).
+  if (node.kind === 'rollup') return 'rollup';
   if (META_ACCENT_KINDS.has(node.kind)) return 'metadata';
   if (node.entries && node.entries.length) return 'entry';
   if (node.isTest) return 'test';
@@ -283,6 +301,124 @@ function frontierMethodKey(node) {
   const method = typeof node.methodLower === 'string' && node.methodLower ? node.methodLower : null;
   if (!cls && !method) return null;
   return method ? `${cls}#${method}` : cls;
+}
+
+// =========================================================================
+// v0.13 (Round 2.5, H2 -- rendering half): APPROXIMATE ROLLUP, map side.
+// Mirrors uitree.js's identical section (same rationale for why this is a
+// pure rendering-layer regroup, not a resolver.js change) as an independent
+// implementation, same "standalone, dev-tool-friendly module" posture as
+// every other small helper this file re-implements rather than requiring
+// uitree.js for (see isRootNode/packageBadge/frontierMethodKey above).
+//
+// UNLIKE uitree.js's shapeNode (which regroups already-shaped UiNode
+// children), this operates on the RAW TNode tree, BEFORE layoutTree ever
+// sees it -- groupApproximateChildren returns a brand-new TNode tree (never
+// mutates its input) with a synthetic `kind:'rollup'` pseudo-node spliced in
+// wherever a node had approximate children to group. layoutTree/
+// shapeNodeForData/shapeEdgeForData then walk this ALREADY-TRANSFORMED tree
+// with ZERO further code changes -- they already walk `children` purely
+// structurally (see layoutTree's own header comment), so a rollup
+// pseudo-node lays out, and shapes into the JSON node/edge arrays, exactly
+// like any other node. Only accentKind (above) and the client-side pill
+// rendering (CLIENT_JS_TEXT, see the ROLLUP PILL section there) need to know
+// kind:'rollup' exists at all.
+//
+// Same three modes as uitree.js (SHOW_UNCONFIRMED_ROLLUP/_HIDE/_EXPAND
+// below), same 'expand' default-when-omitted/unrecognized for identical
+// regression-safety reasons -- see normalizeShowUnconfirmed's doc.
+const SHOW_UNCONFIRMED_ROLLUP = 'rollup';
+const SHOW_UNCONFIRMED_HIDE = 'hide';
+const SHOW_UNCONFIRMED_EXPAND = 'expand';
+const SHOW_UNCONFIRMED_VALUES = new Set([SHOW_UNCONFIRMED_ROLLUP, SHOW_UNCONFIRMED_HIDE, SHOW_UNCONFIRMED_EXPAND]);
+function normalizeShowUnconfirmed(value) {
+  return SHOW_UNCONFIRMED_VALUES.has(value) ? value : SHOW_UNCONFIRMED_EXPAND;
+}
+
+// Mirrors uitree.js's rollupNoun/rollupLabel exactly -- see that file's
+// comments for the singular/plural rationale.
+function rollupNoun(direction, count) {
+  const plural = direction === 'callees' ? 'callees' : 'callers';
+  return count === 1 ? plural.slice(0, -1) : plural;
+}
+function rollupLabel(count, direction) {
+  return `${count} possible ${rollupNoun(direction, count)} (unconfirmed)`;
+}
+
+// The one synthetic rollup TNode shape -- degrades safely through the
+// EXISTING shapeNodeForData (below) with no special-casing there beyond
+// accentKind's new branch: every field that function reads is present here
+// with a safe, inert value (null path/line/className, empty entries/sites,
+// approximate:false -- the pill CONTAINER isn't itself an approximate
+// GUESS, its MEMBERS still carry their own true approximate:true, preserved
+// unchanged by this transform).
+function makeRollupTNode(approxChildren, direction) {
+  return {
+    label: rollupLabel(approxChildren.length, direction),
+    kind: 'rollup',
+    className: '',
+    methodLower: null,
+    path: null,
+    line: null,
+    entries: [],
+    isTest: false,
+    via: null,
+    sites: [],
+    children: approxChildren,
+    cyclic: false,
+    truncated: false,
+    approximate: false,
+    caughtHere: false,
+    seenElsewhere: false,
+    expandable: false,
+    pendingCount: null,
+    methodKey: null,
+    package: null,
+  };
+}
+
+// Pure, recursive, non-mutating TNode -> TNode transform: partitions
+// `tnode.children` into confirmed/approximate (by each child's OWN
+// `approximate` flag, exactly the field resolver.js already stamps per the
+// contract), then per `mode`:
+//   'expand' -- every child kept in its original order, none dropped/
+//               regrouped -- the pre-Round-2.5 flat shape. Still recurses
+//               (producing a full deep clone with identical structure/order/
+//               field values throughout, since a single `mode` applies to
+//               the whole call) rather than short-circuiting to `tnode`
+//               itself, so this stays a genuine identity-shaped TRANSFORM
+//               (easy to reason about/test) rather than a special early
+//               return -- layoutTree only ever reads the result, never the
+//               original `tnode`, so the extra clone has no observable cost
+//               beyond this one pass over the tree.
+//   'hide'  -- drops approximate children (and their entire subtrees)
+//               entirely; confirmed children are kept, recursively
+//               transformed the same way.
+//   'rollup'-- confirmed children kept (recursively transformed, in their
+//               original relative order); if there is at least one
+//               approximate child, ONE makeRollupTNode is appended as the
+//               last child, its own `children` being the (recursively
+//               transformed) approximate children.
+function groupApproximateChildren(tnode, mode, direction) {
+  if (!tnode) return tnode;
+  const rawChildren = Array.isArray(tnode.children) ? tnode.children : [];
+  const recurse = (child) => groupApproximateChildren(child, mode, direction);
+  let newChildren;
+  if (mode === SHOW_UNCONFIRMED_EXPAND) {
+    newChildren = rawChildren.map(recurse);
+  } else {
+    const confirmed = [];
+    const approx = [];
+    for (const child of rawChildren) {
+      (child && child.approximate ? approx : confirmed).push(child);
+    }
+    newChildren = confirmed.map(recurse);
+    if (mode === SHOW_UNCONFIRMED_ROLLUP && approx.length) {
+      newChildren = newChildren.concat([makeRollupTNode(approx.map(recurse), direction)]);
+    }
+    // mode === SHOW_UNCONFIRMED_HIDE: approx children simply omitted.
+  }
+  return Object.assign({}, tnode, { children: newChildren });
 }
 
 // ---- layout: simple leaf-order dendrogram ---------------------------------
@@ -604,10 +740,48 @@ const CSS_TEXT = `
   .node.kind-external { border-left: 4px solid var(--pm-external); }
   .node.is-test { opacity: .62; }
   .node.is-approx { border-style: dashed; border-color: var(--pm-approx); }
+  /* v0.13 (Round 2.5, H2 -- rendering half): the rollup pseudo-node --
+     rendered as a dashed, fully-rounded PILL (no left accent bar, centered
+     text) instead of the ordinary rectangular node shape, so it visually
+     reads as "a grouped placeholder", not one more caller/callee. Reuses
+     --pm-approx (the same color the individual approximate members'
+     dashed borders/edges already use) rather than a brand-new accent
+     variable -- thematically this pill IS "the approximate stuff, grouped". */
+  .node.kind-rollup {
+    border-left: none; border-style: dashed; border-color: var(--pm-approx);
+    border-radius: 999px; text-align: center; display: flex; align-items: center; justify-content: center;
+  }
+  .node.kind-rollup .node-label { -webkit-line-clamp: 3; }
+  /* v0.13 (Round 2.5, H2): a node/edge beneath a COLLAPSED rollup pill --
+     see CLIENT_JS_TEXT's isHiddenByCollapsedRollup/renderGraph, which never
+     even creates these DOM elements while collapsed; this class exists only
+     as a defensive belt-and-suspenders rule (never actually relied on to
+     hide anything, since renderGraph skips creating them in the first
+     place) documenting the invariant for a future reader. */
+  .hidden-by-rollup { display: none; }
 
   .node-label {
     font-size: 12px; font-weight: 600; line-height: 1.25; overflow: hidden; text-overflow: ellipsis;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    /* v0.13 (Round 2.5, LONG-NAME layout hardening): a real-org render bug
+       report showed nodes with very long, SPACE-FREE identifiers (Apex
+       class/method names routinely run 60+ characters, e.g.
+       'SomeVeryLongClassName.someVeryLongMethodName' has no whitespace at
+       all to wrap on) rendering as bare, unboxed-looking text spilling past
+       the node -- text-overflow:ellipsis + -webkit-line-clamp above only
+       reliably clip at natural word-wrap points; a single unbreakable token
+       longer than the node's fixed width needs an explicit permission to
+       break MID-WORD to actually get clipped+ellipsized inside the box
+       rather than overflowing it. overflow-wrap:anywhere (modern, preferred)
+       plus word-break:break-word (broad-compatibility fallback for engines
+       that don't honor the former) both grant that permission; overflow:
+       hidden on this element (kept) and on the parent .node (kept, see
+       above) still do the actual clipping either way -- the FULL untruncated
+       label always still reaches the DOM/tooltip (see buildNodeEl/
+       showTooltip in CLIENT_JS_TEXT: labelEl.textContent and the tooltip
+       title both always use the complete n.label, never a shortened copy),
+       so hovering a visually-clipped node still shows its whole name. */
+    overflow-wrap: anywhere; word-break: break-word;
   }
   .node-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
   .badge {
@@ -750,11 +924,46 @@ const CLIENT_JS_TEXT = `
   edgesSvg.setAttribute('height', String(H));
 
   var nodeById = {};
+  // v0.13 (Round 2.5, H2 -- rendering half): child id -> parent id, rebuilt
+  // alongside nodeById every time DATA changes (initial render + every
+  // applyUpdate) -- used by isHiddenByCollapsedRollup below to walk a
+  // node's ancestor chain looking for a still-collapsed rollup pill.
+  var parentByChild = {};
   function indexNodes() {
     nodeById = {};
+    parentByChild = {};
     DATA.nodes.forEach(function (n) { nodeById[n.id] = n; });
+    DATA.edges.forEach(function (e) { parentByChild[e.from] = e.to; });
   }
   indexNodes();
+
+  // v0.13 (Round 2.5, H2 -- rendering half): ROLLUP PILL expand/collapse
+  // state -- a plain map of rollup-node-id -> true once the user has
+  // clicked it open. Declared OUTSIDE renderGraph/applyUpdate (module-level
+  // in this IIFE) so it PERSISTS across an applyUpdate call -- a rollup the
+  // user already opened must stay open across a server-driven refresh
+  // (e.g. a frontier '+N' click elsewhere growing the trace), never reset
+  // out from under them. Starts empty: every rollup begins COLLAPSED, per
+  // the H2 spec ("collapsibleState collapsed").
+  var expandedRollups = {};
+
+  // A node is hidden iff any ANCESTOR of it (never the node itself) is a
+  // still-collapsed rollup pill -- walks the parent chain via parentByChild
+  // built above. The rollup pill node ITSELF is always visible (it IS the
+  // clickable placeholder); only what's BENEATH an unopened one is hidden.
+  // Recurses past an OPENED rollup's own ancestors too, so nested rollups
+  // (an approximate node that itself has a mixed confirmed/approximate
+  // subtree, per groupApproximateChildren's recursion) hide/show correctly
+  // at every level independently.
+  function isHiddenByCollapsedRollup(nodeId) {
+    var cur = parentByChild[nodeId];
+    while (cur != null) {
+      var parent = nodeById[cur];
+      if (parent && parent.kind === 'rollup' && !expandedRollups[parent.id]) return true;
+      cur = parentByChild[cur];
+    }
+    return false;
+  }
 
   var SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -776,6 +985,7 @@ const CLIENT_JS_TEXT = `
   }
 
   function buildNodeEl(n) {
+    var isRollup = n.kind === 'rollup';
     var el = document.createElement('div');
     el.className = 'node kind-' + n.accent + (n.isTest ? ' is-test' : '') + (n.approximate ? ' is-approx' : '');
     el.style.left = n.x + 'px';
@@ -786,7 +996,16 @@ const CLIENT_JS_TEXT = `
 
     var labelEl = document.createElement('div');
     labelEl.className = 'node-label';
-    labelEl.textContent = (n.approximate ? '~' : '') + n.label;
+    // v0.13 (Round 2.5, H2 -- rendering half): the rollup pill's own label
+    // is prefixed with a disclosure triangle reflecting its CURRENT
+    // expand/collapse state (▸ collapsed / ▾ expanded -- same glyph pair
+    // the #pm-legend <details> element's own ::before rule already uses,
+    // one consistent "there's more, click to reveal" visual vocabulary).
+    // Every other node keeps its pre-existing '~' approximate prefix,
+    // unchanged.
+    labelEl.textContent = isRollup
+      ? (expandedRollups[n.id] ? '\\u25BE ' : '\\u25B8 ') + n.label
+      : (n.approximate ? '~' : '') + n.label;
     el.appendChild(labelEl);
 
     var glyphs = badgeGlyphs(n);
@@ -827,6 +1046,26 @@ const CLIENT_JS_TEXT = `
     el.addEventListener('mouseleave', scheduleHideTooltip);
     el.addEventListener('click', function () {
       if (dragMoved) return; // a pan gesture that ended over a node must not open it
+      // v0.13 (Round 2.5, H2 -- rendering half): a rollup pill has no
+      // source location of its own (n.path is always null, see
+      // makeRollupTNode in pathmap.js) -- clicking it toggles its
+      // expand/collapse state instead of jumping anywhere. REUSES the
+      // in-place update path verbatim: applyUpdate is the EXACT function
+      // extension.js's server-driven {type:'update'} messages already call
+      // (see the bottom of this script) -- calling it again here, locally,
+      // with the SAME DATA reference (nothing server-side changed, only
+      // this rollup's entry in the client-local expandedRollups map),
+      // rebuilds nodesLayer/edgesSvg through renderGraph (which now sees
+      // the flipped expandedRollups state via isHiddenByCollapsedRollup)
+      // and reapplies the preserved pan/zoom -- no postMessage round trip
+      // to the extension at all, since every node/edge this could reveal
+      // is ALREADY present in DATA (resolver.js resolved the full tree up
+      // front; H2 only changed how it's GROUPED for display).
+      if (isRollup) {
+        expandedRollups[n.id] = !expandedRollups[n.id];
+        applyUpdate(DATA);
+        return;
+      }
       postOpen(n.path, n.line, 0);
     });
 
@@ -866,6 +1105,12 @@ const CLIENT_JS_TEXT = `
   // Called once below for the initial render.
   function renderGraph() {
     DATA.nodes.forEach(function (n) {
+      // v0.13 (Round 2.5, H2 -- rendering half): a node beneath a
+      // still-collapsed rollup pill is never even given a DOM element --
+      // simplest possible "collapsed by default, expand in place" (no
+      // separate hide/show pass needed later; re-calling renderGraph via
+      // applyUpdate after a toggle naturally includes/excludes it).
+      if (isHiddenByCollapsedRollup(n.id)) return;
       nodesLayer.appendChild(buildNodeEl(n));
     });
 
@@ -873,6 +1118,12 @@ const CLIENT_JS_TEXT = `
       var from = nodeById[e.from];
       var to = nodeById[e.to];
       if (!from || !to) return;
+      // An edge is hidden whenever EITHER endpoint is -- the child-side
+      // check alone would already cover every case reachable from a
+      // collapsed rollup (its parent is never hidden, see
+      // isHiddenByCollapsedRollup's own doc), but checking both is cheap
+      // and correct regardless of which end a future edge shape might add.
+      if (isHiddenByCollapsedRollup(e.from) || isHiddenByCollapsedRollup(e.to)) return;
 
       var path = document.createElementNS(SVG_NS, 'path');
       path.setAttribute('d', edgePath(from, to));
@@ -950,15 +1201,29 @@ const CLIENT_JS_TEXT = `
     return row;
   }
 
+  // v0.13 (Round 2.5, H2 -- rendering half): the rollup pill's own hover
+  // tooltip explains the grouping itself (mirrors uitree.js's ROLLUP_TOOLTIP
+  // constant, condensed) rather than falling through to the generic
+  // 'no call sites recorded' empty-state text below, which would be
+  // confusing on a node that deliberately never carries sites of its own.
+  var ROLLUP_TOOLTIP_TEXT =
+    'Grouped for clarity: each of these was matched through approximate resolution (interface / unique-name / lexical / override / narrowed / dynamic / ambiguous) and may be wrong, or one of several candidates. Click the pill to expand/collapse.';
+
   function showTooltip(n, el) {
     clearChildren(tooltip);
 
+    var isRollup = n.kind === 'rollup';
     var title = document.createElement('div');
     title.className = 'tt-title';
-    title.textContent = (n.approximate ? '~' : '') + n.label;
+    title.textContent = isRollup ? n.label : (n.approximate ? '~' : '') + n.label;
     tooltip.appendChild(title);
 
-    if (!n.sites.length) {
+    if (isRollup) {
+      var rollupNote = document.createElement('div');
+      rollupNote.className = 'tt-empty';
+      rollupNote.textContent = ROLLUP_TOOLTIP_TEXT;
+      tooltip.appendChild(rollupNote);
+    } else if (!n.sites.length) {
       var empty = document.createElement('div');
       empty.className = 'tt-empty';
       empty.textContent = n.path ? (n.path + (n.line ? ':' + n.line : '')) : 'no call sites recorded';
@@ -1141,6 +1406,7 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="swatch exception"></span><span><span class="k">exception</span>(v0.7) a thrown exception's class, reached by tracing forward (What Does This Call?) through a "throw" statement — always terminal</span></div>
     <div class="legend-row"><span class="swatch unresolved"></span><span><span class="k">unresolved</span>(v0.7) one aggregated leaf per method, summarizing every forward call site that couldn't be resolved to an indexed target (dynamic/platform calls, e.g. HttpRequest/System.debug) — always terminal, approximate. Also covers a DML statement whose target couldn't be narrowed to a concrete SObject type (e.g. a generic List&lt;SObject&gt;) — labeled "DML on unresolved SObject type", no trigger/flow linkage possible</span></div>
     <div class="legend-row"><span class="swatch external"></span><span><span class="k">external</span>(v0.8) a reference into managed-package code this workspace has no source for — terminal when tracing What Does This Call?; a valid trace target with its own local-caller subtree when tracing Who Calls This</span></div>
+    <div class="legend-row"><span class="k">&#x25B8;/&#x25BE; N possible ... (unconfirmed)</span>(v0.13) a ROLLUP pill — groups every DIRECT approximate caller/callee of the node above it into one collapsed placeholder (dashed border, same color as the "~" approximate marker below), so a handful of confirmed edges aren't buried under a wall of guesses. Click the pill to expand it in place (&#x25BE;) or collapse it again (&#x25B8;) — everything it contains was already resolved, so expanding never re-scans or re-fetches anything. Controlled by the apexCallGraph.showUnconfirmed setting ('rollup' default / 'hide' drops these entirely / 'expand' restores the old flat rendering)</div>
     <h4>Markers</h4>
     <div class="legend-row"><span class="k">~ prefix</span>approximate resolution (dashed border too) — via interface/unique-name/lexical/override/narrowed/dynamic fallback, so this edge may be wrong or one of several candidates</div>
     <div class="legend-row"><span class="k">&#x1F9EA;</span>test-only node (also dimmed)</div>
@@ -1221,6 +1487,34 @@ function directionHeaderLine(direction) {
 // reason uitree.js's is (see shapeHeaderLines there): the SAME cap/DAG-
 // memoization machinery now runs in both directions, so "caller" would be
 // misleading for a callees-direction result.
+//
+// v0.13 (Round 2.5, H3 -- header half) REMOVED: stats.unresolvedSites,
+// stats.externalRefs/externalNamespaces, and stats.metaUnresolved USED to
+// each surface their own workspace-global line here (mirroring uitree.js's
+// shapeHeaderLines, which this function has always mirrored) -- see that
+// file's matching SCOPED HEADERS section for the full rationale (a
+// per-trace header has no business reporting workspace-wide totals unrelated
+// to the ONE method being traced; `stats` itself is unchanged, those fields
+// simply move to being an H8 "Scan Stats" output-channel concern only).
+// unresolvedMentionsHeaderLine below is the one new, genuinely SCOPED
+// replacement -- same contract as uitree.js's identical function (see that
+// file's INTEGRATION NOTE on the `treeResult.unresolvedMentions` shape).
+function unresolvedMentionsTargetMethodName(treeResult) {
+  const um = treeResult && treeResult.unresolvedMentions;
+  if (um && typeof um.method === 'string' && um.method) return um.method;
+  const label = (treeResult && treeResult.root && treeResult.root.label) || '';
+  const dotIdx = label.lastIndexOf('.');
+  return dotIdx >= 0 ? label.slice(dotIdx + 1) : label;
+}
+function unresolvedMentionsHeaderLine(treeResult) {
+  if ((treeResult && treeResult.direction) === 'callees') return null;
+  const um = treeResult && treeResult.unresolvedMentions;
+  const count = um && typeof um.count === 'number' ? um.count : 0;
+  if (count <= 0) return null;
+  const method = unresolvedMentionsTargetMethodName(treeResult);
+  const siteWord = count === 1 ? 'site' : 'sites';
+  return `${count} unresolved ${siteWord} elsewhere mention ${method}( — potential unconfirmed callers`;
+}
 function headerExtraLinesForResult(treeResult) {
   const lines = [];
   const stats = treeResult && treeResult.stats;
@@ -1233,34 +1527,8 @@ function headerExtraLinesForResult(treeResult) {
     const cappedNoun = (treeResult && treeResult.direction) === 'callees' ? 'callee' : 'caller';
     lines.push(`Result capped -- not every ${cappedNoun} could be expanded.`);
   }
-  const unresolved = stats && stats.unresolvedSites;
-  // v0.8 (N5, forward-compat): mirrors uitree.js's matching shapeHeaderLines
-  // addition exactly -- see that file's comment for the full rationale and
-  // the byte-identical-when-absent gate this depends on (adv-org, with zero
-  // namespaced refs, always has externalRefs absent/0, so it always takes
-  // the untouched `else` branch below).
-  const externalRefs = stats && stats.externalRefs;
-  const externalNamespaces = stats && Array.isArray(stats.externalNamespaces) ? stats.externalNamespaces : [];
-  if (typeof externalRefs === 'number' && externalRefs > 0) {
-    const unresolvedPart = typeof unresolved === 'number' ? unresolved : 0;
-    const refWord = externalRefs === 1 ? 'ref' : 'refs';
-    const nsPart = externalNamespaces.length ? ` (${externalNamespaces.join(', ')})` : '';
-    lines.push(`${unresolvedPart} unresolved · ${externalRefs} managed-package ${refWord}${nsPart}.`);
-  } else if (typeof unresolved === 'number' && unresolved > 0) {
-    lines.push(`${unresolved} call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).`);
-  }
-  // v0.7.1 (U3, M2 coordination point): mirrors uitree.js's matching
-  // shapeHeaderLines addition -- see that file's comment for the full
-  // rationale (attachMetaCallers() candidate-count gate dropping an
-  // ambiguous/unmatched-namespace metadata ref instead of mis-pointing it
-  // at an unrelated same-name local class). 'metaUnresolved' is the exact
-  // stat field name given in the fix spec.
-  const metaUnresolved = stats && stats.metaUnresolved;
-  if (typeof metaUnresolved === 'number' && metaUnresolved > 0) {
-    lines.push(
-      `${metaUnresolved} metadata reference${metaUnresolved === 1 ? '' : 's'} could not be attached (ambiguous or unmatched namespace).`
-    );
-  }
+  const mentionsLine = unresolvedMentionsHeaderLine(treeResult);
+  if (mentionsLine) lines.push(mentionsLine);
   return lines;
 }
 
@@ -1277,9 +1545,21 @@ function headerExtraLinesForResult(treeResult) {
 // already embedded pre-v0.9 (this is a pure extraction, not a new shape);
 // renderPathMapHtml below now simply calls this and JSON-embeds the result,
 // so the INITIAL render is byte-identical to before this round.
-function buildPathMapData(treeResult) {
-  const root = treeResult && treeResult.root;
+//
+// v0.13 (Round 2.5, H2 -- rendering half): `opts.showUnconfirmed` is an
+// OPTIONAL second-argument field (same "an opts object, not a positional
+// parameter" shape renderPathMapHtml's own `opts.legendOpen` already uses),
+// threaded straight into groupApproximateChildren BEFORE layoutTree ever
+// sees the tree -- see that function's own doc for the full three-mode
+// contract. Omitted/unrecognized normalizes to 'expand' (the pre-Round-2.5
+// flat shape), so every EXISTING call site -- including every fixture in
+// test-pathmap.js written before this round -- keeps rendering
+// byte-identically.
+function buildPathMapData(treeResult, opts) {
+  const options = opts || {};
+  const mode = normalizeShowUnconfirmed(options.showUnconfirmed);
   const direction = treeResult && treeResult.direction;
+  const root = treeResult && treeResult.root ? groupApproximateChildren(treeResult.root, mode, direction) : null;
   const layout = root
     ? layoutTree(root, direction)
     : {
@@ -1365,9 +1645,11 @@ function preserveTransformOnUpdate(prevTransform) {
 // opts (all optional):
 //   legendOpen: boolean — render the legend <details> expanded by default
 //               (default false, kept collapsed so the canvas starts clean).
+//   showUnconfirmed: 'rollup'|'hide'|'expand' — v0.13 (Round 2.5, H2), see
+//               buildPathMapData's own doc; forwarded through unchanged.
 function renderPathMapHtml(treeResult, opts) {
   const options = opts || {};
-  const data = buildPathMapData(treeResult);
+  const data = buildPathMapData(treeResult, options);
 
   const legendOpenAttr = options.legendOpen ? ' open' : '';
   const dataScript = 'var DATA = ' + jsonForScript(data) + ';';
@@ -1432,4 +1714,15 @@ module.exports = {
   buildPathMapData,
   preserveTransformOnUpdate,
   frontierMethodKey,
+  // v0.13 (Round 2.5, H2 -- rendering half): APPROXIMATE ROLLUP surface,
+  // exported so test-pathmap.js can unit-test the grouping transform
+  // directly against bare fixtures, same rationale as everything else in
+  // this block.
+  normalizeShowUnconfirmed,
+  rollupLabel,
+  groupApproximateChildren,
+  // v0.13 (Round 2.5, H3 -- header half): SCOPED HEADERS surface, same
+  // export rationale.
+  unresolvedMentionsTargetMethodName,
+  unresolvedMentionsHeaderLine,
 };

@@ -1,0 +1,5 @@
+public class VertexThirdPartyLogisticsProviderIntegrationAdapterFactoryImpl {
+  public static VertexThirdPartyLogisticsProviderIntegrationAdapterImplementation createAdapterInstanceForCarrierAccountIntegrationConfiguration(String regionCode) {
+    return new VertexThirdPartyLogisticsProviderIntegrationAdapterImplementation();
+  }
+}

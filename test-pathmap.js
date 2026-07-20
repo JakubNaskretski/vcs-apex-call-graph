@@ -30,6 +30,12 @@ const {
   buildPathMapData,
   preserveTransformOnUpdate,
   frontierMethodKey,
+  // v0.13 (Round 2.5, H2 -- rendering half / H3 -- header half)
+  normalizeShowUnconfirmed,
+  rollupLabel,
+  groupApproximateChildren,
+  unresolvedMentionsTargetMethodName,
+  unresolvedMentionsHeaderLine,
 } = require('./pathmap');
 
 let passCount = 0;
@@ -890,12 +896,21 @@ check(html7.includes('&#x21E2;'), 'legend documents the seenElsewhere marker gly
 check(html7.toLowerCase().includes('seenelsewhere'), 'legend mentions seenElsewhere by name');
 
 // H1/H4 forward-compat: header lines for capped + unresolved call sites.
+// v0.13 (Round 2.5, H3 -- header half) REGRESSION: the OLD combined
+// headerExtra array used to include a trailing unresolvedSites line here --
+// H3 removes it unconditionally (workspace-global counters are out of
+// scope for a per-trace header); fixture7 sets no `unresolvedMentions`
+// field, so the NEW scoped line doesn't fire either -- only the capped line
+// survives.
 check(html7.includes('"capped":true') || html7.includes('capped'), 'H1 forward-compat: capped info reaches the rendered document');
-check(html7.includes('"headerExtra":["Result capped -- not every caller could be expanded.","2 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain)."]'), 'H1/H4 forward-compat: both header-extra lines computed server-side, in order, with the exact required unresolved-sites wording');
+check(html7.includes('"headerExtra":["Result capped -- not every caller could be expanded."]'), 'H3 (Round 2.5): headerExtra now has ONLY the capped line -- the old unresolvedSites line is gone');
 check(html7.includes("DATA.meta.headerExtra"), 'client script reads and renders meta.headerExtra');
 
-// headerExtraLinesForResult direct unit checks. unresolvedSites lives under
-// stats, matching resolver.js's real buildCallerTree TreeResult shape.
+// headerExtraLinesForResult direct unit checks.
+// v0.13 (Round 2.5, H3): unresolvedSites/externalRefs/metaUnresolved no
+// longer produce ANY line here (see the REGRESSION assertions further below
+// mirroring test-uitree.js's identical N5 section) -- these two remaining
+// checks (null/no-note fixtures, and capped-only) are unaffected either way.
 assert.deepStrictEqual(headerExtraLinesForResult(null), [], 'null treeResult -> no extra header lines');
 assert.deepStrictEqual(headerExtraLinesForResult({ root: {}, note: null }), [], "today's real TreeResult shape -> no extra header lines");
 assert.deepStrictEqual(
@@ -904,7 +919,8 @@ assert.deepStrictEqual(
 );
 assert.deepStrictEqual(
   headerExtraLinesForResult({ root: {}, stats: { unresolvedSites: 5 } }),
-  ['5 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).']
+  [],
+  'H3 (Round 2.5): stats.unresolvedSites no longer produces ANY header line'
 );
 assert.deepStrictEqual(headerExtraLinesForResult({ root: {}, stats: { unresolvedSites: 0 } }), [], 'stats.unresolvedSites === 0 -> no line');
 passCount += 5;
@@ -1039,7 +1055,7 @@ check(dmlUnresolvedNode.approximate === true, 'U3 (R8): approximate flag reaches
 // the rendered JSON blob's `sites` array -- no independent re-derivation,
 // no second bug in this file either. Uses the exact correct values
 // confirmed live via `node dev/gauntlet/probe2.js` and by reading
-// VertexLedgerBridge.cls/Billing.cls directly in example-data/gauntlet-org.
+// VertexLedgerBridge.cls/Billing.cls directly in test-fixtures/gauntlet-org.
 // =========================================================================
 const fixtureU1 = {
   root: baseNode({
@@ -1089,23 +1105,20 @@ check(
   'U1: the two site rows must never render with identical line numbers ("both L2" was the exact reported symptom)'
 );
 
-// v0.7.1 (U3, M2 coordination point): headerExtraLinesForResult's
-// stats.metaUnresolved forward-compat -- mirrors test-uitree.js's identical
-// shapeHeaderLines addition (metascan.js/resolver.js does not produce this
-// field yet; rendering support is locked in ahead of that engine change).
+// v0.13 (Round 2.5, H3 -- header half) REGRESSION: headerExtraLinesForResult's
+// v0.7.1 (U3, M2) stats.metaUnresolved line USED to fire here -- REMOVED,
+// mirroring test-uitree.js's identical shapeHeaderLines REGRESSION coverage.
 check(
-  JSON.stringify(headerExtraLinesForResult({ root: {}, stats: { metaUnresolved: 2 } })) ===
-    JSON.stringify(['2 metadata references could not be attached (ambiguous or unmatched namespace).']),
-  'U3 (M2): stats.metaUnresolved > 1 produces the exact required header wording, plural'
+  JSON.stringify(headerExtraLinesForResult({ root: {}, stats: { metaUnresolved: 2 } })) === JSON.stringify([]),
+  'H3 (Round 2.5): stats.metaUnresolved no longer produces ANY header line, plural case'
 );
 check(
-  JSON.stringify(headerExtraLinesForResult({ root: {}, stats: { metaUnresolved: 1 } })) ===
-    JSON.stringify(['1 metadata reference could not be attached (ambiguous or unmatched namespace).']),
-  'U3 (M2): stats.metaUnresolved === 1 uses the singular form'
+  JSON.stringify(headerExtraLinesForResult({ root: {}, stats: { metaUnresolved: 1 } })) === JSON.stringify([]),
+  'H3 (Round 2.5): stats.metaUnresolved no longer produces ANY header line, singular case'
 );
 check(
   JSON.stringify(headerExtraLinesForResult({ root: {}, stats: { metaUnresolved: 0 } })) === JSON.stringify([]),
-  'U3 (M2): stats.metaUnresolved === 0 produces no header line'
+  'stats.metaUnresolved === 0 still produces no header line (moot after H3, kept as a harmless sanity check)'
 );
 
 // =========================================================================
@@ -1511,31 +1524,30 @@ check(htmlExternal.includes('.swatch.external'), 'stylesheet defines the externa
 }
 
 // =========================================================================
-// v0.8 (N5, forward-compat): headerExtraLinesForResult's combined
-// 'N unresolved · M managed-package refs (ns1, ns2)' line -- mirrors
-// test-uitree.js's matching N5 section exactly.
+// v0.13 (Round 2.5, H3 -- header half) REGRESSION: headerExtraLinesForResult's
+// v0.8 (N5) combined 'N unresolved · M managed-package refs (ns1, ns2)' line
+// USED to fire here -- REMOVED unconditionally, mirroring test-uitree.js's
+// matching N5 REGRESSION section exactly.
 // =========================================================================
 assert.deepStrictEqual(
   headerExtraLinesForResult({ root: {}, stats: { unresolvedSites: 4, externalRefs: 7, externalNamespaces: ['zenq', 'kwx'] } }),
-  ['4 unresolved · 7 managed-package refs (zenq, kwx).'],
-  'N5: exact CONTRACT-pinned combined wording'
+  [],
+  'H3 (Round 2.5): the old N5 combined wording is gone'
 );
 assert.deepStrictEqual(
   headerExtraLinesForResult({ root: {}, stats: { unresolvedSites: 0, externalRefs: 1, externalNamespaces: ['zenq'] } }),
-  ['0 unresolved · 1 managed-package ref (zenq).'],
-  'singular "ref" wording for externalRefs === 1'
+  [],
+  'H3 (Round 2.5): singular externalRefs === 1 case also renders no line now'
 );
-// REGRESSION: externalRefs absent (the whole adv-org corpus) -> the exact
-// pre-v0.8 unresolvedSites wording, byte-identical.
 assert.deepStrictEqual(
   headerExtraLinesForResult({ root: {}, stats: { unresolvedSites: 5 } }),
-  ['5 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).'],
-  'REGRESSION: externalRefs absent -> unresolvedSites keeps its exact pre-v0.8 wording'
+  [],
+  'H3 (Round 2.5): externalRefs absent -> the old unresolvedSites-only wording is ALSO gone'
 );
 assert.deepStrictEqual(
   headerExtraLinesForResult({ root: {}, stats: { unresolvedSites: 5, externalRefs: 0 } }),
-  ['5 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).'],
-  'REGRESSION: externalRefs === 0 -> old wording, not the new combined line'
+  [],
+  'H3 (Round 2.5): externalRefs === 0 case also renders no line'
 );
 
 // =========================================================================
@@ -1755,6 +1767,260 @@ passCount += 5;
   const byLabel = new Map(data.nodes.map((n) => [n.label, n]));
   check(byLabel.get('S13CycleA').cyclic === true, 'the cyclic flag survives into the data blob unchanged for a subflow node');
   check(byLabel.get('S13CycleA').via === 'subflow', 'a cyclic node still carries its own subflow via correctly, not clobbered by the cyclic flag');
+}
+
+// =========================================================================
+// v0.13 (Round 2.5, H2 -- rendering half): APPROXIMATE ROLLUP, map side.
+// =========================================================================
+
+// --- normalizeShowUnconfirmed: mirrors uitree.js's identical helper ---
+check(normalizeShowUnconfirmed('rollup') === 'rollup');
+check(normalizeShowUnconfirmed('hide') === 'hide');
+check(normalizeShowUnconfirmed('expand') === 'expand');
+check(normalizeShowUnconfirmed(undefined) === 'expand', 'omitted -> expand (regression-safe default)');
+check(normalizeShowUnconfirmed('bogus') === 'expand', 'unrecognized string -> expand, never throws');
+
+// --- rollupLabel: exact H2 spec wording, mirrors uitree.js exactly ---
+check(rollupLabel(1, 'callers') === '1 possible caller (unconfirmed)');
+check(rollupLabel(3, 'callers') === '3 possible callers (unconfirmed)');
+check(rollupLabel(2, 'callees') === '2 possible callees (unconfirmed)');
+
+// --- groupApproximateChildren: pure recursive TNode -> TNode transform ---
+{
+  const confirmed = baseNode({ label: 'Confirmed.foo', className: 'Confirmed', methodLower: 'foo', via: 'typed', path: '/ws/Confirmed.cls' });
+  const approxA = baseNode({ label: 'ApproxA.foo', className: 'ApproxA', methodLower: 'foo', via: 'unique-name', approximate: true, path: '/ws/ApproxA.cls' });
+  const approxB = baseNode({ label: 'ApproxB.foo', className: 'ApproxB', methodLower: 'foo', via: 'interface', approximate: true, path: '/ws/ApproxB.cls' });
+  const root = baseNode({ label: 'Target.reprice', className: 'Target', methodLower: 'reprice', path: '/ws/Target.cls', children: [confirmed, approxA, approxB] });
+
+  // 'expand': identical structure/order/values throughout (a full clone).
+  const expanded = groupApproximateChildren(root, 'expand', 'callers');
+  assert.deepStrictEqual(expanded.children.map((c) => c.label), ['Confirmed.foo', 'ApproxA.foo', 'ApproxB.foo'], "'expand' keeps the original flat order");
+  assert.deepStrictEqual(expanded, root, "'expand' produces a value-identical (deep-equal) tree to the original");
+
+  // 'hide': approximate children (and their subtrees) dropped entirely.
+  const hidden = groupApproximateChildren(root, 'hide', 'callers');
+  assert.deepStrictEqual(hidden.children.map((c) => c.label), ['Confirmed.foo'], "'hide' drops approximate children entirely");
+
+  // 'rollup': confirmed first, then ONE synthetic rollup TNode.
+  const rolled = groupApproximateChildren(root, 'rollup', 'callers');
+  check(rolled.children.length === 2, 'one confirmed child + one rollup pseudo-node');
+  check(rolled.children[0].label === 'Confirmed.foo');
+  const rollupNode = rolled.children[1];
+  check(rollupNode.kind === 'rollup');
+  check(rollupNode.label === '2 possible callers (unconfirmed)');
+  check(rollupNode.approximate === false, 'the pill CONTAINER is not itself approximate -- its members still are');
+  check(rollupNode.path === null && rollupNode.line === null, 'synthetic node carries no source location of its own');
+  assert.deepStrictEqual(rollupNode.children.map((c) => c.label), ['ApproxA.foo', 'ApproxB.foo'], 'rollup children are the (recursively-processed) approximate children, in original relative order');
+  check(rollupNode.children[0].approximate === true, 'members keep their own true approximate:true, unmodified');
+
+  // does not mutate the input.
+  assert.deepStrictEqual(root.children.map((c) => c.label), ['Confirmed.foo', 'ApproxA.foo', 'ApproxB.foo'], 'groupApproximateChildren never mutates its input tree');
+
+  // REGRESSION-POLICY PROOF: flatten(rollup children) + confirmed == the
+  // original flat child set (H2 only regroups rendering, never drops/adds
+  // an edge, underneath).
+  const flattened = [rolled.children[0].label].concat(rollupNode.children.map((c) => c.label)).sort();
+  assert.deepStrictEqual(flattened, ['ApproxA.foo', 'ApproxB.foo', 'Confirmed.foo'], 'REGRESSION POLICY: flatten(rollup children) + confirmed === the original flat child set');
+
+  // Singular count -> singular wording.
+  const singleApproxRoot = { ...root, children: [confirmed, approxA] };
+  const singleRolled = groupApproximateChildren(singleApproxRoot, 'rollup', 'callers');
+  check(singleRolled.children[1].label === '1 possible caller (unconfirmed)', 'singular wording for exactly one rolled-up child');
+
+  // Recursion: an approximate node with its OWN mixed confirmed/approximate
+  // children gets ITS OWN children grouped too, at every depth.
+  const nestedConfirmed = baseNode({ label: 'NestedConfirmed.bar', className: 'NestedConfirmed', methodLower: 'bar', via: 'typed', path: '/ws/NestedConfirmed.cls' });
+  const nestedApprox = baseNode({ label: 'NestedApprox.bar', className: 'NestedApprox', methodLower: 'bar', via: 'lexical', approximate: true, path: '/ws/NestedApprox.cls' });
+  const approxWithKids = { ...approxA, children: [nestedConfirmed, nestedApprox] };
+  const nestedRoot = { ...root, children: [confirmed, approxWithKids] };
+  const nestedRolled = groupApproximateChildren(nestedRoot, 'rollup', 'callers');
+  const outerPill = nestedRolled.children[1];
+  check(outerPill.label === '1 possible caller (unconfirmed)');
+  const approxAShaped = outerPill.children[0];
+  check(approxAShaped.label === 'ApproxA.foo');
+  check(approxAShaped.children.length === 2, 'ApproxA itself now has one confirmed + one nested rollup pill child');
+  check(approxAShaped.children[0].label === 'NestedConfirmed.bar');
+  check(approxAShaped.children[1].kind === 'rollup', 'nested rollup grouping works independently at depth 2');
+  check(approxAShaped.children[1].label === '1 possible caller (unconfirmed)');
+}
+
+// --- buildPathMapData end-to-end: showUnconfirmed threads through, layout
+// treats the rollup pseudo-node exactly like any other node (own id/x/y/
+// column), edges wire up correctly (confirmed parent -> pill -> members) ---
+{
+  const confirmed = baseNode({ label: 'Confirmed.foo', className: 'Confirmed', methodLower: 'foo', via: 'typed', path: '/ws/Confirmed.cls' });
+  const approxA = baseNode({ label: 'ApproxA.foo', className: 'ApproxA', methodLower: 'foo', via: 'unique-name', approximate: true, path: '/ws/ApproxA.cls' });
+  const approxB = baseNode({ label: 'ApproxB.foo', className: 'ApproxB', methodLower: 'foo', via: 'interface', approximate: true, path: '/ws/ApproxB.cls' });
+  const root = baseNode({ label: 'Target.reprice', className: 'Target', methodLower: 'reprice', path: '/ws/Target.cls', children: [confirmed, approxA, approxB] });
+  const tree = { root, targetLabel: 'Target.reprice', note: null, direction: 'callers' };
+
+  // default (opts omitted) is byte-identical to explicit 'expand'.
+  const dataOmitted = buildPathMapData(tree);
+  const dataExplicitExpand = buildPathMapData(tree, { showUnconfirmed: 'expand' });
+  assert.deepStrictEqual(dataOmitted, dataExplicitExpand, "REGRESSION: omitting opts.showUnconfirmed entirely is byte-identical to explicit 'expand'");
+  check(dataOmitted.nodes.length === 4, "default/'expand': flat, 4 plain nodes, no pill");
+  check(!dataOmitted.nodes.some((n) => n.kind === 'rollup'), "default/'expand' never produces a rollup node");
+
+  const dataRollup = buildPathMapData(tree, { showUnconfirmed: 'rollup' });
+  check(dataRollup.nodes.length === 5, 'target + confirmed + rollup pill + 2 grouped members = 5 nodes');
+  const pillRec = dataRollup.nodes.find((n) => n.kind === 'rollup');
+  check(!!pillRec, 'a rollup node is present');
+  check(pillRec.label === '2 possible callers (unconfirmed)');
+  check(pillRec.accent === 'rollup', 'accentKind buckets kind:"rollup" into its own accent');
+  const targetRec = dataRollup.nodes.find((n) => n.label === 'Target.reprice');
+  const confirmedRec = dataRollup.nodes.find((n) => n.label === 'Confirmed.foo');
+  const approxARec = dataRollup.nodes.find((n) => n.label === 'ApproxA.foo');
+  const approxBRec = dataRollup.nodes.find((n) => n.label === 'ApproxB.foo');
+  check(confirmedRec.parentId === targetRec.id, 'confirmed child still parents directly to the target');
+  check(pillRec.parentId === targetRec.id, 'the rollup pill itself parents directly to the target');
+  check(approxARec.parentId === pillRec.id && approxBRec.parentId === pillRec.id, 'both grouped members parent to the ROLLUP, one column further out');
+  // the edge INTO the pill is a plain, non-approximate edge (the container
+  // isn't a guess); the edges from the pill down to its members stay
+  // approximate/dashed, unchanged.
+  const edgeIntoPill = dataRollup.edges.find((e) => e.to === targetRec.id && e.from === pillRec.id);
+  check(!!edgeIntoPill && edgeIntoPill.approximate === false, 'edge into the pill is NOT approximate');
+  const edgeIntoA = dataRollup.edges.find((e) => e.from === approxARec.id);
+  check(edgeIntoA.approximate === true, 'edge from the pill down to a member keeps its own true approximate:true');
+
+  const dataHide = buildPathMapData(tree, { showUnconfirmed: 'hide' });
+  check(dataHide.nodes.length === 2, "'hide': only target + confirmed remain");
+
+  // full HTML render carries the rollup pill through to the embedded JSON
+  // and the CSS/client-script support code.
+  const htmlRollup = renderPathMapHtml(tree, { showUnconfirmed: 'rollup' });
+  check(htmlRollup.includes('"kind":"rollup"'), 'rollup kind reaches the rendered DATA blob');
+  check(htmlRollup.includes('.node.kind-rollup'), 'stylesheet defines the rollup pill CSS rule');
+  check(htmlRollup.includes('isHiddenByCollapsedRollup'), 'client script defines the collapsed-by-default visibility check');
+  check(htmlRollup.includes('expandedRollups'), 'client script tracks per-pill expand/collapse state');
+  check(htmlRollup.includes("n.kind === 'rollup'"), 'client script special-cases the rollup kind for its click-to-toggle behavior');
+  check(htmlRollup.includes('applyUpdate(DATA)'), 'H2: the rollup click handler reuses the EXACT in-place update function, called locally rather than via a fresh postMessage round trip');
+  check(htmlRollup.includes('N possible ... (unconfirmed)') || htmlRollup.toLowerCase().includes('rollup'), 'legend documents the rollup pill');
+  const dataMatchRollup = extractData(htmlRollup);
+  assert.deepStrictEqual(dataMatchRollup, dataRollup, 'the embedded DATA blob matches buildPathMapData(tree, {showUnconfirmed:"rollup"}) exactly');
+}
+
+// =========================================================================
+// v0.13 (Round 2.5, H3 -- header half): SCOPED HEADERS, map side.
+// =========================================================================
+
+check(unresolvedMentionsTargetMethodName({ unresolvedMentions: { method: 'Reprice' }, root: { label: 'Ignored.other' } }) === 'Reprice', 'explicit unresolvedMentions.method wins verbatim');
+check(unresolvedMentionsTargetMethodName({ root: { label: 'VertexPricingService.reprice' } }) === 'reprice', 'derived from root.label after the last dot');
+check(unresolvedMentionsTargetMethodName({ root: { label: 'AccountTrigger' } }) === 'AccountTrigger', 'no dot at all -> the whole label');
+check(unresolvedMentionsTargetMethodName(null) === '', 'defensive: null treeResult -> empty string');
+
+check(
+  unresolvedMentionsHeaderLine({ root: { label: 'X.reprice' }, direction: 'callers', unresolvedMentions: { count: 5 } }) ===
+    '5 unresolved sites elsewhere mention reprice( — potential unconfirmed callers',
+  'exact H3-spec wording, mirrors uitree.js exactly'
+);
+check(
+  unresolvedMentionsHeaderLine({ root: { label: 'X.reprice' }, direction: 'callers', unresolvedMentions: { count: 1 } }) ===
+    '1 unresolved site elsewhere mention reprice( — potential unconfirmed callers',
+  'singular "site" for K === 1'
+);
+check(unresolvedMentionsHeaderLine({ root: { label: 'X.reprice' }, direction: 'callers', unresolvedMentions: { count: 0 } }) === null, 'K === 0 -> null');
+check(unresolvedMentionsHeaderLine({ root: { label: 'X.reprice' }, direction: 'callees', unresolvedMentions: { count: 5 } }) === null, 'callees direction -> null even with K > 0');
+check(unresolvedMentionsHeaderLine(null) === null, 'defensive: null treeResult never throws');
+
+// headerExtraLinesForResult integration: the new scoped line slots in after
+// capped, caller direction only.
+assert.deepStrictEqual(
+  headerExtraLinesForResult({ root: { label: 'X.reprice' }, direction: 'callers', stats: { capped: true }, unresolvedMentions: { count: 3 } }),
+  ['Result capped -- not every caller could be expanded.', '3 unresolved sites elsewhere mention reprice( — potential unconfirmed callers'],
+  'H3: the new scoped line slots in after capped, mirrors test-uitree.js exactly'
+);
+assert.deepStrictEqual(
+  headerExtraLinesForResult({ root: { label: 'X.reprice' }, direction: 'callees', unresolvedMentions: { count: 3 } }),
+  [],
+  'H3: callees direction never gets the new scoped line'
+);
+
+// full render: the new header line reaches meta.headerExtra end to end.
+{
+  const root = baseNode({ label: 'X.reprice', className: 'X', methodLower: 'reprice', path: '/ws/X.cls' });
+  const tree = { root, targetLabel: 'X.reprice', note: null, direction: 'callers', stats: { capped: true }, unresolvedMentions: { count: 3 } };
+  const html = renderPathMapHtml(tree);
+  check(
+    html.includes('"headerExtra":["Result capped -- not every caller could be expanded.","3 unresolved sites elsewhere mention reprice( — potential unconfirmed callers"]'),
+    'H3: the new scoped line reaches the rendered headerExtra array end to end, after the capped line'
+  );
+}
+
+// =========================================================================
+// v0.13 (Round 2.5): LONG-NAME layout hardening.
+//
+// Real-org render bug report: nodes carrying very long, space-free Apex
+// identifiers (class/method names routinely run 60+ characters -- see
+// test-fixtures/gauntlet-org's dedicated long-name fixture, a real 4-class/
+// 3-hop chain: VertexEnterpriseOrderFulfillmentReconciliationOrchestrator-
+// Service (65 chars) -> VertexCrossRegionInventoryAvailabilitySynchronization
+// Coordinator (64 chars) -> VertexThirdPartyLogisticsProviderIntegration-
+// AdapterFactoryImpl (62 chars, static call) -> VertexThirdPartyLogistics-
+// ProviderIntegrationAdapterImplementation (65 chars, instance call))
+// rendered as bare, unboxed-looking text spilling past the node instead of
+// clipping inside it. Pinned here with the REAL corpus class/method names
+// (hand-built TNode fixtures, same style as every other fixture in this
+// file -- no real parser.js/resolver.js invocation, per this file's own
+// "pure data-in/string-out" testing posture).
+// =========================================================================
+{
+  const longLeaf = baseNode({
+    label: 'VertexThirdPartyLogisticsProviderIntegrationAdapterImplementation.buildCarrierAccountIntegrationConfigurationForRegionalPartner',
+    className: 'VertexThirdPartyLogisticsProviderIntegrationAdapterImplementation',
+    methodLower: 'buildcarrieraccountintegrationconfigurationforregionalpartner',
+    path: '/ws/classes/VertexThirdPartyLogisticsProviderIntegrationAdapterImplementation.cls',
+    via: 'typed',
+  });
+  const longMid = baseNode({
+    label: 'VertexCrossRegionInventoryAvailabilitySynchronizationCoordinator.synchronizeInventoryAvailabilitySnapshotsForDistributionRegion',
+    className: 'VertexCrossRegionInventoryAvailabilitySynchronizationCoordinator',
+    methodLower: 'synchronizeinventoryavailabilitysnapshotsfordistributionregion',
+    path: '/ws/classes/VertexCrossRegionInventoryAvailabilitySynchronizationCoordinator.cls',
+    via: 'typed',
+    children: [longLeaf],
+  });
+  const longRoot = baseNode({
+    label: 'VertexEnterpriseOrderFulfillmentReconciliationOrchestratorService.reconcileFulfillmentDiscrepanciesAcrossAllDistributionCenters',
+    className: 'VertexEnterpriseOrderFulfillmentReconciliationOrchestratorService',
+    methodLower: 'reconcilefulfillmentdiscrepanciesacrossalldistributioncenters',
+    path: '/ws/classes/VertexEnterpriseOrderFulfillmentReconciliationOrchestratorService.cls',
+    children: [longMid],
+  });
+
+  check(longRoot.className.length >= 60, 'sanity: the fixture class name is genuinely 60+ characters, matching the real corpus fixture');
+  check(longLeaf.className.length >= 60);
+  check(longMid.className.length >= 60);
+
+  const data = buildPathMapData({ root: longRoot, targetLabel: longRoot.label, note: null, direction: 'callers' });
+  const midRec = data.nodes.find((n) => n.className === 'VertexCrossRegionInventoryAvailabilitySynchronizationCoordinator');
+  check(!!midRec, 'the long-named node is present in the shaped data');
+  // The FULL, untruncated label always reaches the data -- ellipsis/
+  // clamping is a CSS-only rendering concern (see the .node-label rule);
+  // the server never shortens a label itself, so the client-side tooltip
+  // (which reads n.label verbatim, see showTooltip in CLIENT_JS_TEXT) can
+  // always show the complete name on hover regardless of how it's clipped
+  // visually.
+  check(midRec.label === longMid.label, 'the node label reaching the data blob is the COMPLETE, untruncated name -- truncation is a display-only CSS concern, never a data-loss one');
+  check(midRec.label.length >= 60, 'sanity: the label really is 60+ characters in the shaped data');
+
+  const html = renderPathMapHtml({ root: longRoot, targetLabel: longRoot.label, note: null, direction: 'callers' });
+  // bounded box: the fixed node width (LAYOUT.nodeWidth) is still applied
+  // via inline style regardless of label length -- a long label never
+  // grows the box itself, only what happens to the text INSIDE it.
+  check(html.includes("el.style.width = NW + 'px'"), 'client script still applies the fixed node width unconditionally, even for long labels');
+  // the CSS hardening: overflow-wrap/word-break permit a mid-word break so
+  // a single unbreakable long token actually clips+ellipsizes inside the
+  // box instead of overflowing past it (the real-org bug).
+  check(html.includes('overflow-wrap: anywhere'), 'LONG-NAME hardening: .node-label grants permission to break mid-word (overflow-wrap)');
+  check(html.includes('word-break: break-word'), 'LONG-NAME hardening: broad-compatibility fallback for engines that do not honor overflow-wrap:anywhere');
+  check(html.includes('text-overflow: ellipsis') && html.includes('overflow: hidden'), 'the pre-existing ellipsis/clip machinery is still present, now actually reachable for a space-free long token');
+  // the full name is present verbatim SOMEWHERE in the document (the JSON
+  // data blob) even though it will render visually clipped -- proving
+  // "full name in tooltip" isn't lost.
+  check(html.includes(longMid.label), 'the complete, untruncated label reaches the rendered document for the tooltip to read');
+  const extracted = extractData(html);
+  check(extracted.nodes.some((n) => n.label === longRoot.label), 'the 65-char root label also survives untruncated');
+  check(extracted.nodes.some((n) => n.label === longLeaf.label), 'the 65-char leaf label also survives untruncated');
 }
 
 console.log('apex-trace pathmap self-check: ' + passCount + ' assertions passed');

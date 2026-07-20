@@ -1,0 +1,44 @@
+public class VertexBoltOrchestrator {
+    public void runAll(Kappa_Item__c item) {
+        new VertexBoltStep01().run(item);   // step 1
+        new VertexBoltStep02().run(item);   // step 2
+        new VertexBoltStep03().run(item);   // step 3
+        new VertexBoltStep04().run(item);   // step 4
+        new VertexBoltStep05().run(item);   // step 5
+        new VertexBoltStep06().run(item);   // step 6
+        new VertexBoltStep07().run(item);   // step 7
+        new VertexBoltStep08().run(item);   // step 8
+        new VertexBoltStep09().run(item);   // step 9
+        new VertexBoltStep10().run(item);   // step 10
+        new VertexBoltStep11().run(item);   // step 11
+        new VertexBoltStep12().run(item);   // step 12
+        new VertexBoltStep13().run(item);   // step 13
+        new VertexBoltStep14().run(item);   // step 14
+        new VertexBoltStep15().run(item);   // step 15
+        new VertexBoltStep16().run(item);   // step 16
+        new VertexBoltStep17().run(item);   // step 17
+        new VertexBoltStep18().run(item);   // step 18
+        new VertexBoltStep19().run(item);   // step 19
+        new VertexBoltStep20().run(item);   // step 20
+        new VertexBoltStep21().run(item);   // step 21
+        new VertexBoltStep22().run(item);   // step 22
+        new VertexBoltStep23().run(item);   // step 23
+        new VertexBoltStep24().run(item);   // step 24
+        new VertexBoltStep25().run(item);   // step 25
+        new VertexBoltStep26().run(item);   // step 26
+        new VertexBoltStep27().run(item);   // step 27
+        new VertexBoltStep28().run(item);   // step 28
+        new VertexBoltStep29().run(item);   // step 29
+        new VertexBoltStep30().run(item);   // step 30
+        new VertexBoltStep31().run(item);   // step 31
+        new VertexBoltStep32().run(item);   // step 32
+        new VertexBoltStep33().run(item);   // step 33
+        new VertexBoltStep34().run(item);   // step 34
+        new VertexBoltStep35().run(item);   // step 35
+        new VertexBoltStep36().run(item);   // step 36
+        new VertexBoltStep37().run(item);   // step 37
+        new VertexBoltStep38().run(item);   // step 38
+        new VertexBoltStep39().run(item);   // step 39
+        new VertexBoltStep40().run(item);   // step 40
+    }
+}

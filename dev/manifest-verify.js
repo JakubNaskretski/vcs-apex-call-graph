@@ -3,7 +3,7 @@
 //
 // Runs the FULL engine (parser.js + resolver.js + metascan.js, wired
 // exactly the way extension.js wires them for a real workspace scan) over
-// /Users/agent/work/code/example-data/adv-org, then mechanically checks
+// test-fixtures/adv-org, then mechanically checks
 // EVERY ground-truth edge listed in that corpus's MANIFEST.md:
 //   - the edge's source is PRESENT as a caller node of the target
 //   - the caller node's `kind` matches what that source's file type must
@@ -25,7 +25,7 @@
 // "Corpus defects" section) has NOT regressed: same target reachable, same
 // documented `via`.
 //
-// Read-only: never touches example-data/adv-org or any engine file. Every
+// Read-only: never touches test-fixtures/adv-org or any engine file. Every
 // file this script writes (none) or reads outside dev/ is read-only access
 // to the frozen fixture corpus and the engine under test.
 //
@@ -37,7 +37,7 @@ const parser = require('../parser');
 const resolver = require('../resolver');
 const metascan = require('../metascan');
 
-const ADV_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const ADV_ROOT = 'test-fixtures/adv-org';
 const FORCE_APP = path.join(ADV_ROOT, 'force-app', 'main', 'default');
 const MANIFEST_PATH = path.join(ADV_ROOT, 'MANIFEST.md');
 

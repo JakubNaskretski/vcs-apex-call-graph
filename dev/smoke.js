@@ -26,7 +26,7 @@ const metascan = require('../metascan');
 const uitree = require('../uitree');
 const targets = require('../targets');
 
-const ROOT = process.argv[2] || '/Users/agent/work/code/example-data/adv-org/force-app';
+const ROOT = process.argv[2] || 'test-fixtures/adv-org/force-app';
 const SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git']);
 
 // adv-org corpus root and its metadata-file skip set (adds __tests__: LWC
@@ -34,14 +34,14 @@ const SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git']);
 // specifier to jest.mock() it, but represent zero real Apex call edges --
 // metascan.js already excludes these by path too; skipping the directory
 // here just avoids reading them at all).
-const ADV_ORG_ROOT = '/Users/agent/work/code/example-data/adv-org/force-app/main/default';
+const ADV_ORG_ROOT = 'test-fixtures/adv-org/force-app/main/default';
 const ADV_ORG_SKIP_DIRS = new Set(['.sfdx', '.sf', 'node_modules', '.git', '__tests__']);
 // v0.5.0 (G4): anonymous-Apex scripts live OUTSIDE force-app entirely, in
 // their own top-level scripts/ dir (same shape a real sfdx-project.json-
 // rooted workspace uses) -- extension.js's real glob is '**/*.apex'
 // workspace-wide, so this dev tool walks this sibling root separately
 // rather than teaching walkAdvOrg about a path outside ADV_ORG_ROOT.
-const ADV_ORG_SCRIPTS_ROOT = '/Users/agent/work/code/example-data/adv-org/scripts';
+const ADV_ORG_SCRIPTS_ROOT = 'test-fixtures/adv-org/scripts';
 
 // v0.7.0 (B1): the adv-org project root and its 2 NEW packageDirectories
 // (pkg-billing, pkg-shared) -- ADV_ORG_ROOT above only ever walked
@@ -50,7 +50,7 @@ const ADV_ORG_SCRIPTS_ROOT = '/Users/agent/work/code/example-data/adv-org/script
 // sfdx-project.json (mirrors extension.js's discoverPackageMap algorithm --
 // same longest-prefix-wins map, same label fallback rule -- just without
 // the vscode.workspace plumbing, since this is a plain node dev tool).
-const ADV_ORG_PROJECT_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const ADV_ORG_PROJECT_ROOT = 'test-fixtures/adv-org';
 const ADV_ORG_PKG_ROOTS = [
   path.join(ADV_ORG_PROJECT_ROOT, 'pkg-billing', 'main', 'default'),
   path.join(ADV_ORG_PROJECT_ROOT, 'pkg-shared', 'main', 'default'),
@@ -289,7 +289,7 @@ function main() {
 
 // v0.3.0 (A7): adv-org corpus -- Apex + metadata (LWC/Aura/Flow/OmniScript),
 // exercising every amendment (A1-A6) end-to-end against the real ground-
-// truth fixture (see /Users/agent/work/code/example-data/adv-org/MANIFEST.md).
+// truth fixture (see test-fixtures/adv-org/MANIFEST.md).
 function runAdvOrg() {
   console.log('\n\n########################################################');
   console.log('# adv-org (Apex + metadata)');
@@ -705,7 +705,7 @@ function runAdvOrg() {
 //     tree above it (N4's "full normal caller tree above them").
 // Also demonstrates N3 (own-namespace resolves LOCALLY, no external node)
 // and N5's header wording ("N unresolved * M managed-package refs (ns)").
-const GAUNTLET_ORG_PROJECT_ROOT = '/Users/agent/work/code/example-data/gauntlet-org';
+const GAUNTLET_ORG_PROJECT_ROOT = 'test-fixtures/gauntlet-org';
 const GAUNTLET_ORG_ROOT = path.join(GAUNTLET_ORG_PROJECT_ROOT, 'force-app', 'main', 'default');
 
 function walkGauntletOrg(dir, apexOut, metaOut) {
@@ -926,7 +926,7 @@ function runRoundADemo() {
   // A1: long chain -- VtxReportQueryStage12.build, the traced call in
   // VtxReportChainCaller.runTwelveSegmentChain (S=12, exactly at the new
   // CHAIN_MAX cap). NOTE (corpus authoring gap, observed live 2026-07-17,
-  // out of this integrator's ownership -- example-data/gauntlet-org is a
+  // out of this integrator's ownership -- test-fixtures/gauntlet-org is a
   // separate, non-git directory owned by the corpus-authoring phase, not
   // this repo): VtxReportQueryStage1.cls..Stage12.cls each declare the
   // PREVIOUS hop's verb name instead of their own (an off-by-one shift
@@ -1051,12 +1051,13 @@ function runRoundBDemo() {
 // scanAndBuildIndex() derives it from (every '.flow-meta.xml' path this
 // walk saw, regardless of whether it produced a MetaRef), and prints the
 // per-kind counts + a handful of representative entries -- the dev-tool
-// mirror of GROUND-TRUTH.md's "## Entry catalog (v0.12)" section (23 total:
-// 6 trigger + 5 aura + 2 invocable + 0 rest + 0 soap + 9 async + 0 email +
-// 0 platform + 1 flow + 0 anonymous, 0 excludedTestEntries).
+// mirror of GROUND-TRUTH.md's entry-catalog baseline plus v0.13/v0.14
+// additive deltas (34 total: 6 trigger + 6 aura + 3 invocable + 0 rest +
+// 0 soap + 9 async + 0 email + 0 platform + 10 flow + 0 anonymous,
+// 0 excludedTestEntries).
 function runEntryCatalogDemo() {
   console.log('\n\n########################################################');
-  console.log('# ENTRY CATALOG (v0.12.0, gauntlet-org)');
+  console.log('# ENTRY CATALOG (through v0.14.0, gauntlet-org)');
   console.log('########################################################');
 
   const apexOut = [];
@@ -1093,7 +1094,7 @@ function runEntryCatalogDemo() {
 
   console.log(`Catalog build: ${t1 - t0}ms (perf bar: < 50ms; read-only walk over an already-built index).`);
   console.log('stats:', JSON.stringify(catalog.stats));
-  console.log('\nPer-kind counts (expect: trigger 6, aura 5, invocable 2, rest 0, soap 0, async 9, email 0, platform 0, flow 1, anonymous 0, total 23, excludedTestEntries 0):');
+  console.log('\nPer-kind counts (expect: trigger 6, aura 6, invocable 3, rest 0, soap 0, async 9, email 0, platform 0, flow 10, anonymous 0, total 34, excludedTestEntries 0):');
   for (const g of catalog.groups) {
     console.log(`  ${g.kind.padEnd(10)} ${String(g.entries.length).padStart(2)}  (${g.label})`);
   }
@@ -1177,12 +1178,103 @@ function runSubflowChainsDemo() {
   // Raw flowGraph dump + the unknown-subflow-ref negative. buildCallerTree/
   // buildCalleeTree above already ran finalizeFlowSubflowRefs (see its own
   // header note in resolver.js), so sfIndex.flowGraph is fully resolved here.
-  console.log('\nflowGraph (7 new flows + pre-existing Vtx_Namespace_Probe_Flow, unaffected):');
+  console.log('\nflowGraph (v0.13 subflow fixtures + v0.14 Impact parent/child flows + pre-existing namespace probe):');
   const flowGraphKeys = sfIndex.flowGraph instanceof Map ? [...sfIndex.flowGraph.keys()].sort() : [];
   for (const k of flowGraphKeys) {
     console.log(`  ${k.padEnd(34)} ${JSON.stringify(sfIndex.flowGraph.get(k))}`);
   }
   console.log(`\nstats.unknownSubflowRefs: ${sfIndex.stats.unknownSubflowRefs} (expect 1 -- Vtx_WidgetLifecycleFlow's Call_Ghost_Followup names Vtx_Nonexistent_Ghost_Flow, no such file: counted, no fabricated node)`);
+}
+
+// v0.13 / Round 2.5: concise end-to-end smoke over the real fictional
+// hardening fixtures. The exhaustive assertions live in dev/gauntlet/run.js;
+// this section keeps the new user-visible defaults easy to inspect by hand.
+function runHardeningDemo() {
+  console.log('\n\n########################################################');
+  console.log('# v0.13.0 HARDENING (confidence rollups + scoped mentions + long names)');
+  console.log('########################################################');
+
+  const apexOut = [];
+  const metaOut = [];
+  walkGauntletOrg(GAUNTLET_ORG_ROOT, apexOut, metaOut);
+  let ownNamespace = null;
+  try {
+    const project = JSON.parse(fs.readFileSync(path.join(GAUNTLET_ORG_PROJECT_ROOT, 'sfdx-project.json'), 'utf8'));
+    ownNamespace = typeof project.namespace === 'string' && project.namespace.trim() ? project.namespace.trim() : null;
+  } catch (e) { /* optional project file */ }
+
+  const facts = apexOut.map((p) => parser.parseFile({ path: p, text: fs.readFileSync(p, 'utf8') }));
+  const index = resolver.buildSemanticIndex(facts, { ownNamespace });
+  const refs = [];
+  for (const p of metaOut) {
+    const text = fs.readFileSync(p, 'utf8');
+    for (const ref of metascan.parseMetaFile({ path: p, text })) {
+      ref.path = p;
+      refs.push(ref);
+    }
+  }
+  resolver.attachMetaCallers(
+    index,
+    ownNamespace && typeof metascan.stripOwnNamespace === 'function'
+      ? metascan.stripOwnNamespace(refs, ownNamespace)
+      : refs
+  );
+
+  const ensure = (condition, message) => {
+    if (!condition) throw new Error('v0.13 hardening smoke failed: ' + message);
+  };
+  const executionChildren = (tree) => (tree.root.children || []).filter((n) => n.kind !== 'unresolved-mentions');
+
+  const magnet = resolver.buildCallerTree(index, { classLower: 'vertexbindtarget', methodLower: 'bind' });
+  const magnetEdges = executionChildren(magnet);
+  const mentions = (magnet.root.children || []).find((n) => n.kind === 'unresolved-mentions');
+  ensure(magnetEdges.length === 2 && magnetEdges.every((n) => !n.approximate), 'magnet target must have exactly two confirmed callers');
+  ensure(mentions && mentions.children.length === 40, 'magnet target must expose 40 scoped unresolved mentions');
+  console.log('H1/H3 magnet: 2 confirmed callers; 0 approximate edges; 40 scoped unresolved bind( mentions -- PASS');
+  console.log('header:', uitree.unresolvedMentionsHeaderLine(magnet));
+
+  const pricing = resolver.buildCallerTree(index, { classLower: 'vertexpricingservice', methodLower: 'reprice' });
+  const pricingExecution = executionChildren(pricing);
+  const rollup = pricingExecution.find((n) => n.kind === 'rollup');
+  ensure(pricingExecution.filter((n) => n.kind !== 'rollup').length === 16, 'pricing target must keep 16 confirmed callers visible');
+  ensure(rollup && rollup.label === '1 possible caller (unconfirmed)' && rollup.children.length === 1, 'pricing target must group its one approximate caller');
+  console.log('H2 default: 16 confirmed callers + "1 possible caller (unconfirmed)" rollup -- PASS');
+
+  const longTree = resolver.buildCalleeTree(index, {
+    classLower: 'vertexenterpriseorderfulfillmentreconciliationorchestratorservice',
+    methodLower: 'reconcilefulfillmentdiscrepanciesacrossalldistributioncenters',
+  }, { showUnconfirmed: 'expand', maxDepth: 12 });
+  const longExpected = new Set([
+    'VertexCrossRegionInventoryAvailabilitySynchronizationCoordinator.synchronizeInventoryAvailabilitySnapshotsForDistributionRegion',
+    'VertexThirdPartyLogisticsProviderIntegrationAdapterFactoryImpl.createAdapterInstanceForCarrierAccountIntegrationConfiguration',
+    'VertexThirdPartyLogisticsProviderIntegrationAdapterImplementation.buildCarrierAccountIntegrationConfigurationForRegionalPartner',
+  ]);
+  const visit = (node) => {
+    longExpected.delete(node.label);
+    ensure(!node.approximate, `long-name edge unexpectedly approximate: ${node.label}`);
+    for (const child of node.children || []) visit(child);
+  };
+  visit(longTree.root);
+  ensure(longExpected.size === 0, `missing long-name labels: ${JSON.stringify([...longExpected])}`);
+  console.log('long identifiers: all three 60+-character class/method edges resolved and rendered in full -- PASS');
+  console.log(`diagnostics: name-too-common=${index.stats.unresolvedByReason['name-too-common']}, magnetSuppressed=${index.stats.magnetSuppressedAttachments}, viaKinds=${Object.keys(index.stats.viaHistogram || {}).length}`);
+
+  // v0.14: reuse this same real parsed corpus/index for one end-to-end
+  // Impact Analysis report.  This is intentionally a compact smoke; the
+  // exhaustive synthetic classifier/UI assertions live in the test suite.
+  const impact = resolver.buildImpactReport(index, {
+    classLower: 'vertexpricingservice',
+    methodLower: 'reprice',
+    overloadSig: 'reprice(Vertex_Order__c)',
+  });
+  ensure(impact && impact.breaks.length > 0, 'impact report must contain confirmed direct callers');
+  ensure(impact.contract.interfaces.length > 0, 'impact report must include the implemented interface contract');
+  ensure(impact.contract.overrides.overriddenBy.length > 0, 'impact report must include the overriding child declaration');
+  const impactSections = uitree.shapeImpactReport(impact);
+  ensure(impactSections.length === 5, 'impact report must render all five risk sections');
+  console.log('\nv0.14 Impact Analysis:', impact.target.label);
+  console.log('header:', uitree.shapeImpactHeaderLine(impact));
+  console.log('sections:', impactSections.map((section) => `${section.label}=${section.description}`).join(' · '));
 }
 
 main();
@@ -1193,3 +1285,4 @@ runRoundADemo();
 runRoundBDemo();
 runEntryCatalogDemo();
 runSubflowChainsDemo();
+runHardeningDemo();

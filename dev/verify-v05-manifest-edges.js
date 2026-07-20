@@ -9,8 +9,8 @@ const path = require('path');
 const parser = require('../parser.js');
 const resolver = require('../resolver.js');
 
-const ROOT = '/Users/agent/work/code/example-data/adv-org/force-app/main/default';
-const SCRIPTS_ROOT = '/Users/agent/work/code/example-data/adv-org/scripts';
+const ROOT = 'test-fixtures/adv-org/force-app/main/default';
+const SCRIPTS_ROOT = 'test-fixtures/adv-org/scripts';
 
 function walk(dir, out, re) {
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {

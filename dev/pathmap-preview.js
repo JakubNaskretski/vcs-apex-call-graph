@@ -42,7 +42,7 @@ const resolver = require('../resolver');
 const metascan = require('../metascan');
 const { renderPathMapHtml } = require('../pathmap');
 
-const ROOT = process.argv[2] || '/Users/agent/work/code/example-data/adv-org/force-app/main/default';
+const ROOT = process.argv[2] || 'test-fixtures/adv-org/force-app/main/default';
 // v0.5.0 (G4): scripts/*.apex lives outside force-app entirely -- same
 // sibling-root shape dev/smoke.js's ADV_ORG_SCRIPTS_ROOT uses. Only
 // consulted when ROOT is left at its adv-org default (a bare-corpus

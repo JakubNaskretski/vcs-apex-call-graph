@@ -2,7 +2,7 @@
 // Adversarial MANIFEST-accounting verifier (v0.4.0 round).
 //
 // Scope: mechanically checks EVERY edge in the "## v0.4 ground-truth edges"
-// section of /Users/agent/work/code/example-data/adv-org/MANIFEST.md
+// section of test-fixtures/adv-org/MANIFEST.md
 // (F1 dml/trigger + flow-DML-children, F2 generics, F3 override fan-out,
 // F4a Type.forName, F4b CMDT, F5 entry-kind tail) against a LIVE run of the
 // real engine (parser.js + resolver.js + metascan.js), wired the same way
@@ -15,7 +15,7 @@
 // (v0.3.0-era) output to classify every discrepancy it reports as either
 // "expected due to documented v0.4 behavior change" or "real regression".
 //
-// Read-only: never touches example-data/adv-org or any engine file.
+// Read-only: never touches test-fixtures/adv-org or any engine file.
 //
 // Usage: node dev/manifest-verify-v040.js
 
@@ -26,7 +26,7 @@ const parser = require('../parser');
 const resolver = require('../resolver');
 const metascan = require('../metascan');
 
-const ADV_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const ADV_ROOT = 'test-fixtures/adv-org';
 const FORCE_APP = path.join(ADV_ROOT, 'force-app', 'main', 'default');
 
 let pass = 0;

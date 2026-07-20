@@ -203,6 +203,27 @@ function normalizeProgressiveOpts(opts, maxDepth) {
   return { initialDepth, userExpandedKeys };
 }
 
+// v0.13/H2: shared opts-normalization for the new apexCallGraph.showUnconfirmed
+// setting -- 'rollup' (default) | 'hide' | 'expand' (old, pre-H2 flat
+// behavior). Any other/missing value normalizes to 'rollup', matching the
+// setting's own documented default -- so a caller that never touches opts at
+// all (every pre-H2 call site) gets the NEW default, not a silent opt-out;
+// see buildChildrenLevel's own header note for how each mode actually
+// changes the built children array.
+function normalizeShowUnconfirmed(opts) {
+  const v = opts && opts.showUnconfirmed;
+  return v === 'hide' || v === 'expand' ? v : 'rollup';
+}
+
+// v0.13/H4: shared by buildCallerTree/buildExternalCallerTree/buildCalleeTree's
+// own BFS expansion loops (a SEPARATE call from buildSemanticIndex's own
+// internal opts.shouldCancel guard -- these three functions receive the
+// trace-time `opts`, not the index-build-time one, and are called well after
+// the index already exists).
+function shouldCancelOpt(opts) {
+  return !!(opts && typeof opts.shouldCancel === 'function' && opts.shouldCancel());
+}
+
 // Verbatim from the frozen spec's PLATFORM DENYLIST clause.
 const PLATFORM_DENYLIST = new Set([
   'system', 'database', 'test', 'schema', 'math', 'json', 'string', 'integer',
@@ -248,6 +269,21 @@ const HTTP_ANNOTATIONS = new Set(['httpget', 'httppost', 'httpput', 'httpdelete'
 // from one call site, exactly the same "genuinely can't tell which one"
 // reasoning as 'interface'/'narrowed'.
 const APPROX_VIA = new Set(['interface', 'unique-name', 'lexical', 'override', 'dynamic', 'narrowed', 'ambiguous']);
+
+// v0.13/H1: ATTACHMENT CAP for rule 7's unique-name fallback. A bare/dotted
+// call whose receiver could not be resolved to anything at all falls back to
+// "the workspace's sole declarer of this method name" (unresolvedFallback,
+// below) -- fine for a genuinely rare/project-specific name, but a magnet in
+// a big org: a framework-common name (e.g. `bind`) called on thousands of
+// unresolvable receivers attaches EVERY one of them as a false caller of the
+// one local class that happens to declare it. If a single target method
+// would receive MORE than this many unique-name attachments across the whole
+// workspace, none of them are trustworthy signal any more (that volume is
+// itself proof the name is framework-common, not semantically unique) -- see
+// finalizeUniqueNameCap's own header note for how the cap is actually
+// enforced (a post-pass-B reconciliation, since the true total count isn't
+// known until every file has been walked).
+const UNIQUE_NAME_MAX = 5;
 
 // F1: statement-form and Database.xxx() method-form DML ops this resolver
 // understands, and the trigger event(s) each one activates. upsert maps to
@@ -363,6 +399,64 @@ function computeExternalStats(externalsMap) {
   }
   namespaces.sort((a, b) => lc(a).localeCompare(lc(b)));
   return { externalRefs, externalNamespaces: namespaces };
+}
+
+// Round 2.5/H8: counts-only edge histogram for diagnostics. This is
+// deliberately derived from the finished index rather than maintained by
+// dozens of resolution branches, so cap reconciliation and metadata
+// attachment cannot leave the count drifting from the graph that will
+// actually be queried. Metadata refs are object-deduped because the same
+// ref can live in both the class- and method-level lookup maps.
+function refreshIndexDiagnostics(index) {
+  if (!index) return index;
+  const histogram = {};
+  const add = (via, count) => {
+    if (!via) return;
+    const n = typeof count === 'number' ? count : 1;
+    histogram[via] = (histogram[via] || 0) + n;
+  };
+  const countSiteMap = (map) => {
+    if (!(map instanceof Map)) return;
+    for (const sites of map.values()) {
+      for (const site of sites || []) add(site && site.via);
+    }
+  };
+
+  countSiteMap(index.methodCallers);
+  countSiteMap(index.externalCallers);
+
+  if (index.throwers instanceof Map) {
+    for (const sites of index.throwers.values()) add('throws', (sites || []).length);
+  }
+
+  const seenMetaRefs = new Set();
+  const countMetaMap = (map) => {
+    if (!(map instanceof Map)) return;
+    for (const refs of map.values()) {
+      for (const ref of refs || []) {
+        if (ref && typeof ref === 'object') {
+          if (seenMetaRefs.has(ref)) continue;
+          seenMetaRefs.add(ref);
+        }
+        add('metadata');
+      }
+    }
+  };
+  countMetaMap(index.metaCallers);
+  countMetaMap(index.metaMethodCallers);
+  countMetaMap(index.externalMetaRefs);
+
+  if (index.flowGraph instanceof Map) {
+    let subflowEdges = 0;
+    for (const graphNode of index.flowGraph.values()) {
+      subflowEdges += Array.isArray(graphNode && graphNode.children) ? graphNode.children.length : 0;
+    }
+    if (subflowEdges) add('subflow', subflowEdges);
+  }
+
+  index.stats = index.stats || {};
+  index.stats.viaHistogram = histogram;
+  return index;
 }
 
 // F2: splits a generic argument list on top-level commas only (depth-aware,
@@ -788,6 +882,90 @@ function buildSemanticIndex(factsList, opts) {
   // as `stats.unresolvedSites` and threaded through to every TreeResult
   // (H4's "N call sites workspace-wide could not be resolved" header).
   let unresolvedSitesCount = 0;
+  // v0.13/H3: reason breakdown for stats.unresolvedByReason (feeds the H8
+  // Scan Stats channel/diagnostics command -- both out of this file's own
+  // scope, but the counts themselves are only ever knowable HERE, at the
+  // exact call site that decided a site stays unresolved). Every key is
+  // pre-seeded at 0 so a consumer never has to guard a missing key.
+  // 'parse-fallback' is set once, after pass E, directly from
+  // parseFallbacks.length (a FILE-granularity figure, not a call-site one --
+  // see its own assignment below) rather than incremented per-site like the
+  // other four.
+  const unresolvedByReason = {
+    'unknown-receiver': 0,
+    'deep-chain': 0,
+    'non-literal-dynamic': 0,
+    'parse-fallback': 0,
+    'name-too-common': 0,
+  };
+  // v0.13/H3: nameLower -> Array<{reason, callerClass, callerKey, path,
+  // line, col, lineText}> -- every unresolved call site this build can
+  // attribute to a concrete called-method NAME (bookkept alongside
+  // unresolvedSitesCount at the exact same call sites -- see
+  // recordUnresolvedSite below). Powers the caller-direction trace header's
+  // "K unresolved sites elsewhere mention <method>(" figure: K is simply
+  // this map's entry for the traced method's own lowercased name, length
+  // (arity-agnostic by construction -- a call site lands here regardless of
+  // its own argTexts count). NOT every unresolvedSitesCount-contributing
+  // category is represented here (resolveChainedReceiver's two deep-chain
+  // sites don't have a called-method name in scope at their point of
+  // failure -- see their own call sites, unchanged) -- deep-chain mentions
+  // are therefore undercounted here by design, not a bug; deep-chain's own
+  // tally lives in unresolvedByReason instead.
+  const unresolvedSitesByName = new Map();
+  // v0.13/H1: targetKey ('classLower#nameLower') -> running count of
+  // unique-name attachments written so far for that target, incremented
+  // once per successful unresolvedFallback() call (see its own header
+  // note). The TRUE total for a target is only known once pass B has
+  // walked every file, so finalizeUniqueNameCap (run once, right after
+  // pass B) is what actually decides whether a target's attachments
+  // survive or get stripped back to unresolved.
+  const uniqueNameAttachCounts = new Map();
+  let magnetSuppressedAttachments = 0;
+
+  // v0.13/H3: shared by every unresolvedSitesCount-incrementing call site
+  // that has NO concrete call-site/name to attribute (today: only
+  // resolveChainedReceiver's two deep-chain outcomes) -- bumps the total
+  // and the reason tally, nothing else.
+  function bumpUnresolvedReason(reason) {
+    unresolvedSitesCount++;
+    unresolvedByReason[reason] = (unresolvedByReason[reason] || 0) + 1;
+  }
+  // v0.13/H3: shared by every unresolvedSitesCount-incrementing call site
+  // that DOES have a concrete (callerClassLower, callerMethodLabel, call,
+  // nameLower) tuple in scope -- bumps the total + reason tally (like
+  // bumpUnresolvedReason) AND records the site under its called name in
+  // unresolvedSitesByName, for the H3 scoped-header mention count.
+  function recordUnresolvedSite(reason, nameLower, callerClassLower, callerMethodLabel, call) {
+    unresolvedSitesCount++;
+    unresolvedByReason[reason] = (unresolvedByReason[reason] || 0) + 1;
+    if (!nameLower) return;
+    const ccm = classes.get(callerClassLower);
+    const entry = {
+      reason,
+      callerClass: ccm ? ccm.qualified : callerClassLower,
+      callerKey: `${callerClassLower}#${lc(callerMethodLabel)}`,
+      path: ccm ? ccm.path : '',
+      line: call.line,
+      col: call.col,
+      lineText: call.lineText,
+    };
+    if (!unresolvedSitesByName.has(nameLower)) unresolvedSitesByName.set(nameLower, []);
+    unresolvedSitesByName.get(nameLower).push(entry);
+  }
+  // v0.13/H4: opts.shouldCancel() -- an optional zero-arg predicate the host
+  // (extension.js) can pass so a scan over a huge workspace can be aborted
+  // cleanly instead of running to completion once the user has already
+  // moved on. Checked at the TOP of every outer pass loop below (pass
+  // A/B/C/D/E, all of which iterate every file or every class) -- never
+  // mid-file, since MethodFacts/CallFacts processing for one file/class is
+  // already fast and atomic; there is nothing finer-grained worth guarding.
+  // `cancelled` latches true the first time the check fires and is checked
+  // (not re-checked against shouldCancel()) by every LATER pass's own guard,
+  // so one cancellation signal skips every remaining pass, not just the one
+  // that first observed it.
+  const shouldCancel = opts && typeof opts.shouldCancel === 'function' ? opts.shouldCancel : null;
+  let cancelled = false;
   // MUST-FIX #5: whether opts.packageOf ever actually resolved a REAL
   // (non-null) package label for at least one file, as opposed to merely
   // being a function that was PASSED (and might return null for every
@@ -882,6 +1060,11 @@ function buildSemanticIndex(factsList, opts) {
 
   // ---- pass A: register ClassMeta + MethodMeta for every parseable type --
   for (const file of factsList || []) {
+    // v0.13/H4: checked once per file (this loop's own natural grain --
+    // per-file work below is already atomic/fast, nothing finer-grained is
+    // worth guarding) -- see `cancelled`'s own header note for why every
+    // LATER pass also bails via this same flag once it's latched true.
+    if (shouldCancel && shouldCancel()) { cancelled = true; break; }
     if (file.parseError) continue; // handled in the lexical fallback pass below
     const isTriggerFile = file.kind === 'trigger';
     const isAnonymousFile = file.kind === 'anonymous';
@@ -1361,6 +1544,7 @@ function buildSemanticIndex(factsList, opts) {
       via: 'external',
       targetMethod: null,
       overloadSig: null,
+      overloadPick: 'exact',
     };
     if (!externalCallers.has(key)) externalCallers.set(key, []);
     externalCallers.get(key).push(site);
@@ -1438,11 +1622,12 @@ function buildSemanticIndex(factsList, opts) {
   // behavior, per the amendment's "on tie keep current arity behavior"
   // instruction.
   function pickBestOverload(candidates, call, callerClassLower, methodFacts) {
-    if (!call || candidates.length < 2) return candidates[0];
+    if (!call || candidates.length < 2) return Object.assign({}, candidates[0], { overloadPick: 'exact' });
     const argTexts = call.argTexts || [];
     const argInfos = argTexts.map((a) => inferArgHead(a, callerClassLower, methodFacts));
     let best = candidates[0];
     let bestScore = -Infinity;
+    let bestSignatures = new Set();
     for (const cand of candidates) {
       const params = cand.method.params || [];
       const candCm = classes.get(cand.classLower);
@@ -1464,9 +1649,20 @@ function buildSemanticIndex(factsList, opts) {
       if (score > bestScore) {
         bestScore = score;
         best = cand;
+        bestSignatures = new Set([impactMethodSignature(cand.method)]);
+      } else if (score === bestScore) {
+        bestSignatures.add(impactMethodSignature(cand.method));
       }
     }
-    return best;
+    const tiedOverloadSigs = Array.from(bestSignatures);
+    return Object.assign({}, best, {
+      overloadPick: tiedOverloadSigs.length > 1 ? 'arity-tie' : 'exact',
+      // The ordinary graph still keeps ONE deterministic chosen edge, but
+      // Impact Analysis must know every equally-best signature this physical
+      // call might bind to. Optional and tie-only so exact CallSite shapes
+      // remain untouched.
+      tiedOverloadSigs: tiedOverloadSigs.length > 1 ? tiedOverloadSigs : undefined,
+    });
   }
 
   function findMethodOwners(classLower, nameLower, walkSuper, callArity, call, callerClassLower, methodFacts) {
@@ -1488,11 +1684,11 @@ function buildSemanticIndex(factsList, opts) {
         // A4: multiple same-arity overloads tie -- use arg-type scoring
         // instead of blindly taking the first-declared one.
         if (exact.length > 1) return [pickBestOverload(exact, call, callerClassLower, methodFacts)];
-        return [exact[0]]; // closest-declaring-class wins among exact-arity matches
+        return [Object.assign({}, exact[0], { overloadPick: 'exact' })]; // closest-declaring-class wins among exact-arity matches
       }
-      return all; // no arity match anywhere in the chain -> fan out to every overload (approximate)
+      return all.map((o) => Object.assign({}, o, { overloadPick: 'fallback' })); // no arity match anywhere in the chain -> fan out to every overload (approximate)
     }
-    return [all[0]];
+    return [Object.assign({}, all[0], { overloadPick: 'fallback' })];
   }
 
   // A4: 'name(TypeHead1, TypeHead2)' signature string for the CHOSEN
@@ -1531,7 +1727,7 @@ function buildSemanticIndex(factsList, opts) {
     const owners = findMethodOwners(classLower, nameLower, walkSuper, callArity, call, callerClassLower, methodFacts);
     for (const o of owners) {
       const overloadSig = computeOverloadSig(o, nameLower);
-      writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, via, o.method.name, overloadSig, forwardOpt);
+      writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, via, o.method.name, overloadSig, forwardOpt, undefined, o.overloadPick, o.tiedOverloadSigs);
     }
     return owners.length > 0;
   }
@@ -1558,7 +1754,7 @@ function buildSemanticIndex(factsList, opts) {
     const fannedOutFrom = new Set();
     for (const o of owners) {
       const overloadSig = computeOverloadSig(o, nameLower);
-      writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, via, o.method.name, overloadSig);
+      writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, via, o.method.name, overloadSig, undefined, undefined, o.overloadPick, o.tiedOverloadSigs);
       if (!fannedOutFrom.has(o.classLower)) {
         fannedOutFrom.add(o.classLower);
         emitOverrideFanout(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, callArity, methodFacts, 'override');
@@ -1617,9 +1813,9 @@ function buildSemanticIndex(factsList, opts) {
     return found === undefined ? null : found;
   }
 
-  function makeCallSite(callerClassLower, callerMethodLabel, call, via, targetMethodName, overloadSig, approximateOverride) {
+  function makeCallSite(callerClassLower, callerMethodLabel, call, via, targetMethodName, overloadSig, approximateOverride, overloadPick, tiedOverloadSigs) {
     const ccm = classes.get(callerClassLower);
-    return {
+    const site = {
       callerClass: ccm.qualified,
       callerMethod: callerMethodLabel,
       callerKey: `${callerClassLower}#${lc(callerMethodLabel)}`,
@@ -1631,6 +1827,11 @@ function buildSemanticIndex(factsList, opts) {
       via,
       targetMethod: targetMethodName || null,
       overloadSig: overloadSig || null, // A4: optional 'name(TypeHead, ...)' for a true overload family
+      // v0.14 Impact Analysis: exposes HOW overload resolution selected
+      // this edge. Exact includes the sole matching-arity overload or a
+      // unique best type-score; arity-tie is the existing first-candidate
+      // tie-break; fallback is the existing no-matching-arity fan-out.
+      overloadPick: overloadPick === 'arity-tie' || overloadPick === 'fallback' ? overloadPick : 'exact',
       // v0.11/B2: per-EDGE approximate override, independent of `via` --
       // ONLY ever true for a narrowed-generic-DML edge (still via='dml', so
       // the honest "the trigger genuinely fires" via vocabulary stays
@@ -1643,6 +1844,10 @@ function buildSemanticIndex(factsList, opts) {
       // existing consumer of that output shape).
       approximate: !!approximateOverride,
     };
+    if (overloadPick === 'arity-tie' && Array.isArray(tiedOverloadSigs) && tiedOverloadSigs.length > 1) {
+      site.tiedOverloadSigs = tiedOverloadSigs.slice();
+    }
+    return site;
   }
 
   // A1: 'name(TypeHead, ...)'-overload-aware param-name zip, the SAME
@@ -1706,10 +1911,10 @@ function buildSemanticIndex(factsList, opts) {
     return 'call';
   }
 
-  function writeMethodEdge(callerClassLower, callerMethodLabel, targetClassLower, nameLower, call, via, targetMethodName, overloadSig, forward, approximateOverride) {
+  function writeMethodEdge(callerClassLower, callerMethodLabel, targetClassLower, nameLower, call, via, targetMethodName, overloadSig, forward, approximateOverride, overloadPick, tiedOverloadSigs) {
     const key = `${targetClassLower}#${nameLower}`;
     if (!methodCallers.has(key)) methodCallers.set(key, []);
-    methodCallers.get(key).push(makeCallSite(callerClassLower, callerMethodLabel, call, via, targetMethodName, overloadSig, approximateOverride));
+    methodCallers.get(key).push(makeCallSite(callerClassLower, callerMethodLabel, call, via, targetMethodName, overloadSig, approximateOverride, overloadPick, tiedOverloadSigs));
     // A1: forward defaults to true -- every ordinary resolution rule (1-7,
     // incl. DML-trigger/publish-trigger/async edges, which all fund through
     // this same function) records itself as a forward edge too, UNLESS the
@@ -1728,6 +1933,7 @@ function buildSemanticIndex(factsList, opts) {
         args,
         argsRendered: renderArgsForTarget(targetClassLower, nameLower, overloadSig, args),
         overloadSig: overloadSig || null,
+        overloadPick: overloadPick === 'arity-tie' || overloadPick === 'fallback' ? overloadPick : 'exact',
         targetLabel: targetMethodName || nameLower,
       });
     }
@@ -1740,7 +1946,7 @@ function buildSemanticIndex(factsList, opts) {
   // in header: "classCallers rollup scope") so class-level tracing doesn't
   // silently drop constructor-chaining callers.
   function writeCtorEdge(callerClassLower, callerMethodLabel, targetClassLower, call, via, forward) {
-    const site = makeCallSite(callerClassLower, callerMethodLabel, call, via, '<init>');
+    const site = makeCallSite(callerClassLower, callerMethodLabel, call, via, '<init>', null, false, 'exact');
     const key = `${targetClassLower}#<init>`;
     if (!methodCallers.has(key)) methodCallers.set(key, []);
     methodCallers.get(key).push(site);
@@ -1762,6 +1968,7 @@ function buildSemanticIndex(factsList, opts) {
         args,
         argsRendered: renderArgsForTarget(targetClassLower, '<init>', null, args),
         overloadSig: null,
+        overloadPick: 'exact',
         targetLabel: '<init>',
       });
     }
@@ -1797,14 +2004,42 @@ function buildSemanticIndex(factsList, opts) {
   // unresolved-site bookkeeping (below) can tell "genuinely could not
   // resolve this receiver" apart from "resolved via the unique-name
   // fallback".
-  function unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower) {
+  //
+  // v0.13/H1(a) ARITY GATE: unlike every OTHER dispatch rule's use of
+  // findMethodOwners (which, on an arity mismatch, deliberately FANS OUT to
+  // every overload as an approximate multi-candidate guess -- appropriate
+  // for a typed/interface/self-dispatch call, where the receiver's real
+  // class IS known, just not which overload), rule 7 has no such anchor: the
+  // receiver itself never resolved to anything. An arity mismatch here is
+  // not "which overload" ambiguity, it's proof this call site is calling
+  // something else entirely that merely happens to share the bare name --
+  // so a mismatch DECLINES outright (stays unresolved) rather than fanning
+  // out. `methodFacts` is threaded through only for pickBestOverload's
+  // arg-type scoring, used solely to break a tie between two SAME-arity
+  // overloads on the sole declaring class (rare, but possible).
+  function unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower, methodFacts) {
     const owners = methodNameIndex.get(nameLower);
     if (!owners || owners.size !== 1) return false; // not unique -> stays unresolved
     const [onlyClassLower] = owners;
-    const owner = findMethodOwners(onlyClassLower, nameLower, false)[0];
-    if (!owner) return false;
+    const ownCm = classes.get(onlyClassLower);
+    if (!ownCm) return false;
+    const candidates = ownCm.methods.filter((m) => lc(m.name) === nameLower);
+    if (!candidates.length) return false;
+    const callArity = (call.argTexts || []).length;
+    const exact = candidates.filter((m) => m.params.length === callArity);
+    if (!exact.length) return false; // H1(a): arity mismatch -> decline, no fabricated attachment
+    const owner = exact.length > 1
+      ? pickBestOverload(exact.map((m) => ({ classLower: onlyClassLower, method: m })), call, callerClassLower, methodFacts)
+      : { classLower: onlyClassLower, method: exact[0], overloadPick: 'exact' };
     const overloadSig = computeOverloadSig(owner, nameLower);
-    writeMethodEdge(callerClassLower, callerMethodLabel, owner.classLower, nameLower, call, 'unique-name', owner.method.name, overloadSig);
+    writeMethodEdge(callerClassLower, callerMethodLabel, owner.classLower, nameLower, call, 'unique-name', owner.method.name, overloadSig, undefined, undefined, owner.overloadPick, owner.tiedOverloadSigs);
+    // v0.13/H1(b) ATTACHMENT CAP bookkeeping: this attachment is written
+    // OPTIMISTICALLY (same as pre-H1 behavior) -- whether it actually
+    // survives is decided once, after pass B finishes walking every file,
+    // by finalizeUniqueNameCap (see its own header note for why the
+    // decision can't be made any earlier than that).
+    const targetKey = `${owner.classLower}#${nameLower}`;
+    uniqueNameAttachCounts.set(targetKey, (uniqueNameAttachCounts.get(targetKey) || 0) + 1);
     return true;
   }
 
@@ -1929,7 +2164,7 @@ function buildSemanticIndex(factsList, opts) {
         // own forward edges (mirrors the interface-implementer fan-out's
         // own forwardOpt=false, same reasoning: forward tracing shows the
         // single most-direct target, not every possible-override variant).
-        writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, viaLabel, o.method.name, overloadSig, false);
+        writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, viaLabel, o.method.name, overloadSig, false, undefined, o.overloadPick, o.tiedOverloadSigs);
         any = true;
       }
     }
@@ -2004,7 +2239,7 @@ function buildSemanticIndex(factsList, opts) {
       // resolveComplexReceiver) or a prop-call (resolvePropCall) receiver;
       // resolveDotOther's own generic catch-all (below) is taught to skip
       // re-counting this same call site for the same reason.
-      unresolvedSitesCount++;
+      bumpUnresolvedReason('deep-chain'); // v0.13/H3
       return null;
     }
     const isSimpleHead = SIMPLE_IDENT_RE.test(parsed.head);
@@ -2048,7 +2283,7 @@ function buildSemanticIndex(factsList, opts) {
         // v0.10/A1: cycle hit -- degrades to no edge, the SAME "dropped
         // call site" treatment (and the SAME H4 counter) as exceeding
         // CHAIN_MAX, per the amendment's own text.
-        unresolvedSitesCount++;
+        bumpUnresolvedReason('deep-chain'); // v0.13/H3
         return null;
       }
       visited.add(visitKey);
@@ -2264,7 +2499,7 @@ function buildSemanticIndex(factsList, opts) {
       // chain, or a Head that IS platform-denylisted, falls through to the
       // exact pre-v0.8 "honest unresolved site" outcome unchanged.
       if (tryAttachExternalTwoSegmentReceiver(receiverRaw, nameLower, call, callerClassLower, callerMethodLabel)) return;
-      unresolvedSitesCount++;
+      recordUnresolvedSite('unknown-receiver', nameLower, callerClassLower, callerMethodLabel, call); // v0.13/H3
       return;
     }
 
@@ -2353,7 +2588,7 @@ function buildSemanticIndex(factsList, opts) {
     // Rule 7: unique-name fallback.
     const resolved = COLLECTION_ACCESSOR_NAMES.has(nameLower) || (strippedOwnNs && isSimple)
       ? false
-      : unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower);
+      : unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower, methodFacts);
     // H4: every prior rule (5, 6, and rule 7's own unique-name fallback)
     // has now failed -- this receiver never resolved to anything at all
     // ("unknown receiver"). Skip the count when resolveChainedReceiver
@@ -2363,7 +2598,12 @@ function buildSemanticIndex(factsList, opts) {
     if (!resolved) {
       const chainSeg = !isSimple ? parseChainSegments(receiverRaw) : null;
       const alreadyCountedChainCap = !!(chainSeg && chainSeg.segments.length > 4);
-      if (!alreadyCountedChainCap) unresolvedSitesCount++;
+      // v0.13/H3: reason='unknown-receiver' -- this is the catch-all "rule
+      // 7 also declined" outcome (either the name wasn't globally unique, or
+      // -- new in H1 -- it WAS unique but failed the arity gate). Both are
+      // "this call's real target is unknown" from the tracer's point of
+      // view, so both share the same reason bucket.
+      if (!alreadyCountedChainCap) recordUnresolvedSite('unknown-receiver', nameLower, callerClassLower, callerMethodLabel, call);
     }
   }
 
@@ -2509,7 +2749,7 @@ function buildSemanticIndex(factsList, opts) {
       // already does.
       const callArity3 = (call.argTexts || []).length;
       if (emitOwnersWithSelfOverrideFanout(callerClassLower, callerMethodLabel, callerClassLower, nameLower, call, 'this', true, callArity3, methodFacts)) return;
-      unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower);
+      unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower, methodFacts);
       return;
     }
 
@@ -2522,7 +2762,7 @@ function buildSemanticIndex(factsList, opts) {
       const nameLower = lc(call.method);
       const callArity4t = (call.argTexts || []).length;
       if (emitOwnersWithSelfOverrideFanout(callerClassLower, callerMethodLabel, callerClassLower, nameLower, call, 'this', true, callArity4t, methodFacts)) return;
-      unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower);
+      unresolvedFallback(callerClassLower, callerMethodLabel, call, nameLower, methodFacts);
       return;
     }
     if (receiverLower === 'super') {
@@ -2960,7 +3200,7 @@ function buildSemanticIndex(factsList, opts) {
       // H4: the third named "dropped call site" category -- an arg text
       // that never qualifies under any of the four literal-flow shapes
       // (variable, reassigned local, non-final/computed constant, param).
-      unresolvedSitesCount++;
+      recordUnresolvedSite('non-literal-dynamic', lc(call.method), callerClassLower, callerMethodLabel, call); // v0.13/H3
       return;
     }
     const ccm = classes.get(callerClassLower);
@@ -3098,6 +3338,7 @@ function buildSemanticIndex(factsList, opts) {
       via,
       targetMethod: null,
       overloadSig: null,
+      overloadPick: 'exact',
     };
   }
 
@@ -3193,7 +3434,7 @@ function buildSemanticIndex(factsList, opts) {
       const owners = findMethodOwners(targetClassLower, nameLower, true, callArity, call, callerClassLower, methodFacts);
       for (const o of owners) {
         const overloadSig = computeOverloadSig(o, nameLower);
-        writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, 'narrowed', o.method.name, overloadSig);
+        writeMethodEdge(callerClassLower, callerMethodLabel, o.classLower, nameLower, call, 'narrowed', o.method.name, overloadSig, undefined, undefined, o.overloadPick, o.tiedOverloadSigs);
         any = true;
       }
     }
@@ -3239,6 +3480,13 @@ function buildSemanticIndex(factsList, opts) {
 
   // ---- pass B: walk every parseable method's calls -----------------------
   for (const file of factsList || []) {
+    // v0.13/H4: `cancelled` may already be true (latched during pass A) --
+    // this stops pass B from ever starting in that case. Also re-checked
+    // live here (pass B is the expensive one) so a cancellation signaled
+    // partway through pass A but not yet observed there (shouldCancel()
+    // wasn't re-polled between files) still gets caught at the top of the
+    // next pass's own iteration.
+    if (cancelled || (shouldCancel && shouldCancel())) { cancelled = true; break; }
     if (file.parseError) continue;
     for (const tf of file.types || []) {
       const qualifiedLower = lc(tf.qualified);
@@ -3342,6 +3590,64 @@ function buildSemanticIndex(factsList, opts) {
     }
   }
 
+  // v0.13/H1(b) ATTACHMENT CAP finalization -- runs once, immediately after
+  // pass B has walked every file, so uniqueNameAttachCounts now holds the
+  // TRUE final count of unique-name attachments each target method
+  // attracted (unresolvedFallback wrote every one of them OPTIMISTICALLY,
+  // during pass B, exactly like pre-H1 behavior -- the cap could not have
+  // been enforced any earlier, since the total for a target isn't knowable
+  // until the LAST file that might still reference it has been seen). Any
+  // target whose count exceeds UNIQUE_NAME_MAX gets EVERY one of its
+  // unique-name attachments stripped back out here -- both the reverse-
+  // direction CallSite (methodCallers) and the forward-direction ForwardEdge
+  // (methodCallees) -- and returned to the unresolved bookkeeping, tagged
+  // 'name-too-common'. Skipped entirely (loop body never runs) when
+  // cancelled -- a cancelled build's methodCallers/methodCallees are already
+  // partial and about to be discarded by the caller, so there is nothing
+  // honest to finalize.
+  if (!cancelled) {
+    for (const [targetKey, count] of uniqueNameAttachCounts) {
+      if (count <= UNIQUE_NAME_MAX) continue;
+      const sites = methodCallers.get(targetKey) || [];
+      const kept = [];
+      const strippedCallerKeys = [];
+      for (const site of sites) {
+        if (site.via === 'unique-name') strippedCallerKeys.push(site.callerKey);
+        else kept.push(site);
+      }
+      methodCallers.set(targetKey, kept);
+      const hashIdx = targetKey.lastIndexOf('#');
+      const nameLowerForTarget = targetKey.slice(hashIdx + 1);
+      for (const callerKey of strippedCallerKeys) {
+        const edges = methodCallees.get(callerKey) || [];
+        const idx = edges.findIndex((e) => e.targetKey === targetKey && e.via === 'unique-name');
+        if (idx !== -1) edges.splice(idx, 1);
+        unresolvedForwardCounts.set(callerKey, (unresolvedForwardCounts.get(callerKey) || 0) + 1);
+      }
+      unresolvedSitesCount += strippedCallerKeys.length;
+      unresolvedByReason['name-too-common'] += strippedCallerKeys.length;
+      magnetSuppressedAttachments += strippedCallerKeys.length;
+      if (!unresolvedSitesByName.has(nameLowerForTarget)) unresolvedSitesByName.set(nameLowerForTarget, []);
+      const bucket = unresolvedSitesByName.get(nameLowerForTarget);
+      // Re-derive each stripped site's own {callerClass, callerKey, path,
+      // line, col, lineText} from the sites array we just filtered OUT of
+      // `kept` above -- reusing the exact CallSite objects unresolvedFallback
+      // already built (via makeCallSite) rather than reconstructing them.
+      for (const site of sites) {
+        if (site.via !== 'unique-name') continue;
+        bucket.push({
+          reason: 'name-too-common',
+          callerClass: site.callerClass,
+          callerKey: site.callerKey,
+          path: site.path,
+          line: site.line,
+          col: site.col,
+          lineText: site.lineText,
+        });
+      }
+    }
+  }
+
   // ---- pass C: Batchable/Queueable/Schedulable execute() attachment, plus
   // F5's entry-kind tail (all interface-driven synthetic entries, same
   // shape: match by implementsTypes' last dotted segment, then walk the
@@ -3362,6 +3668,7 @@ function buildSemanticIndex(factsList, opts) {
     { iface: 'finalizer', method: 'execute', arity: 1, label: 'Finalizer (async)' },
   ];
   for (const cm of classes.values()) {
+    if (cancelled) break; // v0.13/H4
     const ifaceHeads = (cm.implementsTypes || []).map(lastSegmentLower);
     for (const kind of Object.keys(BQS_ARITY)) {
       if (!ifaceHeads.includes(kind)) continue;
@@ -3394,6 +3701,7 @@ function buildSemanticIndex(factsList, opts) {
   // methods' entries (simplest reading of "entries: [string]" on ClassMeta
   // — see header note; TNode's class-level entries badge reads this).
   for (const cm of classes.values()) {
+    if (cancelled) break; // v0.13/H4
     const seen = new Set();
     const list = [];
     for (const m of cm.methods) {
@@ -3409,6 +3717,7 @@ function buildSemanticIndex(factsList, opts) {
 
   // ---- pass E: PARSE-ERROR FALLBACK — lexical class-mention edges -------
   for (const file of factsList || []) {
+    if (cancelled || (shouldCancel && shouldCancel())) { cancelled = true; break; } // v0.13/H4
     if (!file.parseError) continue;
     parseFallbacks.push(file.path);
     if (typeof file.text !== 'string') continue; // no source to scan (see header note)
@@ -3472,7 +3781,18 @@ function buildSemanticIndex(factsList, opts) {
     }
   }
 
-  return {
+  // v0.13/H3: 'parse-fallback' is a FILE-granularity figure (one per file
+  // that fell back to pass E's lexical scan), set once here directly from
+  // parseFallbacks.length -- NOT incremented per-call-site like the other
+  // four reasons (a parse-broken file has no CallFacts at all to walk), and
+  // deliberately NOT folded into unresolvedSitesCount (that counter's
+  // established meaning -- "call sites this build positively identified as
+  // dropped" -- predates this diagnostics breakdown and stays call-site-only
+  // for every existing consumer, per the regression policy's "engine facts
+  // identical" bar).
+  unresolvedByReason['parse-fallback'] = parseFallbacks.length;
+
+  const result = {
     classes,
     methodCallers,
     classCallers,
@@ -3543,9 +3863,27 @@ function buildSemanticIndex(factsList, opts) {
     // build with no metascan refs attached afterward.
     stats: {
       unresolvedSites: unresolvedSitesCount,
+      // v0.13/H3/H8: reason breakdown for the same unresolvedSites total --
+      // see unresolvedByReason's own header note for exactly which category
+      // each key covers and why 'parse-fallback' is file- not site-granular.
+      unresolvedByReason,
+      magnetSuppressedAttachments,
       duplicateNames: duplicateNamesCount,
       ...computeExternalStats(externals),
     },
+    // v0.13/H3: nameLower -> unresolved-site records (see its own header
+    // note above) -- exposed at the index root (not just under `stats`,
+    // which is a plain counts/labels bag every TreeResult passes through
+    // unchanged) so buildCallerTree's scoped caller-direction header can
+    // look up ONE target method's own mentions directly.
+    unresolvedSitesByName,
+    // v0.13/H4: true only when opts.shouldCancel() fired during THIS build
+    // -- classes/methodCallers/etc. above may be partial when this is true.
+    // The host (extension.js) is expected to discard a cancelled index
+    // rather than pass it to buildCallerTree/buildCalleeTree; every field on
+    // this object still has a well-formed (if partial) shape either way, so
+    // nothing downstream crashes even if that discipline is ever skipped.
+    cancelled,
     // MUST-FIX #1/#5: exposed so post-build query-time code (suggestTargets,
     // below) can apply the SAME real B2 gate this closure used internally
     // -- true only once opts.packageOf actually resolved a non-null label
@@ -3564,6 +3902,8 @@ function buildSemanticIndex(factsList, opts) {
     // index.defaultPackage, so no existing code path is touched.
     defaultPackage,
   };
+  refreshIndexDiagnostics(result);
+  return result;
 }
 
 function computeAnnotationEntries(mf) {
@@ -4141,10 +4481,15 @@ function buildCallerTree(index, target, opts) {
   const ctx = {
     maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set(), direction: 'callers',
     initialDepth, userExpandedKeys, frontierNodes: 0, // P1
+    showUnconfirmed: normalizeShowUnconfirmed(opts), // v0.13/H2
   };
   const queue = [];
   root.children = buildChildrenLevel(index, allPairs, 1, ancestorPath, classLower, excCtx, ctx, queue, root);
   while (queue.length) {
+    // v0.13/H4: guards this outer BFS-expansion loop the same way the index
+    // build's own outer passes are guarded -- an already-huge tree can still
+    // have plenty of unexpanded frontier left when the user cancels.
+    if (shouldCancelOpt(opts)) { ctx.capped = true; break; }
     const task = queue.shift(); // FIFO -> breadth-first across the whole tree
     task.node.children = buildChildrenLevel(index, task.pairs, task.depth, task.ancestorPath, task.targetClassLower, excCtx, ctx, queue, task.node);
   }
@@ -4159,6 +4504,54 @@ function buildCallerTree(index, target, opts) {
   } else if (metaRefs.length) {
     ctx.capped = true;
     root.truncated = true; // v0.7.1/R5: root is the specific node whose (metadata) children were cut
+  }
+
+  // v0.13/H3: scoped caller-direction header info -- "K unresolved sites
+  // elsewhere mention <method>(" -- root-level ONLY (mirrors metaRefs
+  // above), and ONLY for a real METHOD target (never a class/trigger/
+  // anonymous root, which has no single method name to match unresolved
+  // call-site NAMES against). K is index.unresolvedSitesByName's entry for
+  // this exact method name, length -- arity-agnostic by construction (see
+  // that map's own header note in buildSemanticIndex). Rendered as ONE
+  // additional, collapsed info node alongside the ordinary callers (not
+  // folded into them, and never itself subject to H2's approximate-rollup
+  // grouping, which only ever applies inside buildChildrenLevel) -- its own
+  // children are the individual mention sites, so a user can inspect each
+  // one without this file needing to know anything about how the host
+  // actually renders a "collapsed" TreeItem.
+  if (methodLower && !isTrigger && !(isAnonymous && methodLower === '(anonymous)') && ctx.nodeCount < ctx.maxNodes) {
+    const mentions = (index.unresolvedSitesByName && index.unresolvedSitesByName.get(methodLower)) || [];
+    if (mentions.length) {
+      const targetMm = cm.methods.find((m) => lc(m.name) === methodLower);
+      const displayName = targetMm ? targetMm.name : methodLower;
+      // The info node participates in the same hard maxNodes budget as the
+      // rest of the trace. A framework-common name can have tens of
+      // thousands of unresolved mentions; materializing all of them here
+      // would defeat the cap this hardening round is meant to protect.
+      const childBudget = Math.max(0, ctx.maxNodes - ctx.nodeCount - 1);
+      const visibleMentions = mentions.slice(0, childBudget);
+      const mentionChildren = visibleMentions.map((s) => ({
+        label: s.callerClass, kind: 'class', className: s.callerClass, path: s.path, line: s.line,
+        methodLower: null, entries: [], isTest: false, via: s.reason || 'unresolved',
+        sites: [{ path: s.path, line: s.line, col: s.col, lineText: s.lineText, argsRendered: '' }],
+        children: [], cyclic: false, truncated: true, approximate: true, seenElsewhere: false,
+      }));
+      const mentionsCapped = visibleMentions.length < mentions.length;
+      const mentionsNode = {
+        label: `${mentions.length} unresolved site${mentions.length === 1 ? '' : 's'} elsewhere mention ${displayName}( — potential unconfirmed callers`,
+        kind: 'unresolved-mentions', className: '', path: '', line: 0, methodLower: null,
+        entries: [], isTest: false, via: 'unresolved', sites: [],
+        children: mentionChildren,
+        cyclic: false, truncated: mentionsCapped, approximate: true, seenElsewhere: false,
+        collapsibleState: 'collapsed', // consumed by extension.js/uitree.js, out of this file's own scope
+      };
+      ctx.nodeCount += 1 + mentionChildren.length;
+      if (mentionsCapped) {
+        ctx.capped = true;
+        root.truncated = true;
+      }
+      root.children = root.children.concat([mentionsNode]);
+    }
   }
 
   return {
@@ -4212,10 +4605,12 @@ function buildExternalCallerTree(index, key, ext, opts) {
   const ctx = {
     maxDepth, maxNodes, nodeCount: 1, capped: false, expandedKeys: new Set(), uniqueKeys: new Set(), direction: 'callers',
     initialDepth, userExpandedKeys, frontierNodes: 0, // P1
+    showUnconfirmed: normalizeShowUnconfirmed(opts), // v0.13/H2
   };
   const queue = [];
   root.children = buildChildrenLevel(index, pairs, 1, new Set(), key, null, ctx, queue, root);
   while (queue.length) {
+    if (shouldCancelOpt(opts)) { ctx.capped = true; break; } // v0.13/H4
     const task = queue.shift();
     task.node.children = buildChildrenLevel(index, task.pairs, task.depth, task.ancestorPath, task.targetClassLower, null, ctx, queue, task.node);
   }
@@ -4384,6 +4779,7 @@ function buildCalleeTree(index, target, opts) {
     dmlByCallerKey: indexSitesByCallerKey(index.dmlSitesByObject),
     publishByCallerKey: indexSitesByCallerKey(index.publishSitesByObject),
     initialDepth, userExpandedKeys, frontierNodes: 0, // P1
+    showUnconfirmed: normalizeShowUnconfirmed(opts), // v0.13/H2
   };
   const queue = [];
   root.children = buildChildrenLevel(index, pairs, 1, ancestorPath, classLower, null, ctx, queue, root);
@@ -4394,6 +4790,7 @@ function buildCalleeTree(index, target, opts) {
     appendCalleeExtras(index, root, classLower, methodLower, ctx);
   }
   while (queue.length) {
+    if (shouldCancelOpt(opts)) { ctx.capped = true; break; } // v0.13/H4
     const task = queue.shift(); // FIFO -> breadth-first across the whole tree, same as buildCallerTree
     task.node.children = buildChildrenLevel(index, task.pairs, task.depth, task.ancestorPath, task.targetClassLower, null, ctx, queue, task.node);
     // A1: DML/publish flow-fanout + the unresolved-call aggregate leaf are
@@ -5515,6 +5912,7 @@ function attachMetaCallers(index, metaRefs) {
   // or in what order relative to buildSemanticIndex's own initial stats.
   Object.assign(index.stats, computeExternalStats(externals));
 
+  refreshIndexDiagnostics(index);
   return index;
 }
 
@@ -5582,6 +5980,7 @@ function finalizeFlowSubflowRefs(index) {
   index._pendingSubflowRefs = [];
   index.stats = index.stats || {};
   index.stats.unknownSubflowRefs = (index.stats.unknownSubflowRefs || 0) + unknownDelta;
+  refreshIndexDiagnostics(index);
 }
 
 // Returns the method name of the sole @InvocableMethod-annotated method on
@@ -5661,9 +6060,49 @@ function groupPairsByKey(pairs) {
   return groups;
 }
 
+// v0.13/H2: groups every APPROXIMATE child a level built (node.approximate
+// === true -- the SAME flag buildOneChildNode already computes from
+// APPROX_VIA/site.approximate for every via, incl. 'lexical') under ONE
+// collapsed 'rollup' pseudo-node, controlled by ctx.showUnconfirmed:
+//   - 'expand' (old, pre-H2 behavior): `nodes` returned completely
+//     unchanged -- this is the literal flatten(rollup children)+confirmed
+//     == old child set baseline the regression policy's H2 equivalence
+//     proof is checked against.
+//   - 'hide': approximate nodes are dropped entirely (not even a count).
+//   - 'rollup' (default): confirmed nodes pass through untouched; every
+//     approximate node becomes a CHILD of one new pseudo-node instead of a
+//     sibling -- same object references, so any expandTask already queued
+//     for one of them (see buildOneChildNode) still resolves correctly
+//     against `task.node`, wherever that node ends up nested.
+// Direction-agnostic: called identically for callers and callees (the
+// pseudo-node's own label is the only direction-specific bit).
+function applyShowUnconfirmed(nodes, ctx) {
+  const mode = ctx.showUnconfirmed || 'rollup';
+  if (mode === 'expand') return nodes;
+  const confirmed = [];
+  const approx = [];
+  for (const n of nodes) (n.approximate ? approx : confirmed).push(n);
+  if (!approx.length) return nodes; // nothing to group/hide -- no-op either way
+  if (mode === 'hide') return confirmed;
+  const count = approx.length;
+  const noun = ctx.direction === 'callees'
+    ? (count === 1 ? 'callee' : 'callees')
+    : (count === 1 ? 'caller' : 'callers');
+  const rollupNode = {
+    label: `${count} possible ${noun} (unconfirmed)`,
+    kind: 'rollup', className: '', path: '', line: 0, methodLower: null,
+    entries: [], isTest: false, via: null, sites: [],
+    children: approx,
+    cyclic: false, truncated: false, approximate: true, seenElsewhere: false,
+    collapsibleState: 'collapsed', // consumed by extension.js/uitree.js, out of this file's own scope
+  };
+  ctx.nodeCount++; // the pseudo-node itself is one more materialized TNode
+  return confirmed.concat([rollupNode]);
+}
+
 function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower, excCtx, ctx, queue, ownerNode) {
   const groups = groupPairsByKey(pairs);
-  const out = [];
+  let out = [];
   for (const g of groups.values()) {
     if (ctx.nodeCount >= ctx.maxNodes) {
       ctx.capped = true;
@@ -5684,6 +6123,12 @@ function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower,
     out.push(built.node);
     if (built.expandTask) queue.push(built.expandTask);
   }
+  // v0.13/H2: partition/group approximate siblings per ctx.showUnconfirmed
+  // BEFORE the direction-specific ordering below, so the rollup pseudo-node
+  // (when one is created) participates in callers' alphabetical sort like
+  // any other node, and never disturbs callees' source-line order among the
+  // CONFIRMED nodes that keep their original relative positions.
+  out = applyShowUnconfirmed(out, ctx);
   // A2: callers-direction output is UNCHANGED (alphabetical, tests-last,
   // exactly the pre-v0.7 sortTNodes call). Callees direction instead
   // preserves SOURCE-LINE order -- forward tracing is telling "what happens
@@ -6403,10 +6848,372 @@ function buildEntryCatalog(index) {
     total += g.entries.length;
   }
   const packages = Array.from(packageLabelsSeen).sort((a, b) => a.localeCompare(b));
+  const indexStats = index && index.stats ? index.stats : {};
 
   return {
     groups,
-    stats: { total, byKind, packages, excludedTestEntries },
+    stats: {
+      total,
+      byKind,
+      packages,
+      excludedTestEntries,
+      unresolvedSites: Number(indexStats.unresolvedSites) || 0,
+      managedRefs: Number(indexStats.externalRefs) || 0,
+    },
+  };
+}
+
+// =========================================================================
+// v0.14: signature-change Impact Analysis
+// =========================================================================
+
+function impactMethodSignature(method) {
+  if (!method) return null;
+  return `${method.name}(${(method.params || []).map((p) => p.type || 'Object').join(', ')})`;
+}
+
+function impactSameSignature(a, b) {
+  if (!a || !b || lc(a.name) !== lc(b.name)) return false;
+  const ap = a.params || [];
+  const bp = b.params || [];
+  if (ap.length !== bp.length) return false;
+  for (let i = 0; i < ap.length; i++) {
+    if (normalizeTypeName(ap[i].type) !== normalizeTypeName(bp[i].type)) return false;
+  }
+  return true;
+}
+
+function impactResolveType(index, rawType, currentCm) {
+  if (!index || !(index.classes instanceof Map)) return null;
+  const normalized = normalizeTypeName(rawType);
+  if (!normalized) return null;
+  if (currentCm && currentCm.qualified) {
+    const parts = lc(currentCm.qualified).split('.');
+    for (let i = parts.length; i >= 1; i--) {
+      const candidate = `${parts.slice(0, i).join('.')}.${normalized}`;
+      if (index.classes.has(candidate)) return candidate;
+    }
+  }
+  if (index.classes.has(normalized)) return normalized;
+  const simple = lastSegmentLower(rawType);
+  const matches = [];
+  for (const [key, cm] of index.classes) {
+    if (cm && lc(cm.name) === simple) matches.push(key);
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function impactSiteKey(site) {
+  return [site.callerKey, site.path, site.line, site.col, site.via, site.overloadSig, site.overloadPick].join('|');
+}
+
+function impactSortSites(sites) {
+  const seen = new Set();
+  const out = [];
+  for (const site of sites || []) {
+    if (!site) continue;
+    const key = impactSiteKey(site);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(site);
+  }
+  out.sort((a, b) =>
+    String(a.callerClass || '').localeCompare(String(b.callerClass || ''))
+    || String(a.callerMethod || '').localeCompare(String(b.callerMethod || ''))
+    || String(a.path || '').localeCompare(String(b.path || ''))
+    || (Number(a.line) || 0) - (Number(b.line) || 0)
+    || (Number(a.col) || 0) - (Number(b.col) || 0)
+  );
+  return out;
+}
+
+// Contract surfaces can observe the same physical call twice: once against
+// the interface/base declaration and once against the concrete override.
+// Those copies may carry different overloadSig values even though they point
+// to the same source expression, so dedupe them by physical caller location
+// before presenting the contract's own caller list.
+function impactSortPhysicalSites(sites) {
+  const seen = new Set();
+  const out = [];
+  for (const site of sites || []) {
+    if (!site) continue;
+    const key = [site.callerKey, site.path, site.line, site.col, site.via].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(site);
+  }
+  return impactSortSites(out);
+}
+
+function impactFilterSitesForSignature(sites, family, selectedSignature) {
+  if (!selectedSignature || family.length <= 1) return impactSortSites(sites);
+  return impactSortSites(
+    (sites || []).filter(
+      (site) =>
+        site &&
+        (site.overloadSig === selectedSignature ||
+          (site.overloadPick === 'arity-tie' &&
+            Array.isArray(site.tiedOverloadSigs) &&
+            site.tiedOverloadSigs.includes(selectedSignature)))
+    )
+  );
+}
+
+function impactMethodRef(cm, classLower, method) {
+  if (!cm || !method) return null;
+  return {
+    label: `${cm.qualified}.${impactMethodSignature(method)}`,
+    classLower,
+    methodLower: lc(method.name),
+    overloadSig: impactMethodSignature(method),
+    path: cm.path,
+    line: method.line || 0,
+  };
+}
+
+function impactParentFlows(index, flowLabel) {
+  finalizeFlowSubflowRefs(index);
+  if (!(index.flowGraph instanceof Map) || !flowLabel) return [];
+  const out = [];
+  const seen = new Set([lc(flowLabel)]);
+  const queue = [...(((index.flowGraph.get(lc(flowLabel)) || {}).parents) || [])];
+  while (queue.length) {
+    const flowLower = queue.shift();
+    if (seen.has(flowLower)) continue;
+    seen.add(flowLower);
+    const info = index.flowInfo instanceof Map ? index.flowInfo.get(flowLower) : null;
+    out.push({
+      label: info ? info.label : flowLower,
+      path: info ? info.path : '',
+      line: info ? info.line : 0,
+    });
+    const graph = index.flowGraph.get(flowLower);
+    if (graph && Array.isArray(graph.parents)) queue.push(...graph.parents);
+  }
+  return out;
+}
+
+function impactMetadataSites(index, classLower, methodLower) {
+  const refs = index.metaMethodCallers instanceof Map
+    ? index.metaMethodCallers.get(`${classLower}#${methodLower}`) || []
+    : [];
+  const seen = new Set();
+  const out = [];
+  for (const ref of refs) {
+    if (!ref) continue;
+    const key = [ref.kind, ref.label, ref.path, ref.line].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      kind: ref.kind || 'metadata',
+      label: ref.label || ref.path || 'metadata reference',
+      path: ref.path || '',
+      line: ref.line || 0,
+      className: ref.className || null,
+      methodName: ref.methodName || null,
+      parentFlows: ref.kind === 'flow' ? impactParentFlows(index, ref.label) : [],
+    });
+  }
+  out.sort((a, b) => a.kind.localeCompare(b.kind) || a.label.localeCompare(b.label) || a.path.localeCompare(b.path) || a.line - b.line);
+  return out;
+}
+
+// Builds a section-ready report for ONE method overload. `overloadSig` is
+// optional only for non-overloaded methods; callers facing an overload
+// family should choose one of the canonical signatures returned in
+// `availableOverloads` before presenting the report.
+function buildImpactReport(index, target) {
+  target = target || {};
+  const classLower = lc(target.classLower);
+  const methodLower = lc(target.methodLower);
+  const cm = index && index.classes instanceof Map ? index.classes.get(classLower) : null;
+  if (!cm || !methodLower) return null;
+  const family = (cm.methods || []).filter((m) => lc(m.name) === methodLower);
+  if (!family.length) return null;
+  const requestedSignature = target.overloadSig || null;
+  const selectedMethod = requestedSignature
+    ? family.find((m) => impactMethodSignature(m) === requestedSignature)
+    : family.length === 1 ? family[0] : null;
+  const availableOverloads = family.map((m) => ({
+    overloadSig: impactMethodSignature(m),
+    params: (m.params || []).map((p) => ({ name: p.name, type: p.type })),
+    path: cm.path,
+    line: m.line || 0,
+  }));
+  if (!selectedMethod) {
+    return {
+      target: {
+        label: `${cm.qualified}.${family[0].name}`,
+        classLower,
+        methodLower,
+        overloadSig: null,
+        params: [],
+        path: cm.path,
+        line: family[0].line || 0,
+      },
+      availableOverloads,
+      needsOverloadChoice: family.length > 1,
+      breaks: [],
+      mightBreak: [],
+      contract: { interfaces: [], overrides: { base: null, overriddenBy: [], callersOfBase: [] } },
+      metadata: [],
+      otherOverloads: [],
+      stats: { breaks: 0, mightBreak: 0, contractSurfaces: 0, metadataSurfaces: 0, otherOverloads: family.length },
+    };
+  }
+
+  const selectedSignature = impactMethodSignature(selectedMethod);
+  const directSites = impactFilterSitesForSignature(
+    index.methodCallers instanceof Map ? index.methodCallers.get(`${classLower}#${methodLower}`) || [] : [],
+    family,
+    selectedSignature
+  );
+  const breaks = [];
+  const mightBreak = [];
+  for (const site of directSites) {
+    const approximate = APPROX_VIA.has(site.via) || site.approximate === true;
+    if (!approximate && site.overloadPick === 'exact') breaks.push(site);
+    else mightBreak.push(site);
+  }
+
+  // Interfaces implemented by this class or any ancestor, including parent
+  // interfaces. Each surface includes callers of the interface declaration,
+  // which are distinct from callers already attached to this implementation.
+  const interfaceEntries = [];
+  const seenInterfaces = new Set();
+  const interfaceQueue = [];
+  let curForInterfaces = cm;
+  while (curForInterfaces) {
+    for (const raw of curForInterfaces.implementsTypes || []) {
+      const resolved = impactResolveType(index, raw, curForInterfaces);
+      if (resolved) interfaceQueue.push(resolved);
+    }
+    curForInterfaces = curForInterfaces.extendsLower ? index.classes.get(curForInterfaces.extendsLower) : null;
+  }
+  while (interfaceQueue.length) {
+    const ifaceLower = interfaceQueue.shift();
+    if (seenInterfaces.has(ifaceLower)) continue;
+    seenInterfaces.add(ifaceLower);
+    const ifaceCm = index.classes.get(ifaceLower);
+    if (!ifaceCm) continue;
+    const ifaceMethods = (ifaceCm.methods || []).filter((m) => impactSameSignature(m, selectedMethod));
+    for (const ifaceMethod of ifaceMethods) {
+      const ifaceFamily = (ifaceCm.methods || []).filter((m) => lc(m.name) === methodLower);
+      const ifaceSig = impactMethodSignature(ifaceMethod);
+      const declarationCallers = impactFilterSitesForSignature(
+        index.methodCallers instanceof Map ? index.methodCallers.get(`${ifaceLower}#${methodLower}`) || [] : [],
+        ifaceFamily,
+        ifaceSig
+      );
+      // Interface dispatch is stored against each concrete implementer in
+      // the reverse index. Fold those sites back into the contract surface
+      // so an interface declaration never misleadingly shows zero callers.
+      const callers = impactSortPhysicalSites(
+        directSites.filter((site) => site.via === 'interface').concat(declarationCallers)
+      );
+      interfaceEntries.push({
+        iface: ifaceCm.qualified,
+        method: ifaceMethod.name,
+        overloadSig: ifaceSig,
+        path: ifaceCm.path,
+        line: ifaceMethod.line || 0,
+        callers,
+      });
+    }
+    const rawParents = Array.isArray(ifaceCm.typeFacts && ifaceCm.typeFacts.extendsTypes)
+      ? ifaceCm.typeFacts.extendsTypes
+      : ifaceCm.extendsType ? [ifaceCm.extendsType] : [];
+    for (const raw of rawParents) {
+      const resolved = impactResolveType(index, raw, ifaceCm);
+      if (resolved) interfaceQueue.push(resolved);
+    }
+  }
+  interfaceEntries.sort((a, b) => a.iface.localeCompare(b.iface) || a.overloadSig.localeCompare(b.overloadSig));
+
+  // Nearest overridden base declaration plus every descendant declaration
+  // that overrides this exact signature.
+  let base = null;
+  let baseLower = cm.extendsLower || null;
+  while (baseLower && !base) {
+    const baseCm = index.classes.get(baseLower);
+    if (!baseCm) break;
+    const baseMethod = (baseCm.methods || []).find((m) => impactSameSignature(m, selectedMethod));
+    if (baseMethod) base = impactMethodRef(baseCm, baseLower, baseMethod);
+    baseLower = baseCm.extendsLower || null;
+  }
+  const callersOfBase = base
+    ? impactFilterSitesForSignature(
+        index.methodCallers instanceof Map ? index.methodCallers.get(`${base.classLower}#${methodLower}`) || [] : [],
+        (index.classes.get(base.classLower).methods || []).filter((m) => lc(m.name) === methodLower),
+        base.overloadSig
+      )
+    : [];
+  const overriddenBy = [];
+  for (const [candidateLower, candidateCm] of index.classes) {
+    if (!candidateCm || candidateLower === classLower) continue;
+    let ancestor = candidateCm.extendsLower || null;
+    let descendsFromTarget = false;
+    const seenAncestors = new Set();
+    while (ancestor && !seenAncestors.has(ancestor)) {
+      seenAncestors.add(ancestor);
+      if (ancestor === classLower) {
+        descendsFromTarget = true;
+        break;
+      }
+      const ancestorCm = index.classes.get(ancestor);
+      ancestor = ancestorCm ? ancestorCm.extendsLower || null : null;
+    }
+    if (!descendsFromTarget) continue;
+    const method = (candidateCm.methods || []).find((m) => impactSameSignature(m, selectedMethod));
+    if (method) overriddenBy.push(impactMethodRef(candidateCm, candidateLower, method));
+  }
+  overriddenBy.sort((a, b) => a.label.localeCompare(b.label));
+
+  const metadata = impactMetadataSites(index, classLower, methodLower);
+  const otherOverloads = family
+    .filter((m) => m !== selectedMethod)
+    .map((m) => {
+      const overloadSig = impactMethodSignature(m);
+      return {
+        overloadSig,
+        callerCount: impactFilterSitesForSignature(
+          index.methodCallers instanceof Map ? index.methodCallers.get(`${classLower}#${methodLower}`) || [] : [],
+          family,
+          overloadSig
+        ).length,
+        path: cm.path,
+        line: m.line || 0,
+      };
+    });
+
+  const contractSurfaces = interfaceEntries.length + (base ? 1 : 0) + overriddenBy.length;
+  return {
+    target: {
+      label: `${cm.qualified}.${selectedSignature}`,
+      classLower,
+      methodLower,
+      overloadSig: selectedSignature,
+      params: (selectedMethod.params || []).map((p) => ({ name: p.name, type: p.type })),
+      path: cm.path,
+      line: selectedMethod.line || 0,
+    },
+    availableOverloads,
+    needsOverloadChoice: false,
+    breaks: impactSortSites(breaks),
+    mightBreak: impactSortSites(mightBreak),
+    contract: {
+      interfaces: interfaceEntries,
+      overrides: { base, overriddenBy, callersOfBase },
+    },
+    metadata,
+    otherOverloads,
+    stats: {
+      breaks: breaks.length,
+      mightBreak: mightBreak.length,
+      contractSurfaces,
+      metadataSurfaces: metadata.length,
+      otherOverloads: otherOverloads.length,
+    },
   };
 }
 
@@ -6419,6 +7226,8 @@ module.exports = {
   // v0.12/C1: Entry Point Catalog -- see buildEntryCatalog's own header
   // comment for the full contract.
   buildEntryCatalog,
+  buildImpactReport,
+  impactMethodSignature,
   // v0.10/A3: exported for direct unit-level pinning of the clamp math
   // itself (test-resolver.js) -- every OTHER export above is exercised only
   // behaviorally; clampInt is a pure, easily-isolated function, and the

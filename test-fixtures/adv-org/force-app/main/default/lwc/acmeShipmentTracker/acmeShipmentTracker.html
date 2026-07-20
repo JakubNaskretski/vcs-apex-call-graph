@@ -1,0 +1,26 @@
+<template>
+    <lightning-card title="Shipment Tracking" icon-name="standard:shipment">
+        <div class="slds-p-around_medium">
+            <template if:true={hasStatuses}>
+                <template for:each={shipmentStatuses.data} for:item="shipment">
+                    <div key={shipment.Id} class="slds-p-vertical_x-small">
+                        {shipment.trackingNumber} - {shipment.status}
+                    </div>
+                </template>
+            </template>
+            <template if:true={hasError}>
+                <p class="slds-text-color_error">Unable to load shipment statuses.</p>
+            </template>
+            <lightning-button
+                label="Refresh Tracking"
+                variant="neutral"
+                class="slds-m-top_small"
+                onclick={handleRefresh}
+                disabled={isRefreshing}
+            ></lightning-button>
+            <template if:true={errorMessage}>
+                <p class="slds-text-color_error slds-m-top_small">{errorMessage}</p>
+            </template>
+        </div>
+    </lightning-card>
+</template>

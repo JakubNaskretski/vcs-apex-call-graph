@@ -136,7 +136,7 @@ function diffTargets(oldIndex, newIndex, targets, corpusLabel) {
 //    as dev/regress-callers-v07.js required last round -- none of the
 //    v0.7.1 findings were sourced from this corpus).
 // ---------------------------------------------------------------------
-const ADV_ORG_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const ADV_ORG_ROOT = 'test-fixtures/adv-org';
 const advOld = loadIndex(oldResolver, ADV_ORG_ROOT);
 const advNew = loadIndex(newResolver, ADV_ORG_ROOT);
 console.log(`adv-org: loaded ${advOld.fileCount} apex files (old) / ${advNew.fileCount} (new).`);
@@ -157,7 +157,7 @@ const ADV_ORG_TARGETS = [
 // ---------------------------------------------------------------------
 // 2. gauntlet-org: 2 NEW targets, one per permitted-change category.
 // ---------------------------------------------------------------------
-const GAUNTLET_ORG_ROOT = '/Users/agent/work/code/example-data/gauntlet-org/force-app';
+const GAUNTLET_ORG_ROOT = 'test-fixtures/gauntlet-org/force-app';
 const gauntletOld = loadIndex(oldResolver, GAUNTLET_ORG_ROOT);
 const gauntletNew = loadIndex(newResolver, GAUNTLET_ORG_ROOT);
 console.log(`gauntlet-org: loaded ${gauntletOld.fileCount} apex files (old) / ${gauntletNew.fileCount} (new).`);

@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const parser = require('../parser');
 
-const SFDX_STUBS = process.argv[2] || '/Users/agent/work/code/example-data/adv-org/.sfdx';
+const SFDX_STUBS = process.argv[2] || 'test-fixtures/adv-org/.sfdx';
 
 function walk(dir, out) {
   let entries;

@@ -1,0 +1,8 @@
+<apex:component controller="VtxFilterPanelController">
+  <apex:attribute name="regionCode" type="String" description="Selected region code"/>
+  <apex:attribute name="onApply" type="String" description="JS callback name fired after apply"/>
+  <apex:form>
+    <apex:commandButton value="Apply" action="{!applyFilter}"/>
+    <apex:actionFunction name="clearAll" action="{!clearFilters}"/>
+  </apex:form>
+</apex:component>

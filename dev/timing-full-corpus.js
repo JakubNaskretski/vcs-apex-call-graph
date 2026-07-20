@@ -15,7 +15,7 @@
 // and ADV_ORG_ROOT/.sfdx is empty by default. If you want the large-corpus
 // leg of this perf check, point SFDX_STUBS (2nd CLI arg) at any local
 // .sfdx/tools/... stub directory you already have (e.g. by running the CLI
-// once against example-data/adv-org, which has its own sfdx-project.json);
+// once against test-fixtures/adv-org, which has its own sfdx-project.json);
 // absent that, this script reports 0 files for that leg rather than
 // fabricating a result.
 //
@@ -26,7 +26,7 @@ const path = require('path');
 const parser = require('../parser');
 const resolver = require('../resolver');
 
-const ADV_ORG_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const ADV_ORG_ROOT = 'test-fixtures/adv-org';
 const FORCE_APP = process.argv[2] || path.join(ADV_ORG_ROOT, 'force-app');
 const SFDX_STUBS = process.argv[3] || path.join(ADV_ORG_ROOT, '.sfdx');
 

@@ -1,0 +1,13 @@
+<apex:page standardController="Account">
+  <apex:sectionHeader title="{!Account.Name}" subtitle="Account Summary"/>
+  <apex:form>
+    <apex:pageBlock title="Account Detail">
+      <apex:pageBlockButtons>
+        <apex:commandButton value="Edit" action="{!edit}"/>
+        <apex:commandButton value="Save" action="{!save}"/>
+      </apex:pageBlockButtons>
+      <apex:outputField value="{!Account.Name}"/>
+      <apex:outputField value="{!Account.Industry}"/>
+    </apex:pageBlock>
+  </apex:form>
+</apex:page>

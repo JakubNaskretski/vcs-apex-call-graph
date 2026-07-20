@@ -29,6 +29,14 @@ const {
   shapeEntryCatalogGroup,
   shapeEntryCatalog,
   shapeEntryCatalogHeaderLine,
+  shapeImpactSite,
+  shapeImpactReport,
+  shapeImpactHeaderLine,
+  // v0.13 (Round 2.5, H2/H3): resolver-produced rollup and scoped-mention
+  // nodes use the ordinary UI-shaping path; these helpers inspect the
+  // resulting TreeResult without introducing a second grouping layer.
+  findUnresolvedMentionsNode,
+  unresolvedMentionsHeaderLine,
 } = require('./uitree');
 
 // --- labelForNode: approximate '~' prefix ---
@@ -417,7 +425,7 @@ assert(
 // verbatim, with no independent re-derivation -- there is no second bug in
 // the UI layer. These fixtures use the exact correct values confirmed live
 // via `node dev/gauntlet/probe2.js` (VertexRepriceBatch.cls / Billing.cls /
-// VertexLedgerBridge.cls in example-data/gauntlet-org) and pin that the
+// VertexLedgerBridge.cls in test-fixtures/gauntlet-org) and pin that the
 // rendering layer surfaces them correctly, so the fix is verified end-to-
 // end the moment resolver.js's owner lands the one-line fix -- no
 // uitree.js change is required or expected.
@@ -576,19 +584,24 @@ assert.deepStrictEqual(
   ['Result capped -- not every caller could be expanded.'],
   'H1 forward-compat: stats.capped produces a capped header line'
 );
-// NOTE (integrator, v0.6.0): resolver.js's real buildCallerTree output nests
-// unresolvedSites under stats (stats.unresolvedSites), not a top-level
-// TreeResult.unresolvedSites field -- these fixtures match that real shape
-// (shapeHeaderLines was fixed to read from stats to match).
+// v0.13 (Round 2.5, H3 -- header half) REGRESSION: stats.unresolvedSites
+// USED to produce its own workspace-global header line here (see the git
+// history for the exact pre-Round-2.5 wording) -- H3 explicitly REMOVES
+// every workspace-global unresolved/managed counter from the per-trace
+// header (stats itself is untouched; these fields remain a Scan Stats
+// output-channel concern only, an H8/different-file responsibility this
+// round). These four assertions (originally pinning the OLD line) now pin
+// its ABSENCE instead, proving the removal rather than merely deleting the
+// coverage.
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { nodes: 1, uniqueMethods: 1, capped: false, unresolvedSites: 3 } }),
-  ['3 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).'],
-  'H4 forward-compat: stats.unresolvedSites > 0 produces the exact required header wording'
+  [],
+  'H3 (Round 2.5): stats.unresolvedSites no longer produces ANY header line -- workspace-global counters are out of scope for a per-trace header'
 );
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { nodes: 1, uniqueMethods: 1, capped: false, unresolvedSites: 0 } }),
   [],
-  'stats.unresolvedSites === 0 produces no header line'
+  'stats.unresolvedSites === 0 still produces no header line (moot after H3, kept as a harmless sanity check)'
 );
 assert.deepStrictEqual(
   shapeHeaderLines({
@@ -597,35 +610,29 @@ assert.deepStrictEqual(
     note: 'interface dispatch: showing every implementer',
     stats: { nodes: 5, uniqueMethods: 5, capped: true, unresolvedSites: 1 },
   }),
-  [
-    'interface dispatch: showing every implementer',
-    'Result capped -- not every caller could be expanded.',
-    '1 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).',
-  ],
-  'all three header lines combine, note first, in a fixed order'
+  ['interface dispatch: showing every implementer', 'Result capped -- not every caller could be expanded.'],
+  'H3 (Round 2.5): only note + capped remain -- the unresolvedSites line that USED to be third here is gone'
 );
 
-// v0.7.1 (U3, M2 coordination point): stats.metaUnresolved forward-compat --
-// metascan.js/resolver.js does not produce this field yet, but uitree.js's
-// rendering support is locked in ahead of that engine change (same
-// forward-compat rationale as seenElsewhere/duplicateNames above). Mirrors
-// the unresolvedSites tests immediately above, same exact-wording
-// requirement, same "nested under stats" shape, same graceful degrade when
-// absent/zero.
+// v0.13 (Round 2.5, H3 -- header half) REGRESSION: stats.metaUnresolved
+// USED to produce its own workspace-global header line here (v0.7.1 U3/M2
+// coordination point) -- REMOVED for the exact same H3 reason as
+// unresolvedSites immediately above. These four assertions now pin its
+// absence.
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { nodes: 1, uniqueMethods: 1, capped: false, metaUnresolved: 2 } }),
-  ['2 metadata references could not be attached (ambiguous or unmatched namespace).'],
-  'U3 (M2): stats.metaUnresolved > 1 produces the exact required header wording, plural'
+  [],
+  'H3 (Round 2.5): stats.metaUnresolved no longer produces ANY header line'
 );
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { nodes: 1, uniqueMethods: 1, capped: false, metaUnresolved: 1 } }),
-  ['1 metadata reference could not be attached (ambiguous or unmatched namespace).'],
-  'U3 (M2): stats.metaUnresolved === 1 uses the singular form'
+  [],
+  'H3 (Round 2.5): singular metaUnresolved:1 also produces no header line now'
 );
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { nodes: 1, uniqueMethods: 1, capped: false, metaUnresolved: 0 } }),
   [],
-  'U3 (M2): stats.metaUnresolved === 0 produces no header line'
+  'stats.metaUnresolved === 0 still produces no header line (moot after H3, kept as a harmless sanity check)'
 );
 assert.deepStrictEqual(
   shapeHeaderLines({
@@ -634,11 +641,8 @@ assert.deepStrictEqual(
     note: null,
     stats: { nodes: 1, uniqueMethods: 1, capped: false, unresolvedSites: 3, metaUnresolved: 2 },
   }),
-  [
-    '3 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).',
-    '2 metadata references could not be attached (ambiguous or unmatched namespace).',
-  ],
-  'U3 (M2): unresolvedSites and metaUnresolved lines combine, in a fixed order, when both fire'
+  [],
+  'H3 (Round 2.5): unresolvedSites and metaUnresolved together STILL produce zero header lines -- neither fires independently or combined'
 );
 
 // --- tests-last ordering preserved from resolver output (uitree must NOT re-sort) ---
@@ -1172,6 +1176,10 @@ assert.deepStrictEqual(
   [],
   'duplicateNames === 0 -> no header line'
 );
+// v0.13 (Round 2.5, H3): the old fifth line (unresolvedSites) is gone --
+// only note/direction/duplicateNames/capped remain, in callees direction
+// too (H3's removal is unconditional, not caller-only -- only the NEW
+// scoped mentions line is caller-only, see unresolvedMentionsHeaderLine).
 assert.deepStrictEqual(
   shapeHeaderLines({
     root: {},
@@ -1185,9 +1193,8 @@ assert.deepStrictEqual(
     'What Does This Call?',
     "2 duplicate class names across packages — resolution prefers the referring file's package",
     'Result capped -- not every callee could be expanded.',
-    '1 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).',
   ],
-  'all five header lines combine in a fixed order: note, direction, duplicate names, capped, unresolved'
+  "H3 (Round 2.5): four header lines combine in a fixed order (note, direction, duplicate names, capped) -- the OLD 'unresolvedSites' fifth line is gone, and callees direction never gets the new scoped mentions line either"
 );
 
 // =========================================================================
@@ -1534,6 +1541,9 @@ assert.deepStrictEqual(
 
 // --- header composition: the orientation line slots after note/direction,
 // before the stats lines ---
+// v0.13 (Round 2.5, H3): the old trailing unresolvedSites line is gone --
+// see the REGRESSION block near the top of this file's shapeHeaderLines
+// coverage.
 assert.deepStrictEqual(
   shapeHeaderLines(
     { root: {}, targetLabel: 'x', note: 'n', direction: 'callers', stats: { duplicateNames: 2, capped: true, unresolvedSites: 1 } },
@@ -1544,9 +1554,8 @@ assert.deepStrictEqual(
     'Entry-first orientation: entry points at the top, the traced target at each branch tip.',
     "2 duplicate class names across packages — resolution prefers the referring file's package",
     'Result capped -- not every caller could be expanded.',
-    '1 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).',
   ],
-  'entry-first header line slots between the note and the stats lines'
+  'H3 (Round 2.5): entry-first header line still slots between the note and the stats lines; the old unresolvedSites line no longer trails it'
 );
 
 // =========================================================================
@@ -1617,18 +1626,20 @@ assert(
 );
 
 // =========================================================================
-// v0.8 (N5, forward-compat): shapeHeaderLines' combined
-// 'N unresolved · M managed-package refs (ns1, ns2)' line.
+// v0.13 (Round 2.5, H3 -- header half) REGRESSION: shapeHeaderLines' v0.8
+// (N5) combined 'N unresolved · M managed-package refs (ns1, ns2)' line
+// USED to live here (7 pinned scenarios). H3 removes it unconditionally,
+// same as the plain unresolvedSites/metaUnresolved lines above -- every
+// scenario below now asserts the ABSENCE of any such line, proving the
+// removal rather than deleting the coverage.
 // =========================================================================
 
-// externalRefs > 0, no namespaces list -> still renders (defensive, no crash).
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { unresolvedSites: 3, externalRefs: 2 } }),
-  ['3 unresolved · 2 managed-package refs.'],
-  'externalRefs > 0 with no externalNamespaces list still renders (no namespace parenthetical)'
+  [],
+  'H3 (Round 2.5): externalRefs > 0 no longer renders ANY combined line'
 );
 
-// The exact CONTRACT-quoted example: 'N unresolved · M managed-package refs (zenq, kwx)'.
 assert.deepStrictEqual(
   shapeHeaderLines({
     root: {},
@@ -1636,52 +1647,41 @@ assert.deepStrictEqual(
     note: null,
     stats: { unresolvedSites: 4, externalRefs: 7, externalNamespaces: ['zenq', 'kwx'] },
   }),
-  ['4 unresolved · 7 managed-package refs (zenq, kwx).'],
-  'N5: exact CONTRACT-pinned combined wording'
+  [],
+  'H3 (Round 2.5): the old exact CONTRACT-quoted N5 combined wording is gone'
 );
 
-// Singular 'ref' wording for externalRefs === 1.
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { unresolvedSites: 0, externalRefs: 1, externalNamespaces: ['zenq'] } }),
-  ['0 unresolved · 1 managed-package ref (zenq).'],
-  'singular "ref" for externalRefs === 1, and unresolvedSites:0 still renders "0 unresolved"'
+  [],
+  'H3 (Round 2.5): singular externalRefs === 1 case also renders no line now'
 );
 
-// unresolvedSites absent entirely (not just 0) alongside externalRefs -> defensive '0 unresolved'.
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { externalRefs: 3, externalNamespaces: ['kwx'] } }),
-  ['0 unresolved · 3 managed-package refs (kwx).'],
-  'missing unresolvedSites alongside a real externalRefs count still renders cleanly'
+  [],
+  'H3 (Round 2.5): unresolvedSites absent alongside a real externalRefs count still renders no line'
 );
 
-// REGRESSION: externalRefs absent (every pre-v0.8 fixture, and the whole
-// adv-org corpus per the v0.8 REGRESSION POLICY) -> the OLD unresolvedSites
-// line, byte-identical to pre-v0.8, exactly like the pre-existing assertion
-// higher up in this file pins.
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { nodes: 1, uniqueMethods: 1, capped: false, unresolvedSites: 3 } }),
-  ['3 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).'],
-  'REGRESSION: externalRefs absent -> unresolvedSites keeps its exact pre-v0.8 wording'
+  [],
+  'H3 (Round 2.5): externalRefs absent -> the old unresolvedSites-only wording is ALSO gone (not just the combined N5 line)'
 );
-// REGRESSION: externalRefs explicitly 0 -> same untouched old wording, not
-// the new combined line (a workspace that HAS namespace support wired up
-// but genuinely has zero managed-package refs must render identically to a
-// workspace with no namespace support at all).
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { unresolvedSites: 5, externalRefs: 0, externalNamespaces: [] } }),
-  ['5 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).'],
-  'REGRESSION: externalRefs === 0 -> old unresolvedSites wording, not the new combined line'
+  [],
+  'H3 (Round 2.5): externalRefs === 0 case also renders no line'
 );
-// Neither unresolvedSites nor externalRefs fire -> no line at all.
+// Neither unresolvedSites nor externalRefs fire -> still no line, unaffected.
 assert.deepStrictEqual(
   shapeHeaderLines({ root: {}, targetLabel: 'x', note: null, stats: { unresolvedSites: 0, externalRefs: 0 } }),
   [],
-  'both zero -> no header line, exactly like the pre-v0.8 zero case'
+  'both zero -> no header line, unchanged'
 );
 
-// Combines correctly with duplicateNames/capped/metaUnresolved, in the
-// established fixed ordering (duplicateNames, capped, unresolved-line,
-// metaUnresolved).
+// duplicateNames/capped remain; the OLD combined unresolved/managed +
+// metaUnresolved lines that used to trail them are both gone.
 assert.deepStrictEqual(
   shapeHeaderLines({
     root: {},
@@ -1692,10 +1692,8 @@ assert.deepStrictEqual(
   [
     "1 duplicate class names across packages — resolution prefers the referring file's package",
     'Result capped -- not every caller could be expanded.',
-    '2 unresolved · 3 managed-package refs (zenq).',
-    '1 metadata reference could not be attached (ambiguous or unmatched namespace).',
   ],
-  'N5 combined line slots into the existing fixed header-line ordering without disturbing the other stat lines'
+  'H3 (Round 2.5): only duplicateNames + capped remain in the fixed header-line ordering -- the old combined unresolved/managed line and metaUnresolved line are both gone'
 );
 
 // =========================================================================
@@ -2113,6 +2111,16 @@ assert.strictEqual(
   shapeEntryCatalogHeaderLine({ stats: { total: 10, byKind: { trigger: 10 }, packages: ['nova-billing', 'nova-core'] } }),
   '10 entry points across 1 kind · packages: nova-billing, nova-core'
 );
+assert.strictEqual(
+  shapeEntryCatalogHeaderLine({ stats: { total: 10, byKind: { trigger: 10 }, unresolvedSites: 7, managedRefs: 2, packages: [] } }),
+  '10 entry points across 1 kind · 7 unresolved sites · 2 managed references',
+  'catalog header exposes unresolved and managed counts from the shared index'
+);
+assert.strictEqual(
+  shapeEntryCatalogHeaderLine({ stats: { total: 1, byKind: { trigger: 1 }, unresolvedSites: 0, managedRefs: 1, packages: [] } }),
+  '1 entry point across 1 kind · 0 unresolved sites · 1 managed reference',
+  'zero unresolved remains explicit and managed-reference wording is singular'
+);
 assert.strictEqual(shapeEntryCatalogHeaderLine(null), '', 'defensive: null catalog never throws');
 assert.strictEqual(shapeEntryCatalogHeaderLine({}), '', 'defensive: no stats at all');
 assert.strictEqual(shapeEntryCatalogHeaderLine({ stats: {} }), '', 'defensive: stats present but no total');
@@ -2226,6 +2234,264 @@ function subflowFlowNode(label, opts = {}) {
   assert.strictEqual(shapedLeaf.label, 'S13ChainTop');
   assert(shapedLeaf.description.includes('subflow'), 'level 3 of the chain also carries it -- genuinely recursive rendering, not special-cased to one level');
   assert.strictEqual(shapedLeaf.collapsible, false, 'the terminal end of the chain (no parent of its own) renders as a leaf');
+}
+
+// =========================================================================
+// v0.13 (Round 2.5, H2/H3): resolver-produced rollups and scoped mentions.
+// =========================================================================
+
+function hardeningNode(overrides) {
+  return {
+    label: '',
+    kind: 'method',
+    className: '',
+    methodLower: null,
+    path: '/ws/X.cls',
+    line: 1,
+    entries: [],
+    isTest: false,
+    via: null,
+    sites: [],
+    children: [],
+    cyclic: false,
+    truncated: false,
+    approximate: false,
+    seenElsewhere: false,
+    ...overrides,
+  };
+}
+
+// H2: the UI consumes the resolver's one canonical rollup TNode shape.
+{
+  const approxA = hardeningNode({
+    label: 'ApproxA.foo',
+    className: 'ApproxA',
+    methodLower: 'foo',
+    via: 'unique-name',
+    approximate: true,
+  });
+  const approxB = hardeningNode({
+    label: 'ApproxB.foo',
+    className: 'ApproxB',
+    methodLower: 'foo',
+    via: 'interface',
+    approximate: true,
+  });
+  const rollup = hardeningNode({
+    label: '2 possible callers (unconfirmed)',
+    kind: 'rollup',
+    path: '',
+    line: 0,
+    approximate: true,
+    children: [approxA, approxB],
+    collapsibleState: 'collapsed',
+  });
+  const confirmed = hardeningNode({
+    label: 'Confirmed.foo',
+    className: 'Confirmed',
+    methodLower: 'foo',
+    via: 'typed',
+  });
+  const root = hardeningNode({
+    label: 'Target.reprice',
+    className: 'Target',
+    methodLower: 'reprice',
+    children: [confirmed, rollup],
+  });
+
+  const shaped = shapeNode(root, null, undefined, 'callers');
+  assert.deepStrictEqual(
+    shaped.children.map((c) => c.label),
+    ['Confirmed.foo', '~2 possible callers (unconfirmed)'],
+    'resolver ordering and the single rollup node survive UI shaping'
+  );
+  const shapedRollup = shaped.children[1];
+  assert.strictEqual(shapedRollup.iconId, 'layers');
+  assert.strictEqual(shapedRollup.collapsible, true);
+  assert(shapedRollup.tooltip.includes('grouped for clarity'));
+  assert.deepStrictEqual(shapedRollup.children.map((c) => c.label), ['~ApproxA.foo', '~ApproxB.foo']);
+  assert(shapedRollup.children[0].description.includes('unique-name'));
+  assert(shapedRollup.children[1].description.includes('interface'));
+
+  const tree = { root, targetLabel: root.label, note: null, direction: 'callers' };
+  const targetFirst = shapeResult(tree);
+  assert.strictEqual(targetFirst.length, 1);
+  assert.strictEqual(targetFirst[0].children[1].iconId, 'layers');
+
+  const entryFirst = shapeResult(tree, 'entry-first');
+  const flat = [];
+  const visit = (nodes) => {
+    for (const node of nodes) {
+      flat.push(node);
+      visit(node.children || []);
+    }
+  };
+  visit(entryFirst);
+  assert(flat.some((node) => node.iconId === 'layers'), 'entry-first orientation retains the resolver-produced rollup');
+}
+
+// H3: the scoped mention node is a normal child in target-first mode and a
+// separate informational root in entry-first mode (never a fake call path).
+{
+  const mentionSite = hardeningNode({
+    label: 'PossibleCaller',
+    kind: 'class',
+    className: 'PossibleCaller',
+    methodLower: null,
+    path: '/ws/PossibleCaller.cls',
+    line: 7,
+    via: 'name-too-common',
+    approximate: true,
+    truncated: true,
+    sites: [{
+      path: '/ws/PossibleCaller.cls',
+      line: 7,
+      col: 2,
+      lineText: 'unknown.reprice(value);',
+      argsRendered: '',
+      overloadSig: null,
+    }],
+  });
+  const mentions = hardeningNode({
+    label: '1 unresolved site elsewhere mention reprice( — potential unconfirmed callers',
+    kind: 'unresolved-mentions',
+    path: '',
+    line: 0,
+    via: 'unresolved',
+    approximate: true,
+    children: [mentionSite],
+    collapsibleState: 'collapsed',
+  });
+  const confirmed = hardeningNode({
+    label: 'ConfirmedCaller.run',
+    className: 'ConfirmedCaller',
+    methodLower: 'run',
+    via: 'typed',
+  });
+  const root = hardeningNode({
+    label: 'Target.reprice',
+    className: 'Target',
+    methodLower: 'reprice',
+    children: [confirmed, mentions],
+  });
+  const tree = {
+    root,
+    targetLabel: root.label,
+    note: null,
+    direction: 'callers',
+    stats: { capped: true },
+  };
+
+  assert.strictEqual(findUnresolvedMentionsNode(tree), mentions);
+  assert.strictEqual(
+    unresolvedMentionsHeaderLine(tree),
+    '1 unresolved site elsewhere mention reprice( — potential unconfirmed callers'
+  );
+  assert.deepStrictEqual(
+    shapeHeaderLines(tree),
+    [
+      'Result capped -- not every caller could be expanded.',
+      '1 unresolved site elsewhere mention reprice( — potential unconfirmed callers',
+    ]
+  );
+  assert.strictEqual(unresolvedMentionsHeaderLine({ ...tree, direction: 'callees' }), null);
+  assert.strictEqual(unresolvedMentionsHeaderLine({ ...tree, root: { ...root, children: [confirmed] } }), null);
+
+  const targetFirst = shapeResult(tree);
+  assert.strictEqual(targetFirst.length, 1);
+  const shapedMentions = targetFirst[0].children.find((c) => c.iconId === 'question');
+  assert(shapedMentions, 'target-first keeps the mention info node under the traced target');
+  assert.strictEqual(shapedMentions.collapsible, true);
+  assert.strictEqual(shapedMentions.children[0].children[0].jump.path, '/ws/PossibleCaller.cls');
+
+  const entryFirst = shapeResult(tree, 'entry-first');
+  assert.strictEqual(entryFirst.length, 2, 'one execution root plus one informational mention root');
+  assert.strictEqual(entryFirst[0].label, 'ConfirmedCaller.run');
+  assert.strictEqual(entryFirst[1].iconId, 'question');
+  assert(!entryFirst[0].children.some((c) => c.iconId === 'question'), 'mention sites never become execution-path nodes');
+}
+
+// v0.14 Impact Analysis: the report is always rendered as five honest,
+// severity-labelled sections.  Every leaf keeps its source jump and Flow
+// metadata exposes the parent invocation chain beneath the direct action.
+{
+  const site = {
+    callerClass: 'ImpactCaller',
+    callerMethod: 'run',
+    path: '/ws/ImpactCaller.cls',
+    line: 7,
+    col: 4,
+    lineText: "target.change('hello');",
+    via: 'typed',
+    overloadSig: 'change(String)',
+    overloadPick: 'exact',
+  };
+  const uncertain = {
+    ...site,
+    callerClass: 'UncertainCaller',
+    path: '/ws/UncertainCaller.cls',
+    line: 8,
+    via: 'unique-name',
+    overloadPick: 'arity-tie',
+  };
+  const report = {
+    target: { label: 'ImpactTarget.change(String)' },
+    breaks: [site],
+    mightBreak: [uncertain],
+    contract: {
+      interfaces: [{
+        iface: 'ImpactIface',
+        method: 'change',
+        overloadSig: 'change(String)',
+        path: '/ws/ImpactIface.cls',
+        line: 2,
+        callers: [uncertain],
+      }],
+      overrides: {
+        base: { label: 'ImpactBase.change(String)', path: '/ws/ImpactBase.cls', line: 3 },
+        overriddenBy: [{ label: 'ImpactChild.change(String)', path: '/ws/ImpactChild.cls', line: 4 }],
+        callersOfBase: [uncertain],
+      },
+    },
+    metadata: [{
+      kind: 'flow',
+      label: 'ImpactChildFlow',
+      path: '/ws/flows/ImpactChildFlow.flow-meta.xml',
+      line: 3,
+      parentFlows: [{ label: 'ImpactParentFlow', path: '/ws/flows/ImpactParentFlow.flow-meta.xml', line: 4 }],
+    }],
+    otherOverloads: [{ overloadSig: 'change(Integer)', callerCount: 2, path: '/ws/ImpactTarget.cls', line: 11 }],
+    stats: { breaks: 1, mightBreak: 1, contractSurfaces: 3, metadataSurfaces: 1 },
+  };
+
+  const shapedSite = shapeImpactSite(site, 'break');
+  assert.strictEqual(shapedSite.label, 'ImpactCaller.run');
+  assert.strictEqual(shapedSite.iconId, 'error');
+  assert.deepStrictEqual(shapedSite.jump, { path: '/ws/ImpactCaller.cls', line: 7, col: 4 });
+
+  const roots = shapeImpactReport(report);
+  assert.deepStrictEqual(roots.map((root) => root.label), ['BREAKS', 'MIGHT BREAK', 'CONTRACT', 'METADATA', 'OTHER OVERLOADS']);
+  assert.deepStrictEqual(roots.map((root) => root.description), ['1', '1', '3', '1', '1']);
+  assert.strictEqual(roots[0].expanded, true);
+  assert.strictEqual(roots[0].children[0].iconId, 'error');
+  assert.strictEqual(roots[1].children[0].iconId, 'warning');
+  assert.strictEqual(roots[2].children[0].iconId, 'symbol-interface');
+  assert.strictEqual(roots[2].children[1].label, 'ImpactBase.change(String)');
+  assert.strictEqual(roots[2].children[2].label, 'ImpactChild.change(String)');
+  assert.strictEqual(roots[3].children[0].iconId, 'symbol-event');
+  assert.strictEqual(roots[3].children[0].children[0].label, 'ImpactParentFlow');
+  assert.deepStrictEqual(roots[3].children[0].children[0].jump, {
+    path: '/ws/flows/ImpactParentFlow.flow-meta.xml', line: 4, col: 0,
+  });
+  assert.strictEqual(roots[4].children[0].label, 'change(Integer)');
+  assert.strictEqual(roots[4].children[0].description, '2 callers');
+  assert.strictEqual(roots[4].expanded, false);
+  assert.strictEqual(
+    shapeImpactHeaderLine(report),
+    '1 direct break · 1 uncertain · 3 contract surfaces · 1 metadata surface'
+  );
+  assert.deepStrictEqual(shapeImpactReport(null), []);
+  assert.strictEqual(shapeImpactHeaderLine(null), '');
 }
 
 console.log('apex-trace uitree self-check: all assertions passed');

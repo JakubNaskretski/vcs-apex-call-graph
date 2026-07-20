@@ -1,0 +1,14 @@
+.vscode/**
+.gitignore
+*.vsix
+test.js
+test-*.js
+dev/**
+test-fixtures/**
+samples/**
+*.local.md
+CLAUDE.md
+MEMORY.md
+CONTRACT.md
+package-lock.json
+**/.DS_Store

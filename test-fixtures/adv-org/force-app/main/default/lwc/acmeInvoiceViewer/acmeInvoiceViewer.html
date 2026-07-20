@@ -1,0 +1,23 @@
+<template>
+    <lightning-card title="Invoice Summary" icon-name="standard:invoice">
+        <div class="slds-p-around_medium">
+            <template if:true={invoiceSummary}>
+                <p>Total: {invoiceSummary.totalAmount}</p>
+                <p>Status: {invoiceSummary.status}</p>
+            </template>
+            <template if:true={hasError}>
+                <p class="slds-text-color_error">Unable to load invoice summary.</p>
+            </template>
+            <lightning-button
+                label="Recalculate"
+                variant="neutral"
+                class="slds-m-top_small"
+                onclick={handleRecalculate}
+                disabled={isRecalculating}
+            ></lightning-button>
+            <template if:true={errorMessage}>
+                <p class="slds-text-color_error slds-m-top_small">{errorMessage}</p>
+            </template>
+        </div>
+    </lightning-card>
+</template>

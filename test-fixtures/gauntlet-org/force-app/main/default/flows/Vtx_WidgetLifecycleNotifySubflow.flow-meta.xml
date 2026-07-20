@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>59.0</apiVersion>
+    <label>Vtx Widget Lifecycle Notify Subflow</label>
+    <processType>AutoLaunchedFlow</processType>
+    <status>Active</status>
+    <variables>
+        <name>recordId</name>
+        <dataType>String</dataType>
+        <isCollection>false</isCollection>
+        <isInput>true</isInput>
+        <isOutput>false</isOutput>
+    </variables>
+    <start>
+        <locationX>0</locationX>
+        <locationY>0</locationY>
+        <connector>
+            <targetReference>Send_Widget_Notification</targetReference>
+        </connector>
+    </start>
+    <actionCalls>
+        <name>Send_Widget_Notification</name>
+        <label>Send Widget Notification</label>
+        <locationX>0</locationX>
+        <locationY>150</locationY>
+        <actionName>VtxFlowWidgetNotifier.notifyTeam</actionName>
+        <actionType>apex</actionType>
+        <flowTransactionModel>CurrentTransaction</flowTransactionModel>
+        <inputParameters>
+            <name>widgetId</name>
+            <value>
+                <elementReference>recordId</elementReference>
+            </value>
+        </inputParameters>
+        <nameSegment>VtxFlowWidgetNotifier.notifyTeam</nameSegment>
+        <offset>0</offset>
+    </actionCalls>
+</Flow>

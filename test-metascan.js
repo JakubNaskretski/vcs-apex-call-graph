@@ -13,12 +13,12 @@
 //      actionFunction/actionSupport/actionPoller, single-identifier
 //      expressions only -- dotted/compound expressions and value= bindings
 //      deliberately skipped).
-//   2. A real pass over the read-only /Users/agent/work/code/example-data/
+//   2. A real pass over the read-only example-data/
 //      adv-org corpus, asserting the EXACT refs MANIFEST.md's "UI / metadata
 //      callers" ground-truth section promises -- this is the bar the task
 //      brief sets ("assert the exact refs the MANIFEST promises").
 //   3. v0.7.1 (M1) gauntlet-round regression: a real pass over the read-only
-//      /Users/agent/work/code/example-data/gauntlet-org corpus pinning
+//      test-fixtures/gauntlet-org corpus pinning
 //      VALIDATION-REPORT.md Tier-1 #1 -- `LWC_IMPORT_RE` must retain the
 //      namespace segment of `@salesforce/apex/ns.Class.method` specifiers
 //      instead of silently discarding it (the M2 fix that USES this field to
@@ -2190,14 +2190,14 @@ console.log('metascan.js inline-fixture self-check: all assertions passed');
 console.log('metascan.js v0.13 subflow-extraction inline self-check: all assertions passed');
 
 // ===========================================================================
-// REAL CORPUS PASS — /Users/agent/work/code/example-data/adv-org (read-only)
+// REAL CORPUS PASS — test-fixtures/adv-org (read-only)
 // Asserts the exact refs MANIFEST.md's "UI / metadata callers" ground-truth
 // section promises: LWC class.method pairs, dotted + bare Flow actionNames,
 // Aura controller pairs (class-level + method-level), and every
 // remoteClass/remoteMethod pair (os-meta.xml + DataPack JSON).
 // ===========================================================================
 
-const CORPUS_ROOT = '/Users/agent/work/code/example-data/adv-org/force-app/main/default';
+const CORPUS_ROOT = 'test-fixtures/adv-org/force-app/main/default';
 
 function readCorpus(relPath) {
   const p = path.join(CORPUS_ROOT, relPath);
@@ -2447,7 +2447,7 @@ console.log(
 );
 
 // ===========================================================================
-// GAUNTLET-ORG REGRESSION PASS -- /Users/agent/work/code/example-data/
+// GAUNTLET-ORG REGRESSION PASS -- example-data/
 // gauntlet-org (read-only). Pins VALIDATION-REPORT.md Tier-1 #1 / Ranked
 // backlog #4 as a named regression: parseMetaFile() on the real
 // kappaGatewayPanel LWC bundle must retain the 'zenq' namespace segment of
@@ -2459,7 +2459,7 @@ console.log(
 // pinned as its own regression in test-resolver.js.
 // ===========================================================================
 
-const GAUNTLET_ROOT = '/Users/agent/work/code/example-data/gauntlet-org/force-app/main/default';
+const GAUNTLET_ROOT = 'test-fixtures/gauntlet-org/force-app/main/default';
 
 function readGauntlet(relPath) {
   const p = path.join(GAUNTLET_ROOT, relPath);

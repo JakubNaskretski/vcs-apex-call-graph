@@ -343,7 +343,7 @@ addFile('classes/TxStoryInvocable.cls', [
 // v0.5.0 EXCEPTION-STORY fixture: a throw deep in a service, with callers up
 // the chain exercising all four G2 catch-depth scenarios (exact-type catch,
 // supertype catch, bare-Exception catch, and one path that reaches an entry
-// point fully uncaught) -- mirrors example-data/adv-org/MANIFEST.md's v0.5
+// point fully uncaught) -- mirrors test-fixtures/adv-org/MANIFEST.md's v0.5
 // G2 section node for node, as its own self-contained mini fixture set
 // (ExcStory* prefix, no overlap with any other fixture in this file).
 // =========================================================================
@@ -466,7 +466,7 @@ addFile('classes/ExcStoryUtil.cls', [
 // EventBus.publish(...), which resolves to every trigger on that object
 // (G1(a)) and, once the platform-event-triggered flow's meta node is
 // reachable, to the publish sites shown as flow children (G1(b)) -- mirrors
-// example-data/adv-org/MANIFEST.md's v0.5 G1 section node for node.
+// test-fixtures/adv-org/MANIFEST.md's v0.5 G1 section node for node.
 // (PubStory* prefix, no overlap with any other fixture in this file.)
 // =========================================================================
 
@@ -1064,14 +1064,17 @@ resolver.attachMetaCallers(index, v10VfPageMetaRefs);
 // ---------------------------------------------------------------------------
 
 function callers(classLower, methodLower) {
-  const tree = resolver.buildCallerTree(index, { classLower, methodLower }, {});
+  // Most assertions below predate the v0.13 uncertainty rollup and verify
+  // the raw edge topology. Keep that baseline explicit; dedicated v0.13
+  // assertions below cover the new default rollup shape itself.
+  const tree = resolver.buildCallerTree(index, { classLower, methodLower }, { showUnconfirmed: 'expand' });
   return tree;
 }
 
 // v0.7.0 A2: forward-direction counterpart to callers() -- same corpus/index,
 // same {}-opts convention, just buildCalleeTree instead of buildCallerTree.
 function callees(classLower, methodLower) {
-  const tree = resolver.buildCalleeTree(index, { classLower, methodLower }, {});
+  const tree = resolver.buildCalleeTree(index, { classLower, methodLower }, { showUnconfirmed: 'expand' });
   return tree;
 }
 
@@ -1632,11 +1635,9 @@ function findChild(tree, label) {
   );
   const headerLines = uitree.shapeHeaderLines(tree);
   assert.strictEqual(headerLines[0], 'No callers found — this is likely an entry point or unused code.', 'H4 e2e: the note reaches the rendered header line via the real uitree.shapeHeaderLines step, and comes first');
-  // This whole test.js corpus's index also carries a genuine workspace-wide
-  // unresolvedSites count (unrelated to this specific target -- H4's
-  // unresolvedSites stat is global to the index, not per-trace), which
-  // surfaces here too as a second header line -- itself a real H4 behavior
-  // worth pinning, not noise to suppress.
+  // This corpus also carries genuine workspace-wide unresolved/external
+  // counts. Round 2.5 deliberately keeps them on TreeResult.stats for Scan
+  // Stats diagnostics while removing them from this target-specific header.
   // v0.7.1: was pinned at 1 pre-round; the Ns071Caller.probe() fixture below
   // (R1 e2e) used to add exactly one more real unresolved site (the
   // namespaced zenq.Ns071Target.run() reference), pinning this at 2.
@@ -1664,8 +1665,11 @@ function findChild(tree, label) {
   assert.strictEqual(tree.stats.unresolvedSites, 3, 'sanity: this corpus has exactly 3 real unresolved call sites elsewhere (see resolver.js contract -- global to the index); zenq.Ns071Target.run() moved to externalRefs under v0.8, +2 for v0.11/B2\'s V11UnitOfWork.commitBoth() add() calls (ordinary dispatch, unaffected by DML narrowing)');
   assert.strictEqual(tree.stats.externalRefs, 1, 'v0.8/N5: zenq.Ns071Target.run() is the corpus\'s one managed-package (external) reference');
   assert.deepStrictEqual(tree.stats.externalNamespaces, ['zenq'], 'v0.8/N5: externalNamespaces lists the one namespace this corpus references');
-  assert.strictEqual(headerLines.length, 2, 'note + the workspace-wide unresolved/managed-package line');
-  assert.strictEqual(headerLines[1], '3 unresolved · 1 managed-package ref (zenq).', 'v0.8/N5: header now shows BOTH counts on one line once externalRefs > 0, per uitree.js shapeHeaderLines');
+  assert.deepStrictEqual(
+    headerLines,
+    ['No callers found — this is likely an entry point or unused code.'],
+    'Round 2.5/H3: workspace-global unresolved/managed counts stay out of a target-specific trace header'
+  );
 }
 
 // --- v0.7.1/R1 e2e (superseded by v0.8/N1/N2, see below): namespaced-----
@@ -1943,12 +1947,12 @@ const pkgIndex = resolver.buildSemanticIndex(pkgFiles, { packageOf: pkgPackageOf
   assert.ok(alphaEntry && betaEntry && deltaEntry, 'all 3 package candidates present in the PkgDup bucket');
 
   // Same-package preference (reverse direction).
-  const treeAlpha = resolver.buildCallerTree(pkgIndex, { classLower: alphaEntry.classLower, methodLower: 'identify' }, {});
+  const treeAlpha = resolver.buildCallerTree(pkgIndex, { classLower: alphaEntry.classLower, methodLower: 'identify' }, { showUnconfirmed: 'expand' });
   const alphaCaller = treeAlpha.root.children.find((c) => c.label === 'PkgAlphaCaller.go');
   assert.ok(alphaCaller, 'B1 e2e: PkgAlphaCaller (in pkg-alpha) resolves to the pkg-alpha PkgDup candidate (same-package preference)');
   assert.strictEqual(alphaCaller.via, 'static');
 
-  const treeBeta = resolver.buildCallerTree(pkgIndex, { classLower: betaEntry.classLower, methodLower: 'identify' }, {});
+  const treeBeta = resolver.buildCallerTree(pkgIndex, { classLower: betaEntry.classLower, methodLower: 'identify' }, { showUnconfirmed: 'expand' });
   assert.ok(!treeBeta.root.children.some((c) => c.label === 'PkgAlphaCaller.go'), 'B1 e2e: same-package preference wins outright -- no ALSO fanning out to the pkg-beta candidate too');
 
   // Default-package fallback (reverse direction): pkg-gamma has no PkgDup
@@ -1965,8 +1969,8 @@ const pkgIndex = resolver.buildSemanticIndex(pkgFiles, { packageOf: pkgPackageOf
   assert.strictEqual(bucket2.length, 2, 'classBuckets exposes both PkgDup2 candidates');
   const beta2Entry = bucket2.find((b) => b.package === 'pkg-beta');
   const delta2Entry = bucket2.find((b) => b.package === 'pkg-delta');
-  const treeBeta2 = resolver.buildCallerTree(pkgIndex, { classLower: beta2Entry.classLower, methodLower: 'identify' }, {});
-  const treeDelta2 = resolver.buildCallerTree(pkgIndex, { classLower: delta2Entry.classLower, methodLower: 'identify' }, {});
+  const treeBeta2 = resolver.buildCallerTree(pkgIndex, { classLower: beta2Entry.classLower, methodLower: 'identify' }, { showUnconfirmed: 'expand' });
+  const treeDelta2 = resolver.buildCallerTree(pkgIndex, { classLower: delta2Entry.classLower, methodLower: 'identify' }, { showUnconfirmed: 'expand' });
   const epsilonInBeta2 = treeBeta2.root.children.find((c) => c.label === 'PkgEpsilonCaller.go');
   const epsilonInDelta2 = treeDelta2.root.children.find((c) => c.label === 'PkgEpsilonCaller.go');
   assert.ok(epsilonInBeta2 && epsilonInDelta2, 'B3 e2e: the ambiguous call site produces an edge to BOTH candidates, from the same call site');
@@ -1977,7 +1981,7 @@ const pkgIndex = resolver.buildSemanticIndex(pkgFiles, { packageOf: pkgPackageOf
 
   // Forward direction sees the same fan-out from the caller's own side, and
   // each candidate node carries its own package label (B3 badge plumbing).
-  const calleeTreeEps = resolver.buildCalleeTree(pkgIndex, { classLower: 'pkgepsiloncaller', methodLower: 'go' }, {});
+  const calleeTreeEps = resolver.buildCalleeTree(pkgIndex, { classLower: 'pkgepsiloncaller', methodLower: 'go' }, { showUnconfirmed: 'expand' });
   assert.strictEqual(calleeTreeEps.root.children.length, 2, 'B3 forward e2e: the ambiguous call site forwards to both candidates');
   for (const c of calleeTreeEps.root.children) {
     assert.strictEqual(c.label, 'PkgDup2.identify');
@@ -1989,7 +1993,7 @@ const pkgIndex = resolver.buildSemanticIndex(pkgFiles, { packageOf: pkgPackageOf
 
   // Forward direction, same-package (non-ambiguous) call site for contrast
   // -- resolves to exactly ONE candidate, no fan-out.
-  const calleeTreeAlphaCaller = resolver.buildCalleeTree(pkgIndex, { classLower: 'pkgalphacaller', methodLower: 'go' }, {});
+  const calleeTreeAlphaCaller = resolver.buildCalleeTree(pkgIndex, { classLower: 'pkgalphacaller', methodLower: 'go' }, { showUnconfirmed: 'expand' });
   assert.strictEqual(calleeTreeAlphaCaller.root.children.length, 1, 'B1 forward e2e: same-package call site resolves to exactly ONE candidate, no fan-out');
   assert.strictEqual(calleeTreeAlphaCaller.root.children[0].via, 'static');
   assert.strictEqual(calleeTreeAlphaCaller.root.children[0].package, 'pkg-alpha');
@@ -1999,7 +2003,7 @@ const pkgIndex = resolver.buildSemanticIndex(pkgFiles, { packageOf: pkgPackageOf
   // behavior exactly, byte-identical to pre-v0.7.
   const pkgIndexNoOpts = resolver.buildSemanticIndex(pkgFiles);
   assert.strictEqual(pkgIndexNoOpts.stats.duplicateNames, 0, 'B5 e2e: stats.duplicateNames stays 0 when opts.packageOf is inactive, even with real duplicate names present, through the real parser pipeline');
-  const treeNoOpts = resolver.buildCallerTree(pkgIndexNoOpts, { classLower: 'pkgdup', methodLower: 'identify' }, {});
+  const treeNoOpts = resolver.buildCallerTree(pkgIndexNoOpts, { classLower: 'pkgdup', methodLower: 'identify' }, { showUnconfirmed: 'expand' });
   const noOptsCallers = treeNoOpts.root.children.map((c) => c.label).sort();
   assert.deepStrictEqual(
     noOptsCallers,
@@ -2045,7 +2049,7 @@ const v08Index = resolver.buildSemanticIndex(v08Files);
   // expression behavior confirmed live against the real gauntlet-org corpus
   // (VertexLedgerBridge.postToLedger's own callee tree shows the same
   // pattern), unrelated to v0.8, so this e2e only pins the EXTERNAL child.)
-  const calleeTree = resolver.buildCalleeTree(v08Index, { classLower: 'v08billingcaller', methodLower: 'runbilling' }, {});
+  const calleeTree = resolver.buildCalleeTree(v08Index, { classLower: 'v08billingcaller', methodLower: 'runbilling' }, { showUnconfirmed: 'expand' });
   const extChild = calleeTree.root.children.find((c) => c.kind === 'external');
   assert.ok(extChild, 'v0.8/N4 e2e: V08BillingCaller.runBilling has a forward external-node child');
   assert.strictEqual(extChild.kind, 'external', 'v0.8/N4: the forward child is kind=external');
@@ -2391,7 +2395,7 @@ const v08Index = resolver.buildSemanticIndex(v08Files);
 //
 // Two of this fixture's shapes are DELIBERATE spot checks against the real
 // gauntlet-org corpus's documented '## Entry catalog (v0.12)' ground truth
-// (example-data/gauntlet-org/GROUND-TRUTH.md), reproduced here as real
+// (test-fixtures/gauntlet-org/GROUND-TRUTH.md), reproduced here as real
 // source text so the SAME rulings are pinned through the real parser, not
 // just resolver.js's synthetic fixtures:
 //   - EC2ETrigger declares '(after update, after insert)' in that literal,
@@ -2711,6 +2715,8 @@ const v08Index = resolver.buildSemanticIndex(v08Files);
       byKind: { trigger: 1, aura: 1, invocable: 3, rest: 2, soap: 0, async: 3, email: 1, platform: 1, flow: 3, anonymous: 1 },
       packages: ['OtherPkg'],
       excludedTestEntries: 1,
+      unresolvedSites: 0,
+      managedRefs: 0,
     },
   };
   assert.deepStrictEqual(ec2eCatalog, ec2eExpected, 'e2e/entry-catalog: FULL catalog must deep-equal the hand-written ground truth for this fixture subset');
@@ -2733,9 +2739,123 @@ const v08Index = resolver.buildSemanticIndex(v08Files);
 
   assert.strictEqual(
     uitree.shapeEntryCatalogHeaderLine(ec2eCatalog),
-    '16 entry points across 10 kinds · 1 test-class entry excluded · packages: OtherPkg',
-    'e2e: header line summarizes total/kinds/excluded/packages'
+    '16 entry points across 10 kinds · 1 test-class entry excluded · 0 unresolved sites · 0 managed references · packages: OtherPkg',
+    'e2e: header line summarizes total/kinds/excluded/unresolved/managed/packages'
   );
+}
+
+// ---------------------------------------------------------------------------
+// v0.14 Impact Analysis e2e: real Apex source -> parser -> semantic index ->
+// overload-aware report -> five-section UI.  Unit fixtures in
+// test-resolver.js pin the detailed classifier; this seam proves the actual
+// parser emits everything the report needs.
+// ---------------------------------------------------------------------------
+{
+  const impactSources = [
+    ['ImpactIface.cls', [
+      'public interface ImpactIface {',
+      '  void change(String value);',
+      '}',
+    ].join('\n')],
+    ['ImpactBase.cls', [
+      'public virtual class ImpactBase {',
+      '  public virtual void change(String value) {}',
+      '}',
+    ].join('\n')],
+    ['ImpactTarget.cls', [
+      'public class ImpactTarget extends ImpactBase implements ImpactIface {',
+      '  public override void change(String value) {}',
+      '  public void change(Integer value) {}',
+      '  public void change(Decimal value) {}',
+      '  private void untouched() {}',
+      '}',
+    ].join('\n')],
+    ['ImpactChild.cls', [
+      'public class ImpactChild extends ImpactTarget {',
+      '  public override void change(String value) {}',
+      '}',
+    ].join('\n')],
+    ['ImpactExactCaller.cls', [
+      'public class ImpactExactCaller {',
+      "  public void run() { ImpactTarget target = new ImpactTarget(); target.change('hello'); }",
+      '}',
+    ].join('\n')],
+    ['ImpactTieCaller.cls', [
+      'public class ImpactTieCaller {',
+      '  public void run() { ImpactTarget target = new ImpactTarget(); target.change(null); }',
+      '}',
+    ].join('\n')],
+    ['ImpactFallbackCaller.cls', [
+      'public class ImpactFallbackCaller {',
+      "  public void run() { ImpactTarget target = new ImpactTarget(); target.change('x', 'y'); }",
+      '}',
+    ].join('\n')],
+    ['ImpactIfaceCaller.cls', [
+      'public class ImpactIfaceCaller {',
+      "  public void run(ImpactIface target) { target.change('iface'); }",
+      '}',
+    ].join('\n')],
+    ['ImpactBaseCaller.cls', [
+      'public class ImpactBaseCaller {',
+      "  public void run(ImpactBase target) { target.change('base'); }",
+      '}',
+    ].join('\n')],
+  ];
+  const impactFacts = impactSources.map(([name, text]) => parser.parseFile({ path: `/ws/impact/${name}`, text }));
+  assert(impactFacts.every((facts) => !facts.parseError), 'e2e/impact: all real Apex fixtures must parse');
+  const impactIndex = resolver.buildSemanticIndex(impactFacts);
+  resolver.attachMetaCallers(impactIndex, [
+    { kind: 'lwc', label: 'impactPanel', path: '/ws/impact/lwc/impactPanel.js', line: 1, className: 'ImpactTarget', methodName: 'change' },
+    { kind: 'flow', label: 'ImpactChildFlow', path: '/ws/impact/flows/ImpactChildFlow.flow-meta.xml', line: 3, className: 'ImpactTarget', methodName: 'change', subflows: [] },
+    { kind: 'flow', label: 'ImpactParentFlow', path: '/ws/impact/flows/ImpactParentFlow.flow-meta.xml', line: 4, className: null, methodName: null, subflows: ['ImpactChildFlow'] },
+  ]);
+
+  const needsChoice = resolver.buildImpactReport(impactIndex, { classLower: 'impacttarget', methodLower: 'change' });
+  assert.strictEqual(needsChoice.needsOverloadChoice, true);
+  assert.deepStrictEqual(needsChoice.availableOverloads.map((row) => row.overloadSig), [
+    'change(String)', 'change(Integer)', 'change(Decimal)',
+  ]);
+
+  const impact = resolver.buildImpactReport(impactIndex, {
+    classLower: 'impacttarget', methodLower: 'change', overloadSig: 'change(String)',
+  });
+  assert(impact.breaks.some((site) => site.callerClass === 'ImpactExactCaller'));
+  assert(impact.mightBreak.some((site) => site.callerClass === 'ImpactTieCaller' && site.overloadPick === 'arity-tie'));
+  assert(impact.mightBreak.some((site) => site.callerClass === 'ImpactFallbackCaller' && site.overloadPick === 'fallback'));
+  assert(impact.mightBreak.some((site) => site.callerClass === 'ImpactIfaceCaller' && site.via === 'interface'));
+  assert(impact.mightBreak.some((site) => site.callerClass === 'ImpactBaseCaller' && site.via === 'override'));
+  assert.strictEqual(impact.contract.interfaces[0].iface, 'ImpactIface');
+  assert.strictEqual(impact.contract.interfaces[0].callers.length, 1, 'e2e/impact: interface contract callers are deduped by physical source site');
+  assert.strictEqual(impact.contract.overrides.base.label, 'ImpactBase.change(String)');
+  assert.deepStrictEqual(impact.contract.overrides.overriddenBy.map((row) => row.label), ['ImpactChild.change(String)']);
+  assert.deepStrictEqual(impact.metadata.find((row) => row.kind === 'flow').parentFlows.map((row) => row.label), ['ImpactParentFlow']);
+  assert.deepStrictEqual(impact.otherOverloads.map((row) => row.overloadSig), ['change(Integer)', 'change(Decimal)']);
+
+  for (const tiedSignature of ['change(Integer)', 'change(Decimal)']) {
+    const tiedImpact = resolver.buildImpactReport(impactIndex, {
+      classLower: 'impacttarget', methodLower: 'change', overloadSig: tiedSignature,
+    });
+    assert(
+      tiedImpact.mightBreak.some((site) => site.callerClass === 'ImpactTieCaller' && site.overloadPick === 'arity-tie'),
+      `e2e/impact: ${tiedSignature} retains the ambiguous null-call site`
+    );
+    assert(
+      !tiedImpact.breaks.some((site) => site.callerClass === 'ImpactExactCaller'),
+      `e2e/impact: ${tiedSignature} does not inherit the exact String caller`
+    );
+  }
+
+  const impactUi = uitree.shapeImpactReport(impact);
+  assert.deepStrictEqual(impactUi.map((section) => section.label), ['BREAKS', 'MIGHT BREAK', 'CONTRACT', 'METADATA', 'OTHER OVERLOADS']);
+  assert.strictEqual(impactUi[0].children[0].iconId, 'error');
+  assert(impactUi[3].children.some((row) => row.label === 'ImpactChildFlow' && row.children[0].label === 'ImpactParentFlow'));
+
+  const untouched = resolver.buildImpactReport(impactIndex, {
+    classLower: 'impacttarget', methodLower: 'untouched', overloadSig: 'untouched()',
+  });
+  assert.strictEqual(untouched.breaks.length, 0);
+  assert.strictEqual(untouched.mightBreak.length, 0);
+  assert.strictEqual(uitree.shapeImpactReport(untouched).length, 5, 'e2e/impact: an empty honest report still renders every section');
 }
 
 console.log('apex-trace end-to-end self-check: all assertions passed');

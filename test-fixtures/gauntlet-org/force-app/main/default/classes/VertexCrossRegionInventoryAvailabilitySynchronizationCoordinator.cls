@@ -1,0 +1,7 @@
+public class VertexCrossRegionInventoryAvailabilitySynchronizationCoordinator {
+  public void synchronizeInventoryAvailabilitySnapshotsForDistributionRegion(String regionCode) {
+    VertexThirdPartyLogisticsProviderIntegrationAdapterImplementation adapter =
+      VertexThirdPartyLogisticsProviderIntegrationAdapterFactoryImpl.createAdapterInstanceForCarrierAccountIntegrationConfiguration(regionCode);
+    adapter.buildCarrierAccountIntegrationConfigurationForRegionalPartner(regionCode);
+  }
+}

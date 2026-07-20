@@ -16,7 +16,7 @@
 // {methodLower:null} and a '(trigger)' pseudo-method entry both rendering
 // the exact same bare trigger name).
 const assert = require('assert');
-const { refineTargets } = require('./targets');
+const { refineTargets, methodSignature, findDeclarationOverload } = require('./targets');
 
 // ===========================================================================
 // Rule 1: '(init)' suppressed entirely
@@ -531,6 +531,23 @@ const { refineTargets } = require('./targets');
   const ext = out.find((o) => o.classLower === 'zenq.billing');
   assert.strictEqual(ext.label, 'zenq.Billing (managed)', 'external item unaffected by the unrelated same-list package-duplicate group');
   assert.ok(!Object.prototype.hasOwnProperty.call(ext, 'package'), 'external item never gains a package field it never had');
+}
+
+// 29. v0.14 Impact Analysis: a declaration-line cursor selects the exact
+// overload; a call-site/other line deliberately returns null so the host
+// can ask with a QuickPick instead of guessing.
+{
+  const methods = [
+    { name: 'change', line: 4, params: [{ name: 'value', type: 'String' }] },
+    { name: 'change', line: 8, params: [{ name: 'value', type: 'Integer' }] },
+  ];
+  assert.strictEqual(methodSignature(methods[0]), 'change(String)');
+  const exact = findDeclarationOverload(methods, 'change', 8);
+  assert(exact && exact.method === methods[1]);
+  assert.strictEqual(exact.overloadSig, 'change(Integer)');
+  assert.strictEqual(findDeclarationOverload(methods, 'change', 12), null, 'non-declaration line never guesses an overload');
+  assert.strictEqual(findDeclarationOverload(methods, 'other', 8), null);
+  assert.strictEqual(findDeclarationOverload(null, 'change', 8), null);
 }
 
 console.log('apex-trace targets.js self-check: all assertions passed');

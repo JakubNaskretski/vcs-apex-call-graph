@@ -1,0 +1,17 @@
+<template>
+    <lightning-card title="Recent Quotes" icon-name="standard:orders">
+        <div class="slds-p-around_medium">
+            <template if:true={hasQuotes}>
+                <template for:each={recentQuotes.data} for:item="quote">
+                    <div key={quote.Id} class="slds-p-vertical_x-small">
+                        <a href={quote.Id}>{quote.Name}</a>
+                        <span class="slds-m-left_small">{quote.Acme_Status__c}</span>
+                    </div>
+                </template>
+            </template>
+            <template if:true={hasError}>
+                <p class="slds-text-color_error">Unable to load recent quotes.</p>
+            </template>
+        </div>
+    </lightning-card>
+</template>

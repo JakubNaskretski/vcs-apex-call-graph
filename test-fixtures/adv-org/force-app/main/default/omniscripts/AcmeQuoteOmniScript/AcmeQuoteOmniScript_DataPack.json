@@ -1,0 +1,63 @@
+{
+  "VlocityDataPackKey": "OmniScriptDataPack/Acme-Quote-English-1",
+  "VlocityDataPackType": "SObject",
+  "VlocityRecordSObjectType": "%vlocity_namespace%__OmniScript__c",
+  "VlocityRecordSourceKey": "OmniScript/Acme/Quote/English/1",
+  "VlocityDataPackIsIncluded": true,
+  "VlocityRecordData": {
+    "Name": "Acme-Quote-English-1",
+    "%vlocity_namespace%__Type__c": "Acme",
+    "%vlocity_namespace%__SubType__c": "Quote",
+    "%vlocity_namespace%__Language__c": "English",
+    "%vlocity_namespace%__Version__c": 1,
+    "%vlocity_namespace%__IsActive__c": true,
+    "%vlocity_namespace%__IsProcedure__c": false,
+    "%vlocity_namespace%__PropertySet__c": "{\"bDisableLwc\":false,\"bHeaderJSON\":false,\"bSaveForLaterUI\":false}",
+    "%vlocity_namespace%__Element__r": {
+      "VlocityDataPackType": "SObject",
+      "VlocityRecordSObjectType": "%vlocity_namespace%__Element__c",
+      "records": [
+        {
+          "VlocityDataPackKey": "OmniScriptDataPack/Acme-Quote-English-1/CreateQuoteAction",
+          "VlocityDataPackType": "SObject",
+          "VlocityRecordSObjectType": "%vlocity_namespace%__Element__c",
+          "VlocityRecordSourceKey": "Element/Acme-Quote-English-1/CreateQuoteAction",
+          "VlocityRecordData": {
+            "Name": "CreateQuoteAction",
+            "%vlocity_namespace%__Level__c": 1,
+            "%vlocity_namespace%__Order__c": 1,
+            "%vlocity_namespace%__Type__c": "Remote Action",
+            "%vlocity_namespace%__PropertySet__c": "{\"remoteClass\":\"AcmeQuoteAuraService\",\"remoteMethod\":\"createQuote\",\"remoteOptions\":{},\"remoteTimeout\":10000,\"useContinuation\":false,\"inputParameters\":\"quoteRequestJSON\"}",
+            "PropertySetJSON": {
+              "remoteClass": "AcmeQuoteAuraService",
+              "remoteMethod": "createQuote",
+              "remoteOptions": {},
+              "remoteTimeout": 10000,
+              "useContinuation": false
+            }
+          }
+        },
+        {
+          "VlocityDataPackKey": "OmniScriptDataPack/Acme-Quote-English-1/GetInvoiceSummaryAction",
+          "VlocityDataPackType": "SObject",
+          "VlocityRecordSObjectType": "%vlocity_namespace%__Element__c",
+          "VlocityRecordSourceKey": "Element/Acme-Quote-English-1/GetInvoiceSummaryAction",
+          "VlocityRecordData": {
+            "Name": "GetInvoiceSummaryAction",
+            "%vlocity_namespace%__Level__c": 1,
+            "%vlocity_namespace%__Order__c": 2,
+            "%vlocity_namespace%__Type__c": "Remote Action",
+            "%vlocity_namespace%__PropertySet__c": "{\"remoteClass\":\"AcmeQuoteAuraService\",\"remoteMethod\":\"getInvoiceSummary\",\"remoteOptions\":{},\"remoteTimeout\":10000,\"useContinuation\":false,\"inputParameters\":\"quoteId\"}",
+            "PropertySetJSON": {
+              "remoteClass": "AcmeQuoteAuraService",
+              "remoteMethod": "getInvoiceSummary",
+              "remoteOptions": {},
+              "remoteTimeout": 10000,
+              "useContinuation": false
+            }
+          }
+        }
+      ]
+    }
+  }
+}

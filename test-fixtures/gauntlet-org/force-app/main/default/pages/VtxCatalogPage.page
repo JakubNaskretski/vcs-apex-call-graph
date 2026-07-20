@@ -1,0 +1,16 @@
+<apex:page controller="VtxCatalogController" extensions="VtxCatalogFilterExtension" action="{!initCatalog}">
+  <apex:sectionHeader title="Vertex Catalog" subtitle="Browse and filter the fictional catalog"/>
+  <apex:form>
+    <apex:pageBlock title="Catalog Results">
+      <apex:pageBlockButtons>
+        <apex:commandButton value="Refresh" action="{!refreshResults}" reRender="resultsBlock"/>
+        <apex:commandButton value="Reset All" action="{!resetAll}" reRender="resultsBlock"/>
+      </apex:pageBlockButtons>
+      <apex:outputPanel id="resultsBlock">
+        <apex:outputText value="{!statusLabel}"/>
+      </apex:outputPanel>
+    </apex:pageBlock>
+    <apex:actionFunction name="doSort" action="{!vanishedSortHandler}" reRender="resultsBlock"/>
+    <apex:actionSupport event="onchange" action="{!filterExt.legacyReset}"/>
+  </apex:form>
+</apex:page>

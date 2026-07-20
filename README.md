@@ -36,11 +36,37 @@ calls, chains deeper than 12 segments), instead of staying silent about it.
 2. Results land in the **Apex Call Graph** view (Explorer sidebar) — click any call
    site to jump straight to it. The view title's swap-arrow button re-runs the same
    target in the other direction.
-3. Run **Apex Call Graph: Show Path Map** for the same trace as an interactive graph
+3. Before changing a method signature, run **Apex Call Graph: Impact of Changing
+   This Method** to inventory direct breaks, uncertain callers, contracts, metadata,
+   and sibling overloads.
+4. Run **Apex Call Graph: Show Path Map** for the same trace as an interactive graph
    instead of a tree.
-4. Not sure where to start? Run **Apex Call Graph: Show Entry Points** for a browsable
+5. Not sure where to start? Run **Apex Call Graph: Show Entry Points** for a browsable
    index of every trigger, `@AuraEnabled`/`@InvocableMethod`/REST/SOAP method, async job,
    Flow, and anonymous script in the workspace — see [Entry Points view](#entry-points-view).
+
+## Impact of a signature change
+
+Put the cursor on a method and run **Impact of Changing This Method**. If the name is
+overloaded, a cursor on a declaration selects that exact signature; from a call site
+or picker, choose the overload explicitly. The main tree becomes a five-section risk
+report:
+
+- **BREAKS** — confidently resolved direct Apex call sites for the selected overload.
+- **MIGHT BREAK** — approximate dispatch, overload ties, or fallback matches that need
+  review rather than being presented as definite failures.
+- **CONTRACT** — matching interface declarations, the nearest base declaration,
+  descendant overrides, and callers through those surfaces.
+- **METADATA** — Flow, LWC, Aura, OmniScript, Visualforce and other supported metadata
+  consumers. A Flow action expands to show parent Flows that invoke it as a subflow.
+- **OTHER OVERLOADS** — sibling signatures and their caller counts, so the chosen
+  overload stays distinct from methods that share its name.
+
+Every row with a known location jumps to source. A genuinely unused private method
+shows all five sections with zero counts instead of implying the scan failed. Impact
+Analysis is tree-only: trace-direction, orientation, and Path Map controls are hidden
+while the report is displayed because these sections are risk surfaces, not a single
+execution path.
 
 ## Both directions
 
@@ -99,6 +125,22 @@ RIGHT.
   rendering a silent empty tree, and (when non-zero) a workspace-wide count of call
   sites that couldn't be resolved — split into a plain unresolved count and a
   [managed-package](#managed-packages) ref count once any namespace references exist.
+
+### Confirmed vs possible edges
+
+Approximate edges (`~`) are grouped by default under a collapsed **“N possible
+callers/callees (unconfirmed)”** row. Expand that row to inspect them, set
+`apexCallGraph.showUnconfirmed` to `hide` to show confirmed edges only, or use
+`expand` for the earlier flat presentation. Grouping changes presentation only —
+the same underlying sites, source jumps, arguments, and resolution badges remain.
+
+The unique-name fallback is deliberately conservative: an unknown receiver can
+attach to the only class declaring a matching-arity method while the name occurs at
+small scale, but a framework-common name attracting more than five such sites
+attaches none of them. In a caller trace, unresolved sites that still mention the
+target method are surfaced separately as **“K unresolved sites elsewhere mention
+method( — potential unconfirmed callers”**. They remain inspectable evidence, not
+fabricated call edges.
 
 ## Start shallow, expand on click
 
@@ -204,6 +246,7 @@ Tune it in **Settings → Extensions → Apex Call Graph**:
 | `apexCallGraph.maxDepth` | `8` | Hard ceiling on trace depth, however far you click. |
 | `apexCallGraph.maxNodes` | `2000` | Fair cap on total nodes a single trace will materialize. |
 | `apexCallGraph.excludeGlobs` | `[]` | Extra glob patterns to exclude from workspace scanning, appended to the built-in excludes (`node_modules`, `.sfdx`, `.sf`, `.git`). |
+| `apexCallGraph.showUnconfirmed` | `rollup` | Group approximate edges under a collapsed rollup; choose `hide` for confirmed-only or `expand` for the old flat view. |
 
 Setting `initialDepth` equal to `maxDepth` (with nothing ever clicked) reproduces the
 old always-eager v0.8 behavior exactly, byte for byte — this is a pure UX default
@@ -248,7 +291,9 @@ Handlers**, **Platform Hooks** — install/uninstall/SSO/`Comparable`/`Finalizer
 (`N entry points across M kinds`) at the top. Triggers and Flows start expanded — the
 two kinds most useful for "how does this org get entered" at a glance — every other
 group starts collapsed. `@isTest` classes are excluded from the catalog entirely (a
-separate count in the header says how many).
+separate count in the header says how many). The same header also reports unresolved
+call sites and managed-package references, so incomplete analysis is visible instead
+of silently looking exhaustive.
 
 Click any entry to jump to its source. Every entry also carries an inline **What Does
 This Call?** action — the same forward-trace command the main view uses — so you can go
@@ -445,11 +490,26 @@ What it can never show:
 Fully **offline**: no org connection, no language server, no telemetry. Powered by the
 open-source ANTLR Apex grammar (`@apexdevtools/apex-parser`, pure JavaScript — no JVM,
 no WASM). A ~20-file project cold-indexes in ~250 ms; unchanged files (matched by
-modification time **and** size) are cached and never re-parsed. The cache itself —
-derived parse facts, not your source (files with a syntax error are the one exception:
-their raw text is echoed back for the lexical fallback scanner) — is written to VS
-Code's global storage as `facts-<hash>.json`/`meta-<hash>.json`, one pair per
-workspace-folder set; deleting them just forces a cold re-parse next run.
+modification time **and** size) are cached and never re-parsed. File watchers keep a
+dirty set, so a later trace normally re-reads only changed/created files and removes
+deleted ones; if watching is unavailable or uncertain, the extension falls back to a
+safe full sweep. Large cold parses are split across worker threads, while smaller and
+warm scans stay inline to avoid unnecessary startup overhead.
+
+Indexing is cancellable from the progress notification. Cancelling terminates active
+parse workers, preserves already-valid cached facts, discards the partial index, and
+leaves the last good tree untouched. Repeated requests are single-flighted: an
+identical request joins the scan already running, while a newer different target is
+coalesced to the latest request.
+
+The cache itself — derived parse facts, not your source (files with a syntax error are
+the one exception: their raw text is echoed back for the lexical fallback scanner) —
+is written to VS Code's global storage as `facts-<hash>.json`/`meta-<hash>.json`, one
+pair per workspace-folder set; deleting them just forces a cold re-parse next run.
+For performance troubleshooting, open **Apex Call Graph: Scan Stats** or run **Copy
+Diagnostics (counts only)**. The copied JSON contains counts, timings, worker usage,
+resolution-reason totals, and the active display mode — never paths, source text,
+symbols, or call arguments.
 
 ## Commands
 
@@ -457,9 +517,11 @@ workspace-folder set; deleting them just forces a cold re-parse next run.
 |---|---|
 | `Apex Call Graph: Who Calls This?` | Editor context menu (`.cls`/`.trigger`), command palette |
 | `Apex Call Graph: What Does This Call?` | Editor context menu (`.cls`/`.trigger`), command palette |
+| `Apex Call Graph: Impact of Changing This Method` | Editor context menu (`.cls`/`.trigger`), command palette |
 | `Apex Call Graph: Switch Trace Direction` | View title button — re-runs the last target the other way |
 | `Apex Call Graph: Show Path Map` | Editor context menu, view title button, command palette |
 | `Apex Call Graph: Show Entry Points` | Entry Points view title button, view welcome link, command palette |
+| `Apex Call Graph: Copy Diagnostics (counts only)` | Command palette |
 
 ## Reference: how edges are resolved
 

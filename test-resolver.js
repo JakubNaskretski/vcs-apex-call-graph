@@ -7,7 +7,7 @@
 // must-cover behaviors from the task brief (see the section markers below).
 
 const assert = require('assert');
-const { buildSemanticIndex, buildCallerTree, buildCalleeTree, suggestTargets, attachMetaCallers, buildEntryCatalog, clampInt } = require('./resolver');
+const { buildSemanticIndex, buildCallerTree, buildCalleeTree, suggestTargets, attachMetaCallers, buildEntryCatalog, buildImpactReport, impactMethodSignature, clampInt } = require('./resolver');
 
 // ---- fixture builders (mirror the frozen contract's field names exactly) --
 
@@ -89,8 +89,28 @@ const mkFile = (t) => file(P(t.name), 'class', [t]);
 function labelsOf(nodes) {
   return nodes.map((n) => n.label);
 }
+// v0.13/H2: rollup-aware. Direct siblings are checked FIRST (byte-identical
+// to the pre-H2 behavior for every confirmed node, which never moves); only
+// once no direct match exists does this recurse into each sibling's own
+// children -- which is exactly where an approximate node now lives when
+// ctx.showUnconfirmed defaults to 'rollup' (nested one level under a single
+// synthetic pseudo-node, see resolver.js's applyShowUnconfirmed). This one
+// helper change is what lets every PRE-EXISTING findChild(...) assertion in
+// this file keep passing unmodified under the new default, without each of
+// them needing to opt back into 'expand' individually -- see this round's
+// dedicated H2 rollup-shape tests (below) for assertions against the
+// pseudo-node's OWN shape (label/kind/collapsibleState/children), which
+// this helper deliberately does not substitute for.
 function findChild(nodes, label) {
-  return nodes.find((n) => n.label === label);
+  const direct = nodes.find((n) => n.label === label);
+  if (direct) return direct;
+  for (const n of nodes) {
+    if (n.children && n.children.length) {
+      const found = findChild(n.children, label);
+      if (found) return found;
+    }
+  }
+  return undefined;
 }
 
 // =========================================================================
@@ -1059,7 +1079,10 @@ attachMetaCallers(index, metaRefs);
 {
   assert.ok(index.parseFallbacks.includes(P('BrokenGlue')));
   const tree = buildCallerTree(index, { classLower: 'oppservice', methodLower: null });
-  const lex = tree.root.children.find((n) => n.label === 'BrokenGlue');
+  // v0.13/H2: findChild (not a raw .find) -- a lexical node is approximate,
+  // so it now lives nested under the default 'rollup' pseudo-node rather
+  // than directly in tree.root.children; findChild recurses to find it.
+  const lex = findChild(tree.root.children, 'BrokenGlue');
   assert.ok(lex, 'lexical fallback should surface a class-mention edge from the unparsable file');
   assert.strictEqual(lex.kind, 'class');
   assert.strictEqual(lex.via, 'lexical');
@@ -3090,7 +3113,14 @@ attachMetaCallers(indexW7, metaRefsW7);
   // A5 (continued): forward-tracing the INTERFACE method itself fans out to
   // every implementer -- the relationship the call site above deliberately
   // deferred.
-  const ifaceTree = buildCalleeTree(indexW7, { classLower: 'w7notifiable', methodLower: 'notify' });
+  // v0.13/H2: showUnconfirmed:'expand' -- this block's own point is "every
+  // one of these children is via='interface'/approximate", which is a
+  // pre-H2 assertion about EACH fanned-out node, not about how they're
+  // grouped. Passing 'expand' keeps them flat (old behavior) so the loop
+  // below still iterates real per-node children instead of one rollup
+  // pseudo-node; the dedicated H2 rollup tests (below) cover the DEFAULT
+  // 'rollup' grouping behavior this same fixture would otherwise exercise.
+  const ifaceTree = buildCalleeTree(indexW7, { classLower: 'w7notifiable', methodLower: 'notify' }, { showUnconfirmed: 'expand' });
   const ifaceKids = ifaceTree.root.children;
   assert.ok(findChild(ifaceKids, 'W7EmailNotifier.notify'), 'A5: AcmeNotifiable#notify\'s own forward children fan out to every implementer (W7EmailNotifier)');
   assert.ok(findChild(ifaceKids, 'W7SmsNotifier.notify'), 'A5: ...and W7SmsNotifier');
@@ -3298,7 +3328,11 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
   assert.strictEqual(callerInC.via, 'ambiguous');
 
   // Forward direction sees the same fan-out from the caller's own side.
-  const calleeTree = buildCalleeTree(index, { classLower: 'w7ambigcaller2', methodLower: 'go' });
+  // v0.13/H2: showUnconfirmed:'expand' -- this assertion is about the raw
+  // fan-out SHAPE (two distinct 'ambiguous' children, both approximate),
+  // which is exactly what 'rollup' would otherwise collapse into one
+  // pseudo-node; 'expand' keeps pre-H2 flat behavior for this check.
+  const calleeTree = buildCalleeTree(index, { classLower: 'w7ambigcaller2', methodLower: 'go' }, { showUnconfirmed: 'expand' });
   const targets = calleeTree.root.children.map((c) => c.label).sort();
   assert.deepStrictEqual(targets, ['W7Dup2.identify', 'W7Dup2.identify'].sort(), 'B3 forward: the ambiguous call site forwards to BOTH candidates too');
   for (const c of calleeTree.root.children) {
@@ -3451,7 +3485,12 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
   });
   const facts = [mkFile(W7Iface), mkFile(W7Alpha), mkFile(W7Bravo), mkFile(W7Charlie), mkFile(W7Dispatcher)];
   const index = buildSemanticIndex(facts);
-  const ifaceTree = buildCalleeTree(index, { classLower: 'w7notififace', methodLower: 'notify' });
+  // v0.13/H2: showUnconfirmed:'expand' -- this fixture's own point is the
+  // construction-site ORDER among the fanned-out interface implementers;
+  // 'rollup' would otherwise collapse all three into one pseudo-node
+  // (order preserved inside it, but this assertion checks root.children
+  // directly).
+  const ifaceTree = buildCalleeTree(index, { classLower: 'w7notififace', methodLower: 'notify' }, { showUnconfirmed: 'expand' });
   const order = ifaceTree.root.children.map((c) => c.label);
   assert.deepStrictEqual(
     order,
@@ -3501,7 +3540,7 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
 
 // =========================================================================
 // v0.7.1 GAUNTLET REGRESSION PINS -- each block below ports one confirmed
-// finding from /Users/agent/work/code/example-data/gauntlet-org/
+// finding from test-fixtures/gauntlet-org/
 // VALIDATION-REPORT.md (R1-R8) into a self-contained assert, named after
 // the finding. R7's pin lives inline above (the W7 interface-dispatch
 // block, updated in place -- see its own "v0.7.1/R7" comments) since it
@@ -3731,11 +3770,24 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
   });
   const index = buildSemanticIndex([mkFile(G71ServiceLocator), mkFile(G71UnitOfWork)]);
   const tree = buildCallerTree(index, { classLower: 'g71servicelocator', methodLower: 'get' });
+  // v0.13/H3: root.children is no longer unconditionally [] here -- the
+  // SAME collection-accessor-poisoned call site that R3 correctly refuses
+  // to attach as a caller EDGE now legitimately surfaces as an H3 "K
+  // unresolved sites elsewhere mention get(" info node (H3's mention count
+  // is arity/receiver-agnostic BY NAME ONLY, exactly like rule 7 itself --
+  // it doesn't know or care that THIS particular "get" mention came from a
+  // Map accessor rather than a genuine unresolvable dispatch attempt). R3's
+  // real invariant -- no FABRICATED CALLER EDGE to G71ServiceLocator.get --
+  // is what the filter below actually proves; the one remaining child is
+  // the informational mentions node, not a caller.
+  const realCallerEdges = tree.root.children.filter((n) => n.kind !== 'unresolved-mentions');
   assert.deepStrictEqual(
-    tree.root.children,
+    realCallerEdges,
     [],
     "v0.7.1/R3: a Map-typed receiver's .get(...) call must not fabricate an edge to an unrelated globally-unique .get() method elsewhere -- collection-accessor names must never reach rule 7"
   );
+  assert.strictEqual(tree.root.children.length, 1, 'v0.13/H3: the ONLY child is the new unresolved-mentions info node, not a fabricated caller edge');
+  assert.strictEqual(tree.root.children[0].kind, 'unresolved-mentions');
 }
 
 // ---- v0.7.1/R4: template-method self-dispatch override fan-out -----------
@@ -5424,7 +5476,14 @@ function buildV9ChainCallee5() {
 
   // commitBothTypes: 3 narrowed edges total (2 on Kappa_Order__c's two
   // triggers, 1 on Kappa_Shipment__c's one trigger), marker gone.
-  const bothTypesTree = buildCalleeTree(index, { classLower: 'vtxunitofworknarrowing', methodLower: 'commitBothTypes' });
+  // v0.13/H2: showUnconfirmed:'expand' -- every child here (3 narrowed
+  // approximate 'dml' edges + the approximate unresolved-aggregate leaf) is
+  // approximate:true, so 'rollup' would otherwise fold the 3 narrowed edges
+  // into one pseudo-node (the unresolved leaf is appended separately, by
+  // appendCalleeExtras, AFTER buildChildrenLevel's own grouping runs, so it
+  // never joins the rollup); this block's own point is the flat B2
+  // narrowing shape, so 'expand' keeps it byte-identical to pre-H2.
+  const bothTypesTree = buildCalleeTree(index, { classLower: 'vtxunitofworknarrowing', methodLower: 'commitBothTypes' }, { showUnconfirmed: 'expand' });
   assert.strictEqual(findChild(bothTypesTree.root.children, 'DML on unresolved SObject type'), undefined, 'v0.11/B2: the honest marker must be REPLACED once narrowing evidence exists');
   const orderTriggerChild = findChild(bothTypesTree.root.children, 'V11KappaOrderTrigger');
   assert.ok(orderTriggerChild, 'v0.11/B2: commitBothTypes narrows to Kappa_Order__c -> V11KappaOrderTrigger (before insert, after insert -- matches)');
@@ -5459,7 +5518,9 @@ function buildV9ChainCallee5() {
 
   // commitTypedOrdersViaAddAll: narrows via the addAll-of-a-typed-local
   // shape -> Kappa_Order__c's 2 triggers, marker gone.
-  const addAllTree = buildCalleeTree(index, { classLower: 'vtxunitofworknarrowing', methodLower: 'commitTypedOrdersViaAddAll' });
+  // v0.13/H2: showUnconfirmed:'expand' -- same reasoning as commitBothTypes
+  // above (both narrowed-dml children are approximate:true).
+  const addAllTree = buildCalleeTree(index, { classLower: 'vtxunitofworknarrowing', methodLower: 'commitTypedOrdersViaAddAll' }, { showUnconfirmed: 'expand' });
   assert.strictEqual(findChild(addAllTree.root.children, 'DML on unresolved SObject type'), undefined, 'v0.11/B2: addAll-of-a-typed-List<Concrete__c> local must ALSO narrow (not just inline new Concrete__c(...))');
   const addAllOrderTrigger = findChild(addAllTree.root.children, 'V11KappaOrderTrigger');
   assert.ok(addAllOrderTrigger);
@@ -5606,7 +5667,9 @@ function buildV9ChainCallee5() {
   const index = buildSemanticIndex(facts, { packageOf: w7PackageOf, defaultPackage: W7_DEFAULT_PACKAGE });
   assert.strictEqual(index.stats.duplicateNames, 1, 'sanity: Bug3Handler must actually be an ambiguous duplicate in this fixture (same shape B3 already relies on)');
 
-  const calleeTree = buildCalleeTree(index, { classLower: 'bug3ambigcaller', methodLower: 'go' });
+  // v0.13/H2: showUnconfirmed:'expand' -- this regression's own point is the
+  // flat fan-out shape (both distinct ambiguous candidates as siblings).
+  const calleeTree = buildCalleeTree(index, { classLower: 'bug3ambigcaller', methodLower: 'go' }, { showUnconfirmed: 'expand' });
   const dynTargets = calleeTree.root.children.map((c) => c.label).sort();
   assert.deepStrictEqual(dynTargets, ['Bug3FromB.<init>', 'Bug3FromC.<init>'], "BUG FIX regression: Type.forName(Bug3Handler.NAME) must fan out to BOTH ambiguous candidates' OWN literal values (FromB from pkgB's Handler, FromC from pkgC's), never an arbitrary parse-order-dependent single pick");
   for (const c of calleeTree.root.children) {
@@ -5618,7 +5681,9 @@ function buildV9ChainCallee5() {
   // the SAME ambiguous class, must fan out identically -- proving B1(b) is
   // now consistent with pre-existing dispatch instead of secretly using a
   // different (unsafe) resolution path.
-  const ordinaryTree = buildCalleeTree(index, { classLower: 'bug3ambigcaller', methodLower: 'goOrdinary' });
+  // v0.13/H2: showUnconfirmed:'expand' -- flat fan-out shape is this
+  // assertion's own point (both candidates as direct siblings).
+  const ordinaryTree = buildCalleeTree(index, { classLower: 'bug3ambigcaller', methodLower: 'goOrdinary' }, { showUnconfirmed: 'expand' });
   assert.strictEqual(ordinaryTree.root.children.length, 2, 'ordinary Bug3Handler.run() dispatch also fans out to both ambiguous candidates, matching B1(b)\'s new shape');
   for (const c of ordinaryTree.root.children) {
     assert.strictEqual(c.label, 'Bug3Handler.run');
@@ -6016,6 +6081,8 @@ function entryLabels(catalog, kind) {
   let sumGroups = 0;
   for (const g of ecCatalog.groups) sumGroups += g.entries.length;
   assert.strictEqual(sumGroups, ecCatalog.stats.total, 'stats.total must equal the sum of every group\'s entries.length');
+  assert.strictEqual(ecCatalog.stats.unresolvedSites, ecIndex.stats.unresolvedSites, 'catalog carries the shared unresolved-site count into its header stats');
+  assert.strictEqual(ecCatalog.stats.managedRefs, ecIndex.stats.externalRefs, 'catalog carries the shared managed-reference count into its header stats');
   assert.strictEqual(ecCatalog.stats.byKind.trigger, 1);
   assert.strictEqual(ecCatalog.stats.byKind.aura, 3);
   assert.strictEqual(ecCatalog.stats.byKind.invocable, 3);
@@ -6479,6 +6546,543 @@ index13.flowFilePaths = ['flows/S13LeafOnlyFlow.flow-meta.xml'];
   assert.ok(flowNode);
   assert.deepStrictEqual(flowNode.children, [], 'a flow with zero flowGraph parents keeps empty children, unchanged');
   assert.strictEqual(flowNode.truncated, false);
+}
+
+// =========================================================================
+// v0.13 hardening round (Round 2.5): H1 (arity gate + attachment cap), H2
+// (approximate rollup), H3 (scoped caller-direction header), H4
+// (opts.shouldCancel). Fixtures prefixed 'V13' throughout to avoid
+// colliding with this file's pre-existing amendment-letter-coded fixtures
+// (H1/H2/H3/H4 above are historical v0.7.1-era codes, unrelated to this
+// round's own H1-H4 letters).
+// =========================================================================
+
+// ---- H1(a) ARITY GATE: a wrong-arity call to the sole declarer of a
+// name must decline (stay unresolved), never fan out to the mismatched
+// overload the way typed/interface dispatch's OWN arity-mismatch fallback
+// does -- rule 7 has no receiver-class anchor to justify a guess. ---------
+{
+  const V13H1AritySole = ty('V13H1AritySole', 'V13H1AritySole', {
+    methods: [mth('onlyOverload', { line: 1, params: [{ name: 's', type: 'String' }] })],
+  });
+  const V13H1ArityCaller = ty('V13H1ArityCaller', 'V13H1ArityCaller', {
+    methods: [mth('run', {
+      line: 1,
+      calls: [cl('dot', 'onlyOverload', { receiver: 'unresolvedThing', argTexts: ['a', 'b'], line: 1, lineText: 'unresolvedThing.onlyOverload(a, b);' })],
+    })],
+  });
+  const idx = buildSemanticIndex([mkFile(V13H1AritySole), mkFile(V13H1ArityCaller)]);
+  assert.strictEqual(
+    (idx.methodCallers.get('v13h1aritysole#onlyoverload') || []).length,
+    0,
+    'H1(a): a 2-arg call site must NOT attach to the sole declarer\'s 1-arg onlyOverload -- arity mismatch declines outright'
+  );
+  assert.strictEqual(idx.stats.unresolvedSites, 1);
+  assert.strictEqual(idx.stats.unresolvedByReason['unknown-receiver'], 1, 'H1(a): an arity-gate decline is bookkept as an ordinary unknown-receiver miss, never name-too-common (it never even attempted an attachment)');
+  assert.strictEqual(idx.stats.unresolvedByReason['name-too-common'], 0);
+
+  // Positive control: the SAME call site, arity-matched, DOES attach.
+  const V13H1ArityCallerOk = ty('V13H1ArityCallerOk', 'V13H1ArityCallerOk', {
+    methods: [mth('run', {
+      line: 1,
+      calls: [cl('dot', 'onlyOverload', { receiver: 'unresolvedThing2', argTexts: ["'x'"], line: 1, lineText: "unresolvedThing2.onlyOverload('x');" })],
+    })],
+  });
+  const idxOk = buildSemanticIndex([mkFile(V13H1AritySole), mkFile(V13H1ArityCallerOk)]);
+  const okSites = idxOk.methodCallers.get('v13h1aritysole#onlyoverload') || [];
+  assert.strictEqual(okSites.length, 1, 'H1(a): an ARITY-MATCHED unresolvable-receiver call must still attach via unique-name, exactly like pre-H1');
+  assert.strictEqual(okSites[0].via, 'unique-name');
+}
+
+// ---- H1(b) ATTACHMENT CAP boundary: exactly UNIQUE_NAME_MAX (5) survives
+// in full; one more (6) strips ALL of them back to unresolved. -----------
+{
+  const V13H1BoundaryTarget = ty('V13H1BoundaryTarget', 'V13H1BoundaryTarget', {
+    methods: [mth('poke', { line: 1, params: [{ name: 'x', type: 'String' }] })],
+  });
+  function mkV13BoundaryCaller(name, n) {
+    const calls = [];
+    for (let i = 0; i < n; i++) {
+      calls.push(cl('dot', 'poke', { receiver: `v13bReceiver${name}${i}`, argTexts: ["'a'"], line: i + 1, lineText: `v13bReceiver${name}${i}.poke('a');` }));
+    }
+    return ty(name, name, { methods: [mth('run', { line: 1, calls })] });
+  }
+  const idxAtCap = buildSemanticIndex([mkFile(V13H1BoundaryTarget), mkFile(mkV13BoundaryCaller('V13H1AtCapCaller', 5))]);
+  assert.strictEqual(
+    (idxAtCap.methodCallers.get('v13h1boundarytarget#poke') || []).length,
+    5,
+    'H1(b): exactly UNIQUE_NAME_MAX (5) attachments must ALL survive -- the cap only fires when the count EXCEEDS the max'
+  );
+  assert.strictEqual(idxAtCap.stats.unresolvedByReason['name-too-common'], 0);
+
+  const idxOverCap = buildSemanticIndex([mkFile(V13H1BoundaryTarget), mkFile(mkV13BoundaryCaller('V13H1OverCapCaller', 6))]);
+  assert.strictEqual(
+    (idxOverCap.methodCallers.get('v13h1boundarytarget#poke') || []).length,
+    0,
+    'H1(b): one attachment past the cap (6 total) strips ALL of them, not just the excess -- "attach NONE of them for that target"'
+  );
+  assert.strictEqual(idxOverCap.stats.unresolvedSites, 6);
+  assert.strictEqual(idxOverCap.stats.unresolvedByReason['name-too-common'], 6);
+}
+
+// ---- H1 MAGNET / CONTROL matrix (mirrors the gauntlet-org corpus shape):
+// a framework-common name (bind) declared ONCE, called from 40 unresolvable-
+// receiver sites across 10 caller classes (30 arity-1 matches + 10 arity-2
+// mismatches) -- ALL 40 must end up unresolved and ZERO must attach. A
+// separate, unrelated name (relayNotice) called from only 2 sites (well
+// under the cap) must attach BOTH, exactly like pre-H1. ------------------
+const V13H1MagnetTarget = ty('V13H1MagnetTarget', 'V13H1MagnetTarget', {
+  methods: [mth('bind', { line: 1, params: [{ name: 'info', type: 'V13BindInfo' }] })],
+});
+const v13MagnetCallerFiles = [];
+for (let i = 0; i < 10; i++) {
+  const calls = [];
+  for (let j = 0; j < 3; j++) {
+    calls.push(cl('dot', 'bind', {
+      receiver: `v13unresolvedRecv${i}_${j}`, argTexts: ['x'],
+      line: j + 1, lineText: `v13unresolvedRecv${i}_${j}.bind(x); // arity-1, matches the sole overload`,
+    }));
+  }
+  // one arity-2 call per class -> 10 total arity-mismatched sites, declined
+  // by H1(a) before ever reaching the cap machinery at all.
+  calls.push(cl('dot', 'bind', {
+    receiver: `v13unresolvedRecv${i}_3`, argTexts: ['x', 'y'],
+    line: 4, lineText: `v13unresolvedRecv${i}_3.bind(x, y); // arity-2, no matching overload`,
+  }));
+  const cls = ty(`V13MagnetCaller${i}`, `V13MagnetCaller${i}`, { methods: [mth('run', { line: 1, calls })] });
+  v13MagnetCallerFiles.push(mkFile(cls));
+}
+const V13H1ControlTarget = ty('V13H1ControlTarget', 'V13H1ControlTarget', {
+  methods: [mth('relayNotice', { line: 1, params: [{ name: 'msg', type: 'String' }] })],
+});
+const V13H1ControlCallerA = ty('V13H1ControlCallerA', 'V13H1ControlCallerA', {
+  methods: [mth('run', { line: 1, calls: [cl('dot', 'relayNotice', { receiver: 'v13unresolvedRelayA', argTexts: ["'hi'"], line: 1, lineText: "v13unresolvedRelayA.relayNotice('hi');" })] })],
+});
+const V13H1ControlCallerB = ty('V13H1ControlCallerB', 'V13H1ControlCallerB', {
+  methods: [mth('run', { line: 1, calls: [cl('dot', 'relayNotice', { receiver: 'v13unresolvedRelayB', argTexts: ["'hi'"], line: 1, lineText: "v13unresolvedRelayB.relayNotice('hi');" })] })],
+});
+const indexV13H1Magnet = buildSemanticIndex([
+  mkFile(V13H1MagnetTarget), ...v13MagnetCallerFiles,
+  mkFile(V13H1ControlTarget), mkFile(V13H1ControlCallerA), mkFile(V13H1ControlCallerB),
+]);
+
+{
+  assert.strictEqual(
+    (indexV13H1Magnet.methodCallers.get('v13h1magnettarget#bind') || []).length,
+    0,
+    'H1 MAGNET: a name attracting 40 unresolvable-receiver sites through the sole declarer must attach ZERO of them'
+  );
+  assert.strictEqual(indexV13H1Magnet.stats.unresolvedByReason['name-too-common'], 30, 'H1: the 30 arity-MATCHED sites were optimistically attached then stripped by the cap');
+  assert.strictEqual(indexV13H1Magnet.stats.magnetSuppressedAttachments, 30, 'H8 diagnostics expose the exact number of stripped magnet attachments');
+  assert.strictEqual(indexV13H1Magnet.stats.unresolvedByReason['unknown-receiver'] >= 10, true, 'H1: the 10 arity-MISMATCHED sites decline via the ordinary arity-gate path, never even attempting an attachment');
+
+  const controlSites = indexV13H1Magnet.methodCallers.get('v13h1controltarget#relaynotice') || [];
+  assert.strictEqual(controlSites.length, 2, 'H1 CONTROL: a name attracting only 2 unresolvable-receiver sites (well under the cap of 5) must still attach BOTH, exactly like pre-H1');
+  assert.ok(controlSites.every((s) => s.via === 'unique-name'), 'H1 CONTROL: both attached sites must be via unique-name');
+  assert.strictEqual(indexV13H1Magnet.stats.viaHistogram['unique-name'], 2, 'H8 via histogram is derived after magnet reconciliation, so only the two surviving control edges remain');
+}
+
+// =========================================================================
+// v0.13/H3: scoped caller-direction header -- "K unresolved sites elsewhere
+// mention <method>(" -- reuses the SAME H1 magnet/control index above,
+// since the magnet's own cap-stripped sites are exactly what feeds K.
+// =========================================================================
+{
+  const magnetTree = buildCallerTree(indexV13H1Magnet, { classLower: 'v13h1magnettarget', methodLower: 'bind' });
+  const mentionsNode = magnetTree.root.children.find((n) => n.kind === 'unresolved-mentions');
+  assert.ok(mentionsNode, 'H3: a scoped info node must surface once K>0 for the traced method');
+  assert.strictEqual(
+    mentionsNode.children.length,
+    40,
+    'H3: K=40, arity-agnostic -- all 30 cap-stripped (name-too-common) + all 10 arity-mismatched (unknown-receiver) sites mention bind( by name, regardless of their own argTexts count'
+  );
+  assert.ok(mentionsNode.label.includes('40 unresolved sites elsewhere mention'), `unexpected label: ${mentionsNode.label}`);
+  assert.ok(mentionsNode.label.includes('bind('));
+  assert.strictEqual(mentionsNode.collapsibleState, 'collapsed');
+  assert.strictEqual(mentionsNode.kind, 'unresolved-mentions');
+  assert.strictEqual(mentionsNode.truncated, false);
+  // each mention child is a real, inspectable site (class + line), not just
+  // a bare count.
+  for (const child of mentionsNode.children) {
+    assert.ok(child.className);
+    assert.strictEqual(typeof child.line, 'number');
+    assert.strictEqual(child.sites.length, 1);
+  }
+
+  const cappedMentionsTree = buildCallerTree(
+    indexV13H1Magnet,
+    { classLower: 'v13h1magnettarget', methodLower: 'bind' },
+    { maxNodes: 5 }
+  );
+  const cappedMentionsNode = cappedMentionsTree.root.children.find((n) => n.kind === 'unresolved-mentions');
+  assert.strictEqual(cappedMentionsTree.stats.nodes, 5, 'H3 mention-site inspection obeys the same hard maxNodes budget as the call tree');
+  assert.strictEqual(cappedMentionsTree.stats.capped, true);
+  assert.strictEqual(cappedMentionsNode.children.length, 3, 'root + info node leave exactly three child slots under maxNodes=5');
+  assert.strictEqual(cappedMentionsNode.truncated, true);
+  assert.ok(cappedMentionsNode.label.startsWith('40 unresolved sites'), 'the full scoped count stays honest even when only a capped sample is listable');
+
+  // Control: both sites resolved as real callers -- K must be 0/omitted
+  // entirely (no info node at all), and both real callers show up normally.
+  // v0.13/H2: both attached callers are via='unique-name' (approximate), so
+  // by default they're grouped under ONE rollup pseudo-node -- pass
+  // 'expand' to check the flat underlying edge count directly.
+  const controlTree = buildCallerTree(indexV13H1Magnet, { classLower: 'v13h1controltarget', methodLower: 'relaynotice' }, { showUnconfirmed: 'expand' });
+  const controlMentions = controlTree.root.children.find((n) => n.kind === 'unresolved-mentions');
+  assert.strictEqual(controlMentions, undefined, "H3: K=0 -- the control target's 2 sites both resolved as real callers, none stay unresolved under this name");
+  assert.strictEqual(controlTree.root.children.length, 2, 'H1 control: both unresolvable-receiver sites attach via unique-name (under the cap)');
+
+  // Callee direction is UNCHANGED by H3 -- it already had its own per-method
+  // scoped "N unresolved sites" leaf (A6/H4, pre-v0.13); no mentions node
+  // of this NEW kind should ever appear there.
+  const calleeSideTree = buildCalleeTree(indexV13H1Magnet, { classLower: 'v13magnetcaller0', methodLower: 'run' });
+  assert.ok(!calleeSideTree.root.children.some((n) => n.kind === 'unresolved-mentions'), 'H3: the new scoped-mentions node is caller-direction only');
+}
+
+// =========================================================================
+// v0.13/H3: stats.unresolvedByReason breakdown, workspace-wide -- reuses
+// the PRE-EXISTING H4 sanity fixture (indexH4, above: one unknown-receiver,
+// one deep-chain, one non-literal-dynamic site) plus the top-level shared
+// `index` (which already contains a parse-error file, BrokenGlue).
+// =========================================================================
+{
+  assert.strictEqual(indexH4.stats.unresolvedByReason['unknown-receiver'], 1);
+  assert.strictEqual(indexH4.stats.unresolvedByReason['deep-chain'], 1);
+  assert.strictEqual(indexH4.stats.unresolvedByReason['non-literal-dynamic'], 1);
+  assert.strictEqual(indexH4.stats.unresolvedByReason['name-too-common'], 0);
+  assert.strictEqual(indexH4.stats.unresolvedByReason['parse-fallback'], 0, 'indexH4 has no parse-error file');
+  // the four reasons that DO apply here sum to the same total unresolvedSites
+  // already asserted above (3) -- 'parse-fallback' is file-, not
+  // site-granular, and deliberately excluded from this sum (see its own
+  // header note in resolver.js).
+  const siteGranularSum = indexH4.stats.unresolvedByReason['unknown-receiver']
+    + indexH4.stats.unresolvedByReason['deep-chain']
+    + indexH4.stats.unresolvedByReason['non-literal-dynamic']
+    + indexH4.stats.unresolvedByReason['name-too-common'];
+  assert.strictEqual(siteGranularSum, indexH4.stats.unresolvedSites);
+
+  assert.strictEqual(
+    index.stats.unresolvedByReason['parse-fallback'],
+    index.parseFallbacks.length,
+    "H3: 'parse-fallback' is set directly from parseFallbacks.length (file-granular), independent of unresolvedSites"
+  );
+  assert.ok(index.stats.unresolvedByReason['parse-fallback'] >= 1, 'the shared index includes at least the BrokenGlue parse-error fixture');
+}
+
+// =========================================================================
+// v0.13/H2: approximate rollup -- 'rollup' (default) | 'hide' | 'expand'.
+// Mixed confirmed + approximate siblings at ONE level (callee direction:
+// H2Caller.run() calls both a confirmed static target AND an
+// interface-typed receiver, which forward-collapses onto the interface's
+// own node, approximate:true) -- proves grouping/hiding/expanding all
+// operate on the SAME underlying edge set (regression policy (b): flatten
+// equivalence).
+// =========================================================================
+const V13H2Iface = ty('V13H2Iface', 'V13H2Iface', { isInterface: true, methods: [mth('act', { line: 1 })] });
+const V13H2ImplA = ty('V13H2ImplA', 'V13H2ImplA', { implementsTypes: ['V13H2Iface'], methods: [mth('act', { line: 1 })] });
+const V13H2ImplB = ty('V13H2ImplB', 'V13H2ImplB', { implementsTypes: ['V13H2Iface'], methods: [mth('act', { line: 1 })] });
+const V13H2DirectTarget = ty('V13H2DirectTarget', 'V13H2DirectTarget', { methods: [mth('direct', { line: 1 })] });
+const V13H2Caller = ty('V13H2Caller', 'V13H2Caller', {
+  methods: [mth('run', {
+    line: 1,
+    params: [{ name: 'i', type: 'V13H2Iface' }],
+    calls: [
+      cl('dot', 'act', { receiver: 'i', line: 1, lineText: 'i.act();' }),
+      cl('dot', 'direct', { receiver: 'V13H2DirectTarget', line: 2, lineText: 'V13H2DirectTarget.direct();' }),
+    ],
+  })],
+});
+const indexV13H2 = buildSemanticIndex([mkFile(V13H2Iface), mkFile(V13H2ImplA), mkFile(V13H2ImplB), mkFile(V13H2DirectTarget), mkFile(V13H2Caller)]);
+
+function v13FlattenRollup(nodes) {
+  const out = [];
+  for (const n of nodes) {
+    if (n.kind === 'rollup') out.push(...n.children);
+    else out.push(n);
+  }
+  return out;
+}
+
+{
+  // 'expand' -- the pre-H2 flat baseline: the interface call site fans out
+  // to the interface method itself AND both implementers (3 approximate
+  // 'interface' children), plus the one confirmed static target -- 4 direct
+  // siblings, no pseudo-node.
+  const calleeExpand = buildCalleeTree(indexV13H2, { classLower: 'v13h2caller', methodLower: 'run' }, { showUnconfirmed: 'expand' });
+  assert.strictEqual(calleeExpand.root.children.length, 4, "H2 'expand': byte-identical to pre-H2 -- all 4 children flat, no pseudo-node");
+  const expandLabels = calleeExpand.root.children.map((n) => n.label).sort();
+  assert.deepStrictEqual(expandLabels, ['V13H2Iface.act', 'V13H2ImplA.act', 'V13H2ImplB.act', 'V13H2DirectTarget.direct'].sort());
+  const expandDirect = calleeExpand.root.children.find((n) => n.label === 'V13H2DirectTarget.direct');
+  assert.strictEqual(expandDirect.approximate, false);
+  for (const label of ['V13H2Iface.act', 'V13H2ImplA.act', 'V13H2ImplB.act']) {
+    assert.strictEqual(calleeExpand.root.children.find((n) => n.label === label).approximate, true);
+  }
+
+  // 'rollup' (default) -- confirmed node passes through untouched; all 3
+  // approximate nodes move under one new pseudo-node.
+  const calleeDefault = buildCalleeTree(indexV13H2, { classLower: 'v13h2caller', methodLower: 'run' });
+  assert.strictEqual(calleeDefault.root.children.length, 2, "H2 default 'rollup': the confirmed node (1) + the ONE rollup pseudo-node (1) = 2 top-level children");
+  const rollupDirect = calleeDefault.root.children.find((n) => n.label === 'V13H2DirectTarget.direct');
+  assert.ok(rollupDirect, 'H2: the confirmed node is completely untouched by rollup grouping');
+  assert.strictEqual(rollupDirect.approximate, false);
+  const rollupNode = calleeDefault.root.children.find((n) => n.kind === 'rollup');
+  assert.ok(rollupNode, "H2: a 'rollup' pseudo-node must exist by default");
+  assert.strictEqual(rollupNode.label, '3 possible callees (unconfirmed)');
+  assert.strictEqual(rollupNode.collapsibleState, 'collapsed');
+  assert.strictEqual(rollupNode.approximate, true);
+  assert.strictEqual(rollupNode.children.length, 3);
+  assert.deepStrictEqual(
+    rollupNode.children.map((n) => n.label).sort(),
+    ['V13H2Iface.act', 'V13H2ImplA.act', 'V13H2ImplB.act'].sort()
+  );
+  assert.ok(rollupNode.children.every((n) => n.approximate === true));
+
+  // FLATTEN EQUIVALENCE PROOF (regression policy (b)): flatten(rollup
+  // children) + confirmed === the old (expand-mode) flat child set.
+  const flattenedDefault = v13FlattenRollup(calleeDefault.root.children).map((n) => n.label).sort();
+  assert.deepStrictEqual(flattenedDefault, expandLabels, 'H2: flatten(rollup children)+confirmed must equal the pre-H2 flat child set -- the underlying edge set is unchanged, only its RENDERING is regrouped');
+
+  // 'hide' -- approximate children dropped entirely, confirmed set unchanged.
+  const calleeHide = buildCalleeTree(indexV13H2, { classLower: 'v13h2caller', methodLower: 'run' }, { showUnconfirmed: 'hide' });
+  assert.strictEqual(calleeHide.root.children.length, 1, "H2 'hide': the approximate nodes are dropped entirely, not even a count");
+  assert.strictEqual(calleeHide.root.children[0].label, 'V13H2DirectTarget.direct');
+  assert.deepStrictEqual(
+    calleeHide.root.children.map((n) => n.label).sort(),
+    expandLabels.filter((l) => !['V13H2Iface.act', 'V13H2ImplA.act', 'V13H2ImplB.act'].includes(l)),
+    "H2 'hide': confirmed-only set must equal expand-mode's confirmed subset"
+  );
+}
+
+// ---- H2 caller direction + all-approximate level (no confirmed siblings
+// at all -- the rollup pseudo-node is the ONLY child). --------------------
+{
+  // Reuses the shared top-level `index`'s pre-existing IHandler/InterfaceCaller
+  // fixture (a single approximate 'interface' caller, no confirmed siblings
+  // at this level).
+  const ifaceCallerTree = buildCallerTree(index, { classLower: 'ihandler', methodLower: 'handle' });
+  const rollup = ifaceCallerTree.root.children.find((n) => n.kind === 'rollup');
+  assert.ok(rollup, 'H2 callers direction: rollup grouping applies identically to both directions');
+  assert.strictEqual(rollup.label, '1 possible caller (unconfirmed)');
+  assert.strictEqual(ifaceCallerTree.root.children.length, 1, 'H2: with zero confirmed siblings, the rollup pseudo-node is the ONLY child');
+  const nested = findChild(ifaceCallerTree.root.children, 'InterfaceCaller.dispatch');
+  assert.ok(nested, 'H2: findChild recurses into the rollup to find the real nested caller');
+  assert.strictEqual(nested.via, 'interface');
+}
+
+// =========================================================================
+// v0.13/H4: opts.shouldCancel() guards resolver.js's own outer index-build
+// loops (pass A/B/C/D/E) -- a signal observed partway through is LATCHED
+// and skips every remaining pass, not just the one that first saw it.
+// =========================================================================
+{
+  const V13H4CancelA = ty('V13H4CancelA', 'V13H4CancelA', { methods: [mth('m', { line: 1 })] });
+  const V13H4CancelB = ty('V13H4CancelB', 'V13H4CancelB', {
+    methods: [mth('n', { line: 1, calls: [cl('dot', 'm', { receiver: 'V13H4CancelA', line: 1, lineText: 'V13H4CancelA.m();' })] })],
+  });
+  const facts4 = [mkFile(V13H4CancelA), mkFile(V13H4CancelB)];
+
+  // Immediate cancellation -- fires on the very first file pass A visits.
+  const idxImmediate = buildSemanticIndex(facts4, { shouldCancel: () => true });
+  assert.strictEqual(idxImmediate.cancelled, true, 'H4: an always-true shouldCancel must be observed and latched');
+  assert.strictEqual(idxImmediate.classes.size, 0, 'H4: cancelled before pass A registers even the first class');
+  assert.strictEqual(idxImmediate.methodCallers.size, 0);
+
+  // Cancel exactly once pass A has registered both classes (2 files -> 2
+  // calls) but on pass B's very FIRST iteration (the 3rd call overall) --
+  // pass B must never resolve anything once latched.
+  let calls = 0;
+  const idxMidway = buildSemanticIndex(facts4, { shouldCancel: () => { calls++; return calls > 2; } });
+  assert.strictEqual(idxMidway.cancelled, true, "H4: a shouldCancel flipping true PARTWAY through must still be observed by a LATER pass's own guard");
+  assert.strictEqual(idxMidway.classes.size, 2, 'H4: pass A itself completed normally (both classes registered) before the signal fired');
+  assert.strictEqual((idxMidway.methodCallers.get('v13h4cancela#m') || []).length, 0, "H4: pass B never resolves V13H4CancelB's call once cancelled is latched, even though both classes were already registered");
+
+  // Never cancels -- byte-identical to omitting opts.shouldCancel entirely.
+  const idxNormal = buildSemanticIndex(facts4, { shouldCancel: () => false });
+  assert.strictEqual(idxNormal.cancelled, false);
+  assert.strictEqual((idxNormal.methodCallers.get('v13h4cancela#m') || []).length, 1, 'H4: a shouldCancel that never fires must resolve completely normally');
+
+  // Omitted entirely -- must behave exactly like idxNormal (no crash, no
+  // silent regression for every pre-H4 caller of buildSemanticIndex).
+  const idxOmitted = buildSemanticIndex(facts4);
+  assert.strictEqual(idxOmitted.cancelled, false);
+  assert.strictEqual((idxOmitted.methodCallers.get('v13h4cancela#m') || []).length, 1);
+
+  // Trace-time cancellation (buildCallerTree/buildCalleeTree's own BFS
+  // expansion loop) must never crash and must mark the tree capped instead
+  // of silently rendering a partial-but-unmarked tree.
+  const cancelledTree = buildCallerTree(index, { classLower: 'oppservice', methodLower: null }, { shouldCancel: () => true });
+  assert.ok(cancelledTree && cancelledTree.root, 'H4: a trace-time shouldCancel must never crash the tree walk');
+  assert.strictEqual(cancelledTree.stats.capped, true, 'H4: an always-true shouldCancel must mark the tree capped (BFS expansion stopped before draining the queue)');
+}
+
+// =========================================================================
+// v0.14 Impact Analysis: overload precision, uncertain picks, contract
+// surfaces, metadata, parent-flow chains, and empty-honest negatives.
+// =========================================================================
+{
+  const ImpactIface = ty('ImpactIface', 'ImpactIface', {
+    isInterface: true,
+    methods: [mth('change', { line: 2, params: [{ name: 'value', type: 'String' }] })],
+  });
+  const ImpactBase = ty('ImpactBase', 'ImpactBase', {
+    methods: [mth('change', { line: 3, params: [{ name: 'value', type: 'String' }] })],
+  });
+  const ImpactTarget = ty('ImpactTarget', 'ImpactTarget', {
+    extendsType: 'ImpactBase',
+    implementsTypes: ['ImpactIface'],
+    methods: [
+      mth('change', { line: 10, params: [{ name: 'value', type: 'String' }] }),
+      mth('change', { line: 11, params: [{ name: 'value', type: 'Integer' }] }),
+      mth('change', { line: 12, params: [{ name: 'value', type: 'Decimal' }] }),
+      mth('unusedPrivate', { line: 20, modifiers: ['private'] }),
+    ],
+  });
+  const ImpactChild = ty('ImpactChild', 'ImpactChild', {
+    extendsType: 'ImpactTarget',
+    methods: [mth('change', { line: 4, params: [{ name: 'value', type: 'String' }] })],
+  });
+  const ImpactExactCaller = ty('ImpactExactCaller', 'ImpactExactCaller', {
+    methods: [mth('run', {
+      line: 1,
+      locals: [{ name: 'target', type: 'ImpactTarget', line: 1 }],
+      calls: [cl('dot', 'change', { receiver: 'target', argTexts: ["'hello'"], line: 2, lineText: "target.change('hello');" })],
+    })],
+  });
+  const ImpactTieCaller = ty('ImpactTieCaller', 'ImpactTieCaller', {
+    methods: [mth('run', {
+      line: 1,
+      locals: [{ name: 'target', type: 'ImpactTarget', line: 1 }],
+      calls: [cl('dot', 'change', { receiver: 'target', argTexts: ['null'], line: 2, lineText: 'target.change(null);' })],
+    })],
+  });
+  const ImpactFallbackCaller = ty('ImpactFallbackCaller', 'ImpactFallbackCaller', {
+    methods: [mth('run', {
+      line: 1,
+      locals: [{ name: 'target', type: 'ImpactTarget', line: 1 }],
+      calls: [cl('dot', 'change', { receiver: 'target', argTexts: ["'x'", "'y'"], line: 2, lineText: "target.change('x', 'y');" })],
+    })],
+  });
+  const ImpactIfaceCaller = ty('ImpactIfaceCaller', 'ImpactIfaceCaller', {
+    methods: [mth('run', {
+      line: 1,
+      params: [{ name: 'target', type: 'ImpactIface' }],
+      calls: [cl('dot', 'change', { receiver: 'target', argTexts: ["'iface'"], line: 2, lineText: "target.change('iface');" })],
+    })],
+  });
+  const ImpactBaseCaller = ty('ImpactBaseCaller', 'ImpactBaseCaller', {
+    methods: [mth('run', {
+      line: 1,
+      params: [{ name: 'target', type: 'ImpactBase' }],
+      calls: [cl('dot', 'change', { receiver: 'target', argTexts: ["'base'"], line: 2, lineText: "target.change('base');" })],
+    })],
+  });
+  const impactIndex = buildSemanticIndex([
+    mkFile(ImpactIface), mkFile(ImpactBase), mkFile(ImpactTarget), mkFile(ImpactChild),
+    mkFile(ImpactExactCaller), mkFile(ImpactTieCaller), mkFile(ImpactFallbackCaller),
+    mkFile(ImpactIfaceCaller), mkFile(ImpactBaseCaller),
+  ]);
+  attachMetaCallers(impactIndex, [
+    { kind: 'lwc', label: 'impactPanel', path: '/ws/lwc/impactPanel.js', line: 1, className: 'ImpactTarget', methodName: 'change' },
+    { kind: 'vf', label: 'ImpactPage', path: '/ws/pages/ImpactPage.page', line: 2, className: 'ImpactTarget', methodName: 'change' },
+    { kind: 'flow', label: 'ImpactChildFlow', path: '/ws/flows/ImpactChildFlow.flow-meta.xml', line: 3, className: 'ImpactTarget', methodName: 'change', subflows: [] },
+    { kind: 'flow', label: 'ImpactParentFlow', path: '/ws/flows/ImpactParentFlow.flow-meta.xml', line: 4, className: null, methodName: null, subflows: ['ImpactChildFlow'] },
+  ]);
+
+  assert.strictEqual(impactMethodSignature(ImpactTarget.methods[0]), 'change(String)');
+  const impactSites = impactIndex.methodCallers.get('impacttarget#change') || [];
+  assert(impactSites.some((s) => s.callerClass === 'ImpactExactCaller' && s.overloadPick === 'exact'), JSON.stringify(impactSites));
+  const impactTieSite = impactSites.find((s) => s.callerClass === 'ImpactTieCaller' && s.overloadPick === 'arity-tie');
+  assert(impactTieSite);
+  assert.deepStrictEqual(
+    impactTieSite.tiedOverloadSigs,
+    ['change(String)', 'change(Integer)', 'change(Decimal)'],
+    'arity-tie evidence retains every equally-best signature, not only the deterministic graph edge'
+  );
+  assert(impactSites.some((s) => s.callerClass === 'ImpactFallbackCaller' && s.overloadPick === 'fallback'));
+
+  const report = buildImpactReport(impactIndex, {
+    classLower: 'impacttarget', methodLower: 'change', overloadSig: 'change(String)',
+  });
+  assert(report && !report.needsOverloadChoice);
+  assert.strictEqual(report.target.label, 'ImpactTarget.change(String)');
+  assert(report.breaks.some((s) => s.callerClass === 'ImpactExactCaller'), 'exact typed caller is a direct break');
+  assert(!report.breaks.some((s) => s.callerClass === 'ImpactTieCaller'), 'arity tie is never promoted to a direct break');
+  assert(report.mightBreak.some((s) => s.callerClass === 'ImpactTieCaller' && s.overloadPick === 'arity-tie'));
+  assert(report.mightBreak.some((s) => s.callerClass === 'ImpactFallbackCaller' && s.overloadPick === 'fallback'));
+  assert(report.mightBreak.some((s) => s.callerClass === 'ImpactIfaceCaller' && s.via === 'interface'));
+  assert(report.mightBreak.some((s) => s.callerClass === 'ImpactBaseCaller' && s.via === 'override'));
+  assert.strictEqual(report.contract.interfaces.length, 1);
+  assert.strictEqual(report.contract.interfaces[0].iface, 'ImpactIface');
+  assert.strictEqual(report.contract.interfaces[0].callers.length, 1, 'one physical interface call is not duplicated across declaration + implementation indexes');
+  assert(report.contract.overrides.base && report.contract.overrides.base.label === 'ImpactBase.change(String)');
+  assert.deepStrictEqual(report.contract.overrides.overriddenBy.map((o) => o.label), ['ImpactChild.change(String)']);
+  assert(report.contract.overrides.callersOfBase.some((s) => s.callerClass === 'ImpactBaseCaller'));
+  assert.deepStrictEqual(report.metadata.map((m) => m.kind), ['flow', 'lwc', 'vf']);
+  const flowImpact = report.metadata.find((m) => m.kind === 'flow');
+  assert.deepStrictEqual(flowImpact.parentFlows.map((f) => f.label), ['ImpactParentFlow']);
+  assert.deepStrictEqual(report.otherOverloads.map((o) => o.overloadSig), ['change(Integer)', 'change(Decimal)']);
+  assert.strictEqual(report.stats.metadataSurfaces, 3);
+  assert.strictEqual(report.stats.contractSurfaces, 3, 'interface + base + overriding child');
+
+  for (const tiedSignature of ['change(Integer)', 'change(Decimal)']) {
+    const tiedReport = buildImpactReport(impactIndex, {
+      classLower: 'impacttarget', methodLower: 'change', overloadSig: tiedSignature,
+    });
+    assert(
+      tiedReport.mightBreak.some((s) => s.callerClass === 'ImpactTieCaller' && s.overloadPick === 'arity-tie'),
+      `${tiedSignature} must include the same physical null-call tie under MIGHT BREAK`
+    );
+    assert(
+      !tiedReport.breaks.some((s) => s.callerClass === 'ImpactExactCaller'),
+      `${tiedSignature} must not inherit the exact String caller`
+    );
+  }
+
+  // A score tie can cover only a SUBSET of same-arity siblings. Preserve the
+  // actual top-scoring signature set rather than treating every same-arity
+  // overload as relevant.
+  const ImpactSubsetTarget = ty('ImpactSubsetTarget', 'ImpactSubsetTarget', {
+    methods: [
+      mth('choose', { params: [{ name: 'left', type: 'String' }, { name: 'right', type: 'Integer' }] }),
+      mth('choose', { params: [{ name: 'left', type: 'String' }, { name: 'right', type: 'Decimal' }] }),
+      mth('choose', { params: [{ name: 'left', type: 'Integer' }, { name: 'right', type: 'Boolean' }] }),
+    ],
+  });
+  const ImpactSubsetCaller = ty('ImpactSubsetCaller', 'ImpactSubsetCaller', {
+    methods: [mth('run', {
+      locals: [{ name: 'target', type: 'ImpactSubsetTarget', line: 1 }],
+      calls: [cl('dot', 'choose', { receiver: 'target', argTexts: ["'x'", 'null'], line: 2 })],
+    })],
+  });
+  const subsetIndex = buildSemanticIndex([mkFile(ImpactSubsetTarget), mkFile(ImpactSubsetCaller)]);
+  const subsetTieSite = (subsetIndex.methodCallers.get('impactsubsettarget#choose') || [])[0];
+  assert.deepStrictEqual(
+    subsetTieSite.tiedOverloadSigs,
+    ['choose(String, Integer)', 'choose(String, Decimal)'],
+    'only equally-top-scoring siblings are retained as tie candidates'
+  );
+  for (const tiedSignature of subsetTieSite.tiedOverloadSigs) {
+    const tiedReport = buildImpactReport(subsetIndex, {
+      classLower: 'impactsubsettarget', methodLower: 'choose', overloadSig: tiedSignature,
+    });
+    assert(tiedReport.mightBreak.some((s) => s.callerClass === 'ImpactSubsetCaller'));
+  }
+  const unrelatedSameArity = buildImpactReport(subsetIndex, {
+    classLower: 'impactsubsettarget', methodLower: 'choose', overloadSig: 'choose(Integer, Boolean)',
+  });
+  assert(
+    !unrelatedSameArity.mightBreak.some((s) => s.callerClass === 'ImpactSubsetCaller'),
+    'a lower-scoring same-arity sibling must not be contaminated by the tie'
+  );
+
+  const needsChoice = buildImpactReport(impactIndex, { classLower: 'impacttarget', methodLower: 'change' });
+  assert.strictEqual(needsChoice.needsOverloadChoice, true);
+  assert.deepStrictEqual(needsChoice.availableOverloads.map((o) => o.overloadSig), ['change(String)', 'change(Integer)', 'change(Decimal)']);
+
+  const empty = buildImpactReport(impactIndex, {
+    classLower: 'impacttarget', methodLower: 'unusedprivate', overloadSig: 'unusedPrivate()',
+  });
+  assert(empty && empty.breaks.length === 0 && empty.mightBreak.length === 0 && empty.metadata.length === 0, 'private uncalled method produces an honest empty report');
+  assert.strictEqual(buildImpactReport(impactIndex, { classLower: 'missing', methodLower: 'change' }), null);
 }
 
 console.log('test-resolver.js: all assertions passed.');

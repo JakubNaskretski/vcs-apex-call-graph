@@ -1,8 +1,8 @@
 {
   "name": "apex-call-graph",
   "displayName": "Apex Call Graph",
-  "description": "Trace who calls an Apex class or method — with the arguments at every call site — up to trigger/LWC/Flow/API entry points. Traces Flow, LWC, Aura and OmniScript callers too. Offline static analysis: real Apex parser, no org connection, no language server.",
-  "version": "0.12.1",
+  "description": "Trace callers and callees of Apex methods, inspect arguments, and assess signature-change impact across Apex, Flow, LWC, Aura and Visualforce. Offline static analysis: real Apex parser, no org connection, no language server.",
+  "version": "0.14.0",
   "publisher": "Skrety",
   "license": "MIT",
   "icon": "plugin-icon.png",
@@ -23,7 +23,9 @@
   "main": "./extension.js",
   "scripts": {
     "build": "node --check extension.js && node --check apexindex.js",
-    "test": "node test.js"
+    "test": "node test.js",
+    "verify": "node dev/verify.js",
+    "vscode:prepublish": "npm run build && node dev/sanitize-dependency-metadata.js"
   },
   "contributes": {
     "commands": [
@@ -38,6 +40,12 @@
         "title": "What Does This Call?",
         "category": "Apex Call Graph",
         "icon": "$(call-outgoing)"
+      },
+      {
+        "command": "apexTrace.impactAnalysis",
+        "title": "Impact of Changing This Method",
+        "category": "Apex Call Graph",
+        "icon": "$(warning)"
       },
       {
         "command": "apexTrace.toggleDirection",
@@ -62,6 +70,11 @@
         "title": "Show Entry Points",
         "category": "Apex Call Graph",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "apexTrace.copyDiagnostics",
+        "title": "Copy Diagnostics (counts only)",
+        "category": "Apex Call Graph"
       }
     ],
     "menus": {
@@ -77,8 +90,13 @@
           "when": "resourceExtname == .cls || resourceExtname == .trigger"
         },
         {
-          "command": "apexTrace.showPathMap",
+          "command": "apexTrace.impactAnalysis",
           "group": "apextrace@3",
+          "when": "resourceExtname == .cls || resourceExtname == .trigger"
+        },
+        {
+          "command": "apexTrace.showPathMap",
+          "group": "apextrace@4",
           "when": "resourceExtname == .cls || resourceExtname == .trigger"
         }
       ],
@@ -86,17 +104,17 @@
         {
           "command": "apexTrace.showPathMap",
           "group": "navigation",
-          "when": "view == apexTraceView"
+          "when": "view == apexTraceView && apexTrace.mode != 'impact'"
         },
         {
           "command": "apexTrace.toggleDirection",
           "group": "navigation",
-          "when": "view == apexTraceView && apexTrace.hasResults"
+          "when": "view == apexTraceView && apexTrace.hasResults && apexTrace.mode != 'impact'"
         },
         {
           "command": "apexTrace.toggleOrientation",
           "group": "navigation",
-          "when": "view == apexTraceView && apexTrace.hasResults && apexTrace.direction == 'callers'"
+          "when": "view == apexTraceView && apexTrace.hasResults && apexTrace.mode != 'impact' && apexTrace.direction == 'callers'"
         },
         {
           "command": "apexTrace.showEntryCatalog",
@@ -129,7 +147,7 @@
     "viewsWelcome": [
       {
         "view": "apexTraceView",
-        "contents": "Trace who calls an Apex class or method, or what it calls out to.\n[Who Calls This?](command:apexTrace.traceCallers)\n[What Does This Call?](command:apexTrace.traceCallees)\n[Open Path Map](command:apexTrace.showPathMap)"
+        "contents": "Trace who calls an Apex class or method, what it calls out to, or assess a method-signature change.\n[Who Calls This?](command:apexTrace.traceCallers)\n[What Does This Call?](command:apexTrace.traceCallees)\n[Impact of Changing This Method](command:apexTrace.impactAnalysis)\n[Open Path Map](command:apexTrace.showPathMap)"
       },
       {
         "view": "apexTraceEntriesView",
@@ -174,6 +192,17 @@
           },
           "default": [],
           "description": "Extra glob patterns to exclude from workspace scanning, appended to the built-in excludes (node_modules, .sfdx, .sf, .git)."
+        },
+        "apexCallGraph.showUnconfirmed": {
+          "type": "string",
+          "enum": ["rollup", "hide", "expand"],
+          "enumDescriptions": [
+            "Group approximate (unconfirmed) callers/callees under one collapsed \"N possible callers/callees (unconfirmed)\" node.",
+            "Hide approximate (unconfirmed) callers/callees entirely -- only confirmed edges are shown.",
+            "Show approximate (unconfirmed) callers/callees inline, eagerly expanded, as in earlier versions."
+          ],
+          "default": "rollup",
+          "description": "How to display approximate (unconfirmed) callers/callees -- e.g. resolved via interface/override/unique-name/ambiguous/lexical/dynamic matching rather than a direct, confirmed call."
         }
       }
     }

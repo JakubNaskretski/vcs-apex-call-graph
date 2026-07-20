@@ -1,0 +1,4 @@
+Third-party runtime components
+
+@apexdevtools/apex-parser 5.1.0 — BSD-3-Clause
+antlr4 4.13.2 — BSD-3-Clause

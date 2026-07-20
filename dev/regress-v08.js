@@ -56,7 +56,51 @@ const parser = require(path.join(REPO_ROOT, 'parser.js'));
 const newResolver = require(path.join(REPO_ROOT, 'resolver.js'));
 const newUitree = require(path.join(REPO_ROOT, 'uitree.js'));
 
-const OLD_ROOT = '/private/tmp/claude-502/-Users-agent-work-code-vcs-plugins/97303195-81fd-481b-8a8f-5439dcdbafa3/scratchpad/v071extract/extension';
+// Prefer an explicit, machine-local baseline path. For unattended local
+// checks, also discover an already-extracted `v071extract/extension`
+// directory under the system temp roots without baking a user/session path
+// into this tracked script.
+function discoverOldRoot() {
+  const explicit = process.env.APEX_CALL_GRAPH_V071_ROOT;
+  if (explicit && fs.existsSync(path.join(explicit, 'resolver.js'))) return explicit;
+
+  const committed = path.join(REPO_ROOT, 'test-fixtures', 'v071-extension');
+  if (fs.existsSync(path.join(committed, 'resolver.js'))) return committed;
+
+  function search(dir, depth) {
+    if (depth < 0) return null;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      return null;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === 'node_modules' || entry.name === '.git') continue;
+      const full = path.join(dir, entry.name);
+      if (entry.name === 'v071extract') {
+        const candidate = path.join(full, 'extension');
+        if (fs.existsSync(path.join(candidate, 'resolver.js'))) return candidate;
+      }
+      const found = search(full, depth - 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  const roots = [...new Set(['/private/tmp', require('os').tmpdir()])];
+  for (const root of roots) {
+    const found = search(root, 6);
+    if (found) return found;
+  }
+  return null;
+}
+
+const OLD_ROOT = discoverOldRoot();
+if (!OLD_ROOT) {
+  console.error('v0.7.1 baseline not found -- restore test-fixtures/v071-extension or set APEX_CALL_GRAPH_V071_ROOT.');
+  process.exit(2);
+}
 const OLD_RESOLVER_PATH = path.join(OLD_ROOT, 'resolver.js');
 if (!fs.existsSync(OLD_RESOLVER_PATH)) {
   console.error(`v0.7.1 resolver.js not found at ${OLD_RESOLVER_PATH} -- extract apex-call-graph-0.7.1.vsix first (unzip -o apex-call-graph-0.7.1.vsix -d <that dir>).`);
@@ -117,7 +161,13 @@ function collectSiteEdges(root, directOnly) {
       }
     }
     if (directOnly && depth >= 1) return;
-    for (const c of node.children || []) walk(c, myIdentity, depth + 1);
+    for (const c of node.children || []) {
+      // v0.13/H3 informational evidence is deliberately not an execution
+      // edge. Excluding it keeps this older v0.8 regression focused on the
+      // underlying call-site graph it was written to compare.
+      if (c && c.kind === 'unresolved-mentions') continue;
+      walk(c, myIdentity, depth + 1);
+    }
   }
   walk(root, null, 0);
   return edges;
@@ -127,23 +177,33 @@ function collectSiteEdges(root, directOnly) {
 // header line must be byte-identical.
 function diffHeaderLines(oldLines, newLines) {
   if (!Array.isArray(oldLines) || !Array.isArray(newLines)) return { ok: true, notes: ['header lines unavailable on one side -- skipped'] };
-  if (oldLines.length !== newLines.length) {
-    return { ok: false, notes: [`header line COUNT differs: old=${JSON.stringify(oldLines)} new=${JSON.stringify(newLines)}`] };
-  }
   const notes = [];
   let ok = true;
   const N5_OLD_RE = /^(\d+) call sites workspace-wide could not be resolved \(dynamic\/platform\/deep-chain\)\.$/;
   const N5_NEW_RE = /^(\d+) unresolved · (\d+) managed-package refs? \([^)]*\)\.$/;
-  for (let i = 0; i < oldLines.length; i++) {
-    if (oldLines[i] === newLines[i]) continue;
-    const oldM = N5_OLD_RE.exec(oldLines[i]);
-    const newM = N5_NEW_RE.exec(newLines[i]);
+  const H3_SCOPED_RE = /^\d+ unresolved sites? elsewhere mention .+\( — potential unconfirmed callers$/;
+  // v0.13/H3 removed the noisy workspace-global unresolved banner and,
+  // for caller targets with matching unresolved evidence, replaced it with
+  // a target-scoped informational line. Neither is part of the site-edge
+  // regression this v0.8 script owns, so compare the remaining headers.
+  const oldComparable = oldLines.filter((line) => !N5_OLD_RE.test(line) && !N5_NEW_RE.test(line));
+  const newComparable = newLines.filter((line) => !N5_OLD_RE.test(line) && !N5_NEW_RE.test(line) && !H3_SCOPED_RE.test(line));
+  if (oldComparable.length !== oldLines.length || newComparable.length !== newLines.length) {
+    notes.push(`v0.13 H3 informational header delta ignored: old=${JSON.stringify(oldLines)} new=${JSON.stringify(newLines)}`);
+  }
+  if (oldComparable.length !== newComparable.length) {
+    return { ok: false, notes: notes.concat([`comparable header line COUNT differs: old=${JSON.stringify(oldComparable)} new=${JSON.stringify(newComparable)}`]) };
+  }
+  for (let i = 0; i < oldComparable.length; i++) {
+    if (oldComparable[i] === newComparable[i]) continue;
+    const oldM = N5_OLD_RE.exec(oldComparable[i]);
+    const newM = N5_NEW_RE.exec(newComparable[i]);
     if (oldM && newM) {
-      notes.push(`header line ${i} permitted N5 wording swap: "${oldLines[i]}" -> "${newLines[i]}" (OK per REGRESSION POLICY (b))`);
+      notes.push(`header line ${i} permitted N5 wording swap: "${oldComparable[i]}" -> "${newComparable[i]}" (OK per REGRESSION POLICY (b))`);
       continue;
     }
     ok = false;
-    notes.push(`header line ${i} UNEXPECTED CHANGE: "${oldLines[i]}" -> "${newLines[i]}"`);
+    notes.push(`header line ${i} UNEXPECTED CHANGE: "${oldComparable[i]}" -> "${newComparable[i]}"`);
   }
   return { ok, notes };
 }
@@ -154,7 +214,9 @@ function diffTargets(oldIndex, newIndex, targets, corpusLabel, direction) {
   const results = [];
   for (const target of targets) {
     const oldTree = buildOld(oldIndex, target, {});
-    const newTree = buildNew(newIndex, target, {});
+    // v0.13/H2 compatibility mode exposes the same flat edge shape this
+    // v0.8 regression predates; rollup grouping is verified separately.
+    const newTree = buildNew(newIndex, target, { showUnconfirmed: 'expand' });
     const oldEdges = collectSiteEdges(oldTree.root, false);
     const newEdges = collectSiteEdges(newTree.root, false);
     const missing = [...oldEdges].filter((e) => !newEdges.has(e));
@@ -176,7 +238,7 @@ function diffTargets(oldIndex, newIndex, targets, corpusLabel, direction) {
 //    SAME 10 targets dev/regress-callers-v071.js pinned; adv-org has NO
 //    namespaced refs anywhere, per REGRESSION POLICY).
 // ---------------------------------------------------------------------
-const ADV_ORG_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const ADV_ORG_ROOT = 'test-fixtures/adv-org';
 const advOld = loadIndex(oldResolver, ADV_ORG_ROOT);
 const advNew = loadIndex(newResolver, ADV_ORG_ROOT);
 console.log(`adv-org: loaded ${advOld.fileCount} apex files (old) / ${advNew.fileCount} (new).`);
@@ -206,7 +268,7 @@ const ADV_ORG_TARGETS = [
 //    covered separately by test.js's v0.8/N3 e2e and dev/gauntlet/run.js's
 //    v0.8-B1 section.
 // ---------------------------------------------------------------------
-const GAUNTLET_ORG_ROOT = '/Users/agent/work/code/example-data/gauntlet-org/force-app';
+const GAUNTLET_ORG_ROOT = 'test-fixtures/gauntlet-org/force-app';
 const gauntletOld = loadIndex(oldResolver, GAUNTLET_ORG_ROOT);
 const gauntletNew = loadIndex(newResolver, GAUNTLET_ORG_ROOT);
 console.log(`gauntlet-org: loaded ${gauntletOld.fileCount} apex files (old) / ${gauntletNew.fileCount} (new).`);

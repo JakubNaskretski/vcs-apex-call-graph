@@ -1,0 +1,17 @@
+<aura:component controller="AcmeOrderApprovalController"
+                 implements="flexipage:availableForRecordHome,force:hasRecordId"
+                 access="global">
+
+    <aura:attribute name="recordId" type="Id" />
+    <aura:attribute name="isApproving" type="Boolean" default="false" />
+
+    <lightning:card title="Order Approval" iconName="standard:approval">
+        <div class="slds-p-around_medium">
+            <lightning:button
+                label="Approve Order"
+                variant="brand"
+                onclick="{!c.handleApprove}"
+                disabled="{!v.isApproving}" />
+        </div>
+    </lightning:card>
+</aura:component>

@@ -1,0 +1,22 @@
+<aura:component controller="AcmeShipmentAuraService"
+                 implements="flexipage:availableForAllPageTypes"
+                 access="global">
+
+    <aura:attribute name="shipments" type="Object[]" />
+    <aura:attribute name="isLoading" type="Boolean" default="true" />
+
+    <aura:handler name="init" value="{!this}" action="{!c.doInit}" />
+
+    <lightning:card title="Shipment Status Board" iconName="standard:shipment">
+        <div class="slds-p-around_medium">
+            <aura:if isTrue="{!v.isLoading}">
+                <lightning:spinner alternativeText="Loading" size="small" />
+            </aura:if>
+            <aura:iteration items="{!v.shipments}" var="shipment">
+                <div class="slds-p-vertical_x-small">
+                    {!shipment.trackingNumber} - {!shipment.status}
+                </div>
+            </aura:iteration>
+        </div>
+    </lightning:card>
+</aura:component>

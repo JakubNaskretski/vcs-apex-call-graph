@@ -58,7 +58,7 @@ function globToRegExp(glob) {
   return new RegExp('^' + re + '$');
 }
 
-const ADV_ORG_ROOT = '/Users/agent/work/code/example-data/adv-org/force-app/main/default';
+const ADV_ORG_ROOT = 'test-fixtures/adv-org/force-app/main/default';
 const cmdtFiles = fs
   .readdirSync(path.join(ADV_ORG_ROOT, 'customMetadata'))
   .filter((f) => f.endsWith('.md-meta.xml'))

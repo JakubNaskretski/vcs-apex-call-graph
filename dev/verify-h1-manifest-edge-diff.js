@@ -39,7 +39,7 @@ if (!fs.existsSync(OLD_RESOLVER_PATH)) {
 }
 const oldResolver = require(OLD_RESOLVER_PATH);
 
-const ADV_ORG_ROOT = '/Users/agent/work/code/example-data/adv-org/force-app/main/default';
+const ADV_ORG_ROOT = 'test-fixtures/adv-org/force-app/main/default';
 
 function walkFiles(dir, out) {
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {

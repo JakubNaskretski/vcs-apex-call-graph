@@ -1,0 +1,21 @@
+<template>
+    <lightning-card title="New Quote" icon-name="standard:quotes">
+        <div class="slds-p-around_medium">
+            <lightning-input
+                label="Quote Name"
+                value={quoteName}
+                onchange={handleNameChange}
+            ></lightning-input>
+            <lightning-button
+                label="Create Quote"
+                variant="brand"
+                class="slds-m-top_small"
+                onclick={handleCreateQuote}
+                disabled={isSaving}
+            ></lightning-button>
+            <template if:true={errorMessage}>
+                <p class="slds-text-color_error slds-m-top_small">{errorMessage}</p>
+            </template>
+        </div>
+    </lightning-card>
+</template>

@@ -2,7 +2,7 @@
 // Adversarial MANIFEST-accounting verifier (v0.5.0 round).
 //
 // Mechanically checks EVERY edge in the "## v0.5 ground-truth edges" section
-// of /Users/agent/work/code/example-data/adv-org/MANIFEST.md (G1 EventBus->
+// of test-fixtures/adv-org/MANIFEST.md (G1 EventBus->
 // platform-event, G2 throw/catch tracing, G3 instanceof narrowing, G4
 // anonymous Apex, G5 async-hop edges, G6 interface-extends-interface
 // fan-out) against a LIVE run of the real engine (parser.js + resolver.js +
@@ -15,7 +15,7 @@
 // parser.js) -- the v0.4 CMDT lesson (implemented-but-unwired counts as a
 // critical finding).
 //
-// Read-only: never touches example-data/adv-org or any engine file.
+// Read-only: never touches test-fixtures/adv-org or any engine file.
 // Usage: node dev/manifest-verify-v050.js
 
 const fs = require('fs');
@@ -25,7 +25,7 @@ const parser = require('../parser');
 const resolver = require('../resolver');
 const metascan = require('../metascan');
 
-const ADV_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const ADV_ROOT = 'test-fixtures/adv-org';
 const FORCE_APP = path.join(ADV_ROOT, 'force-app', 'main', 'default');
 const SCRIPTS_DIR = path.join(ADV_ROOT, 'scripts');
 

@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.14.0
+
+Understand the blast radius before changing an Apex method signature.
+
+- New **Impact of Changing This Method** command in the editor context menu and
+  command palette. It reports five source-linked sections: confirmed direct callers
+  that break, uncertain callers that might break, interface/inheritance contract
+  surfaces, metadata consumers, and sibling overloads.
+- Overloaded methods are handled explicitly: placing the cursor on a declaration
+  selects that exact overload; other positions show a signature picker. Call sites
+  record whether overload resolution was exact, an arity tie, or a fallback, so
+  uncertain evidence is never promoted to a confirmed break.
+- Contract analysis includes implemented interfaces, the nearest overridden base
+  declaration, descendant overrides, and callers through those surfaces. Flow
+  metadata includes parent subflow chains, alongside LWC, Aura, Visualforce and
+  other supported metadata consumers.
+- Honest empty reports retain all five sections with zero counts. Impact results use
+  the tree only; the Path Map and trace controls are hidden because the result is a
+  risk inventory, not an execution path.
+
+## 0.13.0
+
+Confidence and responsiveness hardening for large, framework-heavy workspaces.
+
+- **Possible edges no longer bury confirmed callers**: approximate callers/callees
+  are grouped under a collapsed rollup by default. A new
+  `apexCallGraph.showUnconfirmed` setting offers `rollup`, confirmed-only `hide`, or
+  backward-compatible flat `expand` modes in both the tree and Path Map.
+- **Common-name false positives are capped**: the unique-name fallback now requires
+  matching arity and attaches only when at most five unresolved-receiver sites point
+  at the sole declarer. Larger “magnet” names attach no guessed edges; caller traces
+  instead show a target-scoped, inspectable unresolved-mention count.
+- **Responsive scanning**: indexing is cancellable end to end, duplicate requests
+  share one in-flight scan, newer requests coalesce to the latest target, file
+  watchers drive incremental dirty-set scans, and cold workspaces over 200 Apex files
+  parse in a bounded worker pool with safe inline fallback.
+- **Counts-only diagnostics**: the new command and Scan Stats output report phase
+  timings, cache reuse, worker activity, resolution reasons, and magnet suppression
+  without copying paths, source, symbols, or arguments.
+- **Flow-to-flow chains**: subflows now connect in both directions, including nested
+  chains and cycle guards, without fabricating missing Flow nodes.
+- Long, whitespace-free Apex identifiers stay contained in Path Map nodes and retain
+  their complete tooltip/source label.
+
 ## 0.12.1
 
 - Fixed the Marketplace/sidebar icon rendering at a quarter of its canvas (the

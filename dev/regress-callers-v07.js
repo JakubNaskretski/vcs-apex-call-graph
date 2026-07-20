@@ -48,7 +48,7 @@ const oldResolver = require(OLD_RESOLVER_PATH);
 // added pkg-billing/ and pkg-shared/ as sibling packageDirectory roots, and
 // the regression must prove callers-direction is unchanged against the
 // FULL post-Corpus-phase file set, not a stale force-app-only subset.
-const ADV_ORG_ROOT = '/Users/agent/work/code/example-data/adv-org';
+const ADV_ORG_ROOT = 'test-fixtures/adv-org';
 
 function walkFiles(dir, out) {
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {

@@ -66,7 +66,7 @@ function trace(index, label, classLower, methodLower) {
   if (hl.length) { console.log('--- PER-SITE DATA NOT SHOWN INLINE (tooltip-only args + dropped overloadSig) ---'); console.log(hl.join('\n')); }
 }
 
-const adv = buildIndex('/Users/agent/work/code/example-data/adv-org/force-app/main/default', '/Users/agent/work/code/example-data/adv-org/scripts');
+const adv = buildIndex('test-fixtures/adv-org/force-app/main/default', 'test-fixtures/adv-org/scripts');
 
 // adv-org — Batch<-Schedulable chain / trigger-service chain
 trace(adv, 'adv: AcmeOrderBatchProcessor.execute (method-level, Schedulable<-Batch chain)', 'acmeorderbatchprocessor', 'execute');

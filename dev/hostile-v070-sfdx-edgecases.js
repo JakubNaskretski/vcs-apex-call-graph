@@ -242,7 +242,7 @@ async function part1() {
 async function part2() {
   console.log('\n--- PART 2: live default-package-fallback repro (real extension.js, real corpus) ---');
 
-  const ADV_ORG_ROOT = '/Users/agent/work/code/example-data/adv-org';
+  const ADV_ORG_ROOT = 'test-fixtures/adv-org';
   const EXCLUDE_DIRS = new Set(['node_modules', '.sfdx', '.sf', '.git']);
   function walk(dir, out) {
     let entries;

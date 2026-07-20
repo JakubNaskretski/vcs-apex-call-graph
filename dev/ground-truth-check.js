@@ -1,5 +1,5 @@
 'use strict';
-// Adversarial integrity check: a hand-built fixture org (dev/fixture-org/)
+// Adversarial integrity check: a hand-built, source-controlled fixture org
 // with a WRITTEN ground-truth call graph (independent of parser.js/resolver.js
 // — line/col positions below are found via plain String.indexOf on the raw
 // source text, not by re-running the engine under test). buildCallerTree is
@@ -11,7 +11,7 @@ const path = require('path');
 const parser = require('../parser');
 const resolver = require('../resolver');
 
-const FIXTURE_DIR = path.join(__dirname, 'fixture-org');
+const FIXTURE_DIR = path.join(__dirname, '..', 'test-fixtures', 'ground-truth-org');
 const FILES = [
   'classes/WorkerService.cls',
   'classes/CallerOne.cls',

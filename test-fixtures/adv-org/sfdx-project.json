@@ -1,0 +1,20 @@
+{
+  "packageDirectories": [
+    {
+      "path": "force-app",
+      "default": true
+    },
+    {
+      "path": "pkg-billing",
+      "package": "nova-billing"
+    },
+    {
+      "path": "pkg-shared",
+      "package": "nova-shared"
+    }
+  ],
+  "name": "adv-org",
+  "namespace": "",
+  "sfdcLoginUrl": "https://login.salesforce.com",
+  "sourceApiVersion": "59.0"
+}

@@ -1,0 +1,63 @@
+{
+  "VlocityDataPackKey": "OmniScriptDataPack/AcmeOrderIntegrationProcedure-English-1",
+  "VlocityDataPackType": "SObject",
+  "VlocityRecordSObjectType": "%vlocity_namespace%__OmniScript__c",
+  "VlocityRecordSourceKey": "OmniScript/AcmeOrderIntegrationProcedure/Default/English/1",
+  "VlocityDataPackIsIncluded": true,
+  "VlocityRecordData": {
+    "Name": "AcmeOrderIntegrationProcedure-Default-English-1",
+    "%vlocity_namespace%__Type__c": "AcmeOrderIntegrationProcedure",
+    "%vlocity_namespace%__SubType__c": "Default",
+    "%vlocity_namespace%__Language__c": "English",
+    "%vlocity_namespace%__Version__c": 1,
+    "%vlocity_namespace%__IsActive__c": true,
+    "%vlocity_namespace%__IsProcedure__c": true,
+    "%vlocity_namespace%__PropertySet__c": "{\"bDisableLwc\":false,\"bReusable\":true}",
+    "%vlocity_namespace%__Element__r": {
+      "VlocityDataPackType": "SObject",
+      "VlocityRecordSObjectType": "%vlocity_namespace%__Element__c",
+      "records": [
+        {
+          "VlocityDataPackKey": "OmniScriptDataPack/AcmeOrderIntegrationProcedure-English-1/RecalculateOrderPricingAction",
+          "VlocityDataPackType": "SObject",
+          "VlocityRecordSObjectType": "%vlocity_namespace%__Element__c",
+          "VlocityRecordSourceKey": "Element/AcmeOrderIntegrationProcedure-English-1/RecalculateOrderPricingAction",
+          "VlocityRecordData": {
+            "Name": "RecalculateOrderPricingAction",
+            "%vlocity_namespace%__Level__c": 1,
+            "%vlocity_namespace%__Order__c": 1,
+            "%vlocity_namespace%__Type__c": "Remote Action",
+            "%vlocity_namespace%__PropertySet__c": "{\"remoteClass\":\"AcmeOrderService\",\"remoteMethod\":\"recalculatePricing\",\"remoteOptions\":{},\"remoteTimeout\":10000,\"useContinuation\":false,\"inputParameters\":\"orderId\"}",
+            "PropertySetJSON": {
+              "remoteClass": "AcmeOrderService",
+              "remoteMethod": "recalculatePricing",
+              "remoteOptions": {},
+              "remoteTimeout": 10000,
+              "useContinuation": false
+            }
+          }
+        },
+        {
+          "VlocityDataPackKey": "OmniScriptDataPack/AcmeOrderIntegrationProcedure-English-1/ScheduleDeliveryAction",
+          "VlocityDataPackType": "SObject",
+          "VlocityRecordSObjectType": "%vlocity_namespace%__Element__c",
+          "VlocityRecordSourceKey": "Element/AcmeOrderIntegrationProcedure-English-1/ScheduleDeliveryAction",
+          "VlocityRecordData": {
+            "Name": "ScheduleDeliveryAction",
+            "%vlocity_namespace%__Level__c": 1,
+            "%vlocity_namespace%__Order__c": 2,
+            "%vlocity_namespace%__Type__c": "Remote Action",
+            "%vlocity_namespace%__PropertySet__c": "{\"remoteClass\":\"AcmeShipmentService\",\"remoteMethod\":\"scheduleDelivery\",\"remoteOptions\":{},\"remoteTimeout\":10000,\"useContinuation\":false,\"inputParameters\":\"orderId,shipmentWindow\"}",
+            "PropertySetJSON": {
+              "remoteClass": "AcmeShipmentService",
+              "remoteMethod": "scheduleDelivery",
+              "remoteOptions": {},
+              "remoteTimeout": 10000,
+              "useContinuation": false
+            }
+          }
+        }
+      ]
+    }
+  }
+}
