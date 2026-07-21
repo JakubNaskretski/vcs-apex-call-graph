@@ -102,6 +102,10 @@ const parser = require('./parser');
 const resolver = require('./resolver');
 const metascan = require('./metascan');
 const cachestore = require('./cachestore');
+const cachefiles = require('./cachefiles');
+const cachecoordinator = require('./cachecoordinator');
+const editoroverlay = require('./editoroverlay');
+const workspacepaths = require('./workspacepaths');
 const targets = require('./targets');
 // Round 2.5 / H5-H8: pure, vscode-free helpers (single-flight+coalescing,
 // the watcher dirty-set tracker, and the counts-only diagnostics payload
@@ -185,6 +189,7 @@ function readSettings() {
   };
   const rawExcludes = cfg.get('excludeGlobs');
   const excludeGlobs = scanflow.normalizeExcludeGlobs(rawExcludes);
+  const excludeMatcher = scanflow.compileExcludeGlobs(excludeGlobs);
   // H2 (Round 2.5): this file OWNS the package.json contribution point for
   // apexCallGraph.showUnconfirmed (the approximate-callers/callees rollup
   // display mode) -- see the task brief's "package.json contributes ONLY:
@@ -206,6 +211,7 @@ function readSettings() {
     maxDepth: clampInt(cfg.get('maxDepth'), 1, 20, MAX_DEPTH),
     maxNodes: clampInt(cfg.get('maxNodes'), 100, 20000, DEFAULT_MAX_NODES_SETTING),
     excludeGlobs,
+    excludeMatcher,
     showUnconfirmed,
   };
 }
@@ -247,7 +253,11 @@ const ORIENTATION_KEY = 'apexCallGraph.orientation';
 // candidates, narrowed generic-DML edges) consume these new parser fields
 // but don't themselves change FileFacts/MetaRef shape, so they ride along
 // on this same bump rather than needing one of their own.
-const ENGINE_CACHE_VERSION = 7;
+// v0.15 hardening moves to an Apex-facts-only disk cache. v9 additionally
+// omits every successful fact object containing source-faithful lines,
+// expressions, receivers, DML targets, or literal values; pre-v9 files are
+// classified as legacy and deleted.
+const ENGINE_CACHE_VERSION = 9;
 
 // H8: the extension's own version, read straight from package.json (a
 // local file this extension ships with, never workspace-derived) -- purely
@@ -259,21 +269,23 @@ const EXTENSION_VERSION = require('./package.json').version;
 // avoids a redundant write-per-scan burst if the user retriggers a trace
 // (e.g. Cmd+. spam) before the previous write finished being useful anyway.
 const PERSIST_DEBOUNCE_MS = 1500;
+const CACHE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
-// Module-level cache: fsPath -> { mtimeMs, facts }. Survives across command
+// Module-level cache: canonical resource URI -> { mtimeMs, size, facts }.
+// URI identity includes scheme + authority, so two remote folders exposing
+// the same fsPath cannot share an entry. Survives across command
 // invocations in the same VS Code session so unchanged files are never
 // re-parsed; the semantic index is still rebuilt from (possibly cached)
 // facts on every run, since the workspace's file set and cross-file
 // resolution can change between runs even when a given file didn't.
-// F6: also persisted to disk (see persistCachesNow/hydrateCaches below) so a
-// fresh VS Code session hydrates from context.globalStorageUri instead of
-// starting cold — a scan of an unchanged big org then only has to stat files.
+// F6: declaration-only entries without source fragments may also persist to
+// disk; all other files safely reparse after restart.
 const fileCache = new Map();
 
-// A7: mtime cache for metadata source files (LWC/Aura/Flow/OmniScript/VF),
-// mirroring fileCache above. Unlike fileCache this stores the raw file TEXT
-// (field name `metaText`, matching cachestore.js's CacheEntry contract),
-// not the extracted MetaRef[] — Aura's cross-file bundling (a .cmp's
+// A7: session-memory-only resource-URI-keyed cache for metadata source files
+// (LWC/Aura/Flow/OmniScript/VF), mirroring fileCache above. Unlike fileCache
+// this stores raw file text, but it is never passed to the disk-persistence
+// boundary. Aura's cross-file bundling (a .cmp's
 // controller="..." attribute plus its sibling Controller/Helper .js files'
 // component.get('c.method') calls) means a single file's MetaRefs can
 // depend on a SIBLING file's content, so per-file ref caching would need
@@ -293,13 +305,14 @@ const metaFileCache = new Map();
 // each uses it) -- a single
 // FileSystemWatcher setup (activate(), below) feeding one tracker is
 // simpler and no less correct than two independent trackers, since the
-// only two things read out of it (dirty/deleted path SETS, and the one
-// fullSweepNeeded latch) are already per-path and per-run, not per-scan-
+// only two things read out of it (dirty/deleted resource-key SETS, and the one
+// fullSweepNeeded latch) are already per-resource and per-run, not per-scan-
 // type. Module-level (like fileCache/metaFileCache above) so it survives
 // across command invocations within one extension-host session.
 const dirtyTracker = scanflow.createDirtyTracker();
+const cacheCoordinator = cachecoordinator.createCacheCoordinator();
 
-// The exact set of fsPaths the LAST successful Apex/metadata sweep (full or
+// The exact set of canonical resource keys the LAST successful Apex/metadata sweep (full or
 // incremental) actually produced FileFacts/text for -- lets a subsequent
 // EMPTY-dirty-set trace reuse the in-memory factsList/metadata with ZERO
 // findFiles+stat calls (H6's "reuses the in-memory factsList + metadata"),
@@ -313,8 +326,8 @@ let lastMetaUriSet = null;
 const APEX_EXT_RE = /\.(cls|trigger|apex)$/i;
 const META_EXT_RE = /\.(js|cmp|app|xml|json|page|component)$/i;
 
-// H6: the full-sweep path always excludes these via combineExcludePattern's
-// builtin pattern (scanWorkspaceUris/scanMetaWorkspaceUris) -- the
+// H6: the full-sweep path always excludes these via the built-in provider
+// pattern (scanWorkspaceUris/scanMetaWorkspaceUris) -- the
 // INCREMENTAL dirty-set fast path below never calls findFiles at all, so it
 // has no glob-exclude pass of its own to lean on. A watcher event for a
 // path under one of these directories (the FileSystemWatcher globs
@@ -328,16 +341,60 @@ function isHardExcludedPath(fsPath) {
   return HARD_EXCLUDED_DIR_RE.test(fsPath);
 }
 
+function resourceKeyForUri(uri) {
+  return workspacepaths.resourceKey(uri);
+}
+
+function sourcePathForUri(uri) {
+  return workspacepaths.sourcePathForUri(uri);
+}
+
+function workspaceLocationForUri(uri) {
+  return workspacepaths.findContainingWorkspaceFolderForUri(uri, vscode.workspace.workspaceFolders, path);
+}
+
+function resourceUriFromKey(resourceKey) {
+  if (typeof resourceKey !== 'string' || !resourceKey) return null;
+  try {
+    return vscode.Uri.parse(resourceKey, true);
+  } catch (_) {
+    return null;
+  }
+}
+
+function resourceUriForSourcePath(sourcePath) {
+  if (typeof sourcePath !== 'string' || !sourcePath) return null;
+  if (workspacepaths.isSerializedResourcePath(sourcePath)) {
+    return resourceUriFromKey(sourcePath);
+  }
+  const location = workspacepaths.findContainingWorkspaceFolder(
+    sourcePath,
+    (vscode.workspace.workspaceFolders || []).filter((folder) => folder.uri.scheme === 'file'),
+    path
+  );
+  if (!location) return null;
+  if (!location.relativePath) return location.folder.uri;
+  return vscode.Uri.joinPath(location.folder.uri, ...location.relativePath.split(/[\\/]/).filter(Boolean));
+}
+
 // FileSystemWatcher paths are absolute, while vscode.workspace.findFiles
 // evaluates string globs relative to the containing workspace folder. Keep
 // the incremental path consistent with the full sweep by converting to the
 // same relative shape before applying scanflow's pure glob matcher.
-function isUserExcludedPath(fsPath, excludeGlobs) {
-  if (!excludeGlobs || !excludeGlobs.length || !fsPath) return false;
-  const uri = vscode.Uri.file(fsPath);
-  const folder = vscode.workspace.getWorkspaceFolder(uri);
-  if (!folder || !folder.uri || !folder.uri.fsPath) return false;
-  const relativePath = path.relative(folder.uri.fsPath, fsPath);
+function isUserExcludedUri(uri, excludeGlobs) {
+  if (!uri || !uri.fsPath) return true;
+  const location = workspaceLocationForUri(uri);
+  const folder = uri ? vscode.workspace.getWorkspaceFolder(uri) : null;
+  // Workspace watchers should already be scoped, but fail closed if another
+  // event source ever hands incremental scanning an external path.
+  if (!folder || !folder.uri || !folder.uri.fsPath) return true;
+  const hasExcludePatterns = Array.isArray(excludeGlobs)
+    ? excludeGlobs.length > 0
+    : !!(excludeGlobs && Array.isArray(excludeGlobs.patterns) && excludeGlobs.patterns.length);
+  if (!hasExcludePatterns) return false;
+  const relativePath = location && location.folder === folder
+    ? location.relativePath
+    : path.relative(folder.uri.fsPath, uri.fsPath);
   return scanflow.matchesExcludeGlobs(relativePath, excludeGlobs);
 }
 
@@ -467,11 +524,12 @@ function toTreeItem(uiNode, traceId, parent) {
   return it;
 }
 
-function openCommand(fsPath, line, col) {
+function openCommand(sourcePath, line, col) {
+  const resourceUri = resourceUriForSourcePath(sourcePath);
   return {
     command: 'vscode.open',
     title: 'Open',
-    arguments: [vscode.Uri.file(fsPath), { selection: new vscode.Range(line, col, line, col) }],
+    arguments: [resourceUri || vscode.Uri.file(sourcePath), { selection: new vscode.Range(line, col, line, col) }],
   };
 }
 
@@ -526,23 +584,6 @@ function toEntryCatalogTreeItem(uiNode) {
   return it;
 }
 
-// v0.9 / P2: appends `extraGlobs` (apexCallGraph.excludeGlobs) onto a
-// builtin '{a,b,c}' brace-list exclude pattern. `extraGlobs` is expected to
-// already be individual glob strings (readSettings() already filtered out
-// non-string/blank entries) with no embedded commas of their own -- a glob
-// containing a literal comma would need its own brace-expansion, which is
-// rare enough for an exclude pattern that this naive split/join is not
-// worth complicating for. Returns `builtinPattern` completely unchanged
-// when there is nothing to append, so a workspace that never sets
-// excludeGlobs (the overwhelmingly common case) scans byte-identically to
-// pre-v0.9.
-function combineExcludePattern(builtinPattern, extraGlobs) {
-  if (!extraGlobs || !extraGlobs.length) return builtinPattern;
-  const inner = builtinPattern.replace(/^\{/, '').replace(/\}$/, '');
-  const parts = inner.split(',').concat(extraGlobs);
-  return '{' + parts.join(',') + '}';
-}
-
 async function scanWorkspaceUris(excludeGlobs) {
   // .sfdx/.sf hold the StandardApexLibrary platform stubs — indexing those
   // would shadow real classes with same-named stubs.
@@ -551,12 +592,16 @@ async function scanWorkspaceUris(excludeGlobs) {
   // parser.parseFile the same way .cls/.trigger do; parser.js (out of scope
   // here) is what special-cases the .apex extension into anonymousUnit()
   // parsing. Same excludes as the pre-existing .cls/.trigger scan.
-  // v0.9 / P2: `excludeGlobs` (apexCallGraph.excludeGlobs) is appended via
-  // combineExcludePattern above -- see readSettings()'s header note.
-  return vscode.workspace.findFiles(
+  // User globs are post-filtered by the same linear matcher used for
+  // incremental watcher paths. Keeping them out of the provider's outer
+  // brace expression preserves literal commas and guarantees parity.
+  const uris = await vscode.workspace.findFiles(
     '**/*.{cls,trigger,apex}',
-    combineExcludePattern('{**/node_modules/**,**/.sfdx/**,**/.sf/**,**/.git/**}', excludeGlobs)
+    '{**/node_modules/**,**/.sfdx/**,**/.sf/**,**/.git/**,**/__tests__/**}'
   );
+  // Defense-in-depth and parity: the same matcher used by incremental
+  // watcher paths post-filters full-scan results too.
+  return uris.filter((uri) => !isUserExcludedUri(uri, excludeGlobs));
 }
 
 // Reparses only files whose mtime changed since the last run (or that are
@@ -590,6 +635,7 @@ async function scanAndParse(progress, excludeGlobs, opts) {
   opts = opts || {};
   const token = opts.token || null;
   const dirtySnapshot = opts.dirtySnapshot || null;
+  const editorOverlays = opts.editorOverlays || null;
   const isCancelled = () => !!(token && token.isCancellationRequested);
 
   const useFullSweep = !dirtySnapshot || dirtySnapshot.fullSweepNeeded || !lastApexUriSet;
@@ -599,21 +645,35 @@ async function scanAndParse(progress, excludeGlobs, opts) {
   if (!useFullSweep) {
     const dirtyApex = new Set(
       [...dirtySnapshot.dirty].filter(
-        (p) => APEX_EXT_RE.test(p) && !isHardExcludedPath(p) && !isUserExcludedPath(p, excludeGlobs)
+        (resourceKey) => {
+          const uri = resourceUriFromKey(resourceKey);
+          return !!(
+            uri &&
+            APEX_EXT_RE.test(uri.fsPath) &&
+            !isHardExcludedPath(uri.fsPath) &&
+            !isUserExcludedUri(uri, excludeGlobs)
+          );
+        }
       )
     );
-    const deletedApex = new Set([...dirtySnapshot.deleted].filter((p) => APEX_EXT_RE.test(p)));
+    const deletedApex = new Set(
+      [...dirtySnapshot.deleted].filter((resourceKey) => {
+        const uri = resourceUriFromKey(resourceKey);
+        return !!(uri && APEX_EXT_RE.test(uri.fsPath));
+      })
+    );
 
     if (dirtyApex.size === 0 && deletedApex.size === 0) {
       // H6: "a subsequent trace with an EMPTY dirty set skips findFiles+stat
       // entirely and reuses the in-memory factsList" -- zero I/O below.
       const factsList = [];
-      for (const fsPath of lastApexUriSet) {
-        const entry = fileCache.get(fsPath);
+      for (const resourceKey of lastApexUriSet) {
+        const entry = fileCache.get(resourceKey);
         if (entry) factsList.push(entry.facts);
       }
+      const applied = editoroverlay.applyApexOverlays(factsList, lastApexUriSet, editorOverlays, parser.parseFile);
       return {
-        factsList,
+        factsList: applied.factsList,
         parsed: 0,
         cached: factsList.length,
         unreadable: 0,
@@ -622,21 +682,24 @@ async function scanAndParse(progress, excludeGlobs, opts) {
         sweepKind: 'skipped',
         timingMs: { glob: 0, stat: 0, parse: 0 },
         workerStats: null,
+        overlaid: applied.overlaid,
       };
     }
 
     // H6: small dirty set -- only re-stat/re-parse those paths.
     const timingMs = { glob: 0, stat: 0, parse: 0 };
-    for (const fsPath of deletedApex) {
-      fileCache.delete(fsPath);
-      lastApexUriSet.delete(fsPath);
+    for (const resourceKey of deletedApex) {
+      fileCache.delete(resourceKey);
+      lastApexUriSet.delete(resourceKey);
     }
     let parsed = 0;
     let unreadable = 0;
     const toParse = [];
-    for (const fsPath of dirtyApex) {
+    for (const resourceKey of dirtyApex) {
       if (isCancelled()) break;
-      const uri = vscode.Uri.file(fsPath);
+      const uri = resourceUriFromKey(resourceKey);
+      if (!uri || !vscode.workspace.getWorkspaceFolder(uri)) continue;
+      const sourcePath = sourcePathForUri(uri);
       const tStat0 = Date.now();
       let stat;
       try {
@@ -645,44 +708,48 @@ async function scanAndParse(progress, excludeGlobs, opts) {
         timingMs.stat += Date.now() - tStat0;
         // Watcher fired a change for a path that's gone by the time we get
         // to it (fast create+delete race) -- treat exactly like a delete.
-        fileCache.delete(fsPath);
-        lastApexUriSet.delete(fsPath);
+        fileCache.delete(resourceKey);
+        lastApexUriSet.delete(resourceKey);
         continue;
       }
       timingMs.stat += Date.now() - tStat0;
-      const entry = fileCache.get(fsPath);
-      if (entry && entry.mtimeMs === stat.mtime && entry.size === stat.size) {
-        lastApexUriSet.add(fsPath); // e.g. a brand-new path already caught up
+      const entry = fileCache.get(resourceKey);
+      // The watcher already told us this path changed. Do not let a coarse
+      // mtime plus a same-byte-length edit turn that authoritative event into
+      // a stale cache hit.
+      if (scanflow.canReuseStatCache(entry, stat, scanflow.isExplicitlyDirty(dirtySnapshot, resourceKey))) {
+        lastApexUriSet.add(resourceKey); // defensive; forceFresh currently makes this unreachable
         continue;
       }
-      toParse.push({ fsPath, stat });
+      toParse.push({ resourceKey, sourcePath, uri, stat });
     }
     const tParse0 = Date.now();
     for (const item of toParse) {
       if (isCancelled()) break;
       try {
-        const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(item.fsPath));
+        const bytes = await vscode.workspace.fs.readFile(item.uri);
         const text = Buffer.from(bytes).toString('utf8');
-        const facts = parser.parseFile({ path: item.fsPath, text }); // contract: never throws
-        fileCache.set(item.fsPath, { mtimeMs: item.stat.mtime, size: item.stat.size, facts });
-        lastApexUriSet.add(item.fsPath);
+        const facts = parser.parseFile({ path: item.sourcePath, text }); // contract: never throws
+        fileCache.set(item.resourceKey, { mtimeMs: item.stat.mtime, size: item.stat.size, facts });
+        lastApexUriSet.add(item.resourceKey);
         parsed++;
       } catch (e) {
         unreadable++;
-        fileCache.delete(item.fsPath);
-        lastApexUriSet.delete(item.fsPath);
+        fileCache.delete(item.resourceKey);
+        lastApexUriSet.delete(item.resourceKey);
       }
       if (progress) progress.report({ message: `re-parsed ${parsed} changed file(s)…` });
     }
     timingMs.parse = Date.now() - tParse0;
 
     const factsList = [];
-    for (const fsPath of lastApexUriSet) {
-      const entry = fileCache.get(fsPath);
+    for (const resourceKey of lastApexUriSet) {
+      const entry = fileCache.get(resourceKey);
       if (entry) factsList.push(entry.facts);
     }
+    const applied = editoroverlay.applyApexOverlays(factsList, lastApexUriSet, editorOverlays, parser.parseFile);
     return {
-      factsList,
+      factsList: applied.factsList,
       parsed,
       cached: factsList.length - parsed,
       unreadable,
@@ -691,6 +758,7 @@ async function scanAndParse(progress, excludeGlobs, opts) {
       sweepKind: 'incremental',
       timingMs,
       workerStats: null,
+      overlaid: applied.overlaid,
     };
   }
 
@@ -705,12 +773,13 @@ async function scanAndParse(progress, excludeGlobs, opts) {
   const factsList = [];
   let cached = 0;
   let unreadable = 0;
-  const toParse = []; // { fsPath, stat }
+  const toParse = []; // { resourceKey, sourcePath, uri, stat }
 
   for (const uri of uris) {
     if (isCancelled()) break;
-    const fsPath = uri.fsPath;
-    seen.add(fsPath);
+    const resourceKey = resourceKeyForUri(uri);
+    const sourcePath = sourcePathForUri(uri);
+    seen.add(resourceKey);
     const tStat0 = Date.now();
     let stat;
     try {
@@ -721,18 +790,18 @@ async function scanAndParse(progress, excludeGlobs, opts) {
       continue; // unstattable — skip
     }
     timingMs.stat += Date.now() - tStat0;
-    const entry = fileCache.get(fsPath);
+    const entry = fileCache.get(resourceKey);
     // H6b: mtimeMs AND size must both match -- mtime resolution on some
     // filesystems is coarse enough that two distinct saves of the same file
     // can land within the same tick, and a same-mtime-different-content
     // false cache hit would silently trace against stale FileFacts. Size is
     // a cheap, free-riding tiebreak (already in the vscode.FileStat we just
     // fetched) that catches that case without a content hash.
-    if (entry && entry.mtimeMs === stat.mtime && entry.size === stat.size) {
+    if (scanflow.canReuseStatCache(entry, stat, scanflow.isExplicitlyDirty(dirtySnapshot, resourceKey))) {
       factsList.push(entry.facts);
       cached++;
     } else {
-      toParse.push({ fsPath, stat });
+      toParse.push({ resourceKey, sourcePath, uri, stat });
     }
     if (progress) {
       progress.report({ message: `stat ${cached + toParse.length} of ${uris.length} file(s)…` });
@@ -744,12 +813,17 @@ async function scanAndParse(progress, excludeGlobs, opts) {
   // on the main thread (vscode.workspace.fs has no worker-thread-callable
   // form), only the parser.parseFile CPU work moves to the pool.
   const tParse0 = Date.now();
-  const readable = []; // { path, text, stat }
+  const readable = []; // { resourceKey, path, text, stat }
   for (const item of toParse) {
     if (isCancelled()) break;
     try {
-      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(item.fsPath));
-      readable.push({ path: item.fsPath, text: Buffer.from(bytes).toString('utf8'), stat: item.stat });
+      const bytes = await vscode.workspace.fs.readFile(item.uri);
+      readable.push({
+        resourceKey: item.resourceKey,
+        path: item.sourcePath,
+        text: Buffer.from(bytes).toString('utf8'),
+        stat: item.stat,
+      });
     } catch (e) {
       unreadable++; // file itself unreadable (permissions, race on delete, …)
     }
@@ -781,7 +855,7 @@ async function scanAndParse(progress, excludeGlobs, opts) {
       }
       for (let i = 0; i < readable.length; i++) {
         const item = readable[i];
-        fileCache.set(item.path, { mtimeMs: item.stat.mtime, size: item.stat.size, facts: facts[i] });
+        fileCache.set(item.resourceKey, { mtimeMs: item.stat.mtime, size: item.stat.size, facts: facts[i] });
         factsList.push(facts[i]);
         parsed++;
       }
@@ -800,7 +874,7 @@ async function scanAndParse(progress, excludeGlobs, opts) {
       };
       for (const item of readable) {
         const facts = parser.parseFile({ path: item.path, text: item.text }); // contract: never throws
-        fileCache.set(item.path, { mtimeMs: item.stat.mtime, size: item.stat.size, facts });
+        fileCache.set(item.resourceKey, { mtimeMs: item.stat.mtime, size: item.stat.size, facts });
         factsList.push(facts);
         parsed++;
         if (progress) {
@@ -818,13 +892,27 @@ async function scanAndParse(progress, excludeGlobs, opts) {
   // that point, and pruning against a partial snapshot could wrongly evict
   // still-live files this run simply never got to yet.
   if (!cancelled) {
-    for (const fsPath of [...fileCache.keys()]) {
-      if (!seen.has(fsPath)) fileCache.delete(fsPath);
+    for (const resourceKey of [...fileCache.keys()]) {
+      if (!seen.has(resourceKey)) fileCache.delete(resourceKey);
     }
     lastApexUriSet = new Set(seen); // H6: this sweep's own path set becomes the baseline the next dirty-set check reasons about
   }
 
-  return { factsList, parsed, cached, unreadable, total: uris.length, cancelled, sweepKind: 'full', timingMs, workerStats };
+  const applied = cancelled
+    ? { factsList, overlaid: 0 }
+    : editoroverlay.applyApexOverlays(factsList, seen, editorOverlays, parser.parseFile);
+  return {
+    factsList: applied.factsList,
+    parsed,
+    cached,
+    unreadable,
+    total: uris.length,
+    cancelled,
+    sweepKind: 'full',
+    timingMs,
+    workerStats,
+    overlaid: applied.overlaid,
+  };
 }
 
 // A7: workspace globs derived from the adv-org corpus's SFDX layout
@@ -850,18 +938,19 @@ const META_GLOBS = [
   '**/customMetadata/**/*.md-meta.xml',
 ];
 
-// v0.9 / P2: `excludeGlobs` folded into META_GLOB_EXCLUDE via
-// combineExcludePattern -- same apexCallGraph.excludeGlobs setting the Apex
-// scan above uses, so one setting covers both scans.
+// v0.9 / P2: apply the same apexCallGraph.excludeGlobs post-filter as the
+// Apex scan above, so one setting covers both scans and full/incremental
+// semantics remain identical even for literal commas or malformed patterns.
 async function scanMetaWorkspaceUris(excludeGlobs) {
-  const excludePattern = combineExcludePattern(META_GLOB_EXCLUDE, excludeGlobs);
-  const results = await Promise.all(META_GLOBS.map((g) => vscode.workspace.findFiles(g, excludePattern)));
+  const results = await Promise.all(META_GLOBS.map((g) => vscode.workspace.findFiles(g, META_GLOB_EXCLUDE)));
   const seen = new Set();
   const uris = [];
   for (const arr of results) {
     for (const uri of arr) {
-      if (seen.has(uri.fsPath)) continue;
-      seen.add(uri.fsPath);
+      if (isUserExcludedUri(uri, excludeGlobs)) continue;
+      const resourceKey = resourceKeyForUri(uri);
+      if (seen.has(resourceKey)) continue;
+      seen.add(resourceKey);
       uris.push(uri);
     }
   }
@@ -884,6 +973,7 @@ async function scanMetaFiles(progress, excludeGlobs, opts) {
   opts = opts || {};
   const token = opts.token || null;
   const dirtySnapshot = opts.dirtySnapshot || null;
+  const editorOverlays = opts.editorOverlays || null;
   const isCancelled = () => !!(token && token.isCancellationRequested);
 
   const useFullSweep = !dirtySnapshot || dirtySnapshot.fullSweepNeeded || !lastMetaUriSet;
@@ -891,73 +981,99 @@ async function scanMetaFiles(progress, excludeGlobs, opts) {
   if (!useFullSweep) {
     const dirtyMeta = new Set(
       [...dirtySnapshot.dirty].filter(
-        (p) =>
-          META_EXT_RE.test(p) &&
-          !APEX_EXT_RE.test(p) &&
-          !isHardExcludedPath(p) &&
-          !isUserExcludedPath(p, excludeGlobs)
+        (resourceKey) => {
+          const uri = resourceUriFromKey(resourceKey);
+          return !!(
+            uri &&
+            META_EXT_RE.test(uri.fsPath) &&
+            !APEX_EXT_RE.test(uri.fsPath) &&
+            !isHardExcludedPath(uri.fsPath) &&
+            !isUserExcludedUri(uri, excludeGlobs)
+          );
+        }
       )
     );
-    const deletedMeta = new Set([...dirtySnapshot.deleted].filter((p) => META_EXT_RE.test(p) && !APEX_EXT_RE.test(p)));
+    const deletedMeta = new Set(
+      [...dirtySnapshot.deleted].filter((resourceKey) => {
+        const uri = resourceUriFromKey(resourceKey);
+        return !!(uri && META_EXT_RE.test(uri.fsPath) && !APEX_EXT_RE.test(uri.fsPath));
+      })
+    );
 
     if (dirtyMeta.size === 0 && deletedMeta.size === 0) {
       const files = [];
-      for (const fsPath of lastMetaUriSet) {
-        const entry = metaFileCache.get(fsPath);
-        if (entry) files.push({ path: fsPath, text: entry.metaText });
+      for (const resourceKey of lastMetaUriSet) {
+        const entry = metaFileCache.get(resourceKey);
+        if (entry) files.push({ path: entry.sourcePath, text: entry.metaText });
       }
-      return { files, read: 0, cached: files.length, unreadable: 0, total: files.length, cancelled: false, sweepKind: 'skipped' };
+      const applied = editoroverlay.applyMetadataOverlays(files, lastMetaUriSet, editorOverlays);
+      return {
+        files: applied.files,
+        read: 0,
+        cached: files.length,
+        unreadable: 0,
+        total: files.length,
+        cancelled: false,
+        sweepKind: 'skipped',
+        overlaid: applied.overlaid,
+      };
     }
 
-    for (const fsPath of deletedMeta) {
-      metaFileCache.delete(fsPath);
-      lastMetaUriSet.delete(fsPath);
+    for (const resourceKey of deletedMeta) {
+      metaFileCache.delete(resourceKey);
+      lastMetaUriSet.delete(resourceKey);
     }
     let read = 0;
     let unreadable = 0;
-    for (const fsPath of dirtyMeta) {
+    for (const resourceKey of dirtyMeta) {
       if (isCancelled()) break;
-      const uri = vscode.Uri.file(fsPath);
+      const uri = resourceUriFromKey(resourceKey);
+      if (!uri || !vscode.workspace.getWorkspaceFolder(uri)) continue;
+      const sourcePath = sourcePathForUri(uri);
       let stat;
       try {
         stat = await vscode.workspace.fs.stat(uri);
       } catch (e) {
-        metaFileCache.delete(fsPath);
-        lastMetaUriSet.delete(fsPath);
+        metaFileCache.delete(resourceKey);
+        lastMetaUriSet.delete(resourceKey);
         continue;
       }
-      const entry = metaFileCache.get(fsPath);
-      if (entry && entry.mtimeMs === stat.mtime && entry.size === stat.size) {
-        lastMetaUriSet.add(fsPath);
+      const entry = metaFileCache.get(resourceKey);
+      // Same rule as dirty Apex: an explicit watcher event always wins over
+      // an unchanged mtime+size tuple.
+      if (scanflow.canReuseStatCache(entry, stat, scanflow.isExplicitlyDirty(dirtySnapshot, resourceKey))) {
+        lastMetaUriSet.add(resourceKey); // defensive; forceFresh currently makes this unreachable
         continue;
       }
       try {
         const bytes = await vscode.workspace.fs.readFile(uri);
         const text = Buffer.from(bytes).toString('utf8');
-        metaFileCache.set(fsPath, { mtimeMs: stat.mtime, size: stat.size, metaText: text });
-        lastMetaUriSet.add(fsPath);
+        metaFileCache.set(resourceKey, { mtimeMs: stat.mtime, size: stat.size, sourcePath, metaText: text });
+        lastMetaUriSet.add(resourceKey);
         read++;
       } catch (e) {
         unreadable++;
-        metaFileCache.delete(fsPath);
-        lastMetaUriSet.delete(fsPath);
+        metaFileCache.delete(resourceKey);
+        lastMetaUriSet.delete(resourceKey);
       }
       if (progress) progress.report({ message: `metadata: re-read ${read} changed file(s)…` });
     }
 
     const files = [];
-    for (const fsPath of lastMetaUriSet) {
-      const entry = metaFileCache.get(fsPath);
-      if (entry) files.push({ path: fsPath, text: entry.metaText });
+    for (const resourceKey of lastMetaUriSet) {
+      const entry = metaFileCache.get(resourceKey);
+      if (entry) files.push({ path: entry.sourcePath, text: entry.metaText });
     }
+    const applied = editoroverlay.applyMetadataOverlays(files, lastMetaUriSet, editorOverlays);
     return {
-      files,
+      files: applied.files,
       read,
       cached: files.length - read,
       unreadable,
       total: files.length,
       cancelled: isCancelled(),
       sweepKind: 'incremental',
+      overlaid: applied.overlaid,
     };
   }
 
@@ -970,8 +1086,9 @@ async function scanMetaFiles(progress, excludeGlobs, opts) {
 
   for (const uri of uris) {
     if (isCancelled()) break;
-    const fsPath = uri.fsPath;
-    seen.add(fsPath);
+    const resourceKey = resourceKeyForUri(uri);
+    const sourcePath = sourcePathForUri(uri);
+    seen.add(resourceKey);
     let stat;
     try {
       stat = await vscode.workspace.fs.stat(uri);
@@ -979,24 +1096,24 @@ async function scanMetaFiles(progress, excludeGlobs, opts) {
       unreadable++;
       continue;
     }
-    const entry = metaFileCache.get(fsPath);
+    const entry = metaFileCache.get(resourceKey);
     let text;
     // H6b: same mtimeMs+size tiebreak as scanAndParse's fileCache above.
-    if (entry && entry.mtimeMs === stat.mtime && entry.size === stat.size) {
+    if (scanflow.canReuseStatCache(entry, stat, scanflow.isExplicitlyDirty(dirtySnapshot, resourceKey))) {
       text = entry.metaText;
       cached++;
     } else {
       try {
         const bytes = await vscode.workspace.fs.readFile(uri);
         text = Buffer.from(bytes).toString('utf8');
-        metaFileCache.set(fsPath, { mtimeMs: stat.mtime, size: stat.size, metaText: text });
+        metaFileCache.set(resourceKey, { mtimeMs: stat.mtime, size: stat.size, sourcePath, metaText: text });
         read++;
       } catch (e) {
         unreadable++;
         continue;
       }
     }
-    files.push({ path: fsPath, text });
+    files.push({ path: sourcePath, text });
     if (progress) {
       progress.report({ message: `metadata: read ${read}, cached ${cached} of ${uris.length} file(s)…` });
     }
@@ -1004,36 +1121,45 @@ async function scanMetaFiles(progress, excludeGlobs, opts) {
 
   const cancelled = isCancelled();
   if (!cancelled) {
-    for (const fsPath of [...metaFileCache.keys()]) {
-      if (!seen.has(fsPath)) metaFileCache.delete(fsPath);
+    for (const resourceKey of [...metaFileCache.keys()]) {
+      if (!seen.has(resourceKey)) metaFileCache.delete(resourceKey);
     }
     lastMetaUriSet = new Set(seen);
   }
 
-  return { files, read, cached, unreadable, total: uris.length, cancelled, sweepKind: 'full' };
+  const applied = cancelled
+    ? { files, overlaid: 0 }
+    : editoroverlay.applyMetadataOverlays(files, seen, editorOverlays);
+  return {
+    files: applied.files,
+    read,
+    cached,
+    unreadable,
+    total: uris.length,
+    cancelled,
+    sweepKind: 'full',
+    overlaid: applied.overlaid,
+  };
 }
 
 // =========================================================================
-// F6: disk-persisted facts cache (cachestore.js does the pure
+// F6/v0.15: disk-persisted clean Apex-facts cache (cachestore.js does the pure
 // serialize/deserialize; everything here is the vscode-side I/O plumbing:
 // where the cache files live, when they get written, and hydrating the
-// in-memory fileCache/metaFileCache from them at activation).
+// in-memory fileCache at activation). Metadata source is memory-only.
 // =========================================================================
 
 // Stable short id for "this workspace" so multiple different projects
 // sharing the same context.globalStorageUri never collide on one cache
 // file, and the SAME project's cache file is found again across sessions.
 // Multi-root workspaces are folded into one id (sorted, joined folder
-// paths) since fileCache/metaFileCache are themselves workspace-wide, not
-// per-folder -- "one file per workspace-folder-path hash" per the task
-// brief, using the full folder SET as the hashed key.
+// URIs) since fileCache/metaFileCache are themselves workspace-wide, not
+// per-folder. Scheme + authority are part of the hash, preventing same-path
+// remote workspaces from sharing a persisted cache file.
 function workspaceCacheKey() {
   const folders = vscode.workspace.workspaceFolders;
   if (!folders || !folders.length) return null;
-  const joined = folders
-    .map((f) => f.uri.fsPath)
-    .sort()
-    .join('|');
+  const joined = workspacepaths.workspaceSetIdentity(folders);
   return crypto.createHash('sha1').update(joined).digest('hex').slice(0, 16);
 }
 
@@ -1044,9 +1170,15 @@ function cacheUris(context) {
   const key = workspaceCacheKey();
   if (!key) return null;
   return {
-    facts: vscode.Uri.joinPath(context.globalStorageUri, `facts-${key}.json`),
-    meta: vscode.Uri.joinPath(context.globalStorageUri, `meta-${key}.json`),
+    facts: vscode.Uri.joinPath(context.globalStorageUri, `facts-v${ENGINE_CACHE_VERSION}-${key}.json`),
   };
+}
+
+async function cleanupCacheFiles(context, opts) {
+  return cachefiles.cleanupCacheFiles(vscode.workspace.fs, vscode.Uri, context.globalStorageUri, {
+    ...(opts || {}),
+    retentionMs: CACHE_RETENTION_MS,
+  });
 }
 
 // Reads one cache file (if present) and merges its entries into targetMap.
@@ -1070,35 +1202,60 @@ async function hydrateOneCache(uri, targetMap, dataKey) {
   restored.forEach((value, fsPath) => targetMap.set(fsPath, value));
 }
 
-// Called once from activate(), before the first scan -- hydrates
-// fileCache/metaFileCache from the last session's persisted cache (if any)
-// so a cold VS Code restart over an unchanged workspace still only has to
-// stat files on its first trace, not re-read/re-parse everything.
+// Called once from activate(), before the first scan -- removes legacy raw-
+// source caches, expires old safe facts, then hydrates clean Apex facts from
+// the last session (if any). Metadata is intentionally reread after restart.
 async function hydrateCaches(context) {
+  // Remove source-bearing pre-v9 facts/meta caches and expire old safe facts
+  // before considering hydration. Metadata text is memory-only; v9 also
+  // excludes successful-parse source fragments and literal values.
+  const cleanup = await cleanupCacheFiles(context);
   const uris = cacheUris(context);
-  if (!uris) return;
+  if (!uris) return cleanup;
   await hydrateOneCache(uris.facts, fileCache, 'facts');
-  await hydrateOneCache(uris.meta, metaFileCache, 'metaText');
+  return cleanup;
 }
 
 async function persistCachesNow(context) {
   const uris = cacheUris(context);
   if (!uris) return;
-  await vscode.workspace.fs.createDirectory(context.globalStorageUri);
-  const factsText = cachestore.serialize({
-    engineVersion: ENGINE_CACHE_VERSION,
-    entries: cachestore.mapToEntries(fileCache, 'facts'),
+  await cachefiles.persistSafeFactsCache(
+    vscode.workspace.fs,
+    context.globalStorageUri,
+    uris.facts,
+    ENGINE_CACHE_VERSION,
+    fileCache
+  );
+}
+
+function resetMemoryCaches() {
+  fileCache.clear();
+  metaFileCache.clear();
+  lastApexUriSet = null;
+  lastMetaUriSet = null;
+  dirtyTracker.markFullSweepNeeded();
+}
+
+function clearCaches(context) {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = null;
+  pendingPersistContext = null;
+  pendingPersistEpoch = null;
+
+  // reset() increments the epoch synchronously. Clear immediately for the
+  // command's in-memory semantics, then clear once more after all older
+  // scans/writes have drained before deleting their possible disk output.
+  const reset = cacheCoordinator.reset(async () => {
+    resetMemoryCaches();
+    return cleanupCacheFiles(context, { clearAll: true });
   });
-  const metaText = cachestore.serialize({
-    engineVersion: ENGINE_CACHE_VERSION,
-    entries: cachestore.mapToEntries(metaFileCache, 'metaText'),
-  });
-  if (factsText) await vscode.workspace.fs.writeFile(uris.facts, Buffer.from(factsText, 'utf8'));
-  if (metaText) await vscode.workspace.fs.writeFile(uris.meta, Buffer.from(metaText, 'utf8'));
+  resetMemoryCaches();
+  return reset;
 }
 
 let persistTimer = null;
 let pendingPersistContext = null; // set alongside persistTimer, read by deactivate()'s flush below
+let pendingPersistEpoch = null;
 
 // Debounced disk write, scheduled after every scan (see computeTrace below).
 // A failed write is swallowed -- the in-memory caches are still correct for
@@ -1108,10 +1265,13 @@ let pendingPersistContext = null; // set alongside persistTimer, read by deactiv
 function schedulePersistCaches(context) {
   if (persistTimer) clearTimeout(persistTimer);
   pendingPersistContext = context;
+  pendingPersistEpoch = cacheCoordinator.currentEpoch();
   persistTimer = setTimeout(() => {
+    const epoch = pendingPersistEpoch;
     persistTimer = null;
     pendingPersistContext = null;
-    persistCachesNow(context).catch(() => {});
+    pendingPersistEpoch = null;
+    cacheCoordinator.enqueuePersist(epoch, () => persistCachesNow(context)).catch(() => {});
   }, PERSIST_DEBOUNCE_MS);
 }
 
@@ -1302,7 +1462,7 @@ async function discoverPackageMap() {
     // Strip the trailing 'sfdx-project.json' filename (whichever separator
     // precedes it) to get the project root, keeping its trailing separator
     // so `projectRoot + relPath` concatenates cleanly below.
-    const projectRoot = uri.fsPath.replace(/[^\\/]*$/, '');
+    const projectRoot = sourcePathForUri(uri).replace(/[^\\/]*$/, '');
 
     for (const dir of dirs) {
       if (!dir || typeof dir.path !== 'string' || !dir.path.trim()) continue;
@@ -1482,7 +1642,7 @@ async function resolveTarget(index, direction, targetContext) {
     const range = editor.document.getWordRangeAtPosition(position);
     if (range) word = editor.document.getText(range);
     cursorLineText = editor.document.lineAt(position.line).text;
-    fileName = editor.document.fileName;
+    fileName = sourcePathForUri(editor.document.uri) || editor.document.fileName;
     documentText = editor.document.getText();
   }
   const wordLower = word ? word.toLowerCase() : null;
@@ -1549,7 +1709,11 @@ async function resolveImpactReport(index, target, targetContext) {
     : editor
       ? editor.selection.active
       : null;
-  const activeFileName = targetContext ? targetContext.fileName : editor ? editor.document.fileName : null;
+  const activeFileName = targetContext
+    ? targetContext.fileName
+    : editor
+      ? (sourcePathForUri(editor.document.uri) || editor.document.fileName)
+      : null;
   const cm = index && index.classes instanceof Map ? index.classes.get(target.classLower) : null;
   if (activeFileName && position && cm && cm.path) {
     const activePath = String(activeFileName).replace(/\\/g, '/').toLowerCase();
@@ -1715,14 +1879,23 @@ async function activate(context) {
   const entryCatalogView = vscode.window.createTreeView('apexTraceEntriesView', { treeDataProvider: entryCatalogProvider });
   context.subscriptions.push(entryCatalogView);
 
-  // F6: hydrate fileCache/metaFileCache from the previous session's
-  // persisted cache before any command can run, so the very first trace in
-  // a fresh VS Code window over an unchanged workspace only has to stat
-  // files instead of re-reading/re-parsing everything. Best-effort: a
-  // missing/corrupt/version-mismatched cache file degrades to "start cold",
-  // never blocks activation on an error.
+  // F6/v0.15: delete source-bearing legacy caches and hydrate only clean Apex
+  // facts before commands can run. Metadata source remains memory-only.
+  // Best-effort: missing/corrupt/version-mismatched cache files degrade to a
+  // cold scan and never block activation.
   try {
-    await hydrateCaches(context);
+    const cleanup = await hydrateCaches(context);
+    if (cleanup && cleanup.inspectionFailed) {
+      vscode.window.showWarningMessage(
+        'Apex Call Graph: could not inspect persisted cache storage; legacy cache cleanup may be incomplete. ' +
+          'Use “Apex Call Graph: Clear Cache” to retry.'
+      );
+    } else if (cleanup && cleanup.failed > 0) {
+      vscode.window.showWarningMessage(
+        `Apex Call Graph: could not remove ${cleanup.failed} expired or legacy cache file(s). ` +
+          'Use “Apex Call Graph: Clear Cache” to retry.'
+      );
+    }
   } catch (e) {
     // never let a cache-hydration failure prevent the extension from activating
   }
@@ -1761,7 +1934,7 @@ async function activate(context) {
     };
     return {
       position,
-      fileName: editor.document.fileName,
+      fileName: sourcePathForUri(editor.document.uri) || editor.document.fileName,
       word: range ? editor.document.getText(range) : null,
       cursorLineText: editor.document.lineAt(position.line).text,
       documentText: editor.document.getText(),
@@ -1792,8 +1965,8 @@ async function activate(context) {
       .join(', ');
     scanStatsChannel.appendLine(
       `[${new Date().toISOString()}] sweep=${stats.sweepKind} ` +
-        `files(apex ${f.apexParsed}/${f.apexCached}/${f.apexTotal} parsed/cached/total, unreadable ${f.apexUnreadable}; ` +
-        `meta ${f.metaRead}/${f.metaCached}/${f.metaTotal}) ` +
+        `files(apex ${f.apexParsed}/${f.apexCached}/${f.apexTotal} parsed/cached/total, overlaid ${f.apexOverlaid || 0}, unreadable ${f.apexUnreadable}; ` +
+        `meta ${f.metaRead}/${f.metaCached}/${f.metaTotal}, overlaid ${f.metaOverlaid || 0}) ` +
         `workers(used=${w.usedPool}, size=${w.poolSize}, chunks=${w.chunksTotal}, viaWorker=${w.chunksViaWorker}, inlineFallback=${w.chunksInlineFallback}, cancelled=${w.chunksCancelled || 0}, errors=${w.workerErrors}) ` +
         `ms(glob=${t.glob}, stat=${t.stat}, parse=${t.parse}, metascan=${t.metascan}, index=${t.index}, tree=${t.tree}) ` +
         `unresolvedByReason(${reasonParts || 'none'}) ` +
@@ -1833,9 +2006,9 @@ async function activate(context) {
           dirtyTracker.markFullSweepNeeded();
         }
       };
-      watcher.onDidChange((uri) => safely(() => dirtyTracker.markChanged(uri.fsPath)));
-      watcher.onDidCreate((uri) => safely(() => dirtyTracker.markCreated(uri.fsPath)));
-      watcher.onDidDelete((uri) => safely(() => dirtyTracker.markDeleted(uri.fsPath)));
+      watcher.onDidChange((uri) => safely(() => dirtyTracker.markChanged(resourceKeyForUri(uri))));
+      watcher.onDidCreate((uri) => safely(() => dirtyTracker.markCreated(resourceKeyForUri(uri))));
+      watcher.onDidDelete((uri) => safely(() => dirtyTracker.markDeleted(resourceKeyForUri(uri))));
     }
   } catch (e) {
     // Watcher setup itself failed (e.g. an exotic/virtual filesystem that
@@ -1844,6 +2017,20 @@ async function activate(context) {
     // back to a full sweep instead.
     dirtyTracker.markWatcherUnavailable();
   }
+
+  // A save makes document.isDirty false immediately, while filesystem
+  // watcher delivery may lag behind the next trace command. Mark the saved
+  // source path synchronously so that trace cannot reuse pre-save disk facts
+  // during that gap. DirtyTracker's generation guard preserves saves that
+  // arrive while a scan is already in flight.
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument(
+      editoroverlay.createDidSaveHandler(
+        (resourceKey) => dirtyTracker.markChanged(resourceKey),
+        (document) => !!vscode.workspace.getWorkspaceFolder(document.uri)
+      )
+    )
+  );
 
   // A workspace-folder add/remove changes the universe searched by
   // findFiles without guaranteeing any per-file watcher event. Invalidate
@@ -1965,6 +2152,17 @@ async function activate(context) {
   // this run accounted for (never a path that arrived mid-scan -- see
   // consume()'s own header for why that's deliberate).
   async function scanAndBuildIndex() {
+    // A cache reset is a barrier: scans requested while it is draining old
+    // work wait here and therefore start from the deliberately empty maps.
+    const operation = await cacheCoordinator.beginOperationAfterReset();
+    try {
+      return await scanAndBuildIndexForEpoch(operation.epoch);
+    } finally {
+      operation.end();
+    }
+  }
+
+  async function scanAndBuildIndexForEpoch(scanCacheEpoch) {
     // v0.9 / P2: read the 5 apexCallGraph.* settings ONCE at the top of
     // this scan+index call -- excludeGlobs feeds both scans below;
     // initialDepth/expandStep/maxDepth/maxNodes ride along on the returned
@@ -1972,11 +2170,15 @@ async function activate(context) {
     // scan itself used (a rare mid-scan settings edit can't produce a
     // mismatched exclude-vs-depth result within one trace operation).
     const settings = readSettings();
+    // Snapshot every dirty file-backed editor once per scan. The resulting
+    // raw text is passed only to ephemeral overlay helpers; fileCache and
+    // metaFileCache remain disk-truth caches and persistence never sees it.
+    const editorOverlays = editoroverlay.captureDirtyDocumentOverlays(vscode.workspace.textDocuments);
     // The last path inventory was built under a different exclusion policy.
     // A clean watcher set cannot describe which previously-included paths
     // must now disappear (or which previously-excluded paths must appear),
     // so the next successful scan must rebuild the inventory from findFiles.
-    if (excludeTracker.requiresFullSweep(settings.excludeGlobs)) {
+    if (excludeTracker.requiresFullSweep(settings.excludeMatcher)) {
       dirtyTracker.markFullSweepNeeded();
     }
     const dirtySnapshot = dirtyTracker.peek();
@@ -1987,7 +2189,7 @@ async function activate(context) {
     const result = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: 'Apex Call Graph: indexing workspace…', cancellable: true },
       async (progress, token) => {
-        const scan = await scanAndParse(progress, settings.excludeGlobs, { token, dirtySnapshot });
+        const scan = await scanAndParse(progress, settings.excludeMatcher, { token, dirtySnapshot, editorOverlays });
         phaseMs.glob += scan.timingMs ? scan.timingMs.glob : 0;
         phaseMs.stat += scan.timingMs ? scan.timingMs.stat : 0;
         phaseMs.parse += scan.timingMs ? scan.timingMs.parse : 0;
@@ -2025,7 +2227,7 @@ async function activate(context) {
         let metaScan = { files: [], read: 0, cached: 0, unreadable: 0, total: 0, cancelled: false, sweepKind: 'full' };
         try {
           const tMeta0 = Date.now();
-          metaScan = await scanMetaFiles(progress, settings.excludeGlobs, { token, dirtySnapshot });
+          metaScan = await scanMetaFiles(progress, settings.excludeMatcher, { token, dirtySnapshot, editorOverlays });
           metaRefs = computeMetaRefs(metaScan.files);
           flowFilePaths = metaScan.files
             .filter((f) => f && typeof f.path === 'string' && /\.flow-meta\.xml$/i.test(f.path))
@@ -2082,6 +2284,14 @@ async function activate(context) {
       }
     );
 
+    // Clear Cache may have run while filesystem/parser work was awaiting.
+    // Discard the old index and clear anything that scan repopulated; never
+    // consume watcher state, schedule persistence, or render this result.
+    if (!cacheCoordinator.isCurrent(scanCacheEpoch)) {
+      resetMemoryCaches();
+      return null;
+    }
+
     if (result.cancelled) {
       // H4: "already-parsed facts stay cached, no partial index/tree is
       // rendered" -- return before ANY resolver.js call; the caller
@@ -2104,7 +2314,7 @@ async function activate(context) {
     // being wrongly marked "handled".
     dirtyTracker.consume(dirtySnapshot);
     if (sweepKind === 'full') dirtyTracker.markSweepDone(dirtySnapshot);
-    excludeTracker.commit(settings.excludeGlobs);
+    excludeTracker.commit(settings.excludeMatcher);
 
     // F6: persist the just-updated fileCache/metaFileCache to disk
     // (debounced) regardless of what happens below -- the parse/read work
@@ -2134,10 +2344,12 @@ async function activate(context) {
         apexParsed: scan.parsed,
         apexCached: scan.cached,
         apexUnreadable: scan.unreadable,
+        apexOverlaid: scan.overlaid || 0,
         metaTotal: (metaScan && metaScan.total) || 0,
         metaRead: (metaScan && metaScan.read) || 0,
         metaCached: (metaScan && metaScan.cached) || 0,
         metaUnreadable: (metaScan && metaScan.unreadable) || 0,
+        metaOverlaid: (metaScan && metaScan.overlaid) || 0,
       },
       sweepKind,
       workers: workerStats || { usedPool: false, poolSize: 0, chunksTotal: 0, chunksViaWorker: 0, chunksInlineFallback: 0, chunksCancelled: 0, workerErrors: 0 },
@@ -2151,7 +2363,7 @@ async function activate(context) {
     lastRunStats = stats;
     logRunStats(stats);
 
-    return { index, scan, settings, stats };
+    return { index, scan, settings, stats, cacheEpoch: scanCacheEpoch };
   }
 
   // Builds the tree for a KNOWN target against an already-built index, and
@@ -2210,7 +2422,11 @@ async function activate(context) {
   // is re-logged to the Scan Stats channel/lastRunStats, since tree-building
   // is the one phase that happens AFTER scanAndBuildIndex already returned
   // (target resolution -- an interactive QuickPick -- sits in between).
-  function traceTarget(index, scan, target, direction, settings, stats) {
+  function traceTarget(index, scan, target, direction, settings, stats, expectedCacheEpoch) {
+    // Target/overload QuickPicks may outlive a cache clear even though their
+    // scan has already finished. Do not let that pre-clear index reappear in
+    // the tree, diagnostics state, or Path Map afterwards.
+    if (!cacheCoordinator.isCurrent(expectedCacheEpoch)) return null;
     const dir = direction === 'callees' ? 'callees' : 'callers';
     const traceId = newTraceState();
     const tTree0 = Date.now();
@@ -2270,7 +2486,7 @@ async function activate(context) {
     }
     const target = await resolveTarget(built.index, direction, targetContext);
     if (!target) return null;
-    return traceTarget(built.index, built.scan, target, direction, built.settings, built.stats);
+    return traceTarget(built.index, built.scan, target, direction, built.settings, built.stats, built.cacheEpoch);
   }
 
   // H6a: re-runs scanAndParse + rebuilds the index/tree for the last
@@ -2290,7 +2506,15 @@ async function activate(context) {
       showScanCancelledMessage();
       return null;
     }
-    return traceTarget(built.index, built.scan, lastTarget, direction || lastDirection, built.settings, built.stats);
+    return traceTarget(
+      built.index,
+      built.scan,
+      lastTarget,
+      direction || lastDirection,
+      built.settings,
+      built.stats,
+      built.cacheEpoch
+    );
   }
 
   // Round 2.5 / H4: one shared toast for every command that discovers its
@@ -2353,7 +2577,9 @@ async function activate(context) {
           // pathmap.js is vscode-agnostic and sends 1-based lines
           const line = Math.max(0, (msg.line || 1) - 1);
           const col = Math.max(0, msg.col || 0);
-          vscode.window.showTextDocument(vscode.Uri.file(msg.path), {
+          const resourceUri = resourceUriForSourcePath(msg.path);
+          if (!resourceUri) return;
+          vscode.window.showTextDocument(resourceUri, {
             selection: new vscode.Range(line, col, line, col),
             viewColumn: vscode.ViewColumn.One,
           });
@@ -2452,7 +2678,15 @@ async function activate(context) {
             showScanCancelledMessage();
             return null;
           }
-          return traceTarget(built.index, built.scan, item._entryTarget, 'callees', built.settings, built.stats);
+          return traceTarget(
+            built.index,
+            built.scan,
+            item._entryTarget,
+            'callees',
+            built.settings,
+            built.stats,
+            built.cacheEpoch
+          );
         });
         if (result && result.superseded) return; // a newer request replaced this one -- nothing to render
         if (result) await vscode.commands.executeCommand('apexTraceView.focus');
@@ -2477,6 +2711,7 @@ async function activate(context) {
           return null;
         }
         const target = await resolveTarget(built.index, 'impact', targetContext);
+        if (!cacheCoordinator.isCurrent(built.cacheEpoch)) return null;
         if (!target) return null;
         if (!target.methodLower) {
           vscode.window.showWarningMessage('Apex Call Graph: Impact Analysis requires a method, not a whole class.');
@@ -2485,6 +2720,7 @@ async function activate(context) {
 
         const tImpact0 = Date.now();
         const report = await resolveImpactReport(built.index, target, targetContext);
+        if (!cacheCoordinator.isCurrent(built.cacheEpoch)) return null;
         built.stats.timingMs.tree += Date.now() - tImpact0;
         lastRunStats = built.stats;
         logRunStats(built.stats);
@@ -2659,6 +2895,50 @@ async function activate(context) {
           ? 'Apex Call Graph: copied diagnostics (counts only) to the clipboard.'
           : 'Apex Call Graph: copied diagnostics (counts only, no scan has run yet this session) to the clipboard.'
       );
+    }),
+    vscode.commands.registerCommand('apexTrace.clearCache', async () => {
+      // Invalidate first (synchronously inside clearCaches), then remove every
+      // closure/UI reference to the prior index while older scan/write work
+      // drains behind the reset barrier.
+      const clearing = clearCaches(context);
+      lastTarget = null;
+      lastDirection = 'callers';
+      lastRender = null;
+      lastRunStats = null;
+      const traceId = newTraceState();
+      provider.setRoots([], traceId);
+      entryCatalogProvider.setRoots([]);
+      view.description = undefined;
+      view.message = undefined;
+      entryCatalogView.description = undefined;
+      entryCatalogView.message = undefined;
+      if (mapPanel) {
+        const panel = mapPanel;
+        mapPanel = null;
+        panel.dispose();
+      }
+      await Promise.all([
+        vscode.commands.executeCommand('setContext', 'apexTrace.hasResults', false),
+        vscode.commands.executeCommand('setContext', 'apexTrace.direction', 'callers'),
+        vscode.commands.executeCommand('setContext', 'apexTrace.mode', 'trace'),
+      ]);
+
+      const cleanup = await clearing;
+      if (cleanup && cleanup.inspectionFailed) {
+        vscode.window.showWarningMessage(
+          'Apex Call Graph: cleared memory, but could not inspect persisted cache storage. ' +
+            'Disk cleanup could not be confirmed; run Clear Cache again to retry.'
+        );
+      } else if (cleanup && cleanup.failed > 0) {
+        vscode.window.showWarningMessage(
+          `Apex Call Graph: cleared memory, but could not remove ${cleanup.failed} persisted cache file(s). ` +
+            'The next trace will still perform a full scan; run Clear Cache again to retry disk cleanup.'
+        );
+      } else {
+        vscode.window.showInformationMessage(
+          'Apex Call Graph: cleared in-memory and persisted caches. The next trace will perform a full scan.'
+        );
+      }
     })
   );
 }
@@ -2673,9 +2953,11 @@ function deactivate() {
   clearTimeout(persistTimer);
   persistTimer = null;
   const context = pendingPersistContext;
+  const epoch = pendingPersistEpoch;
   pendingPersistContext = null;
-  if (!context) return undefined;
-  return persistCachesNow(context).catch(() => {});
+  pendingPersistEpoch = null;
+  if (!context || epoch == null) return undefined;
+  return cacheCoordinator.enqueuePersist(epoch, () => persistCachesNow(context)).catch(() => {});
 }
 
 module.exports = { activate, deactivate };

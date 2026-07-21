@@ -10,6 +10,8 @@ const {
   interactiveRequestKey,
   createDirtyTracker,
   createWorkspaceFolderChangeHandler,
+  canReuseStatCache,
+  isExplicitlyDirty,
   normalizeExcludeGlobs,
   matchesExcludeGlobs,
   excludeGlobsFingerprint,
@@ -344,6 +346,70 @@ async function run() {
       () => createWorkspaceFolderChangeHandler(null),
       /invalidation callback/,
       'invalid wiring fails during activation instead of silently skipping invalidation'
+    );
+  }
+
+  // --- watcher-dirty paths bypass even an identical mtime+size tuple ------
+  {
+    const entry = { mtimeMs: 5000, size: 128, facts: { name: 'Cached' } };
+    const identicalStat = { mtime: 5000, size: 128 };
+    assert.strictEqual(
+      canReuseStatCache(entry, identicalStat, false),
+      true,
+      'an ordinary full sweep may reuse an entry whose mtime and size both match'
+    );
+    assert.strictEqual(
+      canReuseStatCache(entry, identicalStat, true),
+      false,
+      'an explicit watcher-dirty path is always reread even when mtime and size are unchanged'
+    );
+    assert.strictEqual(
+      canReuseStatCache({ mtimeMs: 5000, size: 127 }, identicalStat, false),
+      false,
+      'a size mismatch still invalidates an ordinary full-sweep cache entry'
+    );
+    assert.strictEqual(
+      canReuseStatCache({ mtimeMs: 4999, size: 128 }, identicalStat, false),
+      false,
+      'an mtime mismatch still invalidates an ordinary full-sweep cache entry'
+    );
+    assert.strictEqual(canReuseStatCache(null, identicalStat, false), false);
+    assert.strictEqual(canReuseStatCache(entry, null, false), false);
+
+    // The policy is deliberately payload-agnostic: metadata cache entries
+    // carry metaText instead of facts, but receive exactly the same freshness
+    // decision in extension.js.
+    const metaEntry = { mtimeMs: 5000, size: 128, metaText: '<Flow />' };
+    assert.strictEqual(canReuseStatCache(metaEntry, identicalStat, true), false);
+
+    const fullSweepWithDirtyPath = {
+      fullSweepNeeded: true,
+      dirty: new Set(['/ws/A.cls', '/ws/lwc/panel/panel.js']),
+      deleted: new Set(),
+    };
+    assert.strictEqual(
+      isExplicitlyDirty(fullSweepWithDirtyPath, '/ws/A.cls'),
+      true,
+      'a full-sweep invalidation does not erase the Apex path that was explicitly watcher-dirty'
+    );
+    assert.strictEqual(
+      canReuseStatCache(entry, identicalStat, isExplicitlyDirty(fullSweepWithDirtyPath, '/ws/A.cls')),
+      false,
+      'a watcher-dirty Apex path bypasses identical stats even when another event also forced a full sweep'
+    );
+    assert.strictEqual(
+      canReuseStatCache(
+        metaEntry,
+        identicalStat,
+        isExplicitlyDirty(fullSweepWithDirtyPath, '/ws/lwc/panel/panel.js')
+      ),
+      false,
+      'a watcher-dirty metadata path bypasses identical stats during a forced full sweep too'
+    );
+    assert.strictEqual(
+      canReuseStatCache(entry, identicalStat, isExplicitlyDirty(fullSweepWithDirtyPath, '/ws/Unchanged.cls')),
+      true,
+      'non-dirty files in the same full sweep retain the normal mtime+size cache optimization'
     );
   }
 

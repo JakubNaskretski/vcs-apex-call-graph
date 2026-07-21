@@ -3,7 +3,18 @@
 // Pure data-in/data-out — no vscode, no fs. Every assertion here works
 // against serialize()/deserialize()/mapToEntries()/entriesToMap() directly.
 const assert = require('assert');
-const { serialize, deserialize, mapToEntries, entriesToMap } = require('./cachestore');
+const parser = require('./parser');
+const {
+  serialize,
+  deserialize,
+  mapToEntries,
+  entriesToMap,
+  safeFactsEntries,
+  containsSourceFragments,
+  serializeSafeFactsCache,
+  cacheFileKind,
+  shouldDeleteCacheFile,
+} = require('./cachestore');
 
 // This local constant is independent test scaffolding, decoupled from
 // extension.js's real ENGINE_CACHE_VERSION (which extension.js owns and
@@ -35,19 +46,6 @@ const ENGINE_VERSION = 4;
   assert.ok(text.length > 0);
   const roundtripped = deserialize(text, ENGINE_VERSION);
   assert.deepStrictEqual(roundtripped, payload, 'facts payload (incl. size) round-trips exactly');
-}
-
-// 2. Round-trip with metaText-shaped entries (the metadata-cache shape).
-{
-  const payload = {
-    engineVersion: ENGINE_VERSION,
-    entries: [
-      { fsPath: '/ws/lwc/acmeOrderDashboard/acmeOrderDashboard.js', mtimeMs: 42, size: 128, metaText: "import x from '@salesforce/apex/A.b';" },
-    ],
-  };
-  const text = serialize(payload);
-  const roundtripped = deserialize(text, ENGINE_VERSION);
-  assert.deepStrictEqual(roundtripped, payload);
 }
 
 // 3. Empty entries array round-trips to an empty array, not null/undefined.
@@ -210,7 +208,7 @@ const ENGINE_VERSION = 4;
 // mapToEntries / entriesToMap — the Map<->array plumbing extension.js uses
 // ===========================================================================
 
-// 15. mapToEntries basic shape + key selection (facts vs metaText).
+// 15. mapToEntries basic facts shape.
 // H6(b): value objects now carry `size`, and it must survive into the entry.
 {
   const fileCache = new Map();
@@ -221,11 +219,6 @@ const ENGINE_VERSION = 4;
   const byPath = Object.fromEntries(entries.map((e) => [e.fsPath, e]));
   assert.deepStrictEqual(byPath['/ws/A.cls'], { fsPath: '/ws/A.cls', mtimeMs: 10, size: 100, facts: { name: 'A' } });
   assert.deepStrictEqual(byPath['/ws/B.cls'], { fsPath: '/ws/B.cls', mtimeMs: 20, size: 200, facts: { name: 'B' } });
-
-  const metaCache = new Map();
-  metaCache.set('/ws/x.js', { mtimeMs: 5, size: 42, metaText: 'source text' });
-  const metaEntries = mapToEntries(metaCache, 'metaText');
-  assert.deepStrictEqual(metaEntries, [{ fsPath: '/ws/x.js', mtimeMs: 5, size: 42, metaText: 'source text' }]);
 }
 
 // 16. mapToEntries tolerates missing/malformed input, including H6(b)'s new
@@ -242,7 +235,7 @@ const ENGINE_VERSION = 4;
   mixed.set('/ws/NoSize.cls', { mtimeMs: 1, facts: {} }); // no size -- skipped
   mixed.set('/ws/BadSize.cls', { mtimeMs: 1, size: 'ten', facts: {} }); // non-numeric size -- skipped
   mixed.set('/ws/NegativeSize.cls', { mtimeMs: 1, size: -5, facts: {} }); // negative size -- skipped
-  mixed.set('/ws/WrongKey.cls', { mtimeMs: 1, size: 10, metaText: 'x' }); // asking for 'facts' -- skipped
+  mixed.set('/ws/WrongKey.cls', { mtimeMs: 1, size: 10, other: 'x' }); // asking for 'facts' -- skipped
   mixed.set('/ws/NullValue.cls', null); // skipped, never throws
   assert.doesNotThrow(() => mapToEntries(mixed, 'facts'));
   const entries = mapToEntries(mixed, 'facts');
@@ -355,6 +348,89 @@ const ENGINE_VERSION = 4;
   assert.deepStrictEqual(deserialize(text, 6), payload);
   assert.strictEqual(deserialize(text, 5), null, 'a v6-authored cache must not hydrate under a v5 (or any other) expectation');
   assert.strictEqual(deserialize(text, 7), null, 'nor under a v7 expectation -- strict equality, not >=');
+}
+
+// 23. Source-bearing facts are never eligible for persistence, including a
+// successful parse whose nested calls/literals contain raw source slices.
+{
+  const cache = new Map();
+  cache.set('/ws/Clean.cls', {
+    mtimeMs: 1,
+    size: 20,
+    facts: { path: '/ws/Clean.cls', parseError: null, types: [] },
+  });
+  cache.set('/ws/Broken.cls', {
+    mtimeMs: 2,
+    size: 21,
+    facts: { path: '/ws/Broken.cls', parseError: 'unexpected token', text: 'PRIVATE_SOURCE_SENTINEL' },
+  });
+  cache.set('/ws/UnexpectedText.cls', {
+    mtimeMs: 3,
+    size: 22,
+    facts: { path: '/ws/UnexpectedText.cls', parseError: null, text: 'FUTURE_RAW_TEXT_SENTINEL' },
+  });
+  const successfulSource =
+    "public class ParsedFixture { public static final String VALUE = 'CACHE_VALUE_SENTINEL'; " +
+    "public static void run() { Other.call('CACHE_ARG_SENTINEL'); } }";
+  const successfulFacts = parser.parseFile({ path: '/ws/ParsedFixture.cls', text: successfulSource });
+  assert.strictEqual(successfulFacts.parseError, null);
+  assert.strictEqual(containsSourceFragments(successfulFacts), true);
+  cache.set('/ws/ParsedFixture.cls', {
+    mtimeMs: 4,
+    size: Buffer.byteLength(successfulSource),
+    facts: successfulFacts,
+  });
+  const entries = safeFactsEntries(cache);
+  assert.deepStrictEqual(entries.map((entry) => entry.fsPath), ['/ws/Clean.cls']);
+  const serialized = serializeSafeFactsCache(9, cache);
+  assert.ok(!serialized.includes('PRIVATE_SOURCE_SENTINEL'));
+  assert.ok(!serialized.includes('FUTURE_RAW_TEXT_SENTINEL'));
+  assert.ok(!serialized.includes('CACHE_VALUE_SENTINEL'));
+  assert.ok(!serialized.includes('CACHE_ARG_SENTINEL'));
+  assert.ok(!serialized.includes('Other.call'));
+  assert.deepStrictEqual(deserialize(serialized, 9).entries, entries);
+}
+
+// 24. Cache cleanup recognizes only extension-owned cache filenames.
+{
+  const nowMs = 10_000;
+  const retentionMs = 1_000;
+  assert.strictEqual(cacheFileKind('facts-0123456789abcdef.json'), 'legacy');
+  assert.strictEqual(cacheFileKind('meta-0123456789abcdef.json'), 'legacy');
+  assert.strictEqual(cacheFileKind('facts-v8-0123456789abcdef.json'), 'legacy');
+  assert.strictEqual(cacheFileKind('facts-v9-0123456789abcdef.json'), 'facts');
+  assert.strictEqual(cacheFileKind('facts-v8-not-a-hash.json'), null);
+  assert.strictEqual(cacheFileKind('unrelated.json'), null);
+  assert.strictEqual(
+    shouldDeleteCacheFile('facts-0123456789abcdef.json', { nowMs, retentionMs, mtimeMs: nowMs }),
+    true,
+    'legacy source-bearing caches are removed regardless of age'
+  );
+  assert.strictEqual(
+    shouldDeleteCacheFile('facts-v8-0123456789abcdef.json', { nowMs, retentionMs, mtimeMs: 9_999 }),
+    true,
+    'pre-v9 versioned caches may contain successful-parse source and are always removed'
+  );
+  assert.strictEqual(
+    shouldDeleteCacheFile('facts-v9-0123456789abcdef.json', { nowMs, retentionMs, mtimeMs: 8_999 }),
+    true,
+    'safe facts caches older than the retention window expire'
+  );
+  assert.strictEqual(
+    shouldDeleteCacheFile('facts-v9-0123456789abcdef.json', { nowMs, retentionMs, mtimeMs: 9_001 }),
+    false,
+    'recent safe facts caches remain available'
+  );
+  assert.strictEqual(
+    shouldDeleteCacheFile('facts-v9-0123456789abcdef.json', { clearAll: true }),
+    true,
+    'clear-all removes current safe cache files too'
+  );
+  assert.strictEqual(
+    shouldDeleteCacheFile('unrelated.json', { clearAll: true }),
+    false,
+    'clear-all never touches unrelated global-storage files'
+  );
 }
 
 console.log('apex-trace cachestore self-check: all assertions passed');

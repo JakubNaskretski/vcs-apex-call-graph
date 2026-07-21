@@ -6,15 +6,14 @@
 // live filesystem; this module only knows how to turn an in-memory cache Map
 // into a JSON-safe string and back, defensively.
 //
-// Contract (frozen for this file):
+// Persistence contract:
 //
 //   CachePayload = { engineVersion: number, entries: [CacheEntry] }
 //   CacheEntry   = { fsPath: string, mtimeMs: number, size: number, facts: <FileFacts> }
-//                | { fsPath: string, mtimeMs: number, size: number, metaText: string }
-//     -- exactly one data key (`facts` or `metaText`, or whatever name the
-//        caller picks via `dataKey` below) is present per entry; this module
-//        never inspects that value's internal shape, it round-trips it
-//        through JSON verbatim.
+//     -- only declaration-only Apex FileFacts with no verbatim expression,
+//        source-line, or literal-value fields may cross the live disk-write
+//        boundary. Metadata source, parse-error Apex source, and successful
+//        facts containing source fragments remain memory-only.
 //     -- H6(b): `size` (the file's byte length, i.e. Node `fs.Stats.size`)
 //        is now a REQUIRED sibling of `mtimeMs` on every entry, exactly as
 //        strictly validated as `mtimeMs` is. extension.js (out of scope
@@ -50,10 +49,11 @@
 //     silently dropped rather than invalidating the whole file — one bad
 //     row shouldn't cost every other file its cache hit.
 //
-//   mapToEntries(map, dataKey) -> [CacheEntry]
+//   mapToEntries(map, dataKey) -> [plain entry]
 //     map: Map<fsPath, { mtimeMs, size, [dataKey]: value }> (extension.js's
-//     in-memory fileCache/metaFileCache shape) -> a plain array safe to drop
-//     straight into CachePayload.entries. Tolerates a missing/non-Map `map`
+//     in-memory cache shape) -> a plain array. This generic conversion helper
+//     is retained for defensive load/migration tests; it is NOT a safe disk-
+//     persistence boundary by itself. Tolerates a missing/non-Map `map`
 //     (returns []) and skips any entry missing fsPath/mtimeMs/size/dataKey
 //     (size must additionally be finite and non-negative).
 //
@@ -159,4 +159,91 @@ function entriesToMap(entries, dataKey) {
   return map;
 }
 
-module.exports = { serialize, deserialize, mapToEntries, entriesToMap };
+// These fields are source-faithful slices or literal values, even on a
+// successful parse. Do not recursively delete them and hydrate an incomplete
+// FileFacts object: resolver.js consumes them for overload, DML, dynamic-flow,
+// and UI behavior. Instead fail closed and omit the entire file from the disk
+// cache; the next session reparses it normally.
+const SOURCE_FRAGMENT_FACT_KEYS = new Set([
+  'text',
+  'lineText',
+  'argTexts',
+  'receiver',
+  'targetText',
+  'literal',
+]);
+
+function containsSourceFragments(value, seen) {
+  if (value === null || typeof value !== 'object') return false;
+  seen = seen || new Set();
+  if (seen.has(value)) return true; // unexpected cycles fail closed
+  seen.add(value);
+  for (const [key, child] of Object.entries(value)) {
+    if (SOURCE_FRAGMENT_FACT_KEYS.has(key)) return true;
+    if (containsSourceFragments(child, seen)) return true;
+  }
+  seen.delete(value);
+  return false;
+}
+
+// Only clean, declaration-only derived facts are eligible for persistence.
+// Parse-error facts always carry raw `text`; successful facts with calls,
+// DML, throws, or literal-flow evidence carry one of the guarded fields
+// above. Whole-entry omission preserves correctness and confidentiality.
+function safeFactsEntries(map) {
+  return mapToEntries(map, 'facts').filter((entry) => {
+    const facts = entry.facts;
+    return isPlainObject(facts) && !facts.parseError && !containsSourceFragments(facts);
+  });
+}
+
+// The production serializer: callers cannot supply arbitrary entries or a
+// data-key name, so raw metadata text and parse-error source cannot be
+// accidentally included by using the generic helpers incorrectly.
+function serializeSafeFactsCache(engineVersion, map) {
+  return serialize({ engineVersion, entries: safeFactsEntries(map) });
+}
+
+const LEGACY_CACHE_FILE_RE = /^(?:facts|meta)-[0-9a-f]{16}\.json$/;
+const VERSIONED_FACTS_CACHE_FILE_RE = /^facts-v(\d+)-[0-9a-f]{16}\.json$/;
+const FIRST_SOURCE_FRAGMENT_SAFE_VERSION = 9;
+
+function cacheFileKind(name) {
+  if (typeof name !== 'string') return null;
+  if (LEGACY_CACHE_FILE_RE.test(name)) return 'legacy';
+  const versioned = VERSIONED_FACTS_CACHE_FILE_RE.exec(name);
+  if (versioned) {
+    return Number(versioned[1]) >= FIRST_SOURCE_FRAGMENT_SAFE_VERSION ? 'facts' : 'legacy';
+  }
+  return null;
+}
+
+// Pure retention policy used by extension.js's global-storage cleanup.
+// Legacy files are always removed because old facts files may contain raw
+// parse-error source and old metadata files always contain raw metadata text.
+function shouldDeleteCacheFile(name, opts) {
+  opts = opts || {};
+  const kind = cacheFileKind(name);
+  if (!kind) return false;
+  if (opts.clearAll) return true;
+  if (kind === 'legacy') return true;
+  const mtimeMs = Number(opts.mtimeMs);
+  const nowMs = Number(opts.nowMs);
+  const retentionMs = Number(opts.retentionMs);
+  if (!Number.isFinite(mtimeMs) || !Number.isFinite(nowMs) || !Number.isFinite(retentionMs) || retentionMs < 0) {
+    return false;
+  }
+  return nowMs - mtimeMs > retentionMs;
+}
+
+module.exports = {
+  serialize,
+  deserialize,
+  mapToEntries,
+  entriesToMap,
+  safeFactsEntries,
+  containsSourceFragments,
+  serializeSafeFactsCache,
+  cacheFileKind,
+  shouldDeleteCacheFile,
+};

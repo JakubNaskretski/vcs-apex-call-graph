@@ -245,7 +245,7 @@ Tune it in **Settings → Extensions → Apex Call Graph**:
 | `apexCallGraph.expandStep` | `1` | How many extra levels one click loads. |
 | `apexCallGraph.maxDepth` | `8` | Hard ceiling on trace depth, however far you click. |
 | `apexCallGraph.maxNodes` | `2000` | Fair cap on total nodes a single trace will materialize. |
-| `apexCallGraph.excludeGlobs` | `[]` | Extra glob patterns to exclude from workspace scanning, appended to the built-in excludes (`node_modules`, `.sfdx`, `.sf`, `.git`). |
+| `apexCallGraph.excludeGlobs` | `[]` | Up to 64 extra workspace-relative glob patterns to exclude from full and incremental scanning. Supports `*`, `?`, segment `**`, braces, and character classes; a directory match excludes its descendants. Pattern length and combined brace/token work are bounded so hostile or accidental settings cannot stall a scan. Built-in excludes remain `node_modules`, `.sfdx`, `.sf`, `.git`, and `__tests__`. |
 | `apexCallGraph.showUnconfirmed` | `rollup` | Group approximate edges under a collapsed rollup; choose `hide` for confirmed-only or `expand` for the old flat view. |
 
 Setting `initialDepth` equal to `maxDepth` (with nothing ever clicked) reproduces the
@@ -502,10 +502,23 @@ leaves the last good tree untouched. Repeated requests are single-flighted: an
 identical request joins the scan already running, while a newer different target is
 coalesced to the latest request.
 
-The cache itself — derived parse facts, not your source (files with a syntax error are
-the one exception: their raw text is echoed back for the lexical fallback scanner) —
-is written to VS Code's global storage as `facts-<hash>.json`/`meta-<hash>.json`, one
-pair per workspace-folder set; deleting them just forces a cold re-parse next run.
+Dirty file-backed editors are snapshotted at the start of every scan. Unsaved
+Apex changes participate in parsing and resolution, and unsaved LWC, Aura, Flow,
+OmniScript, Visualforce, and Custom Metadata changes participate in metadata
+edges. These overlays are ephemeral: they never replace the disk-truth in-memory
+cache and are never written to global storage. Saving, reverting, or closing the
+editor therefore makes the next trace fall back to the corresponding disk file.
+
+Only declaration-only Apex facts that contain no source lines, argument/receiver
+expressions, DML targets, or literal values are persisted to VS Code's global
+storage, in a versioned `facts-v<engine>-<hash>.json` file per workspace-folder set.
+Files containing those fields (and every syntax-error file) remain memory-only and
+are reparsed after restart rather than writing partial facts that could change graph
+semantics. LWC, Aura, Flow, OmniScript, Visualforce and Custom Metadata source also
+stays memory-only. Legacy source-bearing cache files are removed automatically, and
+safe facts caches expire after 30 days. Run **Apex
+Call Graph: Clear Cache** at any time to remove both in-memory and persisted caches;
+the next trace simply performs a cold scan.
 For performance troubleshooting, open **Apex Call Graph: Scan Stats** or run **Copy
 Diagnostics (counts only)**. The copied JSON contains counts, timings, worker usage,
 resolution-reason totals, and the active display mode — never paths, source text,
@@ -522,6 +535,7 @@ symbols, or call arguments.
 | `Apex Call Graph: Show Path Map` | Editor context menu, view title button, command palette |
 | `Apex Call Graph: Show Entry Points` | Entry Points view title button, view welcome link, command palette |
 | `Apex Call Graph: Copy Diagnostics (counts only)` | Command palette |
+| `Apex Call Graph: Clear Cache` | Command palette |
 
 ## Reference: how edges are resolved
 

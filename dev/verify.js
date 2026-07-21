@@ -19,6 +19,9 @@ const env = {
 const checks = [
   ['build', 'npm', ['run', 'build']],
   ['cache store', process.execPath, ['test-cachestore.js']],
+  ['cache lifecycle', process.execPath, ['test-cachefiles.js']],
+  ['cache concurrency', process.execPath, ['test-cachecoordinator.js']],
+  ['unsaved editor overlay', process.execPath, ['test-editoroverlay.js']],
   ['parser', process.execPath, ['test-parser.js']],
   ['metadata scan', process.execPath, ['test-metascan.js']],
   ['target selection', process.execPath, ['test-targets.js']],
@@ -26,6 +29,8 @@ const checks = [
   ['UI shaping', process.execPath, ['test-uitree.js']],
   ['path map', process.execPath, ['test-pathmap.js']],
   ['scan coordination', process.execPath, ['test-scanflow.js']],
+  ['glob parity', process.execPath, ['test-globparity.js']],
+  ['workspace path schemes', process.execPath, ['test-workspacepaths.js']],
   ['worker pool', process.execPath, ['test-workerpool.js']],
   ['end-to-end', process.execPath, ['test.js']],
   ['ground truth', process.execPath, ['dev/ground-truth-check.js']],

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.15.0
+
+Safer, fresher traces while you edit.
+
+- Unsaved Apex and supported metadata changes now participate in traces without
+  being persisted.
+- File changes reliably invalidate cached facts, including identical timestamp and
+  size edge cases.
+- Persisted caches exclude source fragments and literal values, with atomic clearing
+  and automatic cleanup of older source-bearing cache formats.
+- Full and incremental exclude-glob behavior now matches, with bounded processing
+  and correct navigation across local, remote, and virtual workspaces.
+
 ## 0.14.0
 
 Understand the blast radius before changing an Apex method signature.

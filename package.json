@@ -2,7 +2,7 @@
   "name": "apex-call-graph",
   "displayName": "Apex Call Graph",
   "description": "Trace callers and callees of Apex methods, inspect arguments, and assess signature-change impact across Apex, Flow, LWC, Aura and Visualforce. Offline static analysis: real Apex parser, no org connection, no language server.",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "publisher": "Skrety",
   "license": "MIT",
   "icon": "plugin-icon.png",
@@ -74,6 +74,11 @@
       {
         "command": "apexTrace.copyDiagnostics",
         "title": "Copy Diagnostics (counts only)",
+        "category": "Apex Call Graph"
+      },
+      {
+        "command": "apexTrace.clearCache",
+        "title": "Clear Cache",
         "category": "Apex Call Graph"
       }
     ],
@@ -187,11 +192,13 @@
         },
         "apexCallGraph.excludeGlobs": {
           "type": "array",
+          "maxItems": 64,
           "items": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 2048
           },
           "default": [],
-          "description": "Extra glob patterns to exclude from workspace scanning, appended to the built-in excludes (node_modules, .sfdx, .sf, .git)."
+          "description": "Up to 64 extra workspace-relative glob patterns to exclude identically from full and incremental scanning. Supports *, ?, segment **, braces, and character classes; a directory match excludes its descendants. Combined expansion work is bounded for responsiveness."
         },
         "apexCallGraph.showUnconfirmed": {
           "type": "string",

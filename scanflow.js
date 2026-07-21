@@ -260,94 +260,361 @@ function createWorkspaceFolderChangeHandler(invalidate) {
   };
 }
 
+// A watcher event is stronger evidence than an unchanged stat tuple. Some
+// filesystems and editor save strategies can replace content without changing
+// either the reported mtime or byte size, so an explicitly dirty path must
+// never reuse cached content. Full sweeps still use the cheap mtime+size match.
+// Keeping this policy pure and shared prevents the Apex and metadata scanners
+// from drifting apart.
+function canReuseStatCache(entry, stat, forceFresh) {
+  if (forceFresh) return false;
+  return !!(
+    entry &&
+    stat &&
+    entry.mtimeMs === stat.mtime &&
+    entry.size === stat.size
+  );
+}
+
+function isExplicitlyDirty(snapshot, fsPath) {
+  return !!(
+    snapshot &&
+    snapshot.dirty instanceof Set &&
+    typeof fsPath === 'string' &&
+    snapshot.dirty.has(fsPath)
+  );
+}
+
 // =========================================================================
 // H6 hardening: user exclude-glob matching + settings invalidation
 // =========================================================================
 
+const MAX_EXCLUDE_GLOB_INPUTS = 128;
+const MAX_EXCLUDE_GLOBS = 64;
+const MAX_EXCLUDE_GLOB_BYTES = 32 * 1024;
+const MAX_GLOB_PATTERN_LENGTH = 2048;
+const MAX_GLOB_EXPANSIONS = 256;
+const MAX_GLOB_COMPILED_TOKENS = 4096;
+const MAX_EXCLUDE_ALTERNATIVES = 256;
+const MAX_EXCLUDE_COMPILED_TOKENS = 4096;
+const MAX_GLOB_CANDIDATE_LENGTH = 8192;
+const MAX_GLOB_MATCH_CELLS = 1_000_000;
+
 function normalizeExcludeGlobs(globs) {
   if (!Array.isArray(globs)) return [];
-  return Array.from(
-    new Set(
-      globs
-        .filter((glob) => typeof glob === 'string')
-        .map((glob) => glob.trim().replace(/\\/g, '/').replace(/^\.\//, ''))
-        .filter(Boolean)
-    )
-  ).sort();
+  const unique = new Set();
+  let totalBytes = 0;
+  const inspected = Math.min(globs.length, MAX_EXCLUDE_GLOB_INPUTS);
+  for (let i = 0; i < inspected && unique.size < MAX_EXCLUDE_GLOBS; i++) {
+    if (typeof globs[i] !== 'string') continue;
+    const glob = globs[i].trim().replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!glob || glob.length > MAX_GLOB_PATTERN_LENGTH || unique.has(glob)) continue;
+    const bytes = Buffer.byteLength(glob, 'utf8');
+    if (totalBytes + bytes > MAX_EXCLUDE_GLOB_BYTES) break;
+    unique.add(glob);
+    totalBytes += bytes;
+  }
+  return [...unique].sort();
+}
+
+function splitBraceChoices(content) {
+  const choices = [];
+  let start = 0;
+  let inClass = false;
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === '[') inClass = true;
+    else if (ch === ']' && inClass) inClass = false;
+    else if (ch === ',' && !inClass) {
+      choices.push(content.slice(start, i));
+      start = i + 1;
+    }
+  }
+  choices.push(content.slice(start));
+  return choices;
+}
+
+// Finds an innermost brace first. Expanding inside-out supports nested and
+// repeated groups without the old "first } wins" ambiguity.
+function findExpandableBrace(pattern) {
+  const stack = [];
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === '[') {
+      inClass = true;
+      continue;
+    }
+    if (ch === ']' && inClass) {
+      inClass = false;
+      continue;
+    }
+    if (inClass) continue;
+    if (ch === '{') stack.push(i);
+    else if (ch === '}' && stack.length) {
+      const open = stack.pop();
+      const choices = splitBraceChoices(pattern.slice(open + 1, i));
+      if (choices.length > 1) return { open, close: i, choices };
+    }
+  }
+  return null;
 }
 
 function expandGlobBraces(pattern) {
-  const open = pattern.indexOf('{');
-  if (open === -1) return [pattern];
-  const close = pattern.indexOf('}', open + 1);
-  if (close === -1) return [pattern];
-  const choices = pattern.slice(open + 1, close).split(',');
-  if (choices.length < 2) return [pattern];
-  const prefix = pattern.slice(0, open);
-  const suffix = pattern.slice(close + 1);
-  return choices.flatMap((choice) => expandGlobBraces(prefix + choice + suffix));
+  const pending = [pattern];
+  const expanded = [];
+  while (pending.length) {
+    const current = pending.pop();
+    const brace = findExpandableBrace(current);
+    if (!brace) {
+      expanded.push(current);
+      if (expanded.length > MAX_GLOB_EXPANSIONS) return [];
+      continue;
+    }
+    if (pending.length + expanded.length + brace.choices.length > MAX_GLOB_EXPANSIONS) return [];
+    const prefix = current.slice(0, brace.open);
+    const suffix = current.slice(brace.close + 1);
+    for (let i = brace.choices.length - 1; i >= 0; i--) {
+      pending.push(prefix + brace.choices[i] + suffix);
+    }
+  }
+  return expanded;
 }
 
-function globToRegExp(glob) {
-  let source = '^';
+const MAX_GLOB_TOKENS = 2048;
+
+function parseClassToken(body) {
+  let negated = false;
+  if (body[0] === '!') {
+    negated = true;
+    body = body.slice(1);
+  }
+  if (!body) return null;
+  const parts = [];
+  for (let i = 0; i < body.length; i++) {
+    if (i + 2 < body.length && body[i + 1] === '-') {
+      const from = body.charCodeAt(i);
+      const to = body.charCodeAt(i + 2);
+      if (from > to) return null;
+      parts.push({ from, to });
+      i += 2;
+    } else {
+      const code = body.charCodeAt(i);
+      parts.push({ from: code, to: code });
+    }
+  }
+  return { type: 'class', negated, parts };
+}
+
+// Compile to simple wildcard tokens, not a regular expression. Matching is
+// dynamic-programming and therefore O(pattern * path), even for adversarial
+// star-heavy settings that cause catastrophic regex backtracking.
+function tokenizeGlob(glob) {
+  if (!glob || glob.length > MAX_GLOB_PATTERN_LENGTH) return null;
+  const tokens = [];
+  let literal = '';
+  const flushLiteral = () => {
+    if (!literal) return;
+    tokens.push({ type: 'literal', value: literal });
+    literal = '';
+  };
+
   for (let i = 0; i < glob.length; i++) {
     const ch = glob[i];
     if (ch === '*') {
-      if (glob[i + 1] === '*') {
-        i++;
-        if (glob[i + 1] === '/') {
-          i++;
-          source += '(?:[^/]+/)*';
-        } else {
-          source += '.*';
-        }
+      flushLiteral();
+      let end = i + 1;
+      while (glob[end] === '*') end++;
+      const isSegmentGlobstar =
+        end - i >= 2 &&
+        (i === 0 || glob[i - 1] === '/') &&
+        (end === glob.length || glob[end] === '/');
+      if (isSegmentGlobstar && glob[end] === '/') {
+        tokens.push({ type: 'globstar-slash' });
+        end++;
+      } else if (isSegmentGlobstar) {
+        tokens.push({ type: 'globstar' });
       } else {
-        source += '[^/]*';
+        tokens.push({ type: 'star' });
       }
-      continue;
-    }
-    if (ch === '?') {
-      source += '[^/]';
-      continue;
-    }
-    if (ch === '[') {
-      const close = glob.indexOf(']', i + 1);
-      if (close !== -1) {
-        let body = glob.slice(i + 1, close);
-        if (body[0] === '!') body = '^' + body.slice(1);
-        source += '[' + body.replace(/\\/g, '\\\\') + ']';
-        i = close;
+      i = end - 1;
+    } else if (ch === '?') {
+      flushLiteral();
+      tokens.push({ type: 'question' });
+    } else if (ch === '[') {
+      let searchFrom = i + 1;
+      if (glob[searchFrom] === '!') searchFrom++;
+      if (glob[searchFrom] === ']') searchFrom++;
+      const close = glob.indexOf(']', searchFrom);
+      if (close === -1) {
+        literal += ch;
         continue;
       }
+      const classToken = parseClassToken(glob.slice(i + 1, close));
+      if (!classToken) return null;
+      flushLiteral();
+      tokens.push(classToken);
+      i = close;
+    } else {
+      literal += ch;
     }
-    source += /[\\^$.*+?()[\]{}|]/.test(ch) ? '\\' + ch : ch;
+    if (tokens.length > MAX_GLOB_TOKENS) return null;
   }
-  return new RegExp(source + '$');
+  flushLiteral();
+  return tokens.length <= MAX_GLOB_TOKENS ? tokens : null;
+}
+
+function classTokenMatches(token, ch) {
+  if (!ch || ch === '/') return false;
+  const code = ch.charCodeAt(0);
+  const included = token.parts.some((part) => code >= part.from && code <= part.to);
+  return token.negated ? !included : included;
+}
+
+function compiledTokenWeight(tokens) {
+  return tokens.reduce(
+    (sum, token) => sum + (token.type === 'class' ? Math.max(1, token.parts.length) : 1),
+    0
+  );
+}
+
+function matchCompiledGlob(tokens, candidate) {
+  const length = candidate.length;
+  let current = new Uint8Array(length + 1);
+  current[0] = 1;
+
+  for (const token of tokens) {
+    const next = new Uint8Array(length + 1);
+    if (token.type === 'literal') {
+      const literalLength = token.value.length;
+      for (let i = 0; i + literalLength <= length; i++) {
+        if (current[i] && candidate.startsWith(token.value, i)) next[i + literalLength] = 1;
+      }
+    } else if (token.type === 'question' || token.type === 'class') {
+      for (let i = 0; i < length; i++) {
+        if (!current[i]) continue;
+        const matches = token.type === 'question'
+          ? candidate[i] !== '/'
+          : classTokenMatches(token, candidate[i]);
+        if (matches) next[i + 1] = 1;
+      }
+    } else if (token.type === 'star' || token.type === 'globstar') {
+      for (let i = 0; i <= length; i++) {
+        if (current[i]) next[i] = 1; // zero characters
+        if (i > 0 && next[i - 1] && (token.type === 'globstar' || candidate[i - 1] !== '/')) next[i] = 1;
+      }
+    } else if (token.type === 'globstar-slash') {
+      let priorStart = false;
+      for (let i = 0; i <= length; i++) {
+        if (current[i]) next[i] = 1; // zero complete segments
+        if (i > 0 && priorStart && candidate[i - 1] === '/') next[i] = 1;
+        if (current[i]) priorStart = true;
+      }
+    }
+    current = next;
+  }
+  return current[length] === 1;
+}
+
+function compileExcludeGlob(glob) {
+  if (typeof glob !== 'string' || !glob) return [];
+  const expanded = expandGlobBraces(glob);
+  if (!expanded.length) return [];
+  const compiled = [];
+  let compiledTokens = 0;
+  try {
+    for (const pattern of expanded) {
+      const tokens = tokenizeGlob(pattern);
+      if (!tokens) return [];
+      compiledTokens += compiledTokenWeight(tokens);
+      if (compiledTokens > MAX_GLOB_COMPILED_TOKENS) return [];
+      compiled.push(tokens);
+    }
+  } catch (_) {
+    return [];
+  }
+  return compiled;
+}
+
+// Compile and budget the complete settings snapshot once. `patterns` is the
+// only representation the hot per-file matcher consumes, so pattern count,
+// input bytes, brace alternatives, and total DP tokens are bounded together
+// rather than multiplying independently across every workspace file.
+function compileExcludeGlobs(globs) {
+  const normalized = normalizeExcludeGlobs(globs);
+  const patterns = [];
+  const accepted = [];
+  let alternatives = 0;
+  let tokensTotal = 0;
+  for (const glob of normalized) {
+    const compiled = compileExcludeGlob(glob);
+    if (!compiled.length) continue;
+    const nextAlternatives = alternatives + compiled.length;
+    const tokenCount = compiled.reduce((sum, tokens) => sum + compiledTokenWeight(tokens), 0);
+    if (
+      nextAlternatives > MAX_EXCLUDE_ALTERNATIVES ||
+      tokensTotal + tokenCount > MAX_EXCLUDE_COMPILED_TOKENS
+    ) {
+      continue;
+    }
+    accepted.push(glob);
+    patterns.push(...compiled);
+    alternatives = nextAlternatives;
+    tokensTotal += tokenCount;
+  }
+  return Object.freeze({
+    globs: Object.freeze(accepted),
+    patterns: Object.freeze(patterns),
+    fingerprint: JSON.stringify(accepted),
+    alternatives,
+    tokensTotal,
+  });
+}
+
+function validExcludeGlobs(globs) {
+  return [...compileExcludeGlobs(globs).globs];
 }
 
 // `relativePath` must be relative to the containing workspace folder, which
 // mirrors how vscode.workspace.findFiles evaluates string glob patterns.
-function matchesExcludeGlobs(relativePath, globs) {
+function matchesExcludeGlobs(relativePath, globsOrCompiled) {
   if (typeof relativePath !== 'string') return false;
   const candidate = relativePath.replace(/\\/g, '/').replace(/^\.\//, '');
-  if (!candidate || candidate === '..' || candidate.startsWith('../')) return false;
-  for (const glob of normalizeExcludeGlobs(globs)) {
-    for (const expanded of expandGlobBraces(glob)) {
-      try {
-        if (globToRegExp(expanded).test(candidate)) return true;
-      } catch (_) {
-        // A hand-edited malformed setting must not break all incremental
-        // scans. vscode's full-scan matcher remains the authority for that
-        // pattern; the settings fingerprint still forces a full sweep when
-        // it changes.
-      }
+  if (
+    !candidate ||
+    candidate.length > MAX_GLOB_CANDIDATE_LENGTH ||
+    candidate === '..' ||
+    candidate.startsWith('../')
+  ) return false;
+
+  // A full VS Code search prunes a directory when the exclusion matches that
+  // directory, so every descendant is excluded too. Test the file and each
+  // ancestor to give watcher-only incremental scans the same behavior.
+  const candidates = [candidate];
+  for (let i = candidate.indexOf('/'); i !== -1; i = candidate.indexOf('/', i + 1)) {
+    if (i > 0) candidates.push(candidate.slice(0, i));
+  }
+  const compiledSet =
+    globsOrCompiled && Array.isArray(globsOrCompiled.patterns)
+      ? globsOrCompiled
+      : compileExcludeGlobs(globsOrCompiled);
+  let remainingCells = MAX_GLOB_MATCH_CELLS;
+  for (const compiled of compiledSet.patterns) {
+    for (const value of candidates) {
+      const cells = Math.max(1, compiledTokenWeight(compiled)) * (value.length + 1);
+      if (cells > remainingCells) return false;
+      remainingCells -= cells;
+      if (matchCompiledGlob(compiled, value)) return true;
     }
   }
   return false;
 }
 
 function excludeGlobsFingerprint(globs) {
-  return JSON.stringify(normalizeExcludeGlobs(globs));
+  if (globs && typeof globs.fingerprint === 'string' && Array.isArray(globs.patterns)) {
+    return globs.fingerprint;
+  }
+  return compileExcludeGlobs(globs).fingerprint;
 }
 
 function createExcludeTracker() {
@@ -567,7 +834,12 @@ module.exports = {
   interactiveRequestKey,
   createDirtyTracker,
   createWorkspaceFolderChangeHandler,
+  canReuseStatCache,
+  isExplicitlyDirty,
   normalizeExcludeGlobs,
+  compileExcludeGlob,
+  compileExcludeGlobs,
+  validExcludeGlobs,
   matchesExcludeGlobs,
   excludeGlobsFingerprint,
   createExcludeTracker,
