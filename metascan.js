@@ -1,21 +1,22 @@
 'use strict';
-// Metadata-caller scanner — amendment A5. Pure data-in/data-out: no vscode,
+// Metadata-caller scanner. Pure data-in/data-out: no vscode,
 // no fs, no dependency on parser.js or resolver.js. Extracts "someone calls
 // an Apex class/method from non-Apex metadata" facts from LWC, Aura, Flow,
-// OmniScript, and Visualforce source text, so resolver.js (amendment A6,
-// out of scope here) can attach them to the call-graph as terminal callers.
+// OmniScript, Visualforce, permission-set, and profile source text, so
+// resolver.js can attach runtime metadata callers and class-access metadata.
 //
-// Contract (frozen for this file):
+// Public data shape:
 //
 //   parseMetaFile({path, text}) -> [MetaRef]
-//   MetaRef = { kind:'lwc'|'aura'|'flow'|'omniscript'|'vf'|'cmdt', label,
+//   MetaRef = { kind:'lwc'|'aura'|'flow'|'omniscript'|'vf'|'cmdt'|
+//               'permissionset'|'profile', label,
 //               className, methodName:string|null, line, lineText }
-//   (v0.10, A2: a 'vf' ref may ALSO be the method-level action-binding shape
+//   (a 'vf' ref may ALSO be the method-level action-binding shape
 //   -- className:null plus controllerClass/extensionClasses -- see below.)
 //
 //   scanBundle(files) -> [MetaRef]      // files: [{path, text}]
 //
-//   stripOwnNamespace(refs, ownNamespace) -> [MetaRef]   // v0.8, N3 -- see below
+//   stripOwnNamespace(refs, ownNamespace) -> [MetaRef]   // see below
 //
 // v0.4 (F1b/F4b) additions to the MetaRef shape, both purely additive (every
 // pre-existing field/kind keeps its exact v0.3 meaning):
@@ -39,7 +40,7 @@
 //     'cmdt', label, className: <the value text>, methodName: null, line,
 //     lineText, fieldName: <the sibling <field> text, or null> }.
 //
-// v0.5 (G1) addition to the MetaRef 'flow' shape, purely additive (the two
+// Additive fields on the MetaRef 'flow' shape (the two
 // v0.4 fields above keep their exact meaning -- flowRecordTriggerType stays
 // null for a platform-event flow, since a real <start> block for one never
 // carries a <recordTriggerType> element at all):
@@ -58,13 +59,13 @@
 //     consumer (resolver.js, out of scope here) this is the platform-event
 //     shape rather than a record-triggered flow with a missing
 //     <recordTriggerType> (both leave flowRecordTriggerType null, but only
-//     one sets flowTriggerType to 'PlatformEvent'). Per the G1(b) spec, a
+//     one sets flowTriggerType to 'PlatformEvent'). A
 //     platform-event-triggered flow node's children are the EventBus.publish
 //     sites on that object -- the same shape v0.4's record-triggered
 //     flowObject/flowRecordTriggerType pair uses for DML children, just a
 //     different child-materialization rule on the resolver side.
 //
-// v0.7.1 (M1, gauntlet-round namespace fix) addition to the MetaRef 'lwc'
+// v0.7.1 namespace handling for the MetaRef 'lwc'
 // shape, purely additive (className/methodName keep their exact pre-existing
 // meaning -- still the bare last-two dot-segments of the specifier):
 //
@@ -85,15 +86,15 @@
 //     index (see the header contract above: no dependency on parser.js or
 //     resolver.js) and never attaches anything itself. It only preserves the
 //     namespace signal faithfully so a downstream consumer -- resolver.js's
-//     attachMetaCallers(), out of scope here -- can gate on it per the M2
+//     attachMetaCallers(), out of scope here -- can gate on it
 //     fix: a non-null namespace means this ref names a method that belongs
 //     to a namespace the LOCAL (unmanaged, no-namespace) workspace does not
 //     own, so it must never be re-pointed at a local class purely because
-//     the bare tail segments happen to match (VALIDATION-REPORT.md Tier-1
-//     #1: `@salesforce/apex/zenq.KappaGateway.dispatch` previously collapsed
-//     onto local `KappaGateway.dispatch`, `via=metadata`, zero gating).
+//     the bare tail segments happen to match. For example,
+//     `@salesforce/apex/zenq.KappaGateway.dispatch` must not collapse onto
+//     local `KappaGateway.dispatch`.
 //
-// v0.8 (N1(c)/N3, namespace/managed-package modeling) additions -- this
+// Namespace and managed-package modeling -- this
 // file's half of the contract only; resolver.js owns attachMetaCallers()
 // routing namespaced refs to external nodes, out of scope here. metascan
 // still has zero knowledge of/dependency on the local workspace's class
@@ -128,10 +129,8 @@
 //     form here folds every segment before the trailing SINGLE class segment
 //     into `namespace`, not the trailing pair): `ns.Class` dotted first, then
 //     the `ns__Class` double-underscore form if there's no dot. Deliberately
-//     NOT extended to the OmniScript/IP DataPack *.json `remoteClass` surface
-//     in this amendment (out of stated scope for N1(c) here; flagged as a
-//     follow-up rather than a silent inconsistency) -- extractOmniscriptJson()
-//     is unchanged, byte-identical to pre-v0.8.
+//     NOT extended to the OmniScript/IP DataPack *.json `remoteClass` surface;
+//     extractOmniscriptJson() remains unchanged.
 //   - New exported pure function `stripOwnNamespace(refs, ownNamespace)`
 //     (N3's metascan-side stripping hook): given an array of MetaRef (as
 //     returned by parseMetaFile()/scanBundle()) and the workspace's own
@@ -147,14 +146,14 @@
 //     text for every kind that carries a `namespace` field, so once
 //     `namespace` is nulled the ref reads exactly like an ordinary local
 //     reference always would have. Refs with no `namespace` field at all
-//     (aura/vf, or a ref this amendment doesn't touch) pass through
+//     (aura/vf, or another unaffected ref) pass through
 //     unchanged (same object, not even copied). This function does NOT run
 //     automatically inside parseMetaFile()/scanBundle() -- like `packageOf`,
 //     it is opts-time plumbing the extension is expected to call explicitly
 //     (see the caller's own `opts.ownNamespace`, out of scope here) AFTER
 //     scanning and BEFORE handing refs to resolver.js's attachMetaCallers().
 //
-// v0.10 (Round A, A2) addition -- Visualforce ACTION-binding extraction.
+// Visualforce ACTION-binding extraction.
 // Purely additive: the pre-existing class-level 'vf' shape
 // ({kind:'vf', className:<ControllerOrExtension>, methodName:null}) is
 // completely unchanged, byte-for-byte. New: a SECOND 'vf' shape, one per
@@ -188,12 +187,11 @@
 //     `{!obj.method}` (dotted -- an instance/property-qualified reference)
 //     and any other non-identifier shape (`{!a && b}`, `{!IF(x,y,z)}`, an
 //     empty `{!}`) are deliberately SKIPPED: no MetaRef is emitted for that
-//     attribute at all. Hard scope boundary per the A2 task brief, not a
-//     missed case -- resolving an object-qualified or compound expression to
+//     attribute at all. Resolving an object-qualified or compound expression to
 //     a method would need real expression parsing, which this file's regex/
 //     text-based design does not attempt.
-//   - `value="{!...}"` bindings (as opposed to `action="{!...}"`) are
-//     deliberately OUT OF SCOPE this round -- property/getter/accessor
+//   - `value="{!...}"` bindings (as opposed to `action="{!...}"`) are not
+//     treated as method calls; they represent property/getter/accessor
 //     territory. The extractor only ever searches for an `action=` attribute
 //     in the first place, so this is "never even looked at", not "extracted
 //     then discarded" -- same documented-gap posture the OmniScript *.json
@@ -207,10 +205,8 @@
 //     syntactic extraction only; it has no class index and cannot know in
 //     advance that a given ref will turn out to be unattachable. Turning an
 //     empty controller/extensions list into "no edge at all" is the
-//     resolver's job (out of scope here) -- see GROUND-TRUTH.md's v0.10-B3
-//     for the exact real-corpus case (VtxAccountSummaryPage.page's
-//     `{!edit}`/`{!save}`, both still extracted here with an empty class
-//     list, both destined to attach nowhere downstream).
+//     resolver's job. Such refs are extracted with an empty class list and
+//     attach nowhere downstream.
 //   - If the root tag itself has no recognizable `<apex:page`/`<apex:component`
 //     opening (VF_ROOT_RE fails to match at all -- not even well-formed
 //     enough for this tolerant scanner), the WHOLE extractor -- class-level
@@ -218,7 +214,7 @@
 //     never attempted on a file that doesn't look like Visualforce at all,
 //     same all-or-nothing gate the pre-existing class-level scan already used.
 //
-// v0.13 (S1, "flow-to-subflow chains") addition to the MetaRef 'flow' shape,
+// Flow-to-subflow chain fields on the MetaRef 'flow' shape,
 // purely additive -- every v0.4-v0.10 field documented above keeps its exact
 // pre-existing meaning:
 //
@@ -243,25 +239,24 @@
 //     node -- e.g. a Screen/Autolaunched Flow whose only job is to launch a
 //     child Flow), the loop that would normally stamp `subflows` onto a ref
 //     never runs, so the fact would otherwise vanish from this file's
-//     output entirely. Per the GOAL text ("every `<subflows>`...
-//     `<flowName>`...`</subflows>` element in *.flow-meta.xml" -- not "every
-//     subflows element attached to an EXISTING apex ref"), extractFlow()
+//     output entirely. To preserve every `<subflows><flowName>` relationship,
+//     extractFlow()
 //     ADDITIONALLY emits exactly ONE synthetic ref in this case: `{
 //     kind:'flow', label, className: null, methodName: null, namespace:
 //     null, subflows, flowObject, flowRecordTriggerType, flowTriggerType,
 //     line, lineText }` -- `line`/`lineText` point at the file's FIRST
 //     `<subflows>` element (best-effort, same convention this file always
 //     uses for element position). `className`/`methodName` are BOTH null on
-//     this one shape only -- every OTHER 'flow' ref, before or after this
-//     amendment, always has a non-null `className` -- which is how a
+//     this one shape only -- every OTHER 'flow' ref always has a non-null
+//     `className` -- which is how a
 //     downstream consumer recognizes "this ref carries no apex target at
 //     all, it exists purely to carry the file's `subflows`/`flowObject`
 //     -family facts". This mirrors, at this file's own layer, the same "a
 //     known file with zero per-ref facts must still be visible somewhere"
 //     problem resolver.js's `index.flowFilePaths` solves downstream for
 //     entry-catalog purposes (see that field's own comment, resolver.js
-//     ~L5725) -- but `subflows` genuinely IS MetaRef-shaped data per this
-//     amendment's own contract (unlike raw file paths), so it is captured
+//     ~L5725) -- but `subflows` genuinely IS MetaRef-shaped data (unlike raw
+//     file paths), so it is captured
 //     here rather than requiring a second, index-level mechanism.
 //
 // Design notes:
@@ -273,15 +268,15 @@
 //   (import specifier, controller= attribute, actionName, remoteMethod key,
 //   ...), 1-based, with lineText trimmed the same way parser.js trims
 //   CallFacts.lineText.
-// - Every extractor is regex/text based (no XML/JS parser dependency, no
-//   new npm deps per the task brief) and is deliberately tolerant: a file
+// - Every extractor is regex/text based (no XML/JS parser dependency) and
+//   deliberately tolerant: a file
 //   that doesn't match the expected shape yields zero refs, never throws.
 // - Aura is the one source that needs CROSS-FILE context: a bundle's
 //   Controller/Helper .js only ever says `component.get('c.methodName')` —
 //   the class it belongs to is declared on a SIBLING .cmp/.app's
 //   `controller="..."` attribute, not in the .js file itself. Design
-//   decision (per the task brief's "pick one, document it"): parseMetaFile()
-//   run on a single .cmp/.app still yields the CLASS-LEVEL ref (that needs
+//   decision: parseMetaFile() run on a single .cmp/.app still yields the
+//   CLASS-LEVEL ref (that needs
 //   no pairing), but a single .js file passed to parseMetaFile() alone
 //   yields NOTHING for Aura (no bundle context available). Callers that want
 //   full Aura coverage (class-level AND method-level) must call
@@ -298,7 +293,7 @@
 
 // Compound extensions that a plain "strip the last dot" would butcher (e.g.
 // 'Foo.flow-meta.xml'.replace(/\.[^.]+$/, '') would leave 'Foo.flow-meta').
-const COMPOUND_EXT = /\.(flow-meta\.xml|os-meta\.xml|cmp-meta\.xml|app-meta\.xml|js-meta\.xml|page-meta\.xml|component-meta\.xml|cls-meta\.xml|trigger-meta\.xml|md-meta\.xml)$/i;
+const COMPOUND_EXT = /\.(flow-meta\.xml|os-meta\.xml|cmp-meta\.xml|app-meta\.xml|js-meta\.xml|page-meta\.xml|component-meta\.xml|cls-meta\.xml|trigger-meta\.xml|md-meta\.xml|permissionset-meta\.xml|profile-meta\.xml)$/i;
 
 function baseNameOf(p) {
   const s = String(p || '');
@@ -364,7 +359,7 @@ function makeRef(kind, label, className, methodName, text, lineStarts, idx) {
   };
 }
 
-// --- namespace-splitting helpers (v0.8, N1(c)/N3) ---------------------------
+// --- namespace-splitting helpers -------------------------------------------
 // Two distinct "this token names something living in a managed namespace"
 // shapes recur across the LWC/Flow/CMDT/OmniScript metadata surfaces:
 //
@@ -376,7 +371,7 @@ function makeRef(kind, label, className, methodName, text, lineStarts, idx) {
 //      dot-joined `namespace` string, verbatim (case preserved -- this
 //      engine never case-normalizes the namespace field, only its lookup
 //      keys). A string with <= tailCount segments has nothing left to fold,
-//      so `namespace` is null (this is the pre-v0.8, pre-M1-even behavior
+//      so `namespace` is null
 //      for a bare 2-segment LWC specifier / Class.method Flow action).
 //   2. DOUBLE-UNDERSCORE — 'ns__Class': the managed-object/API-name-style
 //      convention (no dots at all -- a bare Flow Invocable actionName or a
@@ -415,9 +410,9 @@ function splitBareNamespace(token) {
 // (the `\s` between `from` and the quote already matches newlines), and
 // namespace-dotted specifiers (`@salesforce/apex/ns.Cls.method`) tolerated:
 // className/methodName are always the LAST TWO dot-separated segments, and
-// (v0.7.1, M1) any leading segment(s) before that pair are now retained
+// Any leading segment(s) before that pair are retained
 // verbatim on the ref's `namespace` field instead of being discarded -- see
-// the v0.7.1 (M1) header note above for the full contract.
+// the header note above for the full behavior.
 // `import { refreshApex } from '@salesforce/apex';` (no trailing /Cls.method)
 // deliberately does not match — there's no method to attribute it to.
 const LWC_IMPORT_RE = /from\s+['"]@salesforce\/apex\/([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)['"]/g;
@@ -430,7 +425,7 @@ function extractLwc(path, text, lineStarts, out) {
     const segs = m[1].split('.');
     const methodName = segs[segs.length - 1];
     const className = segs[segs.length - 2];
-    // v0.7.1 (M1): segments before the Class.method pair are the namespace
+    // Segments before the Class.method pair are the namespace
     // prefix -- null for a bare 2-segment specifier, dot-joined verbatim
     // (case preserved) for 3+ segments. Never discarded.
     const namespace = segs.length > 2 ? segs.slice(0, segs.length - 2).join('.') : null;
@@ -463,11 +458,11 @@ function extractAuraClassLevel(path, text, lineStarts, out) {
 // either bare (class only, e.g. an @InvocableMethod class name) or dotted
 // (Class.method, e.g. a plain Apex action). Non-apex actionTypes (emailSimple,
 // etc.) are not matched here.
-// v0.13 (S1): <subflows> blocks -- a flow-to-flow reference, never an Apex
+// <subflows> blocks are flow-to-flow references, never Apex
 // one -- are handled by a SEPARATE extractor (extractFlowSubflows, below)
 // and surface as the new `subflows` field on every 'flow' MetaRef this file
 // produces, not as their own MetaRef kind. See that function's header note
-// and the top-of-file v0.13 contract section for the full shape.
+// and the top-of-file flow-reference section for the full shape.
 const ACTION_CALLS_RE = /<actionCalls>([\s\S]*?)<\/actionCalls>/g;
 const ACTION_TYPE_APEX_RE = /<actionType>\s*apex\s*<\/actionType>/i;
 const ACTION_NAME_RE = /<actionName>([^<]+)<\/actionName>/;
@@ -491,7 +486,7 @@ const RECORD_TRIGGERED_TYPES = new Set(['RecordBeforeSave', 'RecordAfterSave', '
 // RecordBefore*/RecordAfterSave shapes above).
 const PLATFORM_EVENT_TRIGGER_TYPE = 'PlatformEvent';
 
-// v0.13 (S1): a Flow's own <subflows> blocks -- each names a CHILD Flow (its
+// A Flow's own <subflows> blocks each name a child Flow (its
 // <flowName>), never an Apex action. Structurally a repeatable, non-nested
 // top-level block under the Flow root, same shape <actionCalls> already has
 // (a real Flow never nests one <subflows> inside another), so the same
@@ -508,7 +503,7 @@ const SUBFLOWS_RE = /<subflows>([\s\S]*?)<\/subflows>/g;
 const SUBFLOWS_FLOWNAME_RE = /<flowName>([^<]+)<\/flowName>/;
 const SUBFLOWS_OPEN_TAG = '<subflows>';
 
-// v0.13 (S1): collects every <subflows><flowName> value in the file, in
+// Collects every <subflows><flowName> value in the file, in
 // document order, deduped by exact (post-trim) string equality -- a Flow
 // Builder canvas can legitimately call the SAME subflow from two different
 // elements (e.g. two branches of a Decision both routing to the same child
@@ -577,7 +572,7 @@ function extractFlowStart(text) {
 function extractFlow(path, text, lineStarts, out) {
   const label = stemOf(path);
   const start = extractFlowStart(text);
-  // v0.13 (S1): computed once per file, same file-level-fact convention
+  // Computed once per file, using the same file-level-fact convention
   // extractFlowStart already established for <start> -- stamped onto every
   // apex-actionCalls ref below, and (see the zero-actionCalls branch at the
   // end of this function) preserved even when the file produces no such ref
@@ -592,11 +587,11 @@ function extractFlow(path, text, lineStarts, out) {
     const nameMatch = ACTION_NAME_RE.exec(block);
     if (!nameMatch) continue;
     const dotted = nameMatch[1].trim();
-    // v0.8 (N1(c)): a dotted actionName ('Class.method', or namespaced
+    // A dotted actionName ('Class.method', or namespaced
     // 'ns.Class.method'/'ns.Outer.Inner.method') keeps its pre-existing
     // 2-segment meaning (className/methodName = the trailing pair) and
     // additionally folds any segment(s) before that pair into `namespace`,
-    // same convention M1 already gave LWC specifiers. A bare, dot-free
+    // the same convention as LWC specifiers. A bare, dot-free
     // actionName (single segment -- an @InvocableMethod-style action named
     // by class alone) is checked for the managed-object-style 'ns__Class'
     // double-underscore convention instead; an ordinary local bare
@@ -622,14 +617,14 @@ function extractFlow(path, text, lineStarts, out) {
     ref.flowObject = start.flowObject;
     ref.flowRecordTriggerType = start.flowRecordTriggerType;
     ref.flowTriggerType = start.flowTriggerType;
-    // v0.13 (S1): each ref gets its OWN copy of the subflows list -- never a
+    // Each ref gets its OWN copy of the subflows list -- never a
     // shared mutable array a caller could accidentally corrupt for a sibling
     // ref -- same posture this file already takes for extensionClasses (A2).
     ref.subflows = subflows.slice();
     out.push(ref);
   }
 
-  // v0.13 (S1) -- LOAD-BEARING: a flow with >=1 <subflows> reference but
+  // A flow with at least one <subflows> reference but
   // ZERO apex <actionCalls> blocks of its own (a pure orchestration node --
   // e.g. a Screen/Autolaunched Flow whose only job is to launch a child
   // Flow) would otherwise vanish from this file's output entirely: the loop
@@ -638,7 +633,7 @@ function extractFlow(path, text, lineStarts, out) {
   // text ("every <subflows>...<flowName>...</subflows> element in
   // *.flow-meta.xml" -- not "every subflows element attached to an EXISTING
   // apex ref"), emit ONE synthetic 'flow' MetaRef in exactly this case --
-  // see the top-of-file v0.13 contract note for the full shape rationale.
+  // see the top-of-file flow-reference note for the full shape rationale.
   if (subflows.length && out.length === refCountBefore) {
     const ref = makeRef('flow', label, null, null, text, lineStarts, firstIdx);
     ref.namespace = null;
@@ -677,7 +672,7 @@ function extractOmniscriptXml(path, text, lineStarts, out) {
     if (!mm) continue;
     const methodName = mm[1].trim();
     const idx = mm.index;
-    // v0.8 (N1(c)): a namespaced <remoteClass> value carries its namespace
+    // A namespaced <remoteClass> value carries its namespace
     // either dotted ('ns.Class', the same convention a namespaced Apex
     // class is referenced by everywhere else in this file -- LWC/Flow
     // above) or as the managed-object-style 'ns__Class' double-underscore
@@ -783,22 +778,38 @@ const CMDT_FIELD_RE = /<field>([^<]+)<\/field>/;
 const CMDT_VALUE_RE = /<value\b[^>]*>([^<]*)<\/value>/;
 const CMDT_VALUES_OPEN_TAG = '<values>';
 const APEX_IDENTIFIER_RE = /^[A-Za-z_]\w*$/;
+const APEX_QUALIFIED_IDENTIFIER_RE = /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/;
+
+function isTriggerActionClassField(fieldName) {
+  return String(fieldName || '').toLowerCase().endsWith('apex_class_name__c');
+}
+
+function isTriggerActionContextField(fieldName) {
+  return /(?:before_(?:insert|update|delete)|after_(?:insert|update|delete|undelete))__c$/i
+    .test(String(fieldName || ''));
+}
 
 function extractCmdt(path, text, lineStarts, out) {
   const label = stemOf(path);
+  const metadataType = label.split('.')[0].toLowerCase();
+  const isTriggerActionRecord = metadataType.endsWith('trigger_action');
   CMDT_VALUES_RE.lastIndex = 0;
   let bm;
   while ((bm = CMDT_VALUES_RE.exec(text))) {
     const block = bm[1];
     const valueMatch = CMDT_VALUE_RE.exec(block);
     if (!valueMatch) continue;
-    const rawValue = valueMatch[1].trim();
-    if (!APEX_IDENTIFIER_RE.test(rawValue)) continue; // not identifier-shaped -- skip
     const fieldMatch = CMDT_FIELD_RE.exec(block);
     const fieldName = fieldMatch ? fieldMatch[1].trim() : null;
+    const rawValue = valueMatch[1].trim();
+    const isQualifiedTriggerActionValue =
+      isTriggerActionRecord &&
+      (isTriggerActionClassField(fieldName) || isTriggerActionContextField(fieldName)) &&
+      APEX_QUALIFIED_IDENTIFIER_RE.test(rawValue);
+    if (!APEX_IDENTIFIER_RE.test(rawValue) && !isQualifiedTriggerActionValue) continue; // not class/config identifier-shaped -- skip
     const blockStart = bm.index + CMDT_VALUES_OPEN_TAG.length;
     const idx = blockStart + valueMatch.index;
-    // v0.8 (N1(c)): APEX_IDENTIFIER_RE already rejects anything containing a
+    // APEX_IDENTIFIER_RE already rejects anything containing a
     // dot, so a CMDT <value> only ever needs the managed-object-style
     // 'ns__Class' double-underscore split -- an ordinary local value (no
     // '__') is untouched (namespace: null, className verbatim).
@@ -810,16 +821,85 @@ function extractCmdt(path, text, lineStarts, out) {
   }
 }
 
+// --- Permission sets / profiles ------------------------------------------
+// `<classAccesses>` authorizes an Apex class but does not invoke it. Emit a
+// class-level MetaRef only for effective (`enabled=true`) entries; resolver.js
+// gives these refs via='access' so no consumer mistakes them for call edges.
+const CLASS_ACCESS_APEX_RE = /<apexClass\b[^>]*>\s*([^<]+?)\s*<\/apexClass>/i;
+const CLASS_ACCESS_ENABLED_RE = /<enabled\b[^>]*>\s*(true|false)\s*<\/enabled>/i;
+const CLASS_ACCESS_OPEN = '<classaccesses';
+const CLASS_ACCESS_CLOSE = '</classaccesses>';
+const APEX_CLASS_REFERENCE_RE = /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/;
+
+function isTagBoundary(ch) {
+  return ch === '' || ch === '>' || ch === '/' || /\s/.test(ch);
+}
+
+function asciiLowerForXmlSearch(value) {
+  // Salesforce metadata tag names are ASCII. Fold only A-Z so every UTF-16
+  // code-unit offset remains identical to the original source; full Unicode
+  // toLowerCase() can expand characters (for example U+0130) and corrupt the
+  // source offsets later used for line/jump locations.
+  return String(value).replace(/[A-Z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) + 32));
+}
+
+function extractClassAccess(path, text, lineStarts, out, kind) {
+  const label = stemOf(path);
+  // A global lazy `([\s\S]*?)` block regex becomes quadratic when a large,
+  // malformed Profile contains many opening tags and no closing tag. Walk
+  // the text monotonically instead: every search resumes after the previous
+  // match and an unclosed final block terminates in one pass.
+  const lowerText = asciiLowerForXmlSearch(text);
+  let cursor = 0;
+  while (cursor < text.length) {
+    const open = lowerText.indexOf(CLASS_ACCESS_OPEN, cursor);
+    if (open === -1) break;
+    const afterOpen = open + CLASS_ACCESS_OPEN.length;
+    if (!isTagBoundary(lowerText.charAt(afterOpen))) {
+      cursor = afterOpen;
+      continue;
+    }
+    const openEnd = lowerText.indexOf('>', afterOpen);
+    if (openEnd === -1) break;
+    const close = lowerText.indexOf(CLASS_ACCESS_CLOSE, openEnd + 1);
+    if (close === -1) break;
+    const bodyStart = openEnd + 1;
+    const body = text.slice(bodyStart, close);
+    cursor = close + CLASS_ACCESS_CLOSE.length;
+
+    const enabledMatch = CLASS_ACCESS_ENABLED_RE.exec(body);
+    if (!enabledMatch || enabledMatch[1].toLowerCase() !== 'true') continue;
+    const classMatch = CLASS_ACCESS_APEX_RE.exec(body);
+    if (!classMatch) continue;
+    const rawClass = classMatch[1].trim();
+    if (!APEX_CLASS_REFERENCE_RE.test(rawClass)) continue;
+    const idx = bodyStart + classMatch.index;
+    const dotted = rawClass.includes('.') ? splitDottedNamespace(rawClass, 1) : null;
+    const bare = dotted ? null : splitBareNamespace(rawClass);
+    const ref = makeRef(
+      kind,
+      label,
+      dotted ? dotted.tail[0] : bare.className,
+      null,
+      text,
+      lineStarts,
+      idx
+    );
+    ref.namespace = dotted ? dotted.namespace : bare.namespace;
+    out.push(ref);
+  }
+}
+
 // --- Visualforce ---------------------------------------------------------
 // <apex:page controller="Cls" extensions="Ext1,Ext2" ...> (or apex:component).
 // Class-level scan: exercised by inline fixtures below plus the real
-// gauntlet-org VF corpus (v0.10). Method-level (action=) scan added v0.10,
+// Visualforce fixtures. Method-level (action=) scan added v0.10,
 // A2 -- see the header comment block above for the full field contract.
 const VF_ROOT_RE = /<apex:(?:page|component)\b[\s\S]*?>/;
 const VF_EXTENSIONS_ATTR_RE = /\bextensions\s*=\s*["']([^"']+)["']/;
 
-// v0.10 (A2): the six apex-namespaced tags whose `action="{!...}"` attribute
-// is a method binding this amendment extracts. `apex:page` is handled
+// The six apex-namespaced tags whose `action="{!...}"` attribute
+// is a method binding extracted here. `apex:page` is handled
 // separately below (it's the SAME root tag the class-level scan above
 // already matched via VF_ROOT_RE -- no need to search for it a second time);
 // the other five can appear any number of times anywhere in the file, so
@@ -839,17 +919,16 @@ const VF_ACTION_TAG_RE = /<apex:(?:commandButton|commandLink|actionFunction|acti
 // against a `value=` attribute name.
 const VF_ACTION_ATTR_RE = /\baction\s*=\s*["']([^"']*)["']/;
 
-// v0.10 (A2): the brace-expression shape this amendment extracts -- a
+// The supported brace-expression shape is a
 // SINGLE bare identifier, optional whitespace only. Anything else (a dotted
 // `{!obj.method}` instance/property reference, a compound expression like
 // `{!a && b}` or `{!IF(x,y,z)}`, an empty `{!}`) fails this test and the
-// attribute is skipped entirely -- no MetaRef emitted, per the A2 task
-// brief's explicit scope boundary (resolving anything beyond a bare
+// attribute is skipped entirely -- no MetaRef emitted. Resolving beyond a bare
 // identifier would need real expression parsing, which this regex/text-based
 // file does not attempt).
 const VF_ACTION_SINGLE_IDENT_RE = /^\{!\s*([A-Za-z_]\w*)\s*\}$/;
 
-// v0.10 (A2): given one already-isolated tag-text substring (and its start
+// Given one already-isolated tag-text substring (and its start
 // offset in the full file), extracts its `action="{!singleIdentifier}"`
 // binding (if any) into a method-level MetaRef, stamping the page-level
 // controllerClass/extensionClasses facts the caller already computed once
@@ -882,7 +961,7 @@ function extractVf(path, text, lineStarts, out) {
   const tag = rootMatch[0];
   const label = stemOf(path);
 
-  // v0.10 (A2): controllerClass/extensionClasses are computed once here (a
+  // controllerClass/extensionClasses are computed once here (a
   // page/component has exactly one root tag) and restamped onto every
   // action-binding ref below -- same "file-level fact, not re-derived per
   // match" reasoning F1(b) already established for Flow's <start> block.
@@ -907,7 +986,7 @@ function extractVf(path, text, lineStarts, out) {
     }
   }
 
-  // v0.10 (A2): action= bindings. The root tag's OWN action= (apex:page's
+  // action= bindings. The root tag's OWN action= (apex:page's
   // page-level action, e.g. an onload handler) is checked against the same
   // `tag`/`rootMatch.index` the class-level scan above already has in hand
   // -- no second root-tag search. Every other qualifying tag
@@ -937,11 +1016,13 @@ function extractVf(path, text, lineStarts, out) {
  *   .os-meta.xml        -> OmniScript XML remoteClass/remoteMethod.
  *   .json               -> OmniScript/IP DataPack remoteClass/remoteMethod.
  *   .page / .component  -> Visualforce controller=/extensions= (class-level)
- *                          + (v0.10, A2) action="{!method}" bindings on
+ *                          + action="{!method}" bindings on
  *                          apex:page/commandButton/commandLink/
  *                          actionFunction/actionSupport/actionPoller
  *                          (method-level, single-identifier expressions only).
  *   .md-meta.xml        -> F4b Custom Metadata identifier-shaped <value>s.
+ *   .permissionset-meta.xml -> enabled Apex class-access grants.
+ *   .profile-meta.xml       -> enabled Apex class-access grants.
  * Anything else (including malformed input) yields an empty array; this
  * function never throws.
  */
@@ -967,6 +1048,10 @@ function parseMetaFile(file) {
       extractOmniscriptXml(path, text, lineStarts, out);
     } else if (/\.md-meta\.xml$/i.test(path)) {
       extractCmdt(path, text, lineStarts, out);
+    } else if (/\.permissionset-meta\.xml$/i.test(path)) {
+      extractClassAccess(path, text, lineStarts, out, 'permissionset');
+    } else if (/\.profile-meta\.xml$/i.test(path)) {
+      extractClassAccess(path, text, lineStarts, out, 'profile');
     } else if (/\.json$/i.test(path)) {
       extractOmniscriptJson(path, text, lineStarts, out);
     } else if (/\.(page|component)$/i.test(path)) {
@@ -1068,7 +1153,7 @@ function scanBundle(files) {
  * carries a `namespace` field, so nulling it is the entire fix: the ref now
  * reads exactly like an always-local reference would have. Every other ref
  * (non-matching namespace, or no `namespace` field at all -- aura/vf, or any
- * kind this amendment doesn't touch) passes through as the SAME object
+ * unaffected kind) passes through as the SAME object
  * (never copied), so callers that rely on reference identity for refs this
  * function doesn't touch are unaffected.
  *

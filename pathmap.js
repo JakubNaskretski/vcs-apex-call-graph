@@ -1,6 +1,6 @@
 'use strict';
-// pathmap.js — renders a resolver.js TreeResult (the frozen TNode/SiteView
-// contract reproduced below, and mirrored in uitree.js's header comment) as
+// pathmap.js — renders a resolver.js TreeResult (the TNode/SiteView shape
+// reproduced below and mirrored in uitree.js) as
 // a single, fully self-contained HTML document: an interactive,
 // left-to-right "execution path map" — the traced TARGET sits on the right,
 // its callers fan out to the left, one hop (column) per depth level, like a
@@ -9,28 +9,26 @@
 // Pure data-in/string-out, CommonJS, zero new dependencies, no vscode
 // import — so it can be exercised head-less by dev/pathmap-preview.js and
 // unit-tested by test-pathmap.js without a running extension host. The
-// caller (extension.js, wired up later) is expected to hand the returned
+// extension.js hands the returned
 // string straight to a vscode.WebviewPanel's `.webview.html` with
-// `enableScripts: true`; see the integration note delivered alongside this
-// file for the exact wiring.
+// `enableScripts: true`.
 //
-// Frozen input contract (verbatim from resolver.js / uitree.js headers):
+// Input data shape:
 //
 //   treeResult = { root: TNode, targetLabel, note, direction, stats }
 //   TNode = {
 //     label, kind: 'method'|'trigger'|'class'|'lwc'|'aura'|'flow'|
-//       'omniscript'|'vf' (A6/A7: metadata-caller nodes from resolver.js's
-//       attachMetaCallers/buildMetaChildren) | 'cmdt' (v0.4 F4b: Custom
+//       'omniscript'|'vf' (metadata-caller nodes from resolver.js's
+//       attachMetaCallers/buildMetaChildren) | 'cmdt' (Custom
 //       Metadata record, same family, always terminal today) | 'anonymous'
-//       (v0.5 G4: anonymous-Apex-script (.apex) pseudo-type/method node --
+//       (anonymous-Apex-script (.apex) pseudo-type/method node --
 //       Apex-source family like 'method'/'trigger'/'class', NOT part of the
-//       metadata-caller family; always a pure root) | 'exception' (v0.7 A3:
-//       forward-traced throw target, always terminal) | 'unresolved' (v0.7
-//       A6: one aggregated, always-terminal, always-approximate leaf per
+//       metadata-caller family; always a pure root) | 'exception' (
+//       forward-traced throw target, always terminal) | 'unresolved' (one
+//       aggregated, always-terminal, always-approximate leaf per
 //       method summarizing unresolved forward call sites) | 'external'
-//       (v0.8 N1/N4/N6, forward-compat -- resolver.js does not produce this
-//       kind yet, same status as the seenElsewhere field below: a reference
-//       into managed-package code this workspace has no source for.
+//       (a reference into managed-package code this workspace has no source
+//       for.
 //       Terminal in the callees direction; in callers direction its
 //       children are the ordinary local caller subtree of every site that
 //       references it -- no special-casing needed here either way, see
@@ -38,23 +36,23 @@
 //       badge),
 //     className, methodLower,
 //     path, line, entries: [string], isTest,
-//     package,  // string|null|undefined (v0.7 B3): the sfdx package label
+//     package,  // string|null|undefined: the sfdx package label
 //               // this node's file lives under -- see shapeNodeForData's
 //               // targetPackage/packageBadge threading below, which turns
 //               // it into a '(label)' badge ONLY when it differs from the
 //               // traced target's own package (root.package).
-//     ns,       // string|undefined (v0.8 N1/N4, forward-compat): ONLY
+//     ns,       // string|undefined: ONLY
 //               // meaningful on a kind:'external' node -- its managed-
 //               // package namespace, mirrored into the 'managed: <ns>'
 //               // badge (see managedBadge/shapeNodeForData below).
 //     via: string|null,  // ...|'metadata'|'dml'|'dynamic'|'override' (v0.4
 //                         // adds the last three)|'publish'|'throws'|
-//                         // 'narrowed'|'async' (v0.5 G1/G2/G3/G5 add these
+//                         // 'narrowed'|'async'
 //                         // four; only 'narrowed' is approximate)|
-//                         // 'ambiguous' (v0.7 B2: duplicate-named-class
+//                         // 'ambiguous' (duplicate-named-class
 //                         // fan-out that neither same-package nor default-
 //                         // package preference could resolve; approximate)|
-//                         // 'external' (v0.8 N1/N2/N4, forward-compat: a
+//                         // 'external' (a
 //                         // reference into managed-package code -- NOT
 //                         // approximate, see uitree.js's matching TNode.via
 //                         // doc for the rationale)
@@ -63,14 +61,14 @@
 //                         // to show up correctly)
 //     sites: [SiteView], children: [TNode],
 //     cyclic, truncated, approximate,
-//     caughtHere,  // boolean, v0.5 G2: an ancestor catch clause catches the
+//     caughtHere,  // boolean: an ancestor catch clause catches the
 //                  // exception being traced AT THIS NODE. Always paired with
 //                  // a matching entries badge text ('catches <ExcName>',
 //                  // resolver.js's doing) -- this file additionally renders
 //                  // a shield-glyph badge for it (see badgeGlyphs in
 //                  // CLIENT_JS_TEXT). Traversal continues past a caughtHere
 //                  // node, so it is purely an informational marker.
-//     expandable,  // boolean, v0.9 P1 (forward-compat -- resolver.js does
+//     expandable,  // boolean: resolver marks a progressive-depth frontier
 //                  // not produce this yet, mirrors uitree.js's matching
 //                  // field doc verbatim): this node hit the progressive
 //                  // depth frontier -- real callers/callees exist
@@ -82,10 +80,10 @@
 //                  // spans, and excluded from the 'root' flag (isRootNode
 //                  // below) -- same "there IS more, just not shown" family
 //                  // as cyclic/truncated/seenElsewhere.
-//     pendingCount,  // number|undefined, v0.9 P1 (forward-compat): ONLY
+//     pendingCount,  // number|undefined: ONLY
 //                    // meaningful alongside expandable:true -- see
 //                    // uitree.js's matching field doc.
-//     methodKey,     // string|undefined, v0.9 P1 (forward-compat): ONLY
+//     methodKey,     // string|undefined: ONLY
 //                    // meaningful alongside expandable:true -- the
 //                    // methodKeyLower identity the pill's click-to-expand
 //                    // affordance posts back to the extension (see
@@ -95,14 +93,14 @@
 //                    // externalNamespace.
 //   }
 //
-// v0.7 (A3) direction: treeResult.direction is 'callers'|'callees'|absent.
+// treeResult.direction is 'callers'|'callees'|absent.
 // resolver.js's buildCallerTree stamps 'callers' on EVERY TreeResult it
 // returns, unconditionally -- so 'callers' is treated exactly like an
-// absent field: both render byte-identically to before this round
+// absent field: both retain the legacy caller layout
 // (unmirrored layout, no direction header/meta text -- see layoutTree/
 // renderPathMapHtml below, both take the same non-mirrored branch and
 // produce a null directionLabel). 'callees' -- the one genuinely NEW
-// direction this round adds -- mirrors the layout (target LEFT, callees fan
+// 'callees' mirrors the layout (target LEFT, callees fan
 // out RIGHT -- see layoutTree) and shows an explicit 'What Does This Call?'
 // header/meta label. See uitree.js's matching directionHeaderLine for the
 // fuller interpretive-decision writeup (not duplicated here verbatim,
@@ -110,7 +108,7 @@
 // re-implementations rather than a cross-file require).
 //   SiteView = {
 //     path, line, col, lineText, argsRendered: string|null, via,
-//     overloadSig: string|null,  // A4 field, v0.6 (H3): previously
+//     overloadSig: string|null,  // overload selected for this site
 //                                 // serialized here but never surfaced in
 //                                 // the tooltip's site rows -- confirmed
 //                                 // bug, fixed alongside argsRendered below.
@@ -135,7 +133,7 @@
 // special-cased "meta kinds are leaves". Documented explicitly since it's
 // easy to assume otherwise from the A6/A7-era phrasing above.
 //
-// v0.13 (S2/S3) NOTE: a 'flow' node's children can now ALSO be its own
+// A 'flow' node's children can ALSO be its own
 // subflow chain (via:'subflow', both directions — see resolver.js's own
 // contract and this file's LEGEND_HTML "subflow" row), recursing arbitrarily
 // deep and cycle-guarded (cyclic:true, zero children, same as any other
@@ -143,7 +141,7 @@
 // structurally" posture as the F1b note above — no code change was needed
 // here for this either, only the legend text a human reads.
 //
-// v0.13 (Round 2.5, H2 -- rendering half) NOTE: TNode.kind gains 'rollup' --
+// v0.13: TNode.kind gains 'rollup' --
 // UNLIKE every other kind above, resolver.js NEVER produces this one; it is
 // synthesized ENTIRELY by this file's own groupApproximateChildren
 // (see that function's header comment, ahead of layoutTree) as a pure
@@ -172,12 +170,15 @@
 // client-side renderer, which trusts the x/y this file precomputes).
 // ---------------------------------------------------------------------
 const LAYOUT = {
-  colWidth: 260,
-  rowHeight: 96,
-  nodeWidth: 220,
-  nodeHeight: 60,
-  marginX: 48,
-  marginY: 48,
+  // Leave enough horizontal connector space for resolution labels such as
+  // "static" and "typed" to sit clear of both adjoining cards. Edge labels
+  // are centered on half of this gutter in either map direction.
+  colWidth: 340,
+  rowHeight: 116,
+  nodeWidth: 248,
+  nodeHeight: 84,
+  marginX: 56,
+  marginY: 72,
 };
 
 // ---- entry-badge shortening --------------------------------------------
@@ -195,7 +196,7 @@ function shortenEntry(raw) {
 }
 
 // ---- color-accent bucket -------------------------------------------------
-// Spec calls out four accent buckets: trigger/entry/test/normal. A node
+// Nodes use four base accent buckets: trigger/entry/test/normal. A node
 // wears exactly one accent, so ties resolve trigger > entry > test > normal
 // — a trigger or an explicit annotation entry point is a more specific,
 // more load-bearing fact about a node than "this also happens to sit in a
@@ -203,36 +204,36 @@ function shortenEntry(raw) {
 // badge, applied independently of accent — see buildNodeEl in the client
 // script) even when a different accent wins.
 //
-// A7 adds a 5th bucket, 'metadata', for the LWC/Aura/Flow/OmniScript/VF
+// The 'metadata' bucket covers LWC/Aura/Flow/OmniScript/VF
 // caller nodes resolver.js's attachMetaCallers/buildMetaChildren produce
 // (TNode.kind one of 'lwc'|'aura'|'flow'|'omniscript'|'vf'). v0.4 (F4b)
 // folds 'cmdt' (Custom Metadata record) into the same bucket — it is the
 // same "caller lives outside Apex source" family, just a different kind tag.
 // These nodes always carry a non-empty `entries` (their kind-specific
 // label, e.g. '@salesforce/apex import' / 'Custom Metadata record' — see
-// resolver.js's metaEntryLabel) per the A6/F4b contract, so 'metadata' is
+// resolver.js's metaEntryLabel), so 'metadata' is
 // checked ahead of 'entry' — otherwise every metadata node would
 // collapse onto the same accent as an ordinary @AuraEnabled/@future/etc.
 // entry-point node and lose its distinct color in the map.
-const META_ACCENT_KINDS = new Set(['lwc', 'aura', 'flow', 'omniscript', 'vf', 'cmdt']);
+const META_ACCENT_KINDS = new Set(['lwc', 'aura', 'flow', 'omniscript', 'vf', 'cmdt', 'permissionset', 'profile']);
 
-// v0.5 (G4) adds a 6th bucket, 'anonymous', for TNode.kind==='anonymous' --
+// The 'anonymous' bucket covers TNode.kind==='anonymous' --
 // an anonymous-Apex-script node. Deliberately NOT folded into 'metadata':
-// unlike the A6/A7/F4b kinds above, an anonymous script IS real Apex source
+// unlike metadata kinds above, an anonymous script IS real Apex source
 // (parser.js's anonymousUnit(), not metascan.js), it just has no declared
 // class/trigger of its own. Checked right alongside 'trigger' (both are
 // "the kind itself decides the accent" cases), ahead of 'entry'/'test' for
 // the same reason 'metadata' is: an anonymous-script node always carries the
-// 'Anonymous Apex script' entries label per the G4 spec, so it would
+// 'Anonymous Apex script' entry label, so it would
 // otherwise collapse onto the generic 'entry' accent and lose its distinct
 // color.
-// v0.7 (A3): two more "the kind alone decides the accent" buckets, same
+// Two more "the kind alone decides the accent" buckets use the same
 // priority tier as trigger/anonymous, ahead of entry/test -- an exception-
 // class node or an aggregated unresolved-sites leaf could in principle
 // carry entries (e.g. an exception class that is ALSO an inner class with
 // its own annotation) and must not collapse onto the generic 'entry' accent
 // and lose its distinct color.
-// v0.8 (N6, forward-compat): a 7th bucket, 'external', for TNode.kind===
+// The 'external' bucket covers TNode.kind===
 // 'external' -- see the module header's TNode.kind doc above. Same "the
 // kind alone decides the accent" tier as trigger/anonymous/exception/
 // unresolved, ahead of entry/test, for the identical reason: an external
@@ -242,13 +243,13 @@ function accentKind(node) {
   if (node.kind === 'trigger') return 'trigger';
   if (node.kind === 'anonymous') return 'anonymous';
   if (node.kind === 'exception') return 'exception';
-  // v0.7.1 (U3, R8): confirmed against resolver.js's real buildCalleeTree
+  // buildCalleeTree
   // implementation -- the generic-typed-DML marker reuses kind:'unresolved'
   // verbatim (via 'dml-unresolved' is what distinguishes it; see
   // LEGEND_HTML below), so no separate kind/accent branch is needed here.
   if (node.kind === 'unresolved') return 'unresolved';
   if (node.kind === 'external') return 'external';
-  // v0.13 (Round 2.5, H2 -- rendering half): a synthetic rollup pseudo-node
+  // A synthetic rollup pseudo-node
   // (see groupApproximateChildren/ROLLUP_LABEL below) -- same "the kind
   // alone decides the accent" tier as every check above, ahead of entry/
   // test, since a rollup node never carries entries/isTest of its own but
@@ -261,7 +262,64 @@ function accentKind(node) {
   return 'normal';
 }
 
-// v0.8 (N4/N6, forward-compat): mirrors uitree.js's externalNamespace/
+// ---- visual vocabulary ---------------------------------------------------
+// `accentKind` is the long-standing compatibility bucket used by existing
+// tests and consumers.  The Path Map needs a little more information than
+// that one bucket can carry: Flow and LWC are both metadata, for example,
+// but are much easier to scan when their cards say what they actually are.
+// Keep the old accent intact and add a small, allow-listed visual vocabulary
+// for the card's type chip and restrained color family.
+function nodeVisual(node) {
+  const t = node || {};
+  const kind = String(t.kind || '').toLowerCase();
+  const entries = Array.isArray(t.entries) ? t.entries.map((e) => String(e).toLowerCase()).join(' ') : '';
+
+  if (kind === 'trigger') return { key: 'trigger', label: 'Trigger', tone: 'entry' };
+  if (kind === 'lwc') return { key: 'lwc', label: 'LWC', tone: 'interface' };
+  if (kind === 'aura') return { key: 'aura', label: 'Aura', tone: 'interface' };
+  if (kind === 'flow') return { key: 'flow', label: 'Flow', tone: 'automation' };
+  if (kind === 'omniscript') return { key: 'omniscript', label: 'OmniScript', tone: 'automation' };
+  if (kind === 'vf') return { key: 'visualforce', label: 'Visualforce', tone: 'interface' };
+  if (kind === 'cmdt') return { key: 'custom-metadata', label: 'Custom metadata', tone: 'data' };
+  if (kind === 'permissionset') return { key: 'permission-set', label: 'Permission set', tone: 'data' };
+  if (kind === 'profile') return { key: 'profile', label: 'Profile', tone: 'data' };
+  if (kind === 'anonymous') return { key: 'anonymous', label: 'Anonymous Apex', tone: 'entry' };
+  if (kind === 'exception') return { key: 'exception', label: 'Exception', tone: 'danger' };
+  if (kind === 'unresolved') return { key: 'unresolved', label: 'Unresolved', tone: 'neutral' };
+  if (kind === 'external') return { key: 'external', label: 'External', tone: 'external' };
+  if (kind === 'rollup') return { key: 'possible', label: 'Possible', tone: 'approx' };
+
+  if (entries.includes('@auraenabled')) return { key: 'aura-method', label: 'Aura / LWC', tone: 'interface' };
+  if (entries.includes('@invocablemethod')) return { key: 'invocable', label: 'Invocable', tone: 'automation' };
+  if (entries.includes('@future')) return { key: 'future', label: 'Future', tone: 'automation' };
+  if (entries.includes('batchable')) return { key: 'batch', label: 'Batch', tone: 'automation' };
+  if (entries.includes('queueable')) return { key: 'queueable', label: 'Queueable', tone: 'automation' };
+  if (entries.includes('schedulable')) return { key: 'scheduled', label: 'Scheduled', tone: 'automation' };
+  if (entries.includes('@restresource') || /@http(?:get|post|put|patch|delete)/.test(entries)) {
+    return { key: 'rest', label: 'REST', tone: 'entry' };
+  }
+  if (entries.includes('webservice')) return { key: 'soap', label: 'SOAP', tone: 'entry' };
+  if (entries.includes('anonymous apex')) return { key: 'anonymous', label: 'Anonymous Apex', tone: 'entry' };
+  if (entries) return { key: 'entry', label: 'Entry point', tone: 'entry' };
+  if (t.isTest) return { key: 'test-apex', label: 'Test Apex', tone: 'test' };
+  if (kind === 'constructor') return { key: 'constructor', label: 'Constructor', tone: 'apex' };
+  if (kind === 'class') return { key: 'apex-class', label: 'Apex class', tone: 'apex' };
+  return { key: 'apex', label: 'Apex', tone: 'apex' };
+}
+
+function edgeTone(via, approximate) {
+  if (approximate) return 'approx';
+  const v = String(via || '').toLowerCase();
+  if (v === 'metadata' || v === 'subflow') return 'automation';
+  if (v === 'dml' || v === 'publish') return 'data';
+  if (v === 'async') return 'automation';
+  if (v === 'external') return 'external';
+  if (v === 'throws') return 'danger';
+  if (v === 'unresolved' || v === 'dml-unresolved') return 'neutral';
+  return 'apex';
+}
+
+// Mirrors uitree.js's externalNamespace/
 // managedBadge exactly -- kept as independent small implementations here
 // rather than a cross-file require, same rationale as isRootNode/
 // packageBadge above (this file stays a standalone, dev-tool-friendly
@@ -284,7 +342,7 @@ function managedBadge(node) {
   return ns ? `managed: ${ns}` : null;
 }
 
-// v0.9 (P1/P4, forward-compat): mirrors uitree.js's frontierMethodKey
+// Mirrors uitree.js's frontierMethodKey
 // exactly -- see that file's comment for the full "explicit field wins,
 // else derive from className+methodLower" rationale. Kept as an
 // independent small implementation here rather than a cross-file require,
@@ -304,7 +362,7 @@ function frontierMethodKey(node) {
 }
 
 // =========================================================================
-// v0.13 (Round 2.5, H2 -- rendering half): APPROXIMATE ROLLUP, map side.
+// Approximate-edge rollup on the map.
 // Mirrors uitree.js's identical section (same rationale for why this is a
 // pure rendering-layer regroup, not a resolver.js change) as an independent
 // implementation, same "standalone, dev-tool-friendly module" posture as
@@ -382,7 +440,7 @@ function makeRollupTNode(approxChildren, direction) {
 // `approximate` flag, exactly the field resolver.js already stamps per the
 // contract), then per `mode`:
 //   'expand' -- every child kept in its original order, none dropped/
-//               regrouped -- the pre-Round-2.5 flat shape. Still recurses
+//               regrouped -- the legacy flat shape. Still recurses
 //               (producing a full deep clone with identical structure/order/
 //               field values throughout, since a single `mode` applies to
 //               the whole call) rather than short-circuiting to `tnode`
@@ -435,12 +493,12 @@ function groupApproximateChildren(tnode, mode, direction) {
 // to column. By default (the callers direction -- `direction` absent or
 // 'callers', see this file's header note on why those two are treated
 // identically) the target (depth 0) is the RIGHTMOST column, and each hop
-// further from it moves one column left, exactly as before this round.
+// further from it moves one column left.
 //
-// v0.7 (A3): when `direction === 'callees'` the column order MIRRORS -- the
+// When `direction === 'callees'` the column order MIRRORS -- the
 // target (depth 0) becomes the LEFTMOST column and each hop further (each
-// forward call) moves one column right, per the A3 spec ("target LEFT,
-// callees flowing RIGHT (mirror the column math)"). This is a pure column-
+// forward call) moves one column right: target left, callees flowing right.
+// This is a pure column-
 // index flip (`rec.depth` instead of `maxDepth - rec.depth`); row placement
 // (the leaf-order dendrogram pass above) and every other geometry constant
 // (colWidth, width, height) are completely unaffected -- only which end of
@@ -502,13 +560,13 @@ function shapeSiteForData(s) {
   };
 }
 
-// v0.6 (H3): explicit 'root' badge -- see uitree.js's isRootNode, mirrored
+// Explicit 'root' badge -- see uitree.js's isRootNode, mirrored
 // here rather than shared via require so pathmap.js stays a standalone,
 // dev-tool-friendly module (see this file's header note). No known caller
 // in THIS trace (childless), and not cyclic/truncated/seenElsewhere -- all
 // three of those mean "there IS more above, just not shown/expanded here".
 //
-// v0.9 (P1/P4, forward-compat): `expandable` joins the exclusion list, same
+// `expandable` joins the exclusion list, same
 // rationale/regression-safety as uitree.js's matching isRootNode update --
 // `t.expandable` is undefined on every pre-v0.9 fixture, so `!undefined` is
 // `true` and this is a no-op there.
@@ -518,7 +576,7 @@ function isRootNode(t) {
   return !hasChildren && !t.cyclic && !t.truncated && !t.seenElsewhere && !t.expandable;
 }
 
-// v0.7 (B3): the node's package badge text, or null when none applies --
+// The node's package badge text, or null when none applies --
 // mirrors uitree.js's packageBadge exactly (see that file's comment for the
 // full rationale), kept as an independent small implementation here rather
 // than a cross-file require, same rationale as isRootNode above.
@@ -528,7 +586,7 @@ function packageBadge(node, targetPackage) {
   return '(' + node.package + ')';
 }
 
-// v0.7 (B3): `targetPackage` is an OPTIONAL second argument -- the traced
+// `targetPackage` is an OPTIONAL second argument -- the traced
 // target's own `.package` (computed once in renderPathMapHtml from the tree
 // root and threaded through every node). Every EXISTING call site that
 // invokes `shapeNodeForData(rec)` with just one argument keeps behaving
@@ -537,8 +595,9 @@ function packageBadge(node, targetPackage) {
 // `.package` of its own (no pre-v0.7 fixture does).
 function shapeNodeForData(rec, targetPackage) {
   const t = rec.tnode || {};
+  const visual = nodeVisual(t);
   const badges = (t.entries || []).map(shortenEntry);
-  // v0.8 (N4/N6, forward-compat): the 'managed: <ns>' badge for an external
+    // The 'managed: <ns>' badge for an external
   // node -- a node-level fact about THIS node (which managed package it
   // belongs to), so it joins `badges` the same way entries/pkgBadge do,
   // rather than riding on the edge-level `via` field a couple lines below
@@ -551,37 +610,43 @@ function shapeNodeForData(rec, targetPackage) {
   return {
     id: rec.id,
     parentId: rec.parentId,
+    depth: rec.depth,
     x: rec.x,
     y: rec.y,
     label: t.label != null ? String(t.label) : '',
     kind: t.kind || 'class',
     accent: accentKind(t),
+    typeKey: visual.key,
+    typeLabel: visual.label,
+    tone: visual.tone,
+    target: rec.parentId == null,
     badges: badges,
     isTest: !!t.isTest,
     approximate: !!t.approximate,
     cyclic: !!t.cyclic,
     truncated: !!t.truncated,
     caughtHere: !!t.caughtHere,
-    // v0.6 (H1 forward-compat, H5 rendering): resolver.js does not produce
-    // TNode.seenElsewhere yet -- see uitree.js's matching field doc.
+    // `seenElsewhere` is preserved for renderers that support it; see
+    // uitree.js's matching field documentation.
     seenElsewhere: !!t.seenElsewhere,
     root: isRootNode(t),
     via: t.via || null,
     path: t.path || null,
     line: typeof t.line === 'number' ? t.line : null,
     className: t.className || '',
-    // v0.7 (B3): the raw package label (or null) -- not itself rendered as
-    // a badge client-side (the badge string, if any, already landed in
+    methodLower: t.methodLower || null,
+    // The raw package label (or null) is not itself rendered as
+    // a badge client-side (the badge string, if any, is already present in
     // `badges` above); exposed so dev tooling / future callers can inspect
     // it without re-deriving from `entries`.
     package: t.package || null,
-    // v0.8 (N4/N6, forward-compat): the resolved external namespace (or
+    // The resolved external namespace (or
     // null) -- same "raw value exposed alongside its derived badge" pattern
     // as `package` immediately above; the badge string itself, if any,
-    // already landed in `badges` above.
+    // already present in `badges` above.
     ns: externalNamespace(t),
     sites: (t.sites || []).map(shapeSiteForData),
-    // v0.9 (P1/P4, forward-compat): NOT folded into `badges` above (unlike
+    // Frontier state is NOT folded into `badges` above (unlike
     // managed/pkgBadge) -- the frontier marker renders client-side as a
     // distinct, CLICKABLE pill (see CLIENT_JS_TEXT's buildNodeEl), not a
     // plain read-only badge span, so the client needs these raw fields to
@@ -599,6 +664,7 @@ function shapeEdgeForData(e) {
     to: e.to,
     via: t.via || null,
     approximate: !!t.approximate,
+    tone: edgeTone(t.via, !!t.approximate),
   };
 }
 
@@ -649,12 +715,18 @@ const CSS_TEXT = `
     --pm-node-bg: var(--vscode-editorWidget-background, #f3f3f3);
     --pm-muted: var(--vscode-descriptionForeground, #6e6e6e);
     --pm-link: var(--vscode-textLink-foreground, #3794ff);
-    --pm-trigger: var(--vscode-charts-red, #f14c4c);
-    --pm-entry: var(--vscode-charts-blue, #3794ff);
+    --pm-apex: var(--vscode-charts-blue, #4fa3ff);
+    --pm-entry-hue: var(--vscode-charts-red, #ff7a68);
+    --pm-automation: var(--vscode-charts-purple, #b692f6);
+    --pm-interface: var(--vscode-charts-cyan, #40c4d8);
+    --pm-data: var(--vscode-charts-yellow, #e2a73b);
+    --pm-danger: var(--vscode-errorForeground, #f14c4c);
+    --pm-trigger: var(--pm-entry-hue);
+    --pm-entry: var(--pm-entry-hue);
     --pm-test: var(--vscode-charts-green, #89d185);
     --pm-approx: var(--vscode-charts-orange, #d18616);
     --pm-normal: var(--vscode-descriptionForeground, #9d9d9d);
-    --pm-metadata: var(--vscode-charts-purple, #b180d7);
+    --pm-metadata: var(--pm-automation);
     --pm-anonymous: var(--vscode-charts-yellow, #cca700);
     /* v0.7 (A3): no dedicated --vscode-charts-* slot is left unclaimed by
        the buckets above, so these two reach for theme-semantic vars instead
@@ -669,6 +741,17 @@ const CSS_TEXT = `
        cool, "not one of ours" tone fits a node whose source lives outside
        this workspace. */
     --pm-external: var(--vscode-charts-cyan, #29b6f6);
+    --pm-apex-soft: rgba(79, 163, 255, .11);
+    --pm-entry-soft: rgba(255, 122, 104, .11);
+    --pm-automation-soft: rgba(182, 146, 246, .12);
+    --pm-interface-soft: rgba(64, 196, 216, .11);
+    --pm-data-soft: rgba(226, 167, 59, .12);
+    --pm-external-soft: rgba(41, 182, 246, .11);
+    --pm-test-soft: rgba(137, 209, 133, .11);
+    --pm-danger-soft: rgba(241, 76, 76, .11);
+    --pm-neutral-soft: rgba(157, 157, 157, .08);
+    --pm-lane: rgba(127, 127, 127, .035);
+    --pm-lane-target: rgba(79, 163, 255, .055);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -694,10 +777,16 @@ const CSS_TEXT = `
      case; see directionHeaderLine's interpretive-decision comment. */
   #pm-direction { font-weight: 600; font-size: 12px; color: var(--pm-link); }
 
+  #pm-workspace { flex: 1 1 auto; min-height: 0; display: flex; }
+  #pm-sidebar {
+    flex: 0 0 360px; min-width: 280px; max-width: 420px; display: flex;
+    flex-direction: column; min-height: 0; border-left: 1px solid var(--pm-border);
+    background: var(--pm-node-bg);
+  }
+
   #pm-legend {
-    position: fixed; top: 44px; right: 10px; z-index: 6; max-width: 340px; max-height: 70vh; overflow: auto;
-    background: var(--pm-node-bg); border: 1px solid var(--pm-border); border-radius: 6px; padding: 2px 10px;
-    box-shadow: 0 2px 8px rgba(0,0,0,.2);
+    flex: 0 0 auto; max-height: 46%; overflow: auto; padding: 2px 12px;
+    background: var(--pm-node-bg); border-bottom: 1px solid var(--pm-border);
   }
   #pm-legend summary { cursor: pointer; font-weight: 600; padding: 6px 0; list-style: none; }
   #pm-legend summary::-webkit-details-marker { display: none; }
@@ -705,7 +794,7 @@ const CSS_TEXT = `
   #pm-legend[open] summary::before { content: '▾ '; }
   #pm-legend h4 { margin: 8px 0 4px; font-size: 11px; text-transform: uppercase; color: var(--pm-muted); }
   #pm-legend .legend-row { display: flex; align-items: flex-start; gap: 6px; margin: 3px 0; font-size: 12px; line-height: 1.35; }
-  #pm-legend .legend-row .k { flex: 0 0 auto; font-weight: 600; min-width: 78px; }
+  #pm-legend .legend-row .k { flex: 0 0 auto; font-weight: 600; min-width: 78px; margin-right: 5px; }
   .swatch { width: 10px; height: 10px; margin-top: 3px; border-radius: 3px; display: inline-block; flex: 0 0 auto; }
   .swatch.trigger { background: var(--pm-trigger); }
   .swatch.entry { background: var(--pm-entry); }
@@ -716,31 +805,122 @@ const CSS_TEXT = `
   .swatch.exception { background: var(--pm-exception); }
   .swatch.unresolved { background: var(--pm-unresolved); }
   .swatch.external { background: var(--pm-external); }
+  .line-swatch { width: 24px; height: 0; margin-top: 8px; border-top: 2px solid; display: inline-block; flex: 0 0 auto; }
+  .line-swatch.apex { color: var(--pm-apex); }
+  .line-swatch.automation { color: var(--pm-automation); }
+  .line-swatch.data { color: var(--pm-data); }
+  .line-swatch.external { color: var(--pm-external); }
+  .line-swatch.danger { color: var(--pm-danger); }
+  .line-swatch.approx { color: var(--pm-approx); border-top-style: dashed; }
 
-  #pm-viewport { flex: 1 1 auto; position: relative; overflow: hidden; cursor: grab; }
+  #pm-class-context {
+    flex: 0 0 auto; max-height: 156px; overflow: auto; padding: 9px 12px 10px;
+    border-bottom: 1px solid var(--pm-border);
+    background: linear-gradient(105deg, var(--pm-apex-soft), transparent 72%), var(--pm-node-bg);
+  }
+  #pm-class-context[hidden] { display: none; }
+  .class-context-eyebrow {
+    color: var(--pm-muted); font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  }
+  .class-context-title {
+    margin-top: 2px; font-size: 12px; font-weight: 650; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .class-context-methods { display: grid; gap: 3px; margin-top: 7px; }
+  .class-context-method {
+    display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0;
+    padding: 4px 7px; border: 1px solid transparent; border-radius: 5px;
+    background: transparent; color: var(--pm-fg); cursor: pointer;
+    font: inherit; font-size: 11px; text-align: left;
+  }
+  .class-context-method:hover { background: var(--pm-bg); border-color: var(--pm-border); }
+  .class-context-method:focus-visible { outline: 2px solid var(--pm-link); outline-offset: -2px; }
+  .class-context-method.is-current {
+    border-color: var(--pm-link); background: var(--pm-apex-soft);
+  }
+  .class-context-method .method-name {
+    flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; font-family: var(--vscode-editor-font-family, monospace);
+  }
+  .class-context-method .method-hop {
+    flex: 0 0 auto; color: var(--pm-muted); font-size: 9px;
+    font-family: var(--vscode-editor-font-family, monospace); text-transform: uppercase;
+  }
+
+  #pm-viewport { flex: 1 1 auto; min-width: 0; position: relative; overflow: hidden; cursor: grab; }
   #pm-viewport.dragging { cursor: grabbing; }
   #pm-canvas { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+  #pm-lanes, #pm-edges, #pm-nodes { position: absolute; top: 0; left: 0; }
+  #pm-lanes { pointer-events: none; }
   #pm-edges { position: absolute; top: 0; left: 0; overflow: visible; }
   #pm-nodes { position: absolute; top: 0; left: 0; }
 
-  .node {
-    position: absolute; border-radius: 8px; border: 1.5px solid var(--pm-border);
-    background: var(--pm-node-bg); padding: 6px 10px 8px; overflow: hidden; cursor: pointer;
-    box-shadow: 0 1px 2px rgba(0,0,0,.15);
+  .depth-lane {
+    position: absolute; top: 0; border-left: 1px solid rgba(127,127,127,.09);
+    border-right: 1px solid rgba(127,127,127,.09); background: var(--pm-lane);
   }
-  .node:hover { border-color: var(--pm-link); }
-  .node.kind-trigger { border-left: 4px solid var(--pm-trigger); }
-  .node.kind-entry { border-left: 4px solid var(--pm-entry); }
-  .node.kind-test { border-left: 4px solid var(--pm-test); }
-  .node.kind-normal { border-left: 4px solid var(--pm-normal); }
-  .node.kind-metadata { border-left: 4px solid var(--pm-metadata); }
-  .node.kind-anonymous { border-left: 4px solid var(--pm-anonymous); }
-  .node.kind-exception { border-left: 4px solid var(--pm-exception); }
-  .node.kind-unresolved { border-left: 4px solid var(--pm-unresolved); }
-  .node.kind-external { border-left: 4px solid var(--pm-external); }
-  .node.is-test { opacity: .62; }
+  .depth-lane.is-target { background: var(--pm-lane-target); border-color: rgba(79,163,255,.2); }
+  .depth-label {
+    position: absolute; top: 18px; left: 12px; color: var(--pm-muted);
+    font-family: var(--vscode-editor-font-family, monospace); font-size: 10px;
+    font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  }
+  .depth-lane.is-target .depth-label { color: var(--pm-link); }
+
+  #pm-controls {
+    position: absolute; right: 14px; bottom: 14px; z-index: 8; display: flex;
+    overflow: hidden; border: 1px solid var(--pm-border); border-radius: 8px;
+    background: var(--pm-node-bg); box-shadow: 0 3px 12px rgba(0,0,0,.18);
+  }
+  #pm-controls button {
+    min-width: 30px; height: 28px; border: 0; border-right: 1px solid var(--pm-border);
+    padding: 0 8px; background: transparent; color: var(--pm-fg); cursor: pointer;
+    font: inherit;
+  }
+  #pm-controls button:last-child { border-right: 0; }
+  #pm-controls button:hover { background: var(--pm-apex-soft); }
+  #pm-controls button:focus-visible { outline: 2px solid var(--pm-link); outline-offset: -2px; }
+  #pm-controls button.is-primary { color: var(--pm-link); font-weight: 600; min-width: 116px; }
+  #pm-controls button:disabled { color: var(--pm-muted); cursor: default; opacity: .68; }
+  #pm-controls button:disabled:hover { background: transparent; }
+
+  .node {
+    --node-accent: var(--pm-normal); --node-soft: var(--pm-neutral-soft);
+    position: absolute; border-radius: 9px; border: 1px solid var(--pm-border);
+    border-left: 4px solid var(--node-accent);
+    background: linear-gradient(105deg, var(--node-soft), transparent 58%), var(--pm-node-bg);
+    padding: 7px 10px 8px; overflow: hidden; cursor: pointer;
+    box-shadow: 0 2px 5px rgba(0,0,0,.14);
+  }
+  .node:hover { border-color: var(--node-accent); box-shadow: 0 3px 9px rgba(0,0,0,.22); }
+  .node:focus-visible { outline: 2px solid var(--pm-link); outline-offset: 3px; }
+  .node.kind-trigger { --node-accent: var(--pm-trigger); --node-soft: var(--pm-entry-soft); }
+  .node.kind-entry { --node-accent: var(--pm-entry); --node-soft: var(--pm-entry-soft); }
+  .node.kind-test { --node-accent: var(--pm-test); --node-soft: var(--pm-test-soft); }
+  .node.kind-normal { --node-accent: var(--pm-normal); --node-soft: var(--pm-neutral-soft); }
+  .node.kind-metadata { --node-accent: var(--pm-metadata); --node-soft: var(--pm-automation-soft); }
+  .node.kind-anonymous { --node-accent: var(--pm-anonymous); --node-soft: var(--pm-data-soft); }
+  .node.kind-exception { --node-accent: var(--pm-exception); --node-soft: var(--pm-danger-soft); }
+  .node.kind-unresolved { --node-accent: var(--pm-unresolved); --node-soft: var(--pm-neutral-soft); }
+  .node.kind-external { --node-accent: var(--pm-external); --node-soft: var(--pm-external-soft); }
+  .node.tone-apex { --node-accent: var(--pm-apex); --node-soft: var(--pm-apex-soft); }
+  .node.tone-entry { --node-accent: var(--pm-entry-hue); --node-soft: var(--pm-entry-soft); }
+  .node.tone-automation { --node-accent: var(--pm-automation); --node-soft: var(--pm-automation-soft); }
+  .node.tone-interface { --node-accent: var(--pm-interface); --node-soft: var(--pm-interface-soft); }
+  .node.tone-data { --node-accent: var(--pm-data); --node-soft: var(--pm-data-soft); }
+  .node.tone-external { --node-accent: var(--pm-external); --node-soft: var(--pm-external-soft); }
+  .node.tone-test { --node-accent: var(--pm-test); --node-soft: var(--pm-test-soft); }
+  .node.tone-danger { --node-accent: var(--pm-danger); --node-soft: var(--pm-danger-soft); }
+  .node.tone-neutral { --node-accent: var(--pm-unresolved); --node-soft: var(--pm-neutral-soft); }
+  .node.tone-approx { --node-accent: var(--pm-approx); --node-soft: var(--pm-data-soft); }
+  .node.is-target {
+    border-width: 2px; border-left-width: 5px;
+    box-shadow: 0 0 0 3px var(--pm-apex-soft), 0 4px 12px rgba(0,0,0,.2);
+  }
+  .node.is-test { opacity: .78; }
   .node.is-approx { border-style: dashed; border-color: var(--pm-approx); }
-  /* v0.13 (Round 2.5, H2 -- rendering half): the rollup pseudo-node --
+  /* The rollup pseudo-node --
      rendered as a dashed, fully-rounded PILL (no left accent bar, centered
      text) instead of the ordinary rectangular node shape, so it visually
      reads as "a grouped placeholder", not one more caller/callee. Reuses
@@ -752,7 +932,7 @@ const CSS_TEXT = `
     border-radius: 999px; text-align: center; display: flex; align-items: center; justify-content: center;
   }
   .node.kind-rollup .node-label { -webkit-line-clamp: 3; }
-  /* v0.13 (Round 2.5, H2): a node/edge beneath a COLLAPSED rollup pill --
+  /* A node/edge beneath a collapsed rollup pill --
      see CLIENT_JS_TEXT's isHiddenByCollapsedRollup/renderGraph, which never
      even creates these DOM elements while collapsed; this class exists only
      as a defensive belt-and-suspenders rule (never actually relied on to
@@ -760,10 +940,22 @@ const CSS_TEXT = `
      place) documenting the invariant for a future reader. */
   .hidden-by-rollup { display: none; }
 
+  .node-meta { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; min-height: 14px; }
+  .node-type, .node-role {
+    font-family: var(--vscode-editor-font-family, monospace); font-size: 9px; line-height: 1.45;
+    font-weight: 700; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap;
+  }
+  .node-type {
+    max-width: 150px; overflow: hidden; text-overflow: ellipsis; padding: 0 5px;
+    border: 1px solid var(--node-accent); border-radius: 4px; color: var(--node-accent);
+    background: var(--node-soft);
+  }
+  .node-role { margin-left: auto; color: var(--pm-link); }
+
   .node-label {
     font-size: 12px; font-weight: 600; line-height: 1.25; overflow: hidden; text-overflow: ellipsis;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-    /* v0.13 (Round 2.5, LONG-NAME layout hardening): a real-org render bug
+    /* Long-name layout hardening: a real-org render bug
        report showed nodes with very long, SPACE-FREE identifiers (Apex
        class/method names routinely run 60+ characters, e.g.
        'SomeVeryLongClassName.someVeryLongMethodName' has no whitespace at
@@ -784,6 +976,7 @@ const CSS_TEXT = `
     overflow-wrap: anywhere; word-break: break-word;
   }
   .node-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .node.has-frontier .node-badges { padding-right: 74px; }
   .badge {
     font-size: 10px; line-height: 1.5; padding: 0 5px; border-radius: 8px;
     background: var(--pm-bg); border: 1px solid var(--pm-border); color: var(--pm-muted); white-space: nowrap;
@@ -796,32 +989,72 @@ const CSS_TEXT = `
      buildNodeEl in CLIENT_JS_TEXT below and the pill-vs-body click
      separation note there. */
   .frontier-pill {
-    display: inline-block; margin-top: 4px; font-size: 10px; font-weight: 600; line-height: 1.6;
+    position: absolute; right: 8px; bottom: 7px; display: inline-block; margin: 0;
+    font-size: 10px; font-weight: 600; line-height: 1.6;
     padding: 0 7px; border-radius: 9px; background: var(--pm-link); color: var(--pm-node-bg);
-    cursor: pointer; border: none;
+    cursor: pointer; border: none; font-family: inherit;
   }
   .frontier-pill:hover { filter: brightness(1.15); }
   .frontier-pill:active { filter: brightness(0.9); }
+  .frontier-pill:focus-visible { outline: 2px solid var(--pm-link); outline-offset: 2px; }
 
-  .edge-path { fill: none; stroke: var(--pm-border); stroke-width: 1.5; }
-  .edge-path.is-approx { stroke-dasharray: 4 3; stroke: var(--pm-approx); }
-  .edge-label { font-size: 10px; fill: var(--pm-muted); }
+  .edge-path {
+    fill: none; stroke: var(--pm-apex); color: var(--pm-apex); stroke-width: 1.7;
+    stroke-linecap: round; stroke-linejoin: round; opacity: .78;
+  }
+  .edge-path.tone-automation { stroke: var(--pm-automation); color: var(--pm-automation); }
+  .edge-path.tone-data { stroke: var(--pm-data); color: var(--pm-data); }
+  .edge-path.tone-external { stroke: var(--pm-external); color: var(--pm-external); }
+  .edge-path.tone-danger { stroke: var(--pm-danger); color: var(--pm-danger); }
+  .edge-path.tone-neutral { stroke: var(--pm-unresolved); color: var(--pm-unresolved); }
+  .edge-path.tone-approx, .edge-path.is-approx {
+    stroke-dasharray: 5 4; stroke: var(--pm-approx); color: var(--pm-approx);
+  }
+  .edge-label {
+    font-family: var(--vscode-editor-font-family, monospace); font-size: 9px; font-weight: 600;
+    fill: var(--pm-muted); paint-order: stroke; stroke: var(--pm-bg); stroke-width: 4px;
+    stroke-linejoin: round;
+  }
+  .arrow-head.tone-apex { fill: var(--pm-apex); }
+  .arrow-head.tone-automation { fill: var(--pm-automation); }
+  .arrow-head.tone-data { fill: var(--pm-data); }
+  .arrow-head.tone-external { fill: var(--pm-external); }
+  .arrow-head.tone-danger { fill: var(--pm-danger); }
+  .arrow-head.tone-neutral { fill: var(--pm-unresolved); }
+  .arrow-head.tone-approx { fill: var(--pm-approx); }
 
   .pm-tooltip {
-    position: fixed; z-index: 20; max-width: 440px; max-height: 320px; overflow: auto;
-    background: var(--pm-node-bg); border: 1px solid var(--pm-border); border-radius: 6px;
-    padding: 8px 10px; box-shadow: 0 4px 14px rgba(0,0,0,.3); font-size: 12px;
+    flex: 1 1 auto; min-height: 0; overflow: auto; background: var(--pm-node-bg);
+    padding: 12px 14px; font-size: 12px;
   }
-  .pm-tooltip[hidden] { display: none; }
-  .pm-tooltip .tt-title { font-weight: 600; margin-bottom: 6px; }
+  .pm-tooltip .tt-eyebrow {
+    margin-bottom: 5px; color: var(--pm-muted); font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  }
+  .pm-tooltip .tt-title { font-weight: 650; font-size: 13px; margin-bottom: 8px; overflow-wrap: anywhere; }
   .pm-tooltip .tt-empty { color: var(--pm-muted); }
-  .pm-tooltip .tt-site { padding: 4px 6px; border-radius: 4px; cursor: pointer; }
+  .pm-tooltip .tt-site {
+    display: block; width: 100%; margin: 0 0 4px; padding: 6px 7px; border: 0;
+    border-radius: 5px; background: transparent; color: var(--pm-fg); cursor: pointer;
+    font: inherit; text-align: left;
+  }
   .pm-tooltip .tt-site:hover { background: var(--pm-bg); }
+  .pm-tooltip .tt-site:focus-visible { outline: 2px solid var(--pm-link); outline-offset: -2px; }
   .pm-tooltip .tt-line {
     font-family: var(--vscode-editor-font-family, monospace); white-space: pre-wrap; word-break: break-all;
   }
   .pm-tooltip .tt-args { color: var(--pm-muted); margin-top: 2px; white-space: pre-wrap; word-break: break-all; }
   .pm-tooltip .tt-via { color: var(--pm-muted); font-size: 10px; margin-top: 2px; }
+
+  @media (max-width: 900px) {
+    #pm-workspace { flex-direction: column; }
+    #pm-sidebar {
+      flex: 0 0 190px; width: auto; max-width: none; min-width: 0;
+      border-left: 0; border-top: 1px solid var(--pm-border);
+    }
+    #pm-legend { max-height: 90px; }
+    #pm-class-context { max-height: 112px; }
+  }
 `;
 
 // Client-side script. No backticks and no `${` sequences appear anywhere in
@@ -851,9 +1084,8 @@ const CLIENT_JS_TEXT = `
     }
   }
 
-  // v0.9 (P1/P4): posted by a frontier node's '+N' pill click (see
-  // buildNodeEl below) -- {type:'expand', key} per the P2 CONTRACT
-  // AMENDMENT text verbatim. n.expandKey is server-computed
+  // Posted by a frontier node's '+N' pill click (see buildNodeEl below):
+  // {type:'expand', key}. n.expandKey is server-computed
   // (shapeNodeForData/frontierMethodKey in pathmap.js), never re-derived
   // client-side, so this stays a pure postMessage relay, same shape as
   // postOpen immediately above.
@@ -867,6 +1099,23 @@ const CLIENT_JS_TEXT = `
     }
   }
 
+  function requestExpandMany(nodes) {
+    var keys = [];
+    var seen = {};
+    (nodes || []).forEach(function (n) {
+      if (!n || !n.expandKey || seen[n.expandKey]) return;
+      seen[n.expandKey] = true;
+      keys.push(n.expandKey);
+    });
+    if (!keys.length) return;
+    var msg = { type: 'expandMany', keys: keys };
+    if (vscodeApi) {
+      vscodeApi.postMessage(msg);
+    } else {
+      console.log('[apex-trace pathmap] expand many', msg);
+    }
+  }
+
   function clearChildren(el) {
     while (el.firstChild) el.removeChild(el.firstChild);
   }
@@ -876,26 +1125,30 @@ const CLIENT_JS_TEXT = `
   var stats = document.getElementById('pm-stats');
   var noteEl = document.getElementById('pm-note');
 
-  // v0.9 (P1/P4): the header-rendering logic, factored into its own named
+  // Header-rendering logic, factored into its own named
   // function so the {type:'update'} handler (applyUpdate, near the bottom
   // of this script) can reuse it VERBATIM instead of a second, driftable
   // copy -- called once below for the initial render, exactly reproducing
   // this file's pre-v0.9 top-level statement order/behavior.
   function renderHeader() {
     header.textContent = DATA.meta.targetLabel || '(no target)';
-    // v0.7 (A3): direction sign-post -- left EMPTY (matching every pre-v0.7
+    // Direction sign-post -- left EMPTY for callers
     // render byte-for-byte) whenever directionLabel is null, i.e. absent/
     // undirected TreeResults; see directionHeaderLine's interpretive-decision
     // comment for why that specific case must stay exactly "today".
     if (DATA.meta.directionLabel) {
       directionEl.textContent = DATA.meta.directionLabel;
+    } else {
+      directionEl.textContent = '';
     }
     stats.textContent = DATA.meta.nodeCount + ' node' + (DATA.meta.nodeCount === 1 ? '' : 's') +
       ', ' + DATA.meta.edgeCount + ' edge' + (DATA.meta.edgeCount === 1 ? '' : 's');
     if (DATA.meta.note) {
       noteEl.textContent = DATA.meta.note;
+    } else {
+      noteEl.textContent = '';
     }
-    // v0.6 (H1/H4 forward-compat, H4's own header wording): additional header
+    // Additional header
     // lines (capped / workspace-wide unresolved-sites count), precomputed
     // server-side (see headerExtraLinesForResult) so this is a straight
     // display concatenation, appended onto the note line rather than
@@ -907,11 +1160,18 @@ const CLIENT_JS_TEXT = `
   }
   renderHeader();
 
+  var lanesLayer = document.getElementById('pm-lanes');
   var nodesLayer = document.getElementById('pm-nodes');
   var edgesSvg = document.getElementById('pm-edges');
   var canvas = document.getElementById('pm-canvas');
   var viewport = document.getElementById('pm-viewport');
   var tooltip = document.getElementById('pm-tooltip');
+  var classContext = document.getElementById('pm-class-context');
+  var controls = document.getElementById('pm-controls');
+  var expandVisibleButton = document.getElementById('pm-expand-visible');
+  var zoomOutButton = document.getElementById('pm-zoom-out');
+  var fitButton = document.getElementById('pm-fit');
+  var zoomInButton = document.getElementById('pm-zoom-in');
 
   var W = DATA.layout.width;
   var H = DATA.layout.height;
@@ -920,11 +1180,14 @@ const CLIENT_JS_TEXT = `
 
   canvas.style.width = W + 'px';
   canvas.style.height = H + 'px';
+  lanesLayer.style.width = W + 'px';
+  lanesLayer.style.height = H + 'px';
   edgesSvg.setAttribute('width', String(W));
   edgesSvg.setAttribute('height', String(H));
 
   var nodeById = {};
-  // v0.13 (Round 2.5, H2 -- rendering half): child id -> parent id, rebuilt
+  var classPeersByName = Object.create(null);
+  // Child id -> parent id, rebuilt
   // alongside nodeById every time DATA changes (initial render + every
   // applyUpdate) -- used by isHiddenByCollapsedRollup below to walk a
   // node's ancestor chain looking for a still-collapsed rollup pill.
@@ -932,19 +1195,26 @@ const CLIENT_JS_TEXT = `
   function indexNodes() {
     nodeById = {};
     parentByChild = {};
-    DATA.nodes.forEach(function (n) { nodeById[n.id] = n; });
+    classPeersByName = Object.create(null);
+    DATA.nodes.forEach(function (n) {
+      nodeById[n.id] = n;
+      var key = classContextKey(n);
+      if (!key) return;
+      if (!classPeersByName[key]) classPeersByName[key] = [];
+      classPeersByName[key].push(n);
+    });
     DATA.edges.forEach(function (e) { parentByChild[e.from] = e.to; });
   }
   indexNodes();
 
-  // v0.13 (Round 2.5, H2 -- rendering half): ROLLUP PILL expand/collapse
+  // Rollup-pill expand/collapse
   // state -- a plain map of rollup-node-id -> true once the user has
   // clicked it open. Declared OUTSIDE renderGraph/applyUpdate (module-level
   // in this IIFE) so it PERSISTS across an applyUpdate call -- a rollup the
   // user already opened must stay open across a server-driven refresh
   // (e.g. a frontier '+N' click elsewhere growing the trace), never reset
   // out from under them. Starts empty: every rollup begins COLLAPSED, per
-  // the H2 spec ("collapsibleState collapsed").
+  // the tree-view collapsed-state behavior.
   var expandedRollups = {};
 
   // A node is hidden iff any ANCESTOR of it (never the node itself) is a
@@ -965,21 +1235,72 @@ const CLIENT_JS_TEXT = `
     return false;
   }
 
+  function classContextKey(n) {
+    if (!n || !n.className || !n.methodLower) return null;
+    if (n.methodLower === '(trigger)' || n.methodLower === '(anonymous)') return null;
+    return String(n.className).toLowerCase();
+  }
+
+  function methodNameInClass(n) {
+    var label = String((n && n.label) || '');
+    var prefix = String((n && n.className) || '') + '.';
+    return label.indexOf(prefix) === 0 ? label.slice(prefix.length) : label;
+  }
+
+  function visibleFrontierNodes() {
+    return DATA.nodes.filter(function (n) {
+      return n.expandable && n.expandKey && !isHiddenByCollapsedRollup(n.id);
+    });
+  }
+
+  function refreshExpandControl() {
+    var count = visibleFrontierNodes().length;
+    expandVisibleButton.disabled = count === 0;
+    expandVisibleButton.textContent = count === 0
+      ? 'Fully expanded'
+      : ('Expand visible (' + count + ')');
+    expandVisibleButton.title = count === 0
+      ? 'No visible frontier branches remain'
+      : 'Expand all ' + count + ' visible frontier branch' + (count === 1 ? '' : 'es') +
+        ' by the configured expansion step';
+  }
+
+  function renderLanes() {
+    var byDepth = {};
+    DATA.nodes.forEach(function (n) {
+      if (byDepth[n.depth] == null) byDepth[n.depth] = n.x;
+    });
+    Object.keys(byDepth).map(Number).sort(function (a, b) { return byDepth[a] - byDepth[b]; }).forEach(function (depth) {
+      var lane = document.createElement('div');
+      lane.className = 'depth-lane' + (depth === 0 ? ' is-target' : '');
+      lane.style.left = (byDepth[depth] - 16) + 'px';
+      lane.style.width = (NW + 32) + 'px';
+      lane.style.height = H + 'px';
+      lane.setAttribute('aria-hidden', 'true');
+
+      var label = document.createElement('span');
+      label.className = 'depth-label';
+      label.textContent = depth === 0 ? 'Target' : ('Hop ' + depth);
+      lane.appendChild(label);
+      lanesLayer.appendChild(lane);
+    });
+  }
+
   var SVG_NS = 'http://www.w3.org/2000/svg';
 
   function badgeGlyphs(n) {
     var out = n.badges.slice();
-    // v0.5 (G2): shield glyph for caughtHere -- IN ADDITION to the
+    // Shield glyph for caughtHere -- IN ADDITION to the
     // 'catches <ExcName>' text already present in n.badges (from
     // TNode.entries, shortened by shortenEntry server-side). Pushed first,
     // right after the entries-derived badges, mirroring uitree.js's order.
     if (n.caughtHere) out.push('\\uD83D\\uDEE1'); // shield glyph (U+1F6E1)
     if (n.isTest) out.push('\\uD83E\\uDDEA'); // test-tube glyph
-    // v0.6 (H3): 'root' glyph -- mirrors uitree.js's '◉ root' badge.
+    // 'root' glyph -- mirrors uitree.js's '◉ root' badge.
     if (n.root) out.push('\\u25C9'); // FISHEYE (U+25C9) -- root
     if (n.cyclic) out.push('\\u21BA'); // loop-arrow glyph
     if (n.truncated) out.push('\\u2026'); // ellipsis (capped -- depth cap or node-count cap)
-    // v0.6 (H1 forward-compat, H5 rendering): seenElsewhere glyph.
+    // seenElsewhere glyph.
     if (n.seenElsewhere) out.push('\\u21E2'); // dashed rightwards arrow (U+21E2)
     return out;
   }
@@ -987,16 +1308,39 @@ const CLIENT_JS_TEXT = `
   function buildNodeEl(n) {
     var isRollup = n.kind === 'rollup';
     var el = document.createElement('div');
-    el.className = 'node kind-' + n.accent + (n.isTest ? ' is-test' : '') + (n.approximate ? ' is-approx' : '');
+    el.className = 'node kind-' + n.accent + ' type-' + n.typeKey + ' tone-' + n.tone +
+      (n.target ? ' is-target' : '') + (n.isTest ? ' is-test' : '') + (n.approximate ? ' is-approx' : '') +
+      (n.expandable ? ' has-frontier' : '');
     el.style.left = n.x + 'px';
     el.style.top = n.y + 'px';
     el.style.width = NW + 'px';
-    el.style.minHeight = NH + 'px';
+    el.style.height = NH + 'px';
     el.setAttribute('data-id', String(n.id));
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    el.setAttribute('aria-label', n.typeLabel + ': ' + n.label + (n.target ? '. Traced target.' : '') +
+      (n.approximate ? ' Approximate match.' : ''));
+    el.title = n.label;
+
+    if (!isRollup) {
+      var metaRow = document.createElement('div');
+      metaRow.className = 'node-meta';
+      var typeEl = document.createElement('span');
+      typeEl.className = 'node-type';
+      typeEl.textContent = n.typeLabel;
+      metaRow.appendChild(typeEl);
+      if (n.target) {
+        var roleEl = document.createElement('span');
+        roleEl.className = 'node-role';
+        roleEl.textContent = 'Target';
+        metaRow.appendChild(roleEl);
+      }
+      el.appendChild(metaRow);
+    }
 
     var labelEl = document.createElement('div');
     labelEl.className = 'node-label';
-    // v0.13 (Round 2.5, H2 -- rendering half): the rollup pill's own label
+    // The rollup pill's own label
     // is prefixed with a disclosure triangle reflecting its CURRENT
     // expand/collapse state (▸ collapsed / ▾ expanded -- same glyph pair
     // the #pm-legend <details> element's own ::before rule already uses,
@@ -1021,7 +1365,7 @@ const CLIENT_JS_TEXT = `
       el.appendChild(badgeRow);
     }
 
-    // v0.9 (P1/P4): the frontier '+N' pill -- a DISTINCT, clickable element
+    // The frontier '+N' pill -- a DISTINCT, clickable element
     // (see the .frontier-pill CSS rule) appended as its own row, separate
     // from the plain read-only .badge spans above. PILL-VS-BODY CLICK
     // SEPARATION: its own click listener calls ev.stopPropagation() FIRST,
@@ -1029,12 +1373,14 @@ const CLIENT_JS_TEXT = `
     // (which still jumps to source) -- clicking the pill posts {type:
     // 'expand', key}, clicking anywhere else on the node body still jumps.
     if (n.expandable) {
-      var pill = document.createElement('span');
+      var pill = document.createElement('button');
+      pill.type = 'button';
       pill.className = 'frontier-pill';
-      pill.textContent = '+' + (n.pendingCount == null ? '' : n.pendingCount);
+      pill.textContent = 'Expand +' + (n.pendingCount == null ? '' : n.pendingCount);
       var pillNoun = DATA.meta.direction === 'callees' ? 'callees' : 'callers';
       var pillCount = n.pendingCount == null ? 'more' : String(n.pendingCount) + ' more';
       pill.title = pillCount + ' direct ' + pillNoun + ' \\u2014 click to expand';
+      pill.setAttribute('aria-label', 'Expand ' + pillCount + ' direct ' + pillNoun + ' from ' + n.label);
       pill.addEventListener('click', function (ev) {
         ev.stopPropagation();
         requestExpand(n);
@@ -1042,11 +1388,11 @@ const CLIENT_JS_TEXT = `
       el.appendChild(pill);
     }
 
-    el.addEventListener('mouseenter', function () { cancelHideTooltip(); showTooltip(n, el); });
-    el.addEventListener('mouseleave', scheduleHideTooltip);
-    el.addEventListener('click', function () {
+    el.addEventListener('mouseenter', function () { showTooltip(n); });
+    el.addEventListener('focus', function () { showTooltip(n); });
+    function activateNode() {
       if (dragMoved) return; // a pan gesture that ended over a node must not open it
-      // v0.13 (Round 2.5, H2 -- rendering half): a rollup pill has no
+      // A rollup pill has no
       // source location of its own (n.path is always null, see
       // makeRollupTNode in pathmap.js) -- clicking it toggles its
       // expand/collapse state instead of jumping anywhere. REUSES the
@@ -1067,27 +1413,30 @@ const CLIENT_JS_TEXT = `
         return;
       }
       postOpen(n.path, n.line, 0);
+    }
+    el.addEventListener('click', activateNode);
+    el.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();
+      activateNode();
     });
 
     return el;
   }
 
-  // v0.7 (A3): 'to' is always the tree PARENT (edges are gathered child->
+  // 'to' is always the tree PARENT (edges are gathered child->
   // parent, see layoutTree/shapeEdgeForData -- this doesn't change with
   // direction) and 'from' is always the tree CHILD. In the default
   // (non-mirrored) layout the parent sits at a LARGER x than the child (the
   // target/depth-0 node is rightmost), so the curve is drawn child-right-
   // edge -> parent-left-edge, i.e. left-to-right, converging into the
-  // target -- exactly the pre-v0.7 behavior, unchanged when MIRRORED is
-  // false (see the leftNode/rightNode selection below: false picks
-  // leftNode=from/rightNode=to, identical to the original from/to/x1/y1/x2/
-  // y2 assignment this replaced). When MIRRORED is true the parent instead
+  // target. When MIRRORED is true the parent instead
   // sits at the SMALLER x (target/depth-0 is leftmost, see layoutTree), so
-  // leftNode/rightNode swap to keep the curve reading left-to-right
+  // leftNode/rightNode swap to keep the connector reading left-to-right
   // (parent's right edge -> child's left edge) instead of drawing
   // backwards.
   var MIRRORED = !!(DATA.layout && DATA.layout.mirrored);
-  function edgePath(from, to) {
+  function edgePoints(from, to) {
     var leftNode = MIRRORED ? to : from;
     var rightNode = MIRRORED ? from : to;
     var x1 = leftNode.x + NW;
@@ -1095,17 +1444,47 @@ const CLIENT_JS_TEXT = `
     var x2 = rightNode.x;
     var y2 = rightNode.y + NH / 2;
     var midX = (x1 + x2) / 2;
-    return 'M ' + x1 + ' ' + y1 + ' C ' + midX + ' ' + y1 + ', ' + midX + ' ' + y2 + ', ' + x2 + ' ' + y2;
+    return { x1: x1, y1: y1, x2: x2, y2: y2, midX: midX };
+  }
+  function edgePath(from, to) {
+    var p = edgePoints(from, to);
+    // Orthogonal elbow connectors expose the hierarchy at a glance: every
+    // hop leaves a card horizontally, joins the branch rail, then enters
+    // the next depth column horizontally again.
+    return 'M ' + p.x1 + ' ' + p.y1 + ' H ' + p.midX + ' V ' + p.y2 + ' H ' + p.x2;
   }
 
-  // v0.9 (P1/P4): the node+edge DOM construction, factored into its own
+  var EDGE_TONES = ['apex', 'automation', 'data', 'external', 'danger', 'neutral', 'approx'];
+  function renderArrowMarkers() {
+    var defs = document.createElementNS(SVG_NS, 'defs');
+    EDGE_TONES.forEach(function (tone) {
+      var marker = document.createElementNS(SVG_NS, 'marker');
+      marker.setAttribute('id', 'pm-arrow-' + tone);
+      marker.setAttribute('viewBox', '0 0 7 7');
+      marker.setAttribute('refX', '6');
+      marker.setAttribute('refY', '3.5');
+      marker.setAttribute('markerWidth', '7');
+      marker.setAttribute('markerHeight', '7');
+      marker.setAttribute('orient', 'auto');
+      var arrow = document.createElementNS(SVG_NS, 'path');
+      arrow.setAttribute('d', 'M 0 0 L 7 3.5 L 0 7 z');
+      arrow.setAttribute('class', 'arrow-head tone-' + tone);
+      marker.appendChild(arrow);
+      defs.appendChild(marker);
+    });
+    edgesSvg.appendChild(defs);
+  }
+
+  // The node+edge DOM construction, factored into its own
   // named function so the {type:'update'} handler (applyUpdate below) can
   // rebuild the map from a fresh data blob by calling the EXACT same code
   // the initial render already used, instead of a second, driftable copy.
   // Called once below for the initial render.
   function renderGraph() {
+    renderLanes();
+    renderArrowMarkers();
     DATA.nodes.forEach(function (n) {
-      // v0.13 (Round 2.5, H2 -- rendering half): a node beneath a
+      // A node beneath a
       // still-collapsed rollup pill is never even given a DOM element --
       // simplest possible "collapsed by default, expand in place" (no
       // separate hide/show pass needed later; re-calling renderGraph via
@@ -1127,36 +1506,115 @@ const CLIENT_JS_TEXT = `
 
       var path = document.createElementNS(SVG_NS, 'path');
       path.setAttribute('d', edgePath(from, to));
-      path.setAttribute('class', 'edge-path' + (e.approximate ? ' is-approx' : ''));
+      path.setAttribute('class', 'edge-path tone-' + e.tone + (e.approximate ? ' is-approx' : ''));
+      path.setAttribute('marker-end', 'url(#pm-arrow-' + e.tone + ')');
       edgesSvg.appendChild(path);
 
       if (e.via) {
         var text = document.createElementNS(SVG_NS, 'text');
-        var midX = (from.x + NW + to.x) / 2;
-        var midY = (from.y + to.y) / 2 + NH / 2 - 4;
-        text.setAttribute('x', String(midX));
-        text.setAttribute('y', String(midY));
+        var points = edgePoints(from, to);
+        // Put labels on the branch-specific horizontal segment, never on
+        // the shared vertical rail. In callers mode each child owns the
+        // left segment; in callees mode it owns the right segment.
+        var labelX = MIRRORED ? (points.midX + points.x2) / 2 : (points.x1 + points.midX) / 2;
+        var labelY = (MIRRORED ? points.y2 : points.y1) - 6;
+        text.setAttribute('x', String(labelX));
+        text.setAttribute('y', String(labelY));
         text.setAttribute('text-anchor', 'middle');
-        text.setAttribute('class', 'edge-label');
+        text.setAttribute('class', 'edge-label tone-' + e.tone);
         text.textContent = e.via;
         edgesSvg.appendChild(text);
       }
     });
+    refreshExpandControl();
   }
   renderGraph();
 
-  // ---- tooltip: call sites for the hovered node ---------------------------
-  var hideTimer = null;
-  function cancelHideTooltip() {
-    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+  // ---- details inspector: call sites for the hovered/focused node ---------
+  // This is a dedicated sibling of the viewport, never a floating overlay.
+  // It cannot obscure the card or branch being inspected, and the last
+  // inspected node remains stable while the pointer moves into a source row.
+  function renderInspectorEmpty() {
+    renderClassContext(null);
+    clearChildren(tooltip);
+    var eyebrow = document.createElement('div');
+    eyebrow.className = 'tt-eyebrow';
+    eyebrow.textContent = 'Path details';
+    tooltip.appendChild(eyebrow);
+    var empty = document.createElement('div');
+    empty.className = 'tt-empty';
+    empty.textContent = 'Hover or focus a node to inspect its call sites. Select a source line to open it.';
+    tooltip.appendChild(empty);
   }
-  function scheduleHideTooltip() {
-    hideTimer = setTimeout(function () { tooltip.hidden = true; }, 150);
-  }
-  tooltip.addEventListener('mouseenter', cancelHideTooltip);
-  tooltip.addEventListener('mouseleave', scheduleHideTooltip);
 
-  // v0.6 (H3): combined '-> overloadSig · argsRendered' detail text, mirrors
+  // Keep same-class context out of the graph itself: only methods that are
+  // already visible in this map are collected, deduplicated by method
+  // identity, and shown in a compact sidebar frame for the inspected node.
+  function renderClassContext(current) {
+    clearChildren(classContext);
+    var classKey = classContextKey(current);
+    if (!classKey) {
+      classContext.hidden = true;
+      return;
+    }
+
+    var unique = Object.create(null);
+    (classPeersByName[classKey] || []).forEach(function (peer) {
+      if (isHiddenByCollapsedRollup(peer.id)) return;
+      var methodKey = String(peer.methodLower || peer.label).toLowerCase();
+      var kept = unique[methodKey];
+      if (!kept || peer.id === current.id || peer.depth < kept.depth) unique[methodKey] = peer;
+    });
+    var peers = Object.keys(unique).map(function (key) { return unique[key]; });
+    if (peers.length < 2) {
+      classContext.hidden = true;
+      return;
+    }
+    peers.sort(function (a, b) {
+      if (a.id === current.id) return -1;
+      if (b.id === current.id) return 1;
+      if (a.depth !== b.depth) return a.depth - b.depth;
+      return methodNameInClass(a).localeCompare(methodNameInClass(b));
+    });
+
+    classContext.hidden = false;
+    var eyebrow = document.createElement('div');
+    eyebrow.className = 'class-context-eyebrow';
+    eyebrow.textContent = 'Same class in this map';
+    classContext.appendChild(eyebrow);
+
+    var title = document.createElement('div');
+    title.className = 'class-context-title';
+    title.textContent = current.className;
+    title.title = current.className;
+    classContext.appendChild(title);
+
+    var list = document.createElement('div');
+    list.className = 'class-context-methods';
+    peers.forEach(function (peer) {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'class-context-method' + (peer.id === current.id ? ' is-current' : '');
+      button.title = peer.label;
+      if (peer.id === current.id) button.setAttribute('aria-current', 'true');
+
+      var name = document.createElement('span');
+      name.className = 'method-name';
+      name.textContent = methodNameInClass(peer);
+      button.appendChild(name);
+
+      var hop = document.createElement('span');
+      hop.className = 'method-hop';
+      hop.textContent = peer.target ? 'Target' : ('Hop ' + peer.depth);
+      button.appendChild(hop);
+
+      button.addEventListener('click', function () { focusMapNode(peer); });
+      list.appendChild(button);
+    });
+    classContext.appendChild(list);
+  }
+
+  // Combined '-> overloadSig · argsRendered' detail text, mirrors
   // uitree.js's siteDetailLine -- overloadSig used to be rendered NOWHERE
   // (confirmed bug) and argsRendered was tooltip-only; this IS the tooltip,
   // so the fix here is making overloadSig show up at all, plus prefixing
@@ -1170,7 +1628,8 @@ const CLIENT_JS_TEXT = `
   }
 
   function siteRow(site, fallbackPath) {
-    var row = document.createElement('div');
+    var row = document.createElement('button');
+    row.type = 'button';
     row.className = 'tt-site';
 
     var lineEl = document.createElement('div');
@@ -1201,18 +1660,23 @@ const CLIENT_JS_TEXT = `
     return row;
   }
 
-  // v0.13 (Round 2.5, H2 -- rendering half): the rollup pill's own hover
-  // tooltip explains the grouping itself (mirrors uitree.js's ROLLUP_TOOLTIP
+  // The rollup pill's inspector
+  // details explain the grouping itself (mirrors uitree.js's ROLLUP_TOOLTIP
   // constant, condensed) rather than falling through to the generic
   // 'no call sites recorded' empty-state text below, which would be
   // confusing on a node that deliberately never carries sites of its own.
   var ROLLUP_TOOLTIP_TEXT =
     'Grouped for clarity: each of these was matched through approximate resolution (interface / unique-name / lexical / override / narrowed / dynamic / ambiguous) and may be wrong, or one of several candidates. Click the pill to expand/collapse.';
 
-  function showTooltip(n, el) {
+  function showTooltip(n) {
+    renderClassContext(n);
     clearChildren(tooltip);
 
     var isRollup = n.kind === 'rollup';
+    var eyebrow = document.createElement('div');
+    eyebrow.className = 'tt-eyebrow';
+    eyebrow.textContent = n.typeLabel + (n.approximate ? ' \u00B7 approximate' : '') + (n.target ? ' \u00B7 target' : '');
+    tooltip.appendChild(eyebrow);
     var title = document.createElement('div');
     title.className = 'tt-title';
     title.textContent = isRollup ? n.label : (n.approximate ? '~' : '') + n.label;
@@ -1231,22 +1695,8 @@ const CLIENT_JS_TEXT = `
     } else {
       n.sites.forEach(function (s) { tooltip.appendChild(siteRow(s, n.path)); });
     }
-
-    tooltip.hidden = false;
-    var rect = el.getBoundingClientRect();
-    tooltip.style.top = Math.max(4, rect.top) + 'px';
-    tooltip.style.left = (rect.right + 10) + 'px';
-
-    // clamp after layout so the tooltip never runs off the right/bottom edge
-    var tr = tooltip.getBoundingClientRect();
-    if (tr.right > window.innerWidth - 4) {
-      tooltip.style.left = Math.max(4, rect.left - tr.width - 10) + 'px';
-    }
-    var tr2 = tooltip.getBoundingClientRect();
-    if (tr2.bottom > window.innerHeight - 4) {
-      tooltip.style.top = Math.max(4, window.innerHeight - tr2.height - 4) + 'px';
-    }
   }
+  renderInspectorEmpty();
 
   // ---- pan (drag background) + zoom (wheel, clamped) ----------------------
   var scale = 1;
@@ -1259,7 +1709,23 @@ const CLIENT_JS_TEXT = `
     canvas.style.transform = 'translate(' + panX + 'px,' + panY + 'px) scale(' + scale + ')';
   }
 
-  (function fitInitial() {
+  function focusMapNode(n) {
+    if (!n || isHiddenByCollapsedRollup(n.id)) return;
+    panX = (viewport.clientWidth || 800) / 2 - (n.x + NW / 2) * scale;
+    panY = (viewport.clientHeight || 600) / 2 - (n.y + NH / 2) * scale;
+    applyTransform();
+    showTooltip(n);
+    var card = nodesLayer.querySelector('[data-id="' + String(n.id) + '"]');
+    if (card) {
+      try {
+        card.focus({ preventScroll: true });
+      } catch (e) {
+        card.focus();
+      }
+    }
+  }
+
+  function fitMap() {
     // Fit a large map into the viewport on first paint instead of opening
     // zoomed to a single corner; never zooms IN past 1:1 for small maps.
     var vw = viewport.clientWidth || 800;
@@ -1269,7 +1735,33 @@ const CLIENT_JS_TEXT = `
     panX = 24;
     panY = Math.max(24, (vh - H * scale) / 2);
     applyTransform();
-  })();
+  }
+
+  function zoomAround(factor, mouseX, mouseY) {
+    var contentX = (mouseX - panX) / scale;
+    var contentY = (mouseY - panY) / scale;
+    scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale * factor));
+    panX = mouseX - contentX * scale;
+    panY = mouseY - contentY * scale;
+    applyTransform();
+  }
+
+  function zoomFromCenter(factor) {
+    zoomAround(factor, (viewport.clientWidth || 800) / 2, (viewport.clientHeight || 600) / 2);
+  }
+
+  fitMap();
+  controls.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+  expandVisibleButton.addEventListener('click', function () {
+    var frontiers = visibleFrontierNodes();
+    if (!frontiers.length) return;
+    expandVisibleButton.disabled = true;
+    expandVisibleButton.textContent = 'Expanding\u2026';
+    requestExpandMany(frontiers);
+  });
+  zoomOutButton.addEventListener('click', function () { zoomFromCenter(0.85); });
+  fitButton.addEventListener('click', fitMap);
+  zoomInButton.addEventListener('click', function () { zoomFromCenter(1.15); });
 
   var dragging = false;
   var dragMoved = false;
@@ -1279,6 +1771,7 @@ const CLIENT_JS_TEXT = `
   var panStartY = 0;
 
   viewport.addEventListener('mousedown', function (e) {
+    if (e.button !== 0 || (e.target && e.target.closest && e.target.closest('#pm-controls'))) return;
     dragging = true;
     dragMoved = false;
     dragStartX = e.clientX;
@@ -1310,17 +1803,12 @@ const CLIENT_JS_TEXT = `
     var rect = viewport.getBoundingClientRect();
     var mouseX = e.clientX - rect.left;
     var mouseY = e.clientY - rect.top;
-    var contentX = (mouseX - panX) / scale;
-    var contentY = (mouseY - panY) / scale;
     var factor = e.deltaY > 0 ? 0.9 : 1.1;
-    scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale * factor));
-    panX = mouseX - contentX * scale;
-    panY = mouseY - contentY * scale;
-    applyTransform();
+    zoomAround(factor, mouseX, mouseY);
   }, { passive: false });
 
   // ---- update-in-place: {type:'update', data} ------------------------------
-  // v0.9 (P1/P4): posted by extension.js after a frontier click grows the
+  // Posted by extension.js after a frontier click grows the
   // trace (see requestExpand above) -- extension.js builds the data value
   // with pathmap.js's own exported buildPathMapData(newTreeResult), the EXACT
   // same shape this script's DATA already is, then calls
@@ -1365,16 +1853,19 @@ const CLIENT_JS_TEXT = `
     NH = DATA.layout.nodeHeight;
     canvas.style.width = W + 'px';
     canvas.style.height = H + 'px';
+    lanesLayer.style.width = W + 'px';
+    lanesLayer.style.height = H + 'px';
     edgesSvg.setAttribute('width', String(W));
     edgesSvg.setAttribute('height', String(H));
     MIRRORED = !!(DATA.layout && DATA.layout.mirrored);
 
     indexNodes();
 
-    // A lingering tooltip would describe a now-removed DOM node / stale
-    // data -- hidden rather than left open and wrong.
-    tooltip.hidden = true;
+    // A lingering inspector selection could describe a node removed by the
+    // expansion update. Reset it to the stable invitation state.
+    renderInspectorEmpty();
 
+    clearChildren(lanesLayer);
     clearChildren(nodesLayer);
     clearChildren(edgesSvg);
     renderGraph();
@@ -1396,17 +1887,26 @@ const CLIENT_JS_TEXT = `
 
 const LEGEND_HTML = `
     <summary>Legend</summary>
-    <h4>Node color (left accent bar)</h4>
+    <h4>Node cards</h4>
+    <div class="legend-row"><span class="k">type chip</span>names the component directly (Apex, Trigger, Flow, LWC, Aura, Invocable, Visualforce, external, and others), so color is never the only cue</div>
+    <div class="legend-row"><span class="k">Target lane</span>the traced class or method; hop lanes show tree depth away from it</div>
     <div class="legend-row"><span class="swatch trigger"></span><span><span class="k">trigger</span>trigger-file entry point</span></div>
     <div class="legend-row"><span class="swatch entry"></span><span><span class="k">entry</span>has an entry-point annotation (@AuraEnabled, @InvocableMethod, @future, @HttpX, webservice, Batchable, Queueable, Schedulable)</span></div>
     <div class="legend-row"><span class="swatch test"></span><span><span class="k">test</span>only reachable from test code</span></div>
     <div class="legend-row"><span class="swatch normal"></span><span><span class="k">normal</span>regular method or class</span></div>
-    <div class="legend-row"><span class="swatch metadata"></span><span><span class="k">metadata</span>caller from LWC, Aura, Flow, OmniScript, VF, or Custom Metadata — not Apex source (a Flow node here may still have its own children, e.g. the DML sites on its object, or — v0.13 — its own subflow chain; a metadata node is not always a leaf)</span></div>
+    <div class="legend-row"><span class="swatch metadata"></span><span><span class="k">metadata</span>caller from LWC, Aura, Flow, OmniScript, VF, or Custom Metadata — not Apex source (a Flow node here may still have its own children, e.g. the DML sites on its object, or — v0.13 — its own subflow chain; a metadata node is not always a leaf). Permission Set/Profile access grants are authorization facts, not execution edges, and are shown only in the tree view.</span></div>
     <div class="legend-row"><span class="swatch anonymous"></span><span><span class="k">anonymous</span>anonymous Apex script (.apex) — real Apex source, but with no declared class/trigger of its own; always a pure root (nothing calls it)</span></div>
     <div class="legend-row"><span class="swatch exception"></span><span><span class="k">exception</span>(v0.7) a thrown exception's class, reached by tracing forward (What Does This Call?) through a "throw" statement — always terminal</span></div>
     <div class="legend-row"><span class="swatch unresolved"></span><span><span class="k">unresolved</span>(v0.7) one aggregated leaf per method, summarizing every forward call site that couldn't be resolved to an indexed target (dynamic/platform calls, e.g. HttpRequest/System.debug) — always terminal, approximate. Also covers a DML statement whose target couldn't be narrowed to a concrete SObject type (e.g. a generic List&lt;SObject&gt;) — labeled "DML on unresolved SObject type", no trigger/flow linkage possible</span></div>
     <div class="legend-row"><span class="swatch external"></span><span><span class="k">external</span>(v0.8) a reference into managed-package code this workspace has no source for — terminal when tracing What Does This Call?; a valid trace target with its own local-caller subtree when tracing Who Calls This</span></div>
     <div class="legend-row"><span class="k">&#x25B8;/&#x25BE; N possible ... (unconfirmed)</span>(v0.13) a ROLLUP pill — groups every DIRECT approximate caller/callee of the node above it into one collapsed placeholder (dashed border, same color as the "~" approximate marker below), so a handful of confirmed edges aren't buried under a wall of guesses. Click the pill to expand it in place (&#x25BE;) or collapse it again (&#x25B8;) — everything it contains was already resolved, so expanding never re-scans or re-fetches anything. Controlled by the apexCallGraph.showUnconfirmed setting ('rollup' default / 'hide' drops these entirely / 'expand' restores the old flat rendering)</div>
+    <h4>Connection colors</h4>
+    <div class="legend-row"><span class="line-swatch apex"></span><span><span class="k">Apex</span>typed, static, constructor, this/super, and other confirmed code calls</span></div>
+    <div class="legend-row"><span class="line-swatch automation"></span><span><span class="k">Automation</span>Flow/metadata, subflow, and async transitions</span></div>
+    <div class="legend-row"><span class="line-swatch data"></span><span><span class="k">Data/event</span>DML and platform-event publish transitions</span></div>
+    <div class="legend-row"><span class="line-swatch external"></span><span><span class="k">External</span>managed-package boundary</span></div>
+    <div class="legend-row"><span class="line-swatch danger"></span><span><span class="k">Exception</span>throw transition</span></div>
+    <div class="legend-row"><span class="line-swatch approx"></span><span><span class="k">Possible</span>approximate match; always dashed</span></div>
     <h4>Markers</h4>
     <div class="legend-row"><span class="k">~ prefix</span>approximate resolution (dashed border too) — via interface/unique-name/lexical/override/narrowed/dynamic fallback, so this edge may be wrong or one of several candidates</div>
     <div class="legend-row"><span class="k">&#x1F9EA;</span>test-only node (also dimmed)</div>
@@ -1421,7 +1921,7 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="k">N dup. names</span>(v0.7 B3) header note — "&lt;N&gt; duplicate class names across packages" appears above the map whenever this workspace has classes sharing the same qualified name across two or more sfdx packages; resolution always prefers the referring file's own package first, then the default package, before falling back to the ambiguous fan-out below</div>
     <h4>Direction</h4>
     <div class="legend-row"><span class="k">Who Calls This</span>(default, unlabeled above) the traced target sits on the RIGHT; its callers fan out to the LEFT, one hop per column, converging into the target</div>
-    <div class="legend-row"><span class="k">What This Calls</span>(v0.7 A3, forward tracing — shown above as "What Does This Call?") the traced target sits on the LEFT instead; its callees fan out to the RIGHT, one hop per column — the column order and every edge curve mirror the default layout so both directions still read left-to-right</div>
+    <div class="legend-row"><span class="k">What This Calls</span>(v0.7 A3, forward tracing — shown above as "What Does This Call?") the traced target sits on the LEFT instead; its callees fan out to the RIGHT, one hop per column — the column order and every tree connector mirror the default layout so both directions still read left-to-right</div>
     <h4>Edge "via" labels</h4>
     <div class="legend-row"><span class="k">typed</span>resolved through the receiver's declared type</div>
     <div class="legend-row"><span class="k">static</span>Class.method() static call</div>
@@ -1446,7 +1946,7 @@ const LEGEND_HTML = `
     <div class="legend-row"><span class="k">subflow</span>(v0.13) a declared &lt;subflows&gt; reference between two Flow files, never an Apex call — NOT approximate, a declared reference. Who Calls This: the flow's own PARENT flow (the parent invokes it as a subflow), recursing up. What This Calls: the flow's own SUBFLOW (it invokes the child), recursing down into that subflow's own apex actions/further subflows. Cycle-guarded (&#x21BA; on repeat, never hangs)</div>
 `;
 
-// v0.7 (A3): mirrors uitree.js's directionHeaderLine exactly -- see that
+// Mirrors uitree.js's directionHeaderLine exactly -- see that
 // file's INTERPRETIVE DECISION comment for the full byte-identical-bar
 // writeup (not duplicated here verbatim, consistent with this file's
 // existing pattern of small independent re-implementations, same rationale
@@ -1455,27 +1955,27 @@ const LEGEND_HTML = `
 // (like an absent field) stays the silent, byte-identical-to-today case;
 // only 'callees' (the genuinely new v0.7 capability) gets the explicit
 // 'What Does This Call?' sign-post, mirroring apexTrace.traceCallees's
-// command title verbatim (package.json, not owned by this file).
+// command title verbatim from package.json.
 function directionHeaderLine(direction) {
   if (direction === 'callees') return 'What Does This Call?';
   return null;
 }
 
-// v0.6 (H1/H4 forward-compat): additional header lines beyond treeResult.note
-// (which was already rendered before this round). Mirrors uitree.js's
+// Additional header lines beyond treeResult.note
+// (which is rendered separately). Mirrors uitree.js's
 // shapeHeaderLines, kept as an independent small implementation here rather
 // than a cross-file require (see this file's header note on staying
 // self-contained/dev-tool-friendly, same rationale as isRootNode above).
 // Neither field existed on TreeResult when this comment was first written --
 // both checks are defensive.
 //
-// CONTRACT NOTE (integrator, v0.6.0): resolver.js's real buildCallerTree
+// resolver.js's buildCallerTree
 // output nests unresolvedSites under stats (TreeResult.stats.unresolvedSites),
 // not a top-level TreeResult.unresolvedSites field -- read from stats to
 // match what resolver.js actually produces (uitree.js's shapeHeaderLines
 // mirrors this same fix).
 //
-// v0.7 (B3): duplicate-names line prepended ahead of capped/unresolved,
+// Duplicate-names line prepended ahead of capped/unresolved,
 // gated behind stats.duplicateNames > 0 -- does not fire for a
 // pre-v0.7-shaped TreeResult (no `stats.duplicateNames`), so fixture7's
 // existing exact-array assertion in test-pathmap.js is unaffected. (The
@@ -1488,7 +1988,7 @@ function directionHeaderLine(direction) {
 // memoization machinery now runs in both directions, so "caller" would be
 // misleading for a callees-direction result.
 //
-// v0.13 (Round 2.5, H3 -- header half) REMOVED: stats.unresolvedSites,
+// v0.13 removed stats.unresolvedSites,
 // stats.externalRefs/externalNamespaces, and stats.metaUnresolved USED to
 // each surface their own workspace-global line here (mirroring uitree.js's
 // shapeHeaderLines, which this function has always mirrored) -- see that
@@ -1497,8 +1997,7 @@ function directionHeaderLine(direction) {
 // to the ONE method being traced; `stats` itself is unchanged, those fields
 // simply move to being an H8 "Scan Stats" output-channel concern only).
 // unresolvedMentionsHeaderLine below is the one new, genuinely SCOPED
-// replacement -- same contract as uitree.js's identical function (see that
-// file's INTEGRATION NOTE on the `treeResult.unresolvedMentions` shape).
+// replacement, matching uitree.js's identical function.
 function unresolvedMentionsTargetMethodName(treeResult) {
   const um = treeResult && treeResult.unresolvedMentions;
   if (um && typeof um.method === 'string' && um.method) return um.method;
@@ -1532,7 +2031,7 @@ function headerExtraLinesForResult(treeResult) {
   return lines;
 }
 
-// v0.9 (P1/P4): the DATA blob (meta/layout/nodes/edges) renderPathMapHtml
+// The DATA blob (meta/layout/nodes/edges) renderPathMapHtml
 // embeds into the initial document, factored out into its own exported
 // function -- THE "rebuild helper" the update-in-place feature needs to be
 // unit-testable in Node (see this file's module.exports comment and
@@ -1544,22 +2043,29 @@ function headerExtraLinesForResult(treeResult) {
 // this contract. Every field/shape is identical to what renderPathMapHtml
 // already embedded pre-v0.9 (this is a pure extraction, not a new shape);
 // renderPathMapHtml below now simply calls this and JSON-embeds the result,
-// so the INITIAL render is byte-identical to before this round.
+// so the initial render keeps the same data shape.
 //
-// v0.13 (Round 2.5, H2 -- rendering half): `opts.showUnconfirmed` is an
+// v0.13: `opts.showUnconfirmed` is an
 // OPTIONAL second-argument field (same "an opts object, not a positional
 // parameter" shape renderPathMapHtml's own `opts.legendOpen` already uses),
 // threaded straight into groupApproximateChildren BEFORE layoutTree ever
 // sees the tree -- see that function's own doc for the full three-mode
-// contract. Omitted/unrecognized normalizes to 'expand' (the pre-Round-2.5
-// flat shape), so every EXISTING call site -- including every fixture in
-// test-pathmap.js written before this round -- keeps rendering
-// byte-identically.
+// contract. Omitted/unrecognized normalizes to 'expand', preserving the
+// legacy flat shape for existing callers.
 function buildPathMapData(treeResult, opts) {
   const options = opts || {};
   const mode = normalizeShowUnconfirmed(options.showUnconfirmed);
   const direction = treeResult && treeResult.direction;
-  const root = treeResult && treeResult.root ? groupApproximateChildren(treeResult.root, mode, direction) : null;
+  // Permission/profile grants are useful in the tree view but are not
+  // execution edges. Remove them before laying out the Execution Path Map.
+  const runtimeRoot = treeResult && treeResult.root
+    ? Object.assign({}, treeResult.root, {
+        children: (treeResult.root.children || []).filter((c) =>
+          !c || (c.kind !== 'permissionset' && c.kind !== 'profile')
+        ),
+      })
+    : null;
+  const root = runtimeRoot ? groupApproximateChildren(runtimeRoot, mode, direction) : null;
   const layout = root
     ? layoutTree(root, direction)
     : {
@@ -1571,7 +2077,7 @@ function buildPathMapData(treeResult, opts) {
         mirrored: direction === 'callees',
       };
 
-  // v0.7 (B3): the traced target is `root` regardless of direction (see
+  // The traced target is `root` regardless of direction (see
   // this file's header note -- buildCalleeTree's root is the traced method
   // too, only its `children` mean something different), so `root.package`
   // is unambiguously "the target's package" either way.
@@ -1584,7 +2090,7 @@ function buildPathMapData(treeResult, opts) {
       targetLabel: (treeResult && treeResult.targetLabel) || '',
       note: (treeResult && treeResult.note) || null,
       headerExtra: headerExtraLinesForResult(treeResult),
-      // v0.7 (A3): both fields are additive-only and null whenever
+      // Both fields are additive-only and null whenever
       // `direction` is absent -- see directionHeaderLine's interpretive-
       // decision comment for why that specific case must stay exactly
       // "today" (this is the literal mechanism behind the pinned
@@ -1599,7 +2105,10 @@ function buildPathMapData(treeResult, opts) {
       height: layout.height,
       nodeWidth: LAYOUT.nodeWidth,
       nodeHeight: LAYOUT.nodeHeight,
-      // v0.7 (A3): read by CLIENT_JS_TEXT's edgePath to flip which side of
+      colWidth: LAYOUT.colWidth,
+      marginX: LAYOUT.marginX,
+      maxDepth: layout.maxDepth,
+      // Read by CLIENT_JS_TEXT's edgePath to flip which side of
       // an edge is treated as visually-left vs visually-right; false for
       // every direction except 'callees' (see layoutTree's own comment).
       mirrored: !!layout.mirrored,
@@ -1609,7 +2118,7 @@ function buildPathMapData(treeResult, opts) {
   };
 }
 
-// v0.9 (P1/P4): the ENTIRE "preserve pan/zoom on an in-place update" promise
+// The "preserve pan/zoom on an in-place update" promise
 // captured as one pure, DOM-free function, exported so it is unit-testable
 // here in Node -- CLIENT_JS_TEXT's applyUpdate (search
 // 'preserveTransformOnUpdate' there) calls a textually-identical algorithm
@@ -1630,7 +2139,7 @@ function buildPathMapData(treeResult, opts) {
 // checkable (see test-pathmap.js): a future change to the update path that
 // starts threading new-data-derived values into this function to
 // "helpfully" re-fit the view would show up as a changed function
-// signature/behavior a reviewer can catch, rather than a silent DOM
+// signature/behavior that is easy to diagnose, rather than a silent DOM
 // behavior change no test in this suite could ever observe (pathmap.js has
 // no browser/DOM harness -- see this file's header note).
 function preserveTransformOnUpdate(prevTransform) {
@@ -1645,7 +2154,7 @@ function preserveTransformOnUpdate(prevTransform) {
 // opts (all optional):
 //   legendOpen: boolean — render the legend <details> expanded by default
 //               (default false, kept collapsed so the canvas starts clean).
-//   showUnconfirmed: 'rollup'|'hide'|'expand' — v0.13 (Round 2.5, H2), see
+//   showUnconfirmed: 'rollup'|'hide'|'expand' — see
 //               buildPathMapData's own doc; forwarded through unchanged.
 function renderPathMapHtml(treeResult, opts) {
   const options = opts || {};
@@ -1670,16 +2179,28 @@ function renderPathMapHtml(treeResult, opts) {
     '  <div id="pm-title"></div>\n' +
     '  <div id="pm-stats"></div>\n' +
     '  <div id="pm-note"></div>\n' +
-    '  <div id="pm-hint">drag to pan &middot; scroll to zoom &middot; click a node or a tooltip line to open it</div>\n' +
+    '  <div id="pm-hint">hover or focus a node for details &middot; drag to pan &middot; scroll to zoom</div>\n' +
     '</header>\n' +
-    '<details id="pm-legend"' + legendOpenAttr + '>' + LEGEND_HTML + '</details>\n' +
-    '<div id="pm-viewport">\n' +
-    '  <div id="pm-canvas">\n' +
-    '    <svg id="pm-edges"></svg>\n' +
-    '    <div id="pm-nodes"></div>\n' +
+    '<div id="pm-workspace">\n' +
+    '  <div id="pm-viewport">\n' +
+    '    <div id="pm-controls" aria-label="Map controls">\n' +
+    '      <button id="pm-expand-visible" class="is-primary" type="button" title="Expand every visible frontier branch by the configured expansion step">Expand visible</button>\n' +
+    '      <button id="pm-zoom-out" type="button" title="Zoom out" aria-label="Zoom out">&minus;</button>\n' +
+    '      <button id="pm-fit" type="button" title="Fit tree to view">Fit</button>\n' +
+    '      <button id="pm-zoom-in" type="button" title="Zoom in" aria-label="Zoom in">+</button>\n' +
+    '    </div>\n' +
+    '    <div id="pm-canvas">\n' +
+    '      <div id="pm-lanes"></div>\n' +
+    '      <svg id="pm-edges"></svg>\n' +
+    '      <div id="pm-nodes"></div>\n' +
+    '    </div>\n' +
     '  </div>\n' +
+    '  <aside id="pm-sidebar" aria-label="Path details">\n' +
+    '    <details id="pm-legend"' + legendOpenAttr + '>' + LEGEND_HTML + '</details>\n' +
+    '    <section id="pm-class-context" aria-label="Same-class methods" hidden></section>\n' +
+    '    <section id="pm-tooltip" class="pm-tooltip" aria-live="polite"></section>\n' +
+    '  </aside>\n' +
     '</div>\n' +
-    '<div id="pm-tooltip" class="pm-tooltip" hidden></div>\n' +
     '<script>\n' +
     dataScript + '\n' +
     CLIENT_JS_TEXT + '\n' +
@@ -1691,21 +2212,23 @@ function renderPathMapHtml(treeResult, opts) {
 
 module.exports = {
   renderPathMapHtml,
-  // exported for test-pathmap.js / dev tooling; not part of the frozen
+  // exported for test-pathmap.js / dev tooling; not part of the runtime
   // integration surface (only renderPathMapHtml is).
   shortenEntry,
   accentKind,
+  nodeVisual,
+  edgeTone,
   layoutTree,
   isRootNode,
   packageBadge,
-  // v0.8 (N4/N6): external-node badge helpers, exported so test-pathmap.js
+  // External-node badge helpers, exported so test-pathmap.js
   // can unit-test them directly, same rationale as packageBadge/isRootNode.
   externalNamespace,
   managedBadge,
   directionHeaderLine,
   headerExtraLinesForResult,
-  // v0.9 (P1/P4): progressive-depth update-in-place surface. `buildPathMapData`
-  // IS part of the frozen integration surface alongside renderPathMapHtml --
+  // Progressive-depth update-in-place surface. `buildPathMapData`
+  // is part of the integration surface alongside renderPathMapHtml --
   // extension.js calls it directly to build a {type:'update', data} postMessage
   // payload without a full HTML re-render (see its own header comment).
   // `preserveTransformOnUpdate` and `frontierMethodKey` are exported for
@@ -1714,14 +2237,14 @@ module.exports = {
   buildPathMapData,
   preserveTransformOnUpdate,
   frontierMethodKey,
-  // v0.13 (Round 2.5, H2 -- rendering half): APPROXIMATE ROLLUP surface,
+  // Approximate-rollup surface,
   // exported so test-pathmap.js can unit-test the grouping transform
   // directly against bare fixtures, same rationale as everything else in
   // this block.
   normalizeShowUnconfirmed,
   rollupLabel,
   groupApproximateChildren,
-  // v0.13 (Round 2.5, H3 -- header half): SCOPED HEADERS surface, same
+  // Scoped-header surface, same
   // export rationale.
   unresolvedMentionsTargetMethodName,
   unresolvedMentionsHeaderLine,

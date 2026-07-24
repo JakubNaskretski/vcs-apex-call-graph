@@ -20,6 +20,8 @@ const {
   renderPathMapHtml,
   shortenEntry,
   accentKind,
+  nodeVisual,
+  edgeTone,
   layoutTree,
   isRootNode,
   packageBadge,
@@ -1935,6 +1937,23 @@ assert.deepStrictEqual(
   'H3: callees direction never gets the new scoped line'
 );
 
+// Permission/profile nodes are access configuration, not execution paths.
+// They retain metadata styling when inspected directly, but the execution
+// path map deliberately omits them and their pseudo-edges.
+{
+  check(accentKind({ kind: 'permissionset', entries: ['Permission Set Apex access'] }) === 'metadata', 'permission-set access uses metadata styling');
+  check(accentKind({ kind: 'profile', entries: ['Profile Apex access'] }) === 'metadata', 'profile access uses metadata styling');
+  const access = baseNode({
+    label: 'Acme_Portal_Access', kind: 'permissionset', via: 'access',
+    path: '/ws/permissionsets/Acme_Portal_Access.permissionset-meta.xml',
+  });
+  const runtime = baseNode({ label: 'acmePanel', kind: 'lwc', via: 'metadata', path: '/ws/lwc/acmePanel/acmePanel.js' });
+  const root = baseNode({ label: 'AcmePortalController', className: 'AcmePortalController', children: [access, runtime] });
+  const data = buildPathMapData({ root, targetLabel: root.label, direction: 'callers' });
+  check(!data.nodes.some((n) => n.kind === 'permissionset'), 'access metadata is omitted from the execution path map');
+  check(data.nodes.some((n) => n.kind === 'lwc'), 'runtime metadata callers remain in the execution path map');
+}
+
 // full render: the new header line reaches meta.headerExtra end to end.
 {
   const root = baseNode({ label: 'X.reprice', className: 'X', methodLower: 'reprice', path: '/ws/X.cls' });
@@ -2021,6 +2040,201 @@ assert.deepStrictEqual(
   const extracted = extractData(html);
   check(extracted.nodes.some((n) => n.label === longRoot.label), 'the 65-char root label also survives untruncated');
   check(extracted.nodes.some((n) => n.label === longLeaf.label), 'the 65-char leaf label also survives untruncated');
+}
+
+// =========================================================================
+// Tree-map visual system: explicit component labels, restrained color
+// families, depth lanes, orthogonal connectors, keyboard access, and map
+// controls. These assertions keep the visual redesign semantic: color is a
+// reinforcement, never the only way to identify a node or transition.
+// =========================================================================
+{
+  const visualCases = [
+    [{ kind: 'trigger' }, { key: 'trigger', label: 'Trigger', tone: 'entry' }],
+    [{ kind: 'lwc' }, { key: 'lwc', label: 'LWC', tone: 'interface' }],
+    [{ kind: 'aura' }, { key: 'aura', label: 'Aura', tone: 'interface' }],
+    [{ kind: 'flow' }, { key: 'flow', label: 'Flow', tone: 'automation' }],
+    [{ kind: 'omniscript' }, { key: 'omniscript', label: 'OmniScript', tone: 'automation' }],
+    [{ kind: 'vf' }, { key: 'visualforce', label: 'Visualforce', tone: 'interface' }],
+    [{ kind: 'cmdt' }, { key: 'custom-metadata', label: 'Custom metadata', tone: 'data' }],
+    [{ kind: 'external' }, { key: 'external', label: 'External', tone: 'external' }],
+    [{ kind: 'unresolved' }, { key: 'unresolved', label: 'Unresolved', tone: 'neutral' }],
+    [{ kind: 'method', entries: ['@AuraEnabled (LWC/Aura)'] }, { key: 'aura-method', label: 'Aura / LWC', tone: 'interface' }],
+    [{ kind: 'method', entries: ['@InvocableMethod (Flow)'] }, { key: 'invocable', label: 'Invocable', tone: 'automation' }],
+    [{ kind: 'method', entries: ['Queueable'] }, { key: 'queueable', label: 'Queueable', tone: 'automation' }],
+    [{ kind: 'method', entries: ['Anonymous Apex script'] }, { key: 'anonymous', label: 'Anonymous Apex', tone: 'entry' }],
+    [{ kind: 'method', isTest: true }, { key: 'test-apex', label: 'Test Apex', tone: 'test' }],
+  ];
+  visualCases.forEach(([input, expected]) => {
+    assert.deepStrictEqual(nodeVisual(input), expected, 'nodeVisual labels and tones ' + expected.label + ' explicitly');
+    passCount += 1;
+  });
+
+  assert.strictEqual(edgeTone('typed', false), 'apex');
+  assert.strictEqual(edgeTone('metadata', false), 'automation');
+  assert.strictEqual(edgeTone('subflow', false), 'automation');
+  assert.strictEqual(edgeTone('dml', false), 'data');
+  assert.strictEqual(edgeTone('publish', false), 'data');
+  assert.strictEqual(edgeTone('external', false), 'external');
+  assert.strictEqual(edgeTone('throws', false), 'danger');
+  assert.strictEqual(edgeTone('typed', true), 'approx');
+  passCount += 8;
+
+  const visualTree = {
+    root: baseNode({
+      label: 'OrbitService.run',
+      kind: 'method',
+      children: [
+        baseNode({
+          label: 'Orbit_Fulfillment', kind: 'flow', via: 'metadata',
+          children: [baseNode({ label: 'OrbitTrigger', kind: 'trigger', via: 'dml' })],
+        }),
+        baseNode({ label: 'orbitPanel', kind: 'lwc', via: 'metadata' }),
+        baseNode({ label: 'pkg.OrbitBridge', kind: 'external', via: 'external' }),
+        baseNode({ label: 'PossibleRelay.run', kind: 'method', via: 'interface', approximate: true }),
+      ],
+    }),
+    targetLabel: 'OrbitService.run',
+    direction: 'callers',
+  };
+  const visualData = buildPathMapData(visualTree);
+  const visualTarget = visualData.nodes.find((n) => n.label === 'OrbitService.run');
+  const visualFlow = visualData.nodes.find((n) => n.label === 'Orbit_Fulfillment');
+  const visualLwc = visualData.nodes.find((n) => n.label === 'orbitPanel');
+  const possible = visualData.nodes.find((n) => n.label === 'PossibleRelay.run');
+  check(visualTarget.target === true && visualTarget.depth === 0, 'traced target is explicitly marked and occupies depth zero');
+  check(visualTarget.typeLabel === 'Apex' && visualTarget.tone === 'apex', 'target retains its component label and color family');
+  check(visualFlow.typeLabel === 'Flow' && visualFlow.tone === 'automation', 'Flow is distinguishable from other metadata');
+  check(visualLwc.typeLabel === 'LWC' && visualLwc.tone === 'interface', 'LWC is distinguishable from Flow metadata');
+  check(possible.tone === 'apex' && possible.approximate === true, 'node type remains Apex while approximation stays an independent fact');
+  check(visualData.edges.find((e) => e.via === 'metadata').tone === 'automation', 'metadata connection carries automation color semantics');
+  check(visualData.edges.find((e) => e.via === 'dml').tone === 'data', 'DML connection carries data/event color semantics');
+  check(visualData.edges.find((e) => e.approximate).tone === 'approx', 'approximate connection overrides its base via color');
+  check(visualData.layout.maxDepth === 2, 'layout exposes maximum tree depth for lane rendering');
+  check(visualData.layout.colWidth > visualData.layout.nodeWidth, 'depth columns retain a visible connector gutter');
+  check(
+    visualData.layout.colWidth - visualData.layout.nodeWidth >= 90,
+    'connector gutter leaves resolution labels such as static and typed clear of both adjoining cards'
+  );
+
+  const htmlVisual = renderPathMapHtml(visualTree);
+  check(htmlVisual.includes('id="pm-lanes"') && htmlVisual.includes('function renderLanes()'), 'document contains a dedicated depth-lane layer');
+  check(htmlVisual.includes("label.textContent = depth === 0 ? 'Target' : ('Hop ' + depth)"), 'lanes are labeled Target / Hop N rather than decorative stripes');
+  check(htmlVisual.includes("return 'M ' + p.x1 + ' ' + p.y1 + ' H ' + p.midX + ' V ' + p.y2 + ' H ' + p.x2"), 'connections use orthogonal tree elbows');
+  check(htmlVisual.includes("path.setAttribute('marker-end', 'url(#pm-arrow-' + e.tone + ')')"), 'connections carry direction arrows colored by semantic tone');
+  check(htmlVisual.includes('node-type') && htmlVisual.includes('n.typeLabel'), 'node cards render explicit component type chips');
+  check(htmlVisual.includes('node-role') && htmlVisual.includes("roleEl.textContent = 'Target'"), 'target card has a non-color text marker');
+  check(htmlVisual.includes("el.setAttribute('role', 'button')") && htmlVisual.includes("el.setAttribute('tabindex', '0')"), 'node cards are keyboard-focusable buttons');
+  check(htmlVisual.includes("ev.key !== 'Enter' && ev.key !== ' '"), 'Enter and Space activate focused nodes');
+  check(htmlVisual.includes("document.createElement('button')"), 'frontier expansion uses a native button control');
+  check(htmlVisual.includes('id="pm-fit"') && htmlVisual.includes("fitButton.addEventListener('click', fitMap)"), 'map exposes a keyboard-accessible Fit control');
+  check(htmlVisual.includes('id="pm-zoom-in"') && htmlVisual.includes('id="pm-zoom-out"'), 'map exposes explicit zoom controls');
+  check(htmlVisual.includes('--pm-apex-soft') && htmlVisual.includes('--pm-automation-soft') && htmlVisual.includes('--pm-data-soft'), 'card tints come from the bounded semantic palette');
+  check(htmlVisual.includes('type chip') && htmlVisual.includes('color is never the only cue'), 'legend explains the redundant type-label cue');
+  check(htmlVisual.includes('Connection colors') && htmlVisual.includes('line-swatch approx'), 'legend explains semantic and approximate connection colors');
+  check(htmlVisual.includes('clearChildren(lanesLayer)'), 'in-place updates rebuild lanes alongside nodes and edges');
+  check(htmlVisual.includes('id="pm-workspace"') && htmlVisual.includes('id="pm-sidebar"'), 'details live in a dedicated sibling inspector beside the viewport');
+  check(htmlVisual.includes('aria-label="Path details"') && htmlVisual.includes('aria-live="polite"'), 'details inspector has accessible landmark/live-region semantics');
+  check(!htmlVisual.includes('id="pm-tooltip" class="pm-tooltip" hidden'), 'details inspector is persistent, never a transient hidden overlay');
+  check(htmlVisual.includes('function renderInspectorEmpty()'), 'details inspector has a directional empty state');
+  check(htmlVisual.includes('Hover or focus a node to inspect its call sites'), 'empty state tells the user how to populate details');
+  check(htmlVisual.includes("var row = document.createElement('button')"), 'source rows in the inspector use keyboard-accessible buttons');
+  check(!htmlVisual.includes('tooltip.style.top') && !htmlVisual.includes('tooltip.style.left'), 'inspector positioning never floats back over graph nodes');
+  check(htmlVisual.includes('@media (max-width: 900px)'), 'inspector stacks below the map in narrow webviews instead of crushing the canvas');
+  check(htmlVisual.includes('id="pm-expand-visible"'), 'map exposes an explicit Expand visible control');
+  check(htmlVisual.includes('function visibleFrontierNodes()') && htmlVisual.includes('function refreshExpandControl()'), 'global expansion count is derived from currently visible frontier nodes');
+  check(htmlVisual.includes("type: 'expandMany', keys: keys"), 'global control sends frontier keys as one bounded bulk-expansion request');
+  check(htmlVisual.includes("'Expand visible (' + count + ')'"), 'global control shows the number of branches it will expand');
+  check(htmlVisual.includes("'Fully expanded'"), 'global control clearly reports when no frontier branches remain');
+  check(htmlVisual.includes("pill.textContent = 'Expand +'"), 'per-node frontier action is labeled Expand +N instead of an ambiguous bare +N');
+  check(htmlVisual.includes("pill.setAttribute('aria-label'"), 'per-node expansion carries a descriptive accessibility label');
+}
+
+// =========================================================================
+// Compact same-class context: methods that already participate in the map
+// are grouped in the sidebar for the currently inspected class. This must
+// remain presentation-only: no untraced methods are synthesized, repeated
+// appearances of one method are deduplicated, and the map stays uncluttered.
+// =========================================================================
+{
+  const sameClassTree = {
+    root: baseNode({
+      label: 'OrbitCoordinator.finish',
+      className: 'OrbitCoordinator',
+      methodLower: 'finish',
+      children: [
+        baseNode({
+          label: 'OrbitCoordinator.validate',
+          className: 'OrbitCoordinator',
+          methodLower: 'validate',
+          via: 'this',
+        }),
+        baseNode({
+          label: 'OrbitCoordinator.finish',
+          className: 'OrbitCoordinator',
+          methodLower: 'finish',
+          via: 'this',
+          cyclic: true,
+        }),
+        baseNode({
+          label: 'OrbitGateway.send',
+          className: 'OrbitGateway',
+          methodLower: 'send',
+          via: 'static',
+        }),
+      ],
+    }),
+    targetLabel: 'OrbitCoordinator.finish',
+    direction: 'callers',
+  };
+
+  const sameClassData = buildPathMapData(sameClassTree);
+  const coordinatorNodes = sameClassData.nodes.filter((n) => n.className === 'OrbitCoordinator');
+  check(coordinatorNodes.length === 3, 'same-class context uses only method nodes that already exist in the map');
+  check(
+    coordinatorNodes.some((n) => n.methodLower === 'finish') &&
+      coordinatorNodes.some((n) => n.methodLower === 'validate'),
+    'method identity survives data shaping for client-side class grouping and deduplication'
+  );
+  check(
+    sameClassData.nodes.filter((n) => n.className === 'OrbitGateway').length === 1,
+    'methods from another class remain separate from the inspected class group'
+  );
+
+  const htmlSameClass = renderPathMapHtml(sameClassTree);
+  check(
+    htmlSameClass.includes('id="pm-class-context" aria-label="Same-class methods" hidden'),
+    'same-class methods live in a compact, initially hidden sidebar region rather than adding graph nodes'
+  );
+  check(
+    htmlSameClass.includes("eyebrow.textContent = 'Same class in this map'") &&
+      htmlSameClass.includes('title.textContent = current.className'),
+    'class context clearly identifies both its scope and the inspected class'
+  );
+  check(
+    htmlSameClass.includes('if (peers.length < 2)') &&
+      htmlSameClass.includes('var methodKey = String(peer.methodLower || peer.label).toLowerCase()'),
+    'the frame appears only for a real multi-method class and deduplicates repeated method appearances'
+  );
+  check(
+    htmlSameClass.includes('if (isHiddenByCollapsedRollup(peer.id)) return'),
+    'collapsed approximate branches do not leak hidden methods into class context'
+  );
+  check(
+    htmlSameClass.includes("button.setAttribute('aria-current', 'true')") &&
+      htmlSameClass.includes("button.addEventListener('click', function () { focusMapNode(peer); })"),
+    'the current method is accessible and peer rows locate their existing map nodes'
+  );
+  check(
+    htmlSameClass.includes('function focusMapNode(n)') &&
+      htmlSameClass.includes("(n.x + NW / 2) * scale") &&
+      htmlSameClass.includes('card.focus({ preventScroll: true })'),
+    'selecting a peer centers and keyboard-focuses its card without opening or replacing the map'
+  );
+  check(
+    htmlSameClass.includes('function renderInspectorEmpty() {\n    renderClassContext(null);'),
+    'map refreshes and empty inspector states also clear stale class context'
+  );
 }
 
 console.log('apex-trace pathmap self-check: ' + passCount + ' assertions passed');

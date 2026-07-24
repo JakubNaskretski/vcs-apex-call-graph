@@ -1,12 +1,8 @@
 'use strict';
 // Apex Call Graph — method-level semantic call-graph UI shell (v0.3.0).
 //
-// This file is written against the FROZEN CONTRACT ("=== CONTRACT:
-// parser.js ===" / "=== CONTRACT: resolver.js ===" / "=== CONTRACT:
-// extension.js ===") handed down for this rework. parser.js does not exist
-// on disk yet (agent A's file) — this module requires it and calls it
-// exactly per the contract's documented API; it will work the moment
-// parser.js lands with that shape. resolver.js is required the same way.
+// This module coordinates the parser, resolver, metadata scanner, tree view,
+// and Path Map through their documented data-only APIs.
 //
 //   parser.parseFile({ path, text }) -> FileFacts        // never throws
 //   resolver.buildSemanticIndex(factsList[, opts]) -> Index
@@ -17,17 +13,16 @@
 //   metascan.parseMetaFile({ path, text }) -> [MetaRef]   // never throws (A5)
 //   metascan.scanBundle(files) -> [MetaRef]                // Aura cross-file (A5)
 //
-// v0.7 / B1 additive contract: buildSemanticIndex's optional second `opts`
+// buildSemanticIndex's optional second `opts`
 // argument may carry `opts.packageOf(fsPath) -> label|null`, built fresh
 // every run from this workspace's sfdx-project.json file(s) -- see
 // discoverPackageMap()'s header comment below. A workspace with no
 // sfdx-project.json anywhere yields a packageOf that returns null for every
-// path, which resolver.js's B2 contract treats as "nothing to say" --
+// path, which resolver.js treats as "nothing to say" --
 // buildSemanticIndex's behavior in that case stays byte-identical to
 // pre-v0.7.
 //
-// v0.8 / N3 additive contract (this round, plumbing ONLY -- see the
-// CONTRACT AMENDMENTS' own N3 text): the SAME `opts` argument also carries
+// The same `opts` argument also carries
 // `opts.ownNamespace: string|null`, this workspace's OWN managed-package
 // namespace read from sfdx-project.json's top-level `namespace` property
 // (discoverPackageMap() reads it in the same pass as packageOf, see that
@@ -35,8 +30,7 @@
 // ownNamespace (stripping it as a prefix before local class/object/metascan-
 // ref lookup, so e.g. `vtx.VertexPricingService` in a workspace whose own
 // namespace IS `vtx` resolves LOCAL rather than becoming an external node)
-// is entirely out of scope for this file -- resolver.js is frozen this
-// round, a different phase's job. Absent/empty `namespace` (the
+// is handled by resolver.js. Absent/empty `namespace` (the
 // overwhelmingly common unmanaged/unlocked-package workspace) yields
 // ownNamespace: null, which resolver.js's opts contract treats as "nothing
 // to strip" -- byte-identical to pre-v0.8 in that case.
@@ -48,15 +42,14 @@
 // UiNode -> vscode.TreeItem (including the vscode-boundary line-number
 // conversion — see the note below).
 //
-// v1's apexindex.js lexical engine is NOT used here: per the frozen
-// contract, parse-error fallback now lives inside resolver.js itself
+// v1's apexindex.js lexical engine is not used here; parse-error fallback
+// lives inside resolver.js
 // (files with FileFacts.parseError get lexical class-mention edges there,
 // via apexindex.strip). This file never touches apexindex.js directly.
 //
-// v0.9 / P2 (progressive depth + settings) -- CONTRACT AMENDMENT, additive
-// over everything above. This file owns:
+// Progressive depth and settings responsibilities:
 //   - contributes.configuration read-through (readSettings() below) for the
-//     5 new apexCallGraph.* settings (package.json, this round).
+//     apexCallGraph.* settings from package.json.
 //   - per-trace expansion state (a Set<methodKeyLower> per traceId) and the
 //     NATIVE lazy vscode.TreeItem expansion built on top of it -- see the
 //     "progressive-depth tree building" section below (buildTreeForTarget/
@@ -71,7 +64,7 @@
 // `initialDepth` and `expandedKeys` (an iterable of methodKeyLower
 // strings, resolver.js's own internal `${classLower}#${methodLower}`
 // cycleKey convention), and TNode with `expandable`/`pendingCount` on a
-// depth-frontier node. Confirmed against the LANDED resolver.js:
+// depth-frontier node. The resolver output shape is:
 // `methodKey` is NOT stamped onto TNode as an explicit field (the internal
 // cycleKey stays private to resolver.js) -- P3 (uitree.js) instead exports
 // `frontierMethodKey(node)`, which derives the identical string from a
@@ -91,8 +84,8 @@
 // (the same data blob renderPathMapHtml embeds inline, extracted so an
 // 'update' postMessage can ship just the data); guarded via a `typeof`
 // check, same idiom this file already uses for metascan.stripOwnNamespace
-// (v0.8 N3) above, so a pathmap.js build that hasn't landed this specific
-// export yet degrades to a full HTML re-set instead of breaking (see
+// (v0.8 N3) above, so a pathmap.js build without this specific export
+// degrades to a full HTML re-set instead of breaking (see
 // postPathMapUpdate below).
 
 const vscode = require('vscode');
@@ -107,13 +100,13 @@ const cachecoordinator = require('./cachecoordinator');
 const editoroverlay = require('./editoroverlay');
 const workspacepaths = require('./workspacepaths');
 const targets = require('./targets');
-// Round 2.5 / H5-H8: pure, vscode-free helpers (single-flight+coalescing,
+// Pure, vscode-free helpers for single-flight/coalescing,
 // the watcher dirty-set tracker, and the counts-only diagnostics payload
 // shape) -- see scanflow.js's own header for the full contract each export
 // carries; nothing in that file is vscode-aware, which is what makes it
 // independently unit-tested (test-scanflow.js) outside the extension host.
 const scanflow = require('./scanflow');
-// Round 2.5 / H7: pure, vscode-free parse-pool manager (worker_threads),
+// Pure, vscode-free parse-pool manager (worker_threads),
 // used only for a cold parse of >200 files -- see workerpool.js's own
 // header. Also vscode-free/independently unit-tested (test-workerpool.js).
 const workerpool = require('./workerpool');
@@ -121,7 +114,7 @@ const {
   shapeResult,
   shapeHeaderLines,
   effectiveOrientation,
-  // v0.9 / P1/P3: shapeNode shapes ONE raw TNode (recursively) into a
+  // shapeNode shapes ONE raw TNode (recursively) into a
   // UiNode -- used to re-shape just the freshly-expanded node after a
   // load-more click, instead of re-shaping (and re-diffing against) the
   // whole tree. frontierMethodKey is the SAME methodKeyLower derivation
@@ -132,7 +125,7 @@ const {
   // node's identity string.
   shapeNode,
   frontierMethodKey,
-  // v0.12.0 / C2: Entry-Point Catalog shaping surface (uitree.js's own
+  // Entry-Point Catalog shaping surface (uitree.js's own
   // section header above shapeEntryCatalog documents the full contract) --
   // used only by the entry-catalog view wiring below (EntryCatalogProvider/
   // toEntryCatalogTreeItem/apexTrace.showEntryCatalog), never by the
@@ -146,7 +139,7 @@ const {
 } = require('./uitree');
 const { renderPathMapHtml, buildPathMapData } = require('./pathmap');
 
-// v0.9 / P2: internal-only command id (never listed in package.json's
+// Internal-only command id (never listed in package.json's
 // contributes.commands -- it has no business appearing in the Command
 // Palette) that a tree-view load-more TreeItem's `.command` points at, see
 // toTreeItem's `uiNode.loadMore` branch below and this id's
@@ -155,8 +148,7 @@ const LOAD_MORE_COMMAND = 'apexTrace._loadMoreChildren';
 
 const MAX_DEPTH = 8;
 
-// v0.9 / P2: contributes.configuration section id (package.json, this
-// round) and the same 4 numeric defaults resolver.js's own
+// Configuration section id and the same numeric defaults resolver.js's own
 // DEFAULT_MAX_DEPTH/DEFAULT_MAX_NODES already use internally (MAX_DEPTH
 // above mirrors DEFAULT_MAX_DEPTH) -- kept in sync deliberately so a
 // workspace that never opens Settings sees byte-identical maxDepth/maxNodes
@@ -168,7 +160,7 @@ const DEFAULT_INITIAL_DEPTH = 2;
 const DEFAULT_EXPAND_STEP = 1;
 const DEFAULT_MAX_NODES_SETTING = 2000;
 
-// v0.9 / P2: reads the 5 apexCallGraph.* settings fresh via
+// Reads the five apexCallGraph.* settings fresh via
 // vscode.workspace.getConfiguration -- called at the start of every
 // scanAndBuildIndex() (a real trace) AND right before every tree-only
 // rebuild that doesn't rescan (orientation toggle, a frontier-node
@@ -190,19 +182,10 @@ function readSettings() {
   const rawExcludes = cfg.get('excludeGlobs');
   const excludeGlobs = scanflow.normalizeExcludeGlobs(rawExcludes);
   const excludeMatcher = scanflow.compileExcludeGlobs(excludeGlobs);
-  // H2 (Round 2.5): this file OWNS the package.json contribution point for
-  // apexCallGraph.showUnconfirmed (the approximate-callers/callees rollup
-  // display mode) -- see the task brief's "package.json contributes ONLY:
-  // setting apexCallGraph.showUnconfirmed, command copyDiagnostics" scoping
-  // note. The actual CONSUMPTION of this setting (grouping approximate
-  // children under a collapsed 'rollup' pseudo-node vs hiding vs the old
-  // eager-expand behavior) is resolver.js/uitree.js/pathmap.js's job, a
-  // different phase this round -- this file only reads it through fresh,
-  // validated, same as every other apexCallGraph.* setting, and threads it
-  // through wherever this round's H8 diagnostics payload wants to report
-  // the active mode (see scanAndBuildIndex's `stats.showUnconfirmed` and
-  // logRunStats below). An invalid/legacy value falls back to 'rollup', the
-  // documented default.
+  // apexCallGraph.showUnconfirmed controls whether approximate edges are
+  // grouped, hidden, or expanded. Read and validate it like every other
+  // setting; an invalid or legacy value falls back to the documented
+  // 'rollup' default.
   const rawShowUnconfirmed = cfg.get('showUnconfirmed');
   const showUnconfirmed = ['rollup', 'hide', 'expand'].includes(rawShowUnconfirmed) ? rawShowUnconfirmed : 'rollup';
   return {
@@ -229,27 +212,26 @@ const ORIENTATION_KEY = 'apexCallGraph.orientation';
 // checks it with strict equality and discards the ENTIRE on-disk cache on
 // any mismatch, so a stale cache from a prior engine version is never
 // partially trusted. v0.4.0 adds MethodFacts.dml[] and MetaRef.flowObject/
-// flowRecordTriggerType/cmdt/fieldName, so this goes 3 -> 4 for this round.
+// flowRecordTriggerType/cmdt/fieldName, so this moves from 3 to 4.
 // v0.5.0 (parser.js, out of scope here) adds MethodFacts.throwsSites[]/
 // catches[]/narrowings[] (G2/G3) and FileFacts.kind can now be 'anonymous'
-// for .apex files (G4); metascan.js (this round) adds MetaRef.flowTriggerType
+// for .apex files (G4); metascan.js adds MetaRef.flowTriggerType
 // (G1) -- a cached FileFacts/MetaRef from the v0.4 engine is missing all of
-// these fields, so this goes 4 -> 5 for this round.
+// these fields, so this moves from 4 to 5.
 // v0.6.0 (H6b) adds a `size` tiebreak alongside `mtimeMs` to the in-memory
 // fileCache/metaFileCache entry shape -- mtime alone has a known false-
 // negative risk (two saves landing within the same filesystem mtime
-// resolution tick can look "unchanged"), so this goes 5 -> 6 for this round.
-// NOTE: cachestore.js's mapToEntries/entriesToMap (a different file's owner
-// this round) do not yet round-trip a `size` field, so a cache entry
+// resolution tick can look "unchanged"), so this moves from 5 to 6.
+// NOTE: older persisted entries do not round-trip a `size` field, so a cache entry
 // hydrated from disk always comes back with size===undefined and therefore
 // always fails this tiebreak once after a restart -- safe (forces exactly
 // one reparse per file, never a false cache hit), but the full perf win
 // needs a matching cachestore.js update.
-// v0.11.0 (Round B) adds MethodFacts.locals[].literal (optional; single-
-// assignment string-literal locals, B1) and TypeFacts.constants[] (static
-// final String fields with a literal initializer, B1) -- a cached FileFacts
-// from the v0.6 engine is missing both additive fields, so this goes 6 -> 7
-// for this round. resolver.js's own B1/B2 changes (dynamic-dispatch literal
+// v0.11.0 adds MethodFacts.locals[].literal (optional; single-assignment
+// string-literal locals) and TypeFacts.constants[] (static final String
+// fields with a literal initializer) -- a cached FileFacts
+// from the v0.6 engine is missing both additive fields, so this moves from 6
+// to 7. resolver.js's dynamic-dispatch changes (literal
 // candidates, narrowed generic-DML edges) consume these new parser fields
 // but don't themselves change FileFacts/MetaRef shape, so they ride along
 // on this same bump rather than needing one of their own.
@@ -283,21 +265,22 @@ const CACHE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const fileCache = new Map();
 
 // A7: session-memory-only resource-URI-keyed cache for metadata source files
-// (LWC/Aura/Flow/OmniScript/VF), mirroring fileCache above. Unlike fileCache
+// (LWC/Aura/Flow/OmniScript/VF/Custom Metadata/Permission Set/Profile),
+// mirroring fileCache above. Unlike fileCache
 // this stores raw file text, but it is never passed to the disk-persistence
 // boundary. Aura's cross-file bundling (a .cmp's
 // controller="..." attribute plus its sibling Controller/Helper .js files'
 // component.get('c.method') calls) means a single file's MetaRefs can
 // depend on a SIBLING file's content, so per-file ref caching would need
 // bundle-level invalidation bookkeeping. Re-running metascan's regex
-// extractors over already-read text on every scan is cheap (see the A7 task
-// brief's <300ms metascan perf bar) and keeps this correct-by-construction
+// extractors over already-read text on every scan is cheap and keeps this
+// correct by construction
 // instead: mtime caching here only ever saves the vscode.workspace.fs.readFile
 // I/O, not the (already fast) text scan.
 const metaFileCache = new Map();
 
 // =========================================================================
-// Round 2.5 / H6: watcher dirty-set state.
+// Watcher dirty-set state.
 // =========================================================================
 // One shared tracker across BOTH the Apex and metadata scans (scanAndParse
 // and scanMetaFiles each filter its own peek() snapshot down to the paths
@@ -398,7 +381,7 @@ function isUserExcludedUri(uri, excludeGlobs) {
   return scanflow.matchesExcludeGlobs(relativePath, excludeGlobs);
 }
 
-// Round 2.5 / H7: only worth spinning up worker_threads once there is
+// Worker threads are only worthwhile once there is
 // meaningfully more cold-parse work than the spin-up overhead of a handful
 // of threads -- see workerpool.js's own header for the size/chunking
 // contract. Below this, the existing single-threaded inline loop stays
@@ -414,7 +397,7 @@ class TraceProvider {
     this._traceId = 0;
   }
 
-  // `traceId` (v0.9 / P2) is stamped onto every TreeItem this render
+  // `traceId` is stamped onto every TreeItem this render
   // produces (see toTreeItem below) so a LATER load-more click against one
   // of them can tell whether it still belongs to the CURRENT trace -- see
   // the staleness guard on LOAD_MORE_COMMAND's handler in activate() below.
@@ -433,7 +416,7 @@ class TraceProvider {
     return el._uiChildren || [];
   }
 
-  // v0.9 / P2: targeted refresh -- tells vscode ONE element's own rendering
+  // Targeted refresh tells VS Code one element's own rendering
   // (and, since vscode re-fetches, its children) may have changed, without
   // disturbing any sibling/ancestor TreeItem elsewhere in the tree.
   // LOAD_MORE_COMMAND's handler (activate(), below) calls this after
@@ -445,7 +428,7 @@ class TraceProvider {
   }
 }
 
-// v0.12.0 / C2: the Entry-Point Catalog's own TreeDataProvider, backing the
+// The Entry-Point Catalog's own TreeDataProvider, backing the
 // second Explorer view ('apexTraceEntriesView', see activate() below). A
 // flat two-level tree (kind group -> entries, uitree.js's
 // shapeEntryCatalog output) rather than a recursive call tree, so this is
@@ -479,14 +462,14 @@ class EntryCatalogProvider {
 // vscode types — see its header comment); vscode.Position/Range are
 // 0-based, so the conversion happens right here, at the boundary.
 //
-// v0.9 / P2: `traceId` is threaded through purely so a load-more click can
+// `traceId` is threaded through purely so a load-more click can
 // be checked against the CURRENT trace (see LOAD_MORE_COMMAND's handler
 // below); it has no effect on rendering. `parent` (also new) is the
 // enclosing TreeItem this call is building children FOR -- passed through
 // only so a `uiNode.loadMore` child (see below) can capture it as the
 // element its own click handler must mutate + refresh.
 //
-// Per the LANDED P1/P3 contract (uitree.js's shapeNode/shapeLoadMoreChild):
+// uitree.js's shapeNode/shapeLoadMoreChild represent a frontier as follows:
 // a frontier (uiNode.expandable) node's real `children` are simply empty,
 // and shapeNode has already appended exactly ONE synthetic item
 // (uiNode.loadMore:true, uiNode.expandKey:'<methodKeyLower>') as that
@@ -509,7 +492,7 @@ function toTreeItem(uiNode, traceId, parent) {
   const kids = (uiNode.children || []).map((n) => toTreeItem(n, traceId, it));
   it._uiChildren = kids;
   if (uiNode.loadMore) {
-    // v0.9 / P2<->P1/P3: uitree.js's shapeLoadMoreChild's own header note
+    // uitree.js's shapeLoadMoreChild header note
     // explicitly hands this wiring to extension.js ("add expandKey to
     // opts.expandedKeys, re-trace, replace this node's children with the
     // fresh result") -- `parent` is THIS item's enclosing TreeItem (the
@@ -533,7 +516,7 @@ function openCommand(sourcePath, line, col) {
   };
 }
 
-// v0.12.0 / C2: uitree.js's shapeEntryCatalog UiNode -> vscode.TreeItem, the
+// uitree.js's shapeEntryCatalog UiNode -> vscode.TreeItem, the
 // entry-catalog view's own counterpart to toTreeItem above. Deliberately
 // separate (not a mode of toTreeItem) since entry-catalog UiNodes carry
 // fields toTreeItem's caller/callee tree never produces (isGroup/expanded/
@@ -588,7 +571,7 @@ async function scanWorkspaceUris(excludeGlobs) {
   // .sfdx/.sf hold the StandardApexLibrary platform stubs — indexing those
   // would shadow real classes with same-named stubs.
   // v0.5 (G4): '**/*.apex' added alongside .cls/.trigger -- anonymous Apex
-  // scripts (e.g. a corpus's scripts/adhoc-recalc.apex) route through
+  // scripts (e.g. scripts/adhoc-recalc.apex) route through
   // parser.parseFile the same way .cls/.trigger do; parser.js (out of scope
   // here) is what special-cases the .apex extension into anonymousUnit()
   // parsing. Same excludes as the pre-existing .cls/.trigger scan.
@@ -609,8 +592,8 @@ async function scanWorkspaceUris(excludeGlobs) {
 // entries for files no longer present. Returns the facts list plus counts
 // for the progress notification.
 //
-// Round 2.5 additions (opts, all optional -- omitting `opts` entirely keeps
-// pre-Round-2.5 behavior byte-identical except for the new fields on the
+// Optional scan controls; omitting `opts` preserves legacy behavior except
+// for the new fields on the
 // return value):
 //   opts.token   (H4): a vscode.CancellationToken. Checked once per loop
 //     iteration (per file); a cancel mid-loop stops scanning immediately --
@@ -915,11 +898,10 @@ async function scanAndParse(progress, excludeGlobs, opts) {
   };
 }
 
-// A7: workspace globs derived from the adv-org corpus's SFDX layout
+// Workspace globs cover standard SFDX layouts
 // (force-app/main/default/{lwc,aura,flows,omniscripts}/...), plus a VF
-// pattern (per metascan.js's A5 spec — no adv-org fixtures exist for it,
-// but real workspaces may have Visualforce pages/components under those
-// conventional SFDX folder names). Same exclusions as scanWorkspaceUris,
+// pattern for Visualforce pages/components under their conventional SFDX
+// folder names. Same exclusions as scanWorkspaceUris,
 // plus __tests__ (Jest specs under an LWC bundle import the same
 // '@salesforce/apex/Cls.method' specifier to jest.mock() it, but represent
 // zero real Apex call edges — metascan.js already excludes these by path
@@ -936,9 +918,11 @@ const META_GLOBS = [
   '**/pages/**/*.page',
   '**/components/**/*.component',
   '**/customMetadata/**/*.md-meta.xml',
+  '**/permissionsets/**/*.permissionset-meta.xml',
+  '**/profiles/**/*.profile-meta.xml',
 ];
 
-// v0.9 / P2: apply the same apexCallGraph.excludeGlobs post-filter as the
+// Apply the same apexCallGraph.excludeGlobs post-filter as the
 // Apex scan above, so one setting covers both scans and full/incremental
 // semantics remain identical even for literal commas or malformed patterns.
 async function scanMetaWorkspaceUris(excludeGlobs) {
@@ -961,7 +945,7 @@ async function scanMetaWorkspaceUris(excludeGlobs) {
 // file into { path, text } pairs -- extraction itself (metascan.js) happens
 // separately in computeMetaRefs, since Aura needs cross-file bundle context
 // that isn't available file-by-file.
-// Round 2.5: same opts.token (H4)/opts.dirtySnapshot (H6) contract as
+// Uses the same opts.token/opts.dirtySnapshot contract as
 // scanAndParse above -- see that function's own header comment for the
 // full rationale; the two functions are deliberately parallel in shape.
 // No H7 pooling here: metadata extraction is regex-based text scanning
@@ -1359,7 +1343,7 @@ function computeMetaRefs(files) {
 // contributing one (absolute-prefix -> label) entry to a longest-prefix
 // map: `label` is the declared `package` name when present, else the
 // directory path's own last segment (per B1's contract) -- e.g. this
-// round's adv-org corpus declares `force-app` (no `package` field, label
+// a project may declare `force-app` (no `package` field, label
 // falls back to `force-app`), `pkg-billing` (`package: "nova-billing"`),
 // `pkg-shared` (`package: "nova-shared"`).
 //
@@ -1384,10 +1368,8 @@ function computeMetaRefs(files) {
 // must stay behaviorally inert -- see ownNamespace's attachment below).
 // This is pure plumbing: discoverPackageMap()/scanAndBuildIndex() only
 // EXTRACT the value and hand it to resolver.js as opts.ownNamespace,
-// alongside the existing opts.packageOf/opts.defaultPackage -- what
-// resolver.js (frozen this round, a different phase's job -- see N3's
-// CONTRACT AMENDMENT text) does with it (stripping the own-namespace prefix
-// before local class/object lookup, per N3) is entirely out of scope here.
+// alongside the existing opts.packageOf/opts.defaultPackage. resolver.js
+// strips the own-namespace prefix before local class/object lookup.
 // No new vscode.workspace.fs read is added -- `json` is already parsed for
 // packageDirectories a few lines below, so this reads one more property off
 // the SAME parsed object, at zero extra I/O cost.
@@ -1417,7 +1399,7 @@ async function discoverPackageMap() {
   }
 
   const prefixes = []; // { prefix, label }[], sorted longest-prefix-first below
-  // MUST-FIX #6: label of the FIRST packageDirectories entry marked
+  // Label of the first packageDirectories entry marked
   // `default: true`, found across every discovered sfdx-project.json.
   // resolver.js's resolveDuplicateBucket() rule 2 (B2's "candidate in the
   // DEFAULT package" fallback) needs this label as opts.defaultPackage --
@@ -1471,9 +1453,9 @@ async function discoverPackageMap() {
       const label =
         typeof dir.package === 'string' && dir.package.trim() ? dir.package.trim() : relPath.split(/[\\/]/).pop();
       prefixes.push({ prefix: normalizePathForPrefix(projectRoot + relPath), label });
-      // MUST-FIX #6: first default:true entry wins (a malformed sfdx-project.json
-      // with 2+ default:true entries -- see dev/hostile-v070-sfdx-edgecases.js
-      // 7d -- must not throw; picking the first is a defensible, deterministic
+      // The first default:true entry wins (a malformed sfdx-project.json
+      // with 2+ default:true entries must not throw; picking the first is a
+      // defensible, deterministic
       // tie-break, same spirit as B2's own "first wins" duplicate handling).
       if (defaultPackage == null && dir.default === true) defaultPackage = label;
     }
@@ -1491,11 +1473,10 @@ async function discoverPackageMap() {
     }
     return null;
   };
-  // MUST-FIX #6: attached to the returned function (not a second return
+  // Attached to the returned function (not a second return
   // value / wrapper object) so every existing caller that treats
   // discoverPackageMap()'s result as a plain packageOf(fsPath) function --
-  // incl. dev/hostile-v070-sfdx-edgecases.js's PART 1 harness -- keeps
-  // working completely unchanged; scanAndBuildIndex (below) is the only
+  // keeps working unchanged; scanAndBuildIndex (below) is the only
   // reader of this property.
   packageOf.defaultPackage = defaultPackage;
   // v0.8 (N3): same attachment convention as defaultPackage immediately
@@ -1606,7 +1587,7 @@ async function resolveCursorAmbiguity(index, enclosingCls, word, wordLower, encl
 // resolves to a target resolver.js's buildCallerTree/buildCalleeTree can use
 // to pick the RIGHT one of the duplicated ClassMeta candidates, not just
 // whichever one happens to be bucketed first. In a packageless workspace
-// (or against a resolver.js that hasn't landed B2 yet), refineTargets()
+// (or against a resolver.js without package-aware targets), refineTargets()
 // never attaches `package` at all, so `target` keeps its pre-v0.7 two-field
 // shape exactly.
 function buildSuggestPicks(index) {
@@ -1623,7 +1604,7 @@ function buildSuggestPicks(index) {
 // over resolver.suggestTargets(index). H5(c) adds a cursor-ambiguity guard
 // (see resolveCursorAmbiguity above) ahead of the enclosing-class pick.
 //
-// v0.7 / A4: shared verbatim between both trace directions -- `direction`
+// Shared between both trace directions -- `direction`
 // only ever affects the QuickPick's placeholder wording below (the
 // enclosing-method/known-class fast paths above it stay direction-agnostic,
 // since "which class/method" is exactly the same question either way).
@@ -1746,7 +1727,7 @@ async function resolveImpactReport(index, target, targetContext) {
 }
 
 // =========================================================================
-// v0.9 / P2: progressive-depth tree building. Every function in this
+// Progressive-depth tree building. Every function in this
 // section is a plain function of its arguments (no vscode, no closure over
 // activate()'s session state) so it can be called identically from
 // LOAD_MORE_COMMAND's tree-view handler and the Path Map webview's
@@ -1756,11 +1737,10 @@ async function resolveImpactReport(index, target, targetContext) {
 // Shared resolver.js call shape used by a fresh trace (traceTarget),
 // orientation-toggle's expansion-reset rebuild, and expandFrontierKey's
 // stepped lazy-expansion rebuilds. `expandedKeys` is passed straight
-// through as opts.expandedKeys per the P1 CONTRACT AMENDMENT; against a
-// pre-P1 resolver.js (which does not read initialDepth/expandedKeys yet)
-// these are simply inert extra opts properties -- the whole tree
-// materializes eagerly up to maxDepth, exactly like pre-v0.9, until P1
-// lands.
+// through as opts.expandedKeys; against a
+// resolver.js build without initialDepth/expandedKeys support, these are
+// simply inert extra opts properties and the whole tree materializes
+// eagerly up to maxDepth.
 function buildTreeForTarget(index, target, dir, settings, expandedKeys) {
   const opts = {
     maxDepth: settings.maxDepth,
@@ -1772,8 +1752,8 @@ function buildTreeForTarget(index, target, dir, settings, expandedKeys) {
   return dir === 'callees' ? resolver.buildCalleeTree(index, target, opts) : resolver.buildCallerTree(index, target, opts);
 }
 
-// v0.9 / P1<->P2 sub-contract: resolver.js's TNode does NOT stamp an
-// explicit `methodKey` identity field (confirmed against the landed
+// resolver.js's TNode does NOT stamp an
+// explicit `methodKey` identity field (confirmed against
 // resolver.js -- its cycleKey stays purely internal); uitree.js's exported
 // frontierMethodKey() is the authoritative derivation both this file and
 // uitree.js's own shapeLoadMoreChild use, so every key this file computes
@@ -1796,10 +1776,10 @@ function collectNodesByKeys(node, keySet, out) {
 
 // Direct (non-recursive) children of `nodes` that are themselves still
 // frontier (expandable:true) -- exactly the set expandStep's next
-// iteration should add, per P1's "engine stays single-level" design (see
+// iteration should add because the engine stays single-level (see
 // expandFrontierKey's own header note below). Gated on `c.expandable`
 // (unlike collectNodesByKeys above) since only a genuinely-still-frontier
-// child is a meaningful next-round target.
+// child remains available for future enhancement.
 function directFrontierChildKeys(nodes) {
   const keys = new Set();
   for (const n of nodes) {
@@ -1812,20 +1792,21 @@ function directFrontierChildKeys(nodes) {
   return keys;
 }
 
-// v0.9 / P1<->P2 CONTRACT: implements the expandStep mechanics P1's own
-// text documents as the CALLER's job -- "the engine stays single-level"
+// Implements progressive expandStep mechanics. The engine stays single-level:
 // (adding one key to expandedKeys exposes only THAT node's own direct
 // children; grandchildren beyond initialDepth stay frontier), so loading
-// `settings.expandStep` levels on a single click is done here by looping:
-// add the clicked key, rebuild, look at exactly the just-exposed node's
-// direct children for any that are STILL frontier, add those too, and
-// repeat (expandStep - 1) more times (stopping early once nothing new is
-// exposed, e.g. a branch that bottoms out before reaching expandStep
-// levels). Mutates `expandedKeys` in place (the CALLER's per-trace Set) and
-// returns the final rebuilt TreeResult.
-function expandFrontierKey(index, target, dir, settings, expandedKeys, clickedKey) {
+// `settings.expandStep` levels is done here by looping: add the requested
+// key(s), rebuild once, look at exactly those just-exposed nodes' direct
+// children for any that are STILL frontier, add those too, and repeat
+// (expandStep - 1) more times. The plural helper powers the map's
+// "Expand visible" action without rebuilding once per branch; the singular
+// wrapper preserves the tree-view/per-node behavior. Mutates `expandedKeys`
+// in place and returns the final rebuilt TreeResult.
+function expandFrontierKeys(index, target, dir, settings, expandedKeys, clickedKeys) {
   const step = Math.max(1, (settings && settings.expandStep) || 1);
-  let keysToAdd = new Set([clickedKey]);
+  let keysToAdd = new Set(
+    [...(clickedKeys || [])].filter((key) => typeof key === 'string' && key)
+  );
   let tree = null;
   for (let i = 0; i < step && keysToAdd.size; i++) {
     for (const k of keysToAdd) expandedKeys.add(k);
@@ -1835,6 +1816,10 @@ function expandFrontierKey(index, target, dir, settings, expandedKeys, clickedKe
     keysToAdd = directFrontierChildKeys([...justExpanded.values()]);
   }
   return tree || buildTreeForTarget(index, target, dir, settings, expandedKeys);
+}
+
+function expandFrontierKey(index, target, dir, settings, expandedKeys, clickedKey) {
+  return expandFrontierKeys(index, target, dir, settings, expandedKeys, [clickedKey]);
 }
 
 // Finds the raw TNode matching `key` anywhere under `root` (depth-first) --
@@ -1851,12 +1836,12 @@ function findRawNodeByKey(root, key) {
   return null;
 }
 
-// v0.9 / P2<->P4 sub-contract: ships an incremental 'update' postMessage to
+// Ships an incremental 'update' postMessage to
 // an already-open Path Map panel instead of re-setting its whole .html
-// (which would discard the user's current pan/zoom -- see P4's own CONTRACT
-// AMENDMENT text). pathmap.buildPathMapData is P4's job to add; guarded via
+// (which would discard the user's current pan/zoom). The optional
+// pathmap.buildPathMapData export is guarded via
 // typeof, same idiom this file already uses for metascan.stripOwnNamespace
-// (v0.8 N3) -- until it lands, this safely falls back to the pre-v0.9 full
+// (v0.8 N3) -- when unavailable, this safely falls back to the pre-v0.9 full
 // HTML re-set so the feature degrades instead of breaking.
 function postPathMapUpdate(panel, tree) {
   if (typeof buildPathMapData === 'function') {
@@ -1871,8 +1856,8 @@ async function activate(context) {
   const view = vscode.window.createTreeView('apexTraceView', { treeDataProvider: provider });
   context.subscriptions.push(view);
 
-  // v0.12.0 / C2: the Entry-Point Catalog's own second Explorer view --
-  // always visible (no `when` clause, same as apexTraceView per H8), shows
+  // The Entry-Point Catalog's own second Explorer view --
+  // always visible (no `when` clause, same as apexTraceView), shows
   // a viewsWelcome (package.json) until apexTrace.showEntryCatalog is run
   // at least once this session.
   const entryCatalogProvider = new EntryCatalogProvider();
@@ -1900,9 +1885,8 @@ async function activate(context) {
     // never let a cache-hydration failure prevent the extension from activating
   }
 
-  // Round 2.5 / H8: one OutputChannel, written to once per completed scan
-  // (see logRunStats below) -- never per-file, so this stays cheap even on
-  // a huge org. Round 2.5 / H5: one shared single-flight/coalescing flow
+  // One OutputChannel is written once per completed scan, never per-file,
+  // so this stays cheap even on a huge org. A shared single-flight/coalescing flow
   // for every trace-triggering command registered below (see scanflow.js's
   // own header for the exact join/queue/latest-wins contract).
   const scanStatsChannel = vscode.window.createOutputChannel('Apex Call Graph: Scan Stats');
@@ -1975,7 +1959,7 @@ async function activate(context) {
   }
 
   // =========================================================================
-  // Round 2.5 / H6: FileSystemWatcher-fed dirty-set tracking.
+  // FileSystemWatcher-fed dirty-set tracking.
   // =========================================================================
   // One watcher per glob (vscode.workspace.createFileSystemWatcher takes a
   // single GlobPattern), covering the same Apex + metadata globs
@@ -2045,7 +2029,7 @@ async function activate(context) {
 
   // H6a: tracks the last RESOLVED TARGET (not the last TreeResult) -- see
   // retraceLastTarget/scanAndBuildIndex below. Keeping only the target and
-  // re-deriving the tree from a fresh scan+index every time showPathMap
+  // re-deriving the tree from a fresh scan+index every time refreshPathMap
   // needs it is what makes the map never go stale after an edit: the
   // mtime(+size, H6b) cache in scanAndParse/scanMetaFiles makes a re-scan of
   // an otherwise-unchanged workspace cheap (stat-only for every file except
@@ -2070,17 +2054,16 @@ async function activate(context) {
   // pure view transform of an already-computed tree, so what is on screen
   // stays exactly as fresh -- or stale -- as it was the moment before the
   // toggle; nothing about the underlying result changes). Deliberately NOT
-  // used by showPathMap: H6a's "always re-derive the map from a fresh
+  // used by refreshPathMap: H6a's "always re-derive the map from a fresh
   // scan" decision stands unchanged.
-  // v0.9 / P2: gains `index`/`target`/`traceId` -- both the orientation-
+  // Adds `index`/`target`/`traceId`; both the orientation-
   // toggle rebuild and the frontier-expand handlers (getChildren/the map's
   // 'expand' message, wired below) need to call resolver.js again against
   // the SAME already-built index/target without re-scanning.
   let lastRender = null; // { tree, scan, dir, index, target, traceId }
   let mapPanel = null; // singleton webview panel
 
-  // v0.9 / P2: per-trace expansion state -- see this file's header note on
-  // the P1 CONTRACT AMENDMENT for the full progressive-depth design.
+  // Per-trace expansion state for progressive depth.
   // `expandedKeysByTrace` maps a monotonically increasing traceId to the
   // Set<methodKeyLower> of frontier nodes the user has clicked open for
   // THAT trace. Keyed by traceId (not just "the current Set") so a
@@ -2095,8 +2078,7 @@ async function activate(context) {
   const expandedKeysByTrace = new Map();
 
   // A brand-new trace (a fresh target resolution, a direction toggle via
-  // retraceLastTarget) always starts with ZERO expanded frontier nodes --
-  // "state resets on re-trace/direction" per the CONTRACT AMENDMENT.
+  // retraceLastTarget) always starts with zero expanded frontier nodes.
   function newTraceState() {
     currentTraceId += 1;
     expandedKeysByTrace.clear();
@@ -2104,8 +2086,8 @@ async function activate(context) {
     return currentTraceId;
   }
 
-  // Orientation toggle keeps the SAME trace (same target/direction, no
-  // re-scan) but per the CONTRACT AMENDMENT still "resets expansion state"
+  // Orientation toggle keeps the same trace (same target/direction, no
+  // rescan) but still resets expansion state
   // -- see apexTrace.toggleOrientation below for why (re-rooting a tree
   // that mixes fully-expanded-by-click branches with frontier stubs is
   // exactly the ambiguity this sidesteps). Clears the CURRENT trace's Set
@@ -2140,7 +2122,7 @@ async function activate(context) {
   // for BOTH falsy-null and `.cancelled` before treating the result as a
   // real `{ index, scan, settings, stats }`.
   //
-  // Round 2.5 / H4 + H6 + H8: the ENTIRE scan (Apex parse + metadata scan)
+  // The entire scan (Apex parse + metadata scan)
   // now runs under ONE cancellable withProgress call sharing ONE
   // CancellationToken, instead of two separate non-cancellable ones -- this
   // is also what makes H5's "cancel cancels the shared scan for all
@@ -2163,7 +2145,7 @@ async function activate(context) {
   }
 
   async function scanAndBuildIndexForEpoch(scanCacheEpoch) {
-    // v0.9 / P2: read the 5 apexCallGraph.* settings ONCE at the top of
+    // Read the five apexCallGraph.* settings once at the top of
     // this scan+index call -- excludeGlobs feeds both scans below;
     // initialDepth/expandStep/maxDepth/maxNodes ride along on the returned
     // object so traceTarget builds its tree against the SAME snapshot the
@@ -2202,25 +2184,22 @@ async function activate(context) {
           return { empty: true, scan };
         }
 
-        // A7: LWC/Aura/Flow/OmniScript/VF metadata callers. Best-effort and
-        // additive -- a workspace with zero metadata files (or one where the
-        // scan throws for some unexpected reason) still traces Apex-to-Apex
-        // callers exactly as before; metascan.js's own extractors already never
-        // throw per-file (see its header contract), so the only realistic
-        // failure mode here is the vscode.workspace.fs I/O layer itself, which
-        // this still guards defensively since it runs on every trace.
+        // A7: non-Apex runtime references plus Permission Set/Profile class
+        // access. Best-effort and additive -- a workspace with zero metadata
+        // files (or one where the scan throws for some unexpected reason)
+        // still traces Apex-to-Apex callers exactly as before; metascan.js's
+        // own extractors already never throw per-file (see its header contract),
+        // so the only realistic failure mode here is the vscode.workspace.fs
+        // I/O layer itself, which this still guards defensively on every trace.
         let metaRefs = [];
-        // v0.12.0 / C1 seam: every '.flow-meta.xml' path this same metadata scan
+        // Every '.flow-meta.xml' path this same metadata scan
         // saw, REGARDLESS of whether metascan.parseMetaFile() emitted any MetaRef
         // for it (a Screen/Autolaunched Flow with zero apex <actionCalls> emits
         // nothing at all today -- see resolver.js's buildEntryCatalog / its
         // collectFlowEntries header note) -- this is the index.flowFilePaths
-        // "future extension.js round" that comment anticipates, landing this
-        // round so the Entry Point Catalog's flow group actually lists every
+        // mechanism ensures the Entry Point Catalog's flow group lists every
         // distinct flow file (not just the ones with an apex action), matching
-        // both corpora's GROUND-TRUTH/MANIFEST 'Entry catalog' sections (e.g.
-        // adv-org's AcmeBackorderResolutionFlow/AcmeNotifyCustomerSubflow/
-        // AcmeQuoteApprovalScreenFlow, none of which have an apex action).
+        // distinct Flow file, including flows with no Apex action.
         // Best-effort same as metaRefs above: stays [] (today's byte-identical
         // absence) on any scan failure, never blocks the trace.
         let flowFilePaths = [];
@@ -2325,7 +2304,7 @@ async function activate(context) {
     // Package discovery, namespace stripping, and semantic indexing were
     // completed inside the cancellable withProgress scope above.
 
-    // Round 2.5 / H8: counts-only run stats, gathered fresh every scan --
+    // Counts-only run stats are gathered fresh every scan and
     // fed to the 'Apex Call Graph: Scan Stats' output channel AND stashed as
     // `lastRunStats` (see its own declaration above) so apexTrace.
     // copyDiagnostics has something to report even before a NEW trace runs
@@ -2333,8 +2312,7 @@ async function activate(context) {
     // idiom this file already uses for metascan.stripOwnNamespace/
     // pathmap.buildPathMapData) since resolver.js's own H1/H2/H3 stats
     // fields (unresolvedByReason, viaHistogram, magnetSuppressedAttachments)
-    // are a different phase's work this round -- absent today, picked up
-    // automatically the moment that lands, no extension.js change needed.
+    // are read defensively when present.
     const engineStats = index && typeof index.stats === 'object' && index.stats ? index.stats : {};
     const stats = {
       engineCacheVersion: ENGINE_CACHE_VERSION,
@@ -2390,7 +2368,7 @@ async function activate(context) {
   // state deliberately renders BYTE-IDENTICALLY to pre-v0.7.1 (no suffix,
   // no header line) -- absence of the marker means the default, and the
   // toggle command's own toast announces every switch.
-  // v0.9 / P2: `traceId` (see newTraceState/currentTraceId above) is
+  // `traceId` (see newTraceState/currentTraceId above) is
   // threaded through to provider.setRoots so every TreeItem this render
   // produces is stamped with the trace it belongs to -- needed by the
   // staleness guard on LOAD_MORE_COMMAND's handler below.
@@ -2409,15 +2387,14 @@ async function activate(context) {
     view.message = headerLines.length ? headerLines.join('  •  ') : undefined;
   }
 
-  // v0.9 / P2: `settings` comes from the SAME scanAndBuildIndex() call that
+  // `settings` comes from the SAME scanAndBuildIndex() call that
   // produced `index`/`scan` (see computeTrace/retraceLastTarget below) --
   // maxDepth/maxNodes/initialDepth now come from apexCallGraph.* settings
   // instead of the old hardcoded `{ maxDepth: MAX_DEPTH }`. A brand-new
-  // trace always starts with a FRESH, empty expansion Set (newTraceState())
-  // -- "state resets on re-trace/direction" per the CONTRACT AMENDMENT;
+  // trace always starts with a fresh, empty expansion Set (newTraceState());
   // apexTrace.toggleDirection reaches this via retraceLastTarget, so it
   // gets the same fresh-state treatment for free.
-  // Round 2.5 / H8: `stats` (optional -- the SAME object scanAndBuildIndex
+  // `stats` is optional; the same object scanAndBuildIndex
   // attached to `built.stats`) gets its `timingMs.tree` filled in here and
   // is re-logged to the Scan Stats channel/lastRunStats, since tree-building
   // is the one phase that happens AFTER scanAndBuildIndex already returned
@@ -2463,7 +2440,7 @@ async function activate(context) {
     lastDirection = dir;
     // v0.7.1: everything toggleOrientation needs to re-render without a
     // re-scan (the path map deliberately excluded -- see lastRender's decl).
-    // v0.9 / P2: `index`/`target`/`traceId` added -- the orientation-toggle
+    // `index`/`target`/`traceId` let the orientation-toggle
     // rebuild and the frontier-expand handlers (wired below) need them to
     // call resolver.js again without re-scanning.
     lastRender = { tree, scan, dir, index, target, traceId };
@@ -2490,12 +2467,12 @@ async function activate(context) {
   }
 
   // H6a: re-runs scanAndParse + rebuilds the index/tree for the last
-  // RESOLVED target (no QuickPick) -- called by showPathMap so the map is
+  // RESOLVED target (no QuickPick) -- called by refreshPathMap so the map is
   // never stale after an edit, instead of reusing whatever TreeResult
   // happened to be computed last.
   //
   // v0.7 / A3: `direction` defaults to lastDirection (i.e. "re-run the same
-  // way it last ran") when omitted -- showPathMap's refresh wants that.
+  // way it last ran") when omitted -- refreshPathMap wants that.
   // apexTrace.toggleDirection instead passes the OPPOSITE of lastDirection
   // explicitly.
   async function retraceLastTarget(direction) {
@@ -2517,7 +2494,7 @@ async function activate(context) {
     );
   }
 
-  // Round 2.5 / H4: one shared toast for every command that discovers its
+  // One shared toast handles every command that discovers its
   // scan was cancelled -- "already-parsed facts stay cached, no partial
   // index/tree is rendered" (nothing here mutates provider/view state; the
   // tree view is simply left exactly as it was before the cancelled run).
@@ -2525,7 +2502,7 @@ async function activate(context) {
     vscode.window.setStatusBarMessage('Apex Call Graph: scan cancelled.', 5000);
   }
 
-  // v0.9 / P2: the tree view's half of the progressive-depth contract --
+  // The tree view's half of progressive depth:
   // registered once (after traceTarget/lastRender/currentExpandedKeys exist
   // as closures), invoked via LOAD_MORE_COMMAND's TreeItem.command on the
   // synthetic load-more child uitree.js's shapeLoadMoreChild appends to a
@@ -2579,21 +2556,28 @@ async function activate(context) {
           const col = Math.max(0, msg.col || 0);
           const resourceUri = resourceUriForSourcePath(msg.path);
           if (!resourceUri) return;
+          // Never navigate over the Path Map itself. If the map occupies
+          // column one (including the one-group-only layout), `Beside`
+          // reuses or creates another group. Otherwise column one is a
+          // stable, already-different destination. WebviewPanel.viewColumn
+          // follows the panel when the user moves it between groups.
+          const sourceViewColumn = mapPanel.viewColumn === vscode.ViewColumn.One
+            ? vscode.ViewColumn.Beside
+            : vscode.ViewColumn.One;
           vscode.window.showTextDocument(resourceUri, {
             selection: new vscode.Range(line, col, line, col),
-            viewColumn: vscode.ViewColumn.One,
+            viewColumn: sourceViewColumn,
           });
           return;
         }
-        // v0.9 / P2<->P4: the map's own '+N' pill click posts
+        // The map's own '+N' pill click posts
         // {type:'expand', key} (pathmap.js's client-side requestExpand,
         // key = its own frontierMethodKey mirror -- same derivation
         // uitree.js/this file use, see the require() header note above).
         // Drives the SAME per-trace expandedKeys Set the tree view's
         // LOAD_MORE_COMMAND handler uses (registered above) -- a node
-        // expanded from either surface counts as expanded for both, even
-        // though this round does not live-push one surface's expansion
-        // into the other's already-rendered view. A stale message
+        // expanded from either surface counts as expanded for both. The two
+        // already-rendered surfaces update independently. A stale message
         // (mapPanel reused across a re-trace, msg.key referring to a node
         // from a trace that no longer exists) is handled the same
         // defensive way expandFrontierKey/findRawNodeByKey always do: "not
@@ -2602,6 +2586,24 @@ async function activate(context) {
           const settings = readSettings();
           const expandedKeys = currentExpandedKeys();
           const tree = expandFrontierKey(lastRender.index, lastRender.target, lastRender.dir, settings, expandedKeys, msg.key);
+          if (tree && tree.root) {
+            lastRender.tree = tree;
+            postPathMapUpdate(mapPanel, tree);
+          }
+          return;
+        }
+        // The map-level "Expand visible" control posts every CURRENTLY
+        // visible frontier key together. Expand them in one resolver rebuild
+        // per configured step (not once per key), with a defensive bound and
+        // shape check even though the offline webview is the only sender.
+        if (msg && msg.type === 'expandMany' && Array.isArray(msg.keys) && lastRender) {
+          const keys = [...new Set(
+            msg.keys.filter((key) => typeof key === 'string' && key.length > 0 && key.length <= 512)
+          )].slice(0, 2000);
+          if (!keys.length) return;
+          const settings = readSettings();
+          const expandedKeys = currentExpandedKeys();
+          const tree = expandFrontierKeys(lastRender.index, lastRender.target, lastRender.dir, settings, expandedKeys, keys);
           if (tree && tree.root) {
             lastRender.tree = tree;
             postPathMapUpdate(mapPanel, tree);
@@ -2615,7 +2617,7 @@ async function activate(context) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('apexTrace.traceCallers', async () => {
-      // Round 2.5 / H5: single-flighted -- see scanFlow's own header for the
+      // Single-flighted; see scanFlow's header for the
       // join/queue/latest-wins contract. Freeze the initiating editor and
       // cursor so different targets never coalesce under a direction-only
       // key while indexing is still in flight.
@@ -2629,7 +2631,7 @@ async function activate(context) {
     // direction per A4; only the resolver call + tree.direction differ,
     // both handled inside traceTarget/computeTrace above.
     //
-    // v0.12.0 / C2: this SAME command id is also wired as the entry-catalog
+    // This same command id is also wired as the entry-catalog
     // view's per-entry INLINE action (package.json's "view/item/context",
     // icon $(call-outgoing) -- the identical title/icon this command
     // already declares, so reusing the id rather than minting a new command
@@ -2645,11 +2647,11 @@ async function activate(context) {
     // null for a flow entry (toEntryCatalogTreeItem above stamps it on
     // every entry leaf, present-but-null included) -- see uitree.js's
     // entryCatalogTarget doc for why a flow entry never carries a real one.
-    // A null target here is EXACTLY the C2 contract's "flows: run the
+    // A null target here represents "flows: run the
     // callee trace only when the flow has traceable children -- else no-op
     // toast" case (documented at uitree.js's shapeEntryCatalogEntry: today's
-    // C1 contract never gives a flow entry a target at all, so this is the
-    // no-op branch for every flow entry as of this round).
+    // current catalog never gives a flow entry a target at all, so this is the
+    // no-op branch for a Flow entry without a traceable Apex target).
     vscode.commands.registerCommand('apexTrace.traceCallees', async (item) => {
       if (item && Object.prototype.hasOwnProperty.call(item, '_entryTarget')) {
         if (!item._entryTarget) {
@@ -2665,7 +2667,7 @@ async function activate(context) {
         // that the target is already known, so resolveTarget()'s
         // cursor/QuickPick step is skipped entirely.
         //
-        // Round 2.5 / H5: single-flighted under a KNOWN-target key -- a
+        // Single-flighted under a known-target key: a
         // second click on the SAME entry-catalog row while its scan is
         // still in flight coalesces (no second scan); a click on a
         // DIFFERENT entry queues (latest wins), same as every other
@@ -2738,14 +2740,14 @@ async function activate(context) {
       if (result && result.superseded) return;
       if (result) await vscode.commands.executeCommand('apexTraceView.focus');
     }),
-    // v0.12.0 / C2: builds the Entry-Point Catalog -- palette command
+    // Builds the Entry-Point Catalog -- palette command
     // (category 'Apex Call Graph') AND the entry-catalog view's own
     // title-bar refresh button (package.json's "view/title", same '+
-    // re-run to refresh' idiom apexTrace.showPathMap already uses for
+    // re-run to refresh' idiom apexTrace.refreshPathMap uses for
     // apexTraceView above) AND the viewsWelcome command link shown before
     // the view has ever been populated this session.
     vscode.commands.registerCommand('apexTrace.showEntryCatalog', async () => {
-      // Round 2.5 / H5: single-flighted under a fixed 'catalog' key -- a
+      // Single-flighted under a fixed 'catalog' key: a
       // repeat click while a catalog build is already in flight coalesces;
       // any OTHER trace request queues behind it (latest wins), same as
       // every other command here.
@@ -2756,12 +2758,8 @@ async function activate(context) {
           showScanCancelledMessage();
           return null;
         }
-        // C1 (resolver.js's buildEntryCatalog) may still be in flight this
-        // round -- same forward-compat `typeof` guard idiom this file already
-        // uses for metascan.stripOwnNamespace (v0.8 N3) and
-        // pathmap.buildPathMapData (v0.9 P2) above, so a resolver.js build
-        // that hasn't landed C1 yet degrades to a clear warning instead of
-        // throwing a TypeError.
+        // Keep a defensive capability guard so a mismatched resolver build
+        // degrades to a clear warning instead of throwing a TypeError.
         if (typeof resolver.buildEntryCatalog !== 'function') {
           vscode.window.showWarningMessage(
             'Apex Call Graph: the entry-point catalog is not available in this build of resolver.js yet.'
@@ -2796,7 +2794,7 @@ async function activate(context) {
         return;
       }
       const nextDirection = lastDirection === 'callees' ? 'callers' : 'callees';
-      // Round 2.5 / H5: single-flighted under the KNOWN target+direction key.
+      // Single-flighted under the known target+direction key.
       const key = `known:${lastTarget.classLower}#${lastTarget.methodLower}:${nextDirection}`;
       const tree = await scanFlow.request(key, () => retraceLastTarget(nextDirection));
       if (tree && tree.superseded) return;
@@ -2826,10 +2824,10 @@ async function activate(context) {
       orientation = orientation === 'entry-first' ? 'target-first' : 'entry-first';
       await context.workspaceState.update(ORIENTATION_KEY, orientation);
       if (lastRender) {
-        // v0.9 / P2: still no re-scan (readSettings()/buildTreeForTarget
+        // Still no re-scan (readSettings()/buildTreeForTarget
         // below are pure resolver.js calls against the already-built
-        // lastRender.index -- no vscode.workspace.fs I/O). Per the CONTRACT
-        // AMENDMENT ("orientation toggle reset[s] expansion state"), any
+        // lastRender.index -- no vscode.workspace.fs I/O). An orientation
+        // toggle resets expansion state, so any
         // progressive-depth clicks made under the OLD orientation are
         // discarded first: re-rooting a tree that mixes fully-expanded-by-
         // click branches with frontier stubs is exactly the ambiguity this
@@ -2857,23 +2855,34 @@ async function activate(context) {
       );
     }),
     vscode.commands.registerCommand('apexTrace.showPathMap', async () => {
-      // H6a: prefer re-tracing the last KNOWN target over reusing a
-      // possibly-stale cached TreeResult -- see retraceLastTarget's comment.
-      // Round 2.5 / H5: single-flighted -- known-target key when there's a
-      // lastTarget to re-trace, else the same editor+selection identity a
-      // traceCallers invocation uses. Requests from the same position still
-      // coalesce; requests from different positions queue independently.
-      const targetContext = lastTarget ? null : captureInteractiveTargetContext('callers');
-      const key = lastTarget
-        ? `known:${lastTarget.classLower}#${lastTarget.methodLower}:${lastDirection}`
-        : targetContext.key;
-      const tree = await scanFlow.request(key, () =>
-        lastTarget ? retraceLastTarget() : computeTrace('callers', targetContext)
-      );
+      // This is the editor-context / Command Palette action: always resolve
+      // the target under the cursor (or ask via QuickPick). Reusing
+      // `lastTarget` here made a second invocation on another class silently
+      // redraw the first class, which looked as if an open singleton panel
+      // refused to be replaced. Preserve the current trace direction so a
+      // caller/callee workflow can retarget without also changing modes.
+      const direction = lastDirection;
+      const targetContext = captureInteractiveTargetContext(`pathmap:${direction}`);
+      const tree = await scanFlow.request(targetContext.key, () => computeTrace(direction, targetContext));
       if (tree && tree.superseded) return;
       if (tree) showPathMapPanel(tree);
     }),
-    // Round 2.5 / H8: clipboard JSON containing ONLY numbers/enums -- see
+    vscode.commands.registerCommand('apexTrace.refreshPathMap', async () => {
+      // The Call Graph view-title action intentionally refreshes the last
+      // resolved target from a new scan. Before any trace exists, retain the
+      // old convenience behavior by resolving the active editor/QuickPick.
+      let tree;
+      if (lastTarget) {
+        const key = `known:${lastTarget.classLower}#${lastTarget.methodLower}:${lastDirection}`;
+        tree = await scanFlow.request(key, () => retraceLastTarget());
+      } else {
+        const targetContext = captureInteractiveTargetContext(`pathmap:${lastDirection}`);
+        tree = await scanFlow.request(targetContext.key, () => computeTrace(lastDirection, targetContext));
+      }
+      if (tree && tree.superseded) return;
+      if (tree) showPathMapPanel(tree);
+    }),
+    // Clipboard JSON contains only numbers/enums; see
     // scanflow.js's buildDiagnosticsPayload/assertCountsOnly for the full
     // contract. `assertCountsOnly` is run as a last-line-of-defense
     // assertion right before the clipboard write, never trusting

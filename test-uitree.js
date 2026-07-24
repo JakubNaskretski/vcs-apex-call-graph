@@ -109,6 +109,19 @@ assert.strictEqual(
   'gear',
   'cmdt kind gets its own icon, wins over the entries-badge fallback'
 );
+assert.strictEqual(iconForNode({ kind: 'permissionset', entries: ['Permission Set Apex access'] }), 'shield');
+assert.strictEqual(iconForNode({ kind: 'profile', entries: ['Profile Apex access'] }), 'account');
+
+{
+  const permissionUi = shapeNode({
+    label: 'Acme_Portal_Access', kind: 'permissionset', className: '', methodLower: null,
+    path: '/ws/permissionsets/Acme_Portal_Access.permissionset-meta.xml', line: 4,
+    entries: ['Permission Set Apex access'], isTest: false, via: 'access', sites: [], children: [],
+    cyclic: false, truncated: false, approximate: false, seenElsewhere: false,
+  });
+  assert.ok(permissionUi.tooltip.includes('access:'), 'access metadata receives a dedicated non-caller explanation');
+  assert.ok(permissionUi.tooltip.includes('does not invoke Apex'));
+}
 
 // --- iconForNode: v0.5 G4 'anonymous' kind gets its own distinct icon
 // ('terminal'), Apex-source family (like trigger), NOT the metadata-caller

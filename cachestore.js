@@ -99,8 +99,8 @@ function serialize(payload) {
     const entries = Array.isArray(payload.entries) ? payload.entries : [];
     return JSON.stringify({ engineVersion: payload.engineVersion, entries });
   } catch (e) {
-    // circular structure, BigInt, or any other JSON.stringify failure --
-    // never throw, degrade to "nothing to persist this round".
+    // Circular structures, BigInt, and other JSON.stringify failures are
+    // non-fatal; degrade to an empty persistence payload.
     return '';
   }
 }

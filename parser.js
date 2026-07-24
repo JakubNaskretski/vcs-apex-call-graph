@@ -1,13 +1,12 @@
 'use strict';
 // Semantic (AST-based) Apex facts extractor — a thin facade over
-// @apexdevtools/apex-parser that produces the frozen FileFacts contract with
+// @apexdevtools/apex-parser that produces the documented FileFacts shape with
 // a SINGLE listener walk per file. parseFile() must never throw: any parse
 // or walk failure degrades to `parseError` set + whatever partial facts were
 // gathered before the failure (resolver.js falls back to lexical scanning
 // for files with parseError set).
 //
-// Design notes (spec was ambiguous on these; simplest reading picked, see
-// KNOWN PITFALLS review this was written against):
+// Design notes:
 //
 // - SOQL bind-expression calls (`[SELECT Id FROM Account WHERE Id = :f()]`):
 //   verified live — no special extraction needed. `:f()` parses as an
@@ -24,16 +23,16 @@
 //   namespace prefix and/or generic args, e.g. 'Database.Batchable<sObject>');
 //   normalizing that is resolver.js's job.
 // - interfaces may `extends` multiple parents; TypeFacts.extendsType is a
-//   single nullable string per the frozen shape, so only the FIRST
+//   single nullable string, so only the FIRST
 //   extends-list entry is kept — an accepted, documented approximation.
 // - '(init)' is ONE synthetic method per type that aggregates every field
 //   initializer plus every static/instance initializer block in that type
 //   (Apex has no way to distinguish "which init ran first" statically, and
-//   the frozen shape has no room for more than one such scope per type).
+//   the extracted shape has no room for more than one such scope per type).
 //   Its line/endLine expand to span every contributing occurrence.
 // - '(get NAME)'/'(set NAME)' synthetic scopes are created for EVERY
 //   declared accessor (enterGetter/enterSetter fire once per accessor,
-//   independent of whether it has a body) so resolver.js's A2 property-
+//   independent of whether it has a body) so resolver.js's property-
 //   accessor edges always have a real MethodFacts entry to land on --
 //   auto-implemented accessors (`{ get; set; }`, no body block) register
 //   the scope but simply have nothing to walk (no pushScope), so `calls`
@@ -44,7 +43,7 @@
 //   'withsharing') since the grammar packs them into a single
 //   ModifierContext token run. Cosmetic-only; not part of the required
 //   test-coverage list.
-// - AMENDMENT F1 (DML statement facts, MethodFacts.dml[]): the grammar gives
+// - DML statement facts (MethodFacts.dml[]): the grammar gives
 //   each DML STATEMENT form (`insert x;`, `update x;`, ...) its own rule/
 //   context type (InsertStatementContext, UpdateStatementContext,
 //   DeleteStatementContext, UndeleteStatementContext, UpsertStatementContext,
@@ -64,7 +63,7 @@
 //   verified live it already flows through enterDotExpression/enterMethodCall
 //   as an ordinary 'dot' CallFacts with receiver 'Database'; resolver.js maps
 //   the method name to a DML op instead of parser.js special-casing it.
-// - AMENDMENT G2 (throw/catch tracing, MethodFacts.throwsSites[]/catches[]):
+// - Throw/catch tracing (MethodFacts.throwsSites[]/catches[]):
 //   a `throw` statement's expression is either a NewExpressionContext
 //   (`throw new AcmeX(...)`) -- creator head text, same generics-stripped
 //   convention as enterNewExpression -- or, for the caught-and-rethrown
@@ -85,17 +84,17 @@
 //   try inside a catch/finally) all attribute to the same enclosing method
 //   scope, which is what lets resolver.js's ancestor-catch-badge walk work
 //   with a flat per-method catches[] list.
-// - AMENDMENT G3 (instanceof narrowing, MethodFacts.narrowings[]): only the
+// - Instanceof narrowing (MethodFacts.narrowings[]): only the
 //   "simple-identifier receiver" shape is captured (`x instanceof T`, where
 //   `x` is a bare local/param/field reference) -- same
-//   PrimaryExpressionContext/IdPrimaryContext shape check as the G2 `throw e`
+//   PrimaryExpressionContext/IdPrimaryContext shape check as the `throw e`
 //   case, reused via simpleIdentifierName(). A non-identifier receiver
 //   (`this.x instanceof T`, `getX() instanceof T`) is captured nowhere,
-//   since resolver.js's G3 fallback is keyed purely on varName. No scope
+//   since resolver.js's narrowing fallback is keyed purely on varName. No scope
 //   push: instanceOf expressions can appear anywhere an expression is legal
 //   (if-condition, ternary, plain statement, ...) and always attribute to
 //   whatever method-like scope is already active.
-// - AMENDMENT G4 (anonymous Apex, FileFacts.kind 'anonymous'): a `.apex`
+// - Anonymous Apex (FileFacts.kind 'anonymous'): a `.apex`
 //   path is parsed via parser.anonymousUnit() (grammar entry rule for
 //   "Execute Anonymous" scripts) instead of parser.compilationUnit() --
 //   verified live, no top-level type wrapper is required or expected. A
@@ -104,12 +103,12 @@
 //   one synthetic method '(anonymous)', which is pushed as the active scope
 //   so every statement in the script's top-level block -- calls, DML,
 //   locals, throws, catches, narrowings alike -- attributes to it exactly
-//   like any other method body. Per the G4 spec this method also directly
+//   like any other method body. This method also directly
 //   carries `entries: ['Anonymous Apex script']` on its MethodFacts (unlike
 //   every other entry-point label in this codebase, which resolver.js
 //   derives from annotations/modifiers -- an anonymous script has no
 //   annotation to derive from, so parser.js hard-codes it here instead).
-// - AMENDMENT A1 (property accessor CallFacts, kind 'prop'): the grammar's
+// - Property accessor calls (CallFacts.kind 'prop'): the grammar's
 //   left-recursive `expression DOT (dotMethodCall | anyId)` production means
 //   a DotExpressionContext with no dotMethodCall() is the anyId()-only
 //   alternative -- a bare `x.Prop` reference, not a method call. That is a
@@ -124,11 +123,11 @@
 //   even though the outermost expression is a write, so no special-casing
 //   is needed there. `x.Prop(...)` is unaffected (dotMethodCall() present)
 //   and keeps producing kind 'dot' exactly as before. Only the dot form is
-//   handled per the amendment's own scope note ("dot property READS");
+//   handled for dot-property reads;
 //   implicit/bare (`Prop = x` with no receiver, inside the declaring class)
 //   is out of scope. Over-emission (e.g. a dotted access that turns out to
 //   be a field, not a declared property) is explicitly acceptable per the
-//   amendment -- resolver.js is the one that filters to declared
+//   parser output -- resolver.js is the component that filters to declared
 //   properties, not parser.js.
 
 const {
@@ -147,13 +146,13 @@ const {
 
 function baseName(p) {
   const b = String(p || '').split(/[\\/]/).pop() || '';
-  // G4: '.apex' (anonymous-script) files join the existing cls/trigger
+  // Anonymous-script '.apex' files join the existing cls/trigger
   // extensions here -- same stem-extraction convention, no -meta.xml
   // sidecar exists for anonymous scripts but the alternation is harmless.
   return b.replace(/\.(cls|trigger|apex)(-meta\.xml)?$/i, '');
 }
 
-// G2/G3: source-faithful "is this expression a bare identifier?" check,
+// Source-faithful "is this expression a bare identifier?" check,
 // shared by throw-statement rethrow resolution (`throw e;`) and instanceof
 // narrowing (`x instanceof T`). A bare identifier parses as a
 // PrimaryExpressionContext wrapping an IdPrimaryContext -- verified live.
@@ -165,7 +164,7 @@ function simpleIdentifierName(exprCtx) {
   return primary.id().getText();
 }
 
-// PARSER CONTRACT (v0.11 Round B / B1): unescapes a single-quoted Apex
+// Unescapes a single-quoted Apex
 // StringLiteral token's raw getText() (which still carries its surrounding
 // quotes, e.g. `'VtxRouterHandler'` or `'it\'s'`) into the actual string
 // VALUE the literal denotes -- this is what locals[].literal /
@@ -189,7 +188,7 @@ function unescapeApexStringLiteral(raw) {
   });
 }
 
-// PARSER CONTRACT (B1): source-faithful "is this expression exactly a
+// Source-faithful "is this expression exactly a
 // single string literal?" check, shared by locals[].literal (single-
 // assignment local proof) and TypeFacts.constants (static final String
 // field proof). A string literal parses as PrimaryExpressionContext ->
@@ -221,7 +220,7 @@ function stringLiteralValue(exprCtx) {
   return null;
 }
 
-// BUG FIX (finding #5): @apexdevtools/apex-parser's CharStream is built with
+// @apexdevtools/apex-parser's CharStream is built with
 // decodeToUnicodeCodePoints=true (verified live in
 // node_modules/@apexdevtools/apex-parser/dist/esm/CaseInsensitiveInputStream.js,
 // which passes that flag straight to antlr4's CharStream ctor), so
@@ -352,7 +351,7 @@ class FactsListener extends ApexParserBaseListener {
     // enterDotExpression(ctx) visit can tell "this is a write, already
     // emitted as 'set'" apart from "this is a plain read, emit 'get'".
     this.propWriteTargets = new WeakSet();
-    // PARSER CONTRACT (B1): MethodFacts (mf) object -> Set<localName> of
+    // MethodFacts (mf) object -> Set<localName> of
     // names seen as the target of an assignment/compound-assignment/inc-dec
     // expression anywhere while that scope was active. Purely a bookkeeping
     // side-channel (never attached to the mf object itself, so it can't leak
@@ -379,7 +378,7 @@ class FactsListener extends ApexParserBaseListener {
     }
   }
 
-  // PARSER CONTRACT (B1): records that `name` was seen as an
+  // Records that `name` was seen as an
   // assignment/compound-assignment/inc-dec TARGET while `mf` was the active
   // scope -- see enterAssignExpression/enterPostOpExpression/
   // enterPreOpExpression below, all of which route through this same
@@ -395,10 +394,10 @@ class FactsListener extends ApexParserBaseListener {
     set.add(name);
   }
 
-  // PARSER CONTRACT (B1): at scope-pop time (the whole method body has been
+  // At scope-pop time (the whole method body has been
   // walked), strip `literal` from any local whose name was ever seen as a
   // reassignment target anywhere in this scope. Purely syntactic/name-based
-  // (not block/reachability-aware, per the CONTRACT's own note) -- a
+  // (not block/reachability-aware) -- a
   // same-named local declared in a disjoint sibling block would also lose
   // its `literal` here even though it's individually never reassigned; that
   // is an accepted conservative approximation (under-resolving is safe,
@@ -485,14 +484,14 @@ class FactsListener extends ApexParserBaseListener {
     });
   }
 
-  // PARSER CONTRACT (B1): `literal` is set ONLY when the declaration
+  // `literal` is set ONLY when the declaration
   // initializer is a single string literal -- see stringLiteralValue(). It
   // is attached optimistically here (before any later-in-method
   // reassignment can be known); finalizeLiteralLocals() strips it back off
   // at scope-pop time if a reassignment of this name ever turns up. Callers
   // that have no initializer to check (enhanced-for loop vars, catch
   // clauses) simply omit the argument, leaving the field absent -- the
-  // frozen "optional" contract, never present-but-null.
+  // optional field is never present-but-null.
   addLocal(name, type, ctx, literal) {
     const scope = this.currentScope();
     if (!scope) return;
@@ -582,7 +581,7 @@ class FactsListener extends ApexParserBaseListener {
           : [],
       annotations,
       fields: [],
-      // PARSER CONTRACT (B1-b): static final String fields with a
+      // Static final String fields with a
       // single-literal initializer -- populated by enterFieldDeclaration.
       // Present (possibly empty) on every TypeFacts uniformly, including
       // the trigger/anonymous-script synthetic pseudo-types, even though
@@ -627,7 +626,7 @@ class FactsListener extends ApexParserBaseListener {
       implementsTypes: [],
       annotations,
       fields: [],
-      // PARSER CONTRACT (B1-b): static final String fields with a
+      // Static final String fields with a
       // single-literal initializer -- populated by enterFieldDeclaration.
       // Present (possibly empty) on every TypeFacts uniformly, including
       // the trigger/anonymous-script synthetic pseudo-types, even though
@@ -657,7 +656,7 @@ class FactsListener extends ApexParserBaseListener {
       implementsTypes: [],
       annotations,
       fields: [],
-      // PARSER CONTRACT (B1-b): static final String fields with a
+      // Static final String fields with a
       // single-literal initializer -- populated by enterFieldDeclaration.
       // Present (possibly empty) on every TypeFacts uniformly, including
       // the trigger/anonymous-script synthetic pseudo-types, even though
@@ -706,15 +705,15 @@ class FactsListener extends ApexParserBaseListener {
     this.popType();
   }
 
-  // ---- anonymous Apex (G4) -----------------------------------------------
+  // ---- anonymous Apex ----------------------------------------------------
 
   // parser.anonymousUnit() (see parseFile) has no top-level type wrapper at
   // all -- a single synthetic pseudo-type named from the file stem (already
   // computed as fileFacts.name by baseName()) stands in for it, with one
   // synthetic '(anonymous)' method scope so every top-level statement in the
-  // script attributes to it exactly like an ordinary method body. Per the G4
-  // spec this method directly carries entries: ['Anonymous Apex script'] --
-  // see the AMENDMENT G4 header note for why that lives here instead of
+  // script attributes to it exactly like an ordinary method body. This
+  // method directly carries entries: ['Anonymous Apex script']; see the
+  // header note for why that lives here instead of
   // being derived by resolver.js the way other entry labels are.
   enterAnonymousUnit(ctx) {
     const name = this.fileFacts.name;
@@ -854,7 +853,7 @@ class FactsListener extends ApexParserBaseListener {
     const isStatic = modifiers.includes('static');
     const isFinal = modifiers.includes('final');
     const fieldType = ctx.typeRef().getText();
-    // PARSER CONTRACT (B1-b): 'String' is matched case-insensitively (Apex
+    // 'String' is matched case-insensitively (Apex
     // identifiers/type names are case-insensitive), same convention used
     // nowhere else in this file only because no other rule cared about a
     // specific type name before now.
@@ -952,7 +951,7 @@ class FactsListener extends ApexParserBaseListener {
   enterLocalVariableDeclaration(ctx) {
     const type = ctx.typeRef().getText();
     for (const vd of ctx.variableDeclarators().variableDeclarator_list()) {
-      // PARSER CONTRACT (B1-a): single-literal initializer proof lives
+      // Single-literal initializer proof lives
       // purely at THIS declaration site -- vd.expression() is the
       // initializer (null when there is none, e.g. `String s;`).
       const literal = stringLiteralValue(vd.expression ? vd.expression() : null);
@@ -969,17 +968,17 @@ class FactsListener extends ApexParserBaseListener {
     const typeName = ctx.qualifiedName().getText();
     const varName = ctx.id().getText();
     this.addLocal(varName, typeName, ctx);
-    // G2: also index as a catches[] fact (distinct from locals[] -- callers
+    // Also index as a catches[] fact (distinct from locals[] -- callers
     // resolving `throw e;`/badge-matching want typed catch clauses only,
     // not the full local-variable env).
     this.addCatchFact(typeName, varName, ctx);
   }
 
-  // G2: `throw new AcmeX(...)` (creator-type shape, generics stripped same
+  // `throw new AcmeX(...)` uses the creator-type shape (generics stripped the same
   // as enterNewExpression) or `throw e;` (bare-identifier rethrow shape --
   // typeName left null, varName captured for resolver.js to resolve via the
   // enclosing method's catches/locals/params). Any other throw-expression
-  // shape records neither (see AMENDMENT G2 header note).
+  // shape records neither (see the header note).
   enterThrowStatement(ctx) {
     const expr = ctx.expression();
     let typeName = null;
@@ -995,8 +994,8 @@ class FactsListener extends ApexParserBaseListener {
     this.addThrow(typeName, varName, ctx);
   }
 
-  // G3: `x instanceof T` narrowing -- only the simple-identifier-receiver
-  // shape is recorded (see AMENDMENT G3 header note); a non-identifier
+  // `x instanceof T` narrowing -- only the simple-identifier-receiver
+  // shape is recorded (see the header note); a non-identifier
   // receiver contributes no narrowings[] entry.
   enterInstanceOfExpression(ctx) {
     const scope = this.currentScope();
@@ -1010,7 +1009,7 @@ class FactsListener extends ApexParserBaseListener {
     });
   }
 
-  // PARSER CONTRACT (B1): `x++` / `x--` (postfix). PostOpExpressionContext
+  // `x++` / `x--` (postfix). PostOpExpressionContext
   // is the ONLY shape this production covers (unlike PreOpExpression below,
   // which also covers unary +/-), so no INC()/DEC() gate is needed -- kept
   // anyway as defensive belt-and-suspenders against a future grammar shape
@@ -1021,7 +1020,7 @@ class FactsListener extends ApexParserBaseListener {
     if (name) this.markReassigned(name);
   }
 
-  // PARSER CONTRACT (B1): `++x` / `--x` (prefix). PreOpExpressionContext
+  // `++x` / `--x` (prefix). PreOpExpressionContext
   // ALSO covers unary `+x`/`-x` (same production, distinguished by
   // ADD()/SUB() vs INC()/DEC() -- verified live against the installed
   // grammar's .d.ts) -- only the INC/DEC tokens denote a mutation, so a
@@ -1059,11 +1058,11 @@ class FactsListener extends ApexParserBaseListener {
     this.addPropCall('get', receiver, method, [], ctx);
   }
 
-  // A1: `receiver.Prop = value` / `receiver.Prop += value` / any compound
+  // `receiver.Prop = value` / `receiver.Prop += value` / any compound
   // assignment operator -- all share one grammar production
   // (AssignExpressionContext: expression (ASSIGN|..._ASSIGN) expression),
-  // so a single handler covers plain and compound assignment alike, per the
-  // amendment's "compound += etc. as 'set'" instruction. Only fires a 'prop'
+  // so a single handler covers plain and compound assignment alike. It only
+  // fires a 'prop'
   // set when the LHS is itself a bare dotted property reference (not e.g. a
   // plain identifier or a `receiver.Prop(...)` call result, which can't be
   // an assignment target anyway). Runs before the walker descends into the
@@ -1072,7 +1071,7 @@ class FactsListener extends ApexParserBaseListener {
   // otherwise emit for that same node.
   enterAssignExpression(ctx) {
     const lhs = ctx.expression(0);
-    // PARSER CONTRACT (B1): a bare-identifier LHS (`handlerName = ...` /
+    // A bare-identifier LHS (`handlerName = ...` /
     // `handlerName += ...` / any compound-assign operator -- all share this
     // one AssignExpressionContext production, same as the A1 prop-write
     // case below) marks that name reassigned for the currently active
@@ -1146,7 +1145,7 @@ class FactsListener extends ApexParserBaseListener {
 
   // MergeStatementContext exposes expression_list() (master record first,
   // record(s)-to-merge second), not a single expression() -- verified live,
-  // see the AMENDMENT F1 header note.
+  // as described in the DML header note.
   enterMergeStatement(ctx) {
     const exprs = ctx.expression_list();
     if (!exprs || !exprs.length) return;
@@ -1209,7 +1208,7 @@ function parseFile({ path, text }) {
     fileFacts.parseError = fileFacts.parseError || 'unexpected: ' + (e && e.message ? e.message : String(e));
   }
 
-  // CONTRACT MISMATCH FIX (integrator): the frozen FileFacts shape has no
+  // The FileFacts shape has no
   // `text` field, but resolver.js's PARSE-ERROR FALLBACK rule requires the
   // raw source of a file whose parseError is set (to lexically scan it for
   // class-name mentions) and has no other way to obtain it (pure data-in/

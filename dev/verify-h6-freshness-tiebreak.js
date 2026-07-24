@@ -6,7 +6,7 @@
 //     edit: extension.js's scanAndParse must reparse a file whose mtime is
 //     UNCHANGED but whose size changed, rather than trusting the stale
 //     cached FileFacts.
-// (b) proves showPathMap (H6a) reflects a file edit WITHOUT re-running the
+// (b) proves refreshPathMap (H6a) reflects a file edit WITHOUT re-running the
 //     interactive traceCallers/resolveTarget flow (no second QuickPick) --
 //     it uses the stored lastTarget + a fresh scanAndParse+rebuild instead
 //     of reusing a stale TreeResult.
@@ -48,8 +48,14 @@ let quickPickCalls = 0;
 let quickPickAnswer = null; // set before each computeTrace() that must resolve interactively
 
 const events = []; // captured showInformationMessage/showWarningMessage text, for debugging
+const workspaceFolderChangeHandlers = [];
 
-function mkUri(fsPath) { return { fsPath }; }
+function mkUri(fsPath) {
+  return {
+    scheme: 'file', authority: '', path: fsPath, fsPath,
+    toString() { return `file://${fsPath}`; },
+  };
+}
 
 const mockVscode = {
   EventEmitter: class {
@@ -62,11 +68,20 @@ const mockVscode = {
   },
   TreeItemCollapsibleState: { Collapsed: 1, None: 0 },
   ThemeIcon: class { constructor(id) { this.id = id; } },
-  Uri: { file: mkUri },
+  Position: class { constructor(line, character) { this.line = line; this.character = character; } },
+  Uri: {
+    file: mkUri,
+    parse: (value) => mkUri(String(value).replace(/^file:\/\//, '')),
+    joinPath: (base, ...parts) => mkUri(path.join(base.fsPath, ...parts)),
+  },
   Range: class { constructor(a, b, c, d) { this.args = [a, b, c, d]; } },
   ProgressLocation: { Notification: 1 },
   ViewColumn: { Beside: 1, One: 2 },
   workspace: {
+    workspaceFolders: [{ name: 'h6', uri: mkUri(__dirname) }],
+    textDocuments: [],
+    getWorkspaceFolder: () => ({ name: 'h6', uri: mkUri(__dirname) }),
+    getConfiguration: () => ({ get: () => undefined }),
     findFiles: async (glob) => {
       // Only care about the **/*.{cls,trigger,apex} glob for this repro --
       // metadata globs (lwc/aura/flow/omniscript/vf) match nothing in this
@@ -79,27 +94,46 @@ const mockVscode = {
     fs: {
       stat: async (uri) => {
         const e = vfs.get(uri.fsPath);
-        if (!e) throw new Error('ENOENT: ' + uri.fsPath);
+        if (!e) { const error = new Error('ENOENT'); error.code = 'FileNotFound'; throw error; }
         return { mtime: e.mtime, size: Buffer.byteLength(e.text, 'utf8') };
       },
       readFile: async (uri) => {
         const e = vfs.get(uri.fsPath);
-        if (!e) throw new Error('ENOENT: ' + uri.fsPath);
+        if (!e) { const error = new Error('ENOENT'); error.code = 'FileNotFound'; throw error; }
         return Buffer.from(e.text, 'utf8');
       },
+      readDirectory: async () => [],
+      createDirectory: async () => {},
+      writeFile: async () => {},
+      delete: async () => {},
+    },
+    createFileSystemWatcher: () => ({
+      onDidChange: () => ({ dispose() {} }),
+      onDidCreate: () => ({ dispose() {} }),
+      onDidDelete: () => ({ dispose() {} }),
+      dispose() {},
+    }),
+    onDidSaveTextDocument: () => ({ dispose() {} }),
+    onDidChangeWorkspaceFolders: (handler) => {
+      workspaceFolderChangeHandlers.push(handler);
+      return { dispose() {} };
     },
   },
   window: {
     activeTextEditor: undefined, // forces resolveTarget() down the QuickPick path
     createTreeView: () => ({ }),
-    withProgress: async (opts, task) => task({ report: () => {} }),
+    createOutputChannel: () => ({ appendLine() {}, dispose() {} }),
+    withProgress: async (opts, task) => task(
+      { report: () => {} },
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }
+    ),
     showWarningMessage: (msg) => { events.push(['warn', msg]); },
     showInformationMessage: (msg) => { events.push(['info', msg]); },
     setStatusBarMessage: () => {},
     showQuickPick: async () => { quickPickCalls++; return quickPickAnswer; },
     createWebviewPanel: () => {
       const panel = {
-        webview: { html: '', onDidReceiveMessage: () => {} },
+        webview: { html: '', onDidReceiveMessage: () => ({}), postMessage: async () => true },
         onDidDispose: () => {},
         reveal: () => {},
       };
@@ -135,7 +169,8 @@ if (!fs.existsSync(storageDir)) fs.mkdirSync(storageDir, { recursive: true });
 
 const context = {
   subscriptions: [],
-  globalStorageUri: { fsPath: storageDir },
+  globalStorageUri: mkUri(storageDir),
+  workspaceState: { get: () => undefined, update: async () => {} },
 };
 
 let failures = 0;
@@ -147,7 +182,7 @@ async function main() {
   await extension.activate(context);
   const registry = mockVscode.commands._registry;
   assert(registry.has('apexTrace.traceCallers'), 'apexTrace.traceCallers command registered');
-  assert(registry.has('apexTrace.showPathMap'), 'apexTrace.showPathMap command registered');
+  assert(registry.has('apexTrace.refreshPathMap'), 'apexTrace.refreshPathMap command registered');
 
   // --- Round 1: trace A.target's CALLERS interactively (sets lastTarget) --
   // (B.caller1 is a call SITE, not the trace target -- tracing callers of
@@ -163,17 +198,25 @@ async function main() {
   // the v1 FileFacts (missing the new call site); the mtimeMs+size tiebreak
   // must force a reparse.
   const v1 = vfs.get(pB).text;
-  const v2 = `public class B { public void caller1(){ A a = new A(); a.target(); a.target(); } }`;
+  const v2 = [
+    'public class B {',
+    '  public void caller1(){ A a = new A(); a.target(); }',
+    '  public void caller2(){ A a = new A(); a.target(); }',
+    '}',
+  ].join('\n');
   assert(Buffer.byteLength(v2) !== Buffer.byteLength(v1), 'sanity: v2 has a different byte size than v1');
   vfsWrite(pB, v2, 5000); // mtime UNCHANGED
+  // Force the next scan down its trust-nothing full-sweep path so the
+  // mtime+size cache tiebreak (rather than dirty-file bypass) is exercised.
+  for (const handler of workspaceFolderChangeHandlers) handler({ added: [{}], removed: [] });
   assert(vfs.get(pB).mtime === 5000, 'sanity: B.cls mtime unchanged after edit');
 
-  // --- H6(a): showPathMap must reflect the edit WITHOUT a second QuickPick -
-  const showPathMapFn = registry.get('apexTrace.showPathMap');
+  // --- H6(a): refreshPathMap reflects the edit without another QuickPick --
+  const refreshPathMapFn = registry.get('apexTrace.refreshPathMap');
   const qpBefore = quickPickCalls;
   quickPickAnswer = null; // if resolveTarget ran again it would find no QuickPick answer and abort
-  await showPathMapFn();
-  assert(quickPickCalls === qpBefore, 'showPathMap did not re-invoke the interactive QuickPick (used lastTarget, not re-run traceCallers)');
+  await refreshPathMapFn();
+  assert(quickPickCalls === qpBefore, 'refreshPathMap did not re-invoke the interactive QuickPick (used lastTarget, not re-run traceCallers)');
 
   // The webview panel's html is the only externally-observable signal here;
   // pathmap.js renders every call-site's rendered line text into the HTML,
@@ -184,7 +227,7 @@ async function main() {
   // content produces 2 call sites -- this corroborates that scanAndParse (as
   // exercised through activate()'s real code path above) is the thing
   // capable of catching the edit, which is what round-trips through
-  // showPathMap's retraceLastTarget. To directly observe the panel content,
+  // refreshPathMap's retraceLastTarget. To directly observe the panel content,
   // we monkeypatch createWebviewPanel to capture the html that gets set.
   console.log('(no assertion failure above means: same-mtime/different-size edit was NOT silently served stale from cache and no re-QuickPick occurred)');
 }
@@ -206,6 +249,7 @@ async function mainWithHtmlCapture() {
         get html() { return this._html; },
         set html(v) { this._html = v; capturedHtml = v; },
         onDidReceiveMessage: () => {},
+        postMessage: async () => true,
       },
       onDidDispose: () => {},
       reveal: () => {},
@@ -214,7 +258,11 @@ async function mainWithHtmlCapture() {
   };
 
   const ext2 = require(path.join(__dirname, '..', 'extension.js'));
-  const ctx2 = { subscriptions: [], globalStorageUri: { fsPath: storageDir } };
+  const ctx2 = {
+    subscriptions: [],
+    globalStorageUri: mkUri(storageDir),
+    workspaceState: { get: () => undefined, update: async () => {} },
+  };
   await ext2.activate(ctx2);
   const reg2 = mockVscode.commands._registry;
 
@@ -225,18 +273,24 @@ async function mainWithHtmlCapture() {
   const countCallSites = (html) => (html.match(/a\.target\(\)/g) || []).length;
   const before = countCallSites(capturedHtml || '');
 
-  // showPathMap right after traceCallers (no edit yet) opens the panel too --
+  // refreshPathMap right after traceCallers (no edit yet) opens the panel too --
   // this call also lets us prime capturedHtml deterministically before the edit.
   quickPickAnswer = null;
-  await reg2.get('apexTrace.showPathMap')();
+  await reg2.get('apexTrace.refreshPathMap')();
   const afterFirstMap = countCallSites(capturedHtml || '');
 
   // Now edit: same mtime, bigger size, second call site added.
-  vfsWrite(pB, `public class B { public void caller1(){ A a = new A(); a.target(); a.target(); } }`, 5000);
-  await reg2.get('apexTrace.showPathMap')();
+  vfsWrite(pB, [
+    'public class B {',
+    '  public void caller1(){ A a = new A(); a.target(); }',
+    '  public void caller2(){ A a = new A(); a.target(); }',
+    '}',
+  ].join('\n'), 5000);
+  for (const handler of workspaceFolderChangeHandlers) handler({ added: [{}], removed: [] });
+  await reg2.get('apexTrace.refreshPathMap')();
   const afterEdit = countCallSites(capturedHtml || '');
 
-  assert(quickPickCalls === qpCount1, 'html-capture run: showPathMap calls never triggered an extra QuickPick after the initial trace');
+  assert(quickPickCalls === qpCount1, 'html-capture run: refreshPathMap calls never triggered an extra QuickPick after the initial trace');
   assert(afterFirstMap >= 1, 'html-capture run: path map html contains at least one target() call-site mention pre-edit');
   assert(afterEdit > afterFirstMap, `html-capture run: path map html reflects the edit (call-site mentions grew ${afterFirstMap} -> ${afterEdit}) without re-running traceCallers`);
 }

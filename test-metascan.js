@@ -45,6 +45,97 @@ function refsOf(kind, refs) {
   return refs.filter((r) => r.kind === kind);
 }
 
+// Permission sets and profiles grant class access but do not invoke Apex.
+// They are extracted as class-level access metadata so the resolver can
+// surface them separately from runtime caller edges.
+{
+  const permissionText = src([
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '  <classAccesses>',
+    '    <apexClass>AcmePortalController</apexClass>',
+    '    <enabled>true</enabled>',
+    '  </classAccesses>',
+    '  <classAccesses>',
+    '    <enabled>true</enabled>',
+    '    <apexClass>AcmePortalAdminController</apexClass>',
+    '  </classAccesses>',
+    '  <classAccesses>',
+    '    <apexClass>AcmeDisabledController</apexClass>',
+    '    <enabled>false</enabled>',
+    '  </classAccesses>',
+    '</PermissionSet>',
+  ]);
+  const refs = parseMetaFile({
+    path: 'permissionsets/Acme_Portal_Access.permissionset-meta.xml',
+    text: permissionText,
+  });
+  assert.deepStrictEqual(refs.map((r) => r.kind), ['permissionset', 'permissionset']);
+  assert.deepStrictEqual(refs.map((r) => r.label), ['Acme_Portal_Access', 'Acme_Portal_Access']);
+  assert.deepStrictEqual(refs.map((r) => r.className), ['AcmePortalController', 'AcmePortalAdminController']);
+  assert.ok(refs.every((r) => r.methodName === null));
+  assert.deepStrictEqual(refs.map((r) => r.line), [4, 9]);
+  assert.ok(refs[0].lineText.includes('<apexClass>AcmePortalController</apexClass>'));
+  assert.ok(!refs.some((r) => r.className === 'AcmeDisabledController'), 'enabled=false class access is not effective');
+}
+
+{
+  const profileText = src([
+    '<Profile xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '  <classAccesses>',
+    '    <enabled>true</enabled>',
+    '    <apexClass>AcmePortalController</apexClass>',
+    '  </classAccesses>',
+    '  <classAccesses>',
+    '    <apexClass>zenq.ManagedPortalController</apexClass>',
+    '    <enabled>true</enabled>',
+    '  </classAccesses>',
+    '</Profile>',
+  ]);
+  const refs = parseMetaFile({ path: 'profiles/Acme_Consultant.profile-meta.xml', text: profileText });
+  assert.strictEqual(refs.length, 2);
+  assert.strictEqual(refs[0].kind, 'profile');
+  assert.strictEqual(refs[0].label, 'Acme_Consultant');
+  assert.strictEqual(refs[0].className, 'AcmePortalController');
+  assert.strictEqual(refs[0].line, 4);
+  assert.strictEqual(refs[1].className, 'ManagedPortalController');
+  assert.strictEqual(refs[1].namespace, 'zenq', 'dotted managed class access preserves its namespace');
+}
+
+// Malformed workspace XML is untrusted input. A long run of unclosed blocks
+// must remain linear and return safely rather than backtracking quadratically
+// on the extension host thread.
+{
+  const malformed = '<classAccesses>'.repeat(20000);
+  const started = process.hrtime.bigint();
+  const refs = parseMetaFile({ path: 'profiles/Acme_Malformed.profile-meta.xml', text: malformed });
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.deepStrictEqual(refs, []);
+  assert.ok(elapsedMs < 250, `malformed classAccesses scan must stay linear; took ${elapsedMs.toFixed(1)}ms`);
+}
+
+// Case-insensitive tag matching must not shift offsets when unrelated XML
+// text contains a Unicode character whose full lowercase form expands.
+{
+  const text = '<Profile><description>\u0130</description><CLASSACCESSES>' +
+    '<apexClass>AcmePortalController</apexClass><enabled>true</enabled>' +
+    '</CLASSACCESSES></Profile>';
+  const refs = parseMetaFile({ path: 'profiles/Acme_Unicode.profile-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'AcmePortalController');
+  assert.strictEqual(refs[0].line, 1);
+  assert.ok(refs[0].lineText.includes('<apexClass>AcmePortalController</apexClass>'));
+}
+
+// The pure extractor is not enough: pin the extension's real workspace
+// inventory so both metadata types are reachable in full and watcher-fed
+// incremental scans.
+{
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.js'), 'utf8');
+  assert.ok(extensionSource.includes("'**/permissionsets/**/*.permissionset-meta.xml'"));
+  assert.ok(extensionSource.includes("'**/profiles/**/*.profile-meta.xml'"));
+}
+
 // ===========================================================================
 // LWC — @salesforce/apex imports
 // ===========================================================================
@@ -684,6 +775,48 @@ function refsOf(kind, refs) {
   });
   assert.strictEqual(refs.length, 1);
   assert.strictEqual(refs[0].className, 'AcmeLegacyHandlerRemoved');
+}
+
+// 16g.1. Trigger Actions Framework permits an inner class in its explicit
+// Apex_Class_Name__c field. Qualified values stay rejected for arbitrary
+// fields, but this schema-known class field may carry Outer.Inner.
+{
+  const text = src([
+    '<CustomMetadata xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <values>',
+    '        <field>pkg__TAF_Apex_Class_Name__c</field>',
+    '        <value xsi:type="xsd:string">TafQueries.Service</value>',
+    '    </values>',
+    '</CustomMetadata>',
+  ]);
+  const refs = parseMetaFile({
+    path: 'customMetadata/Trigger_Action.Query_Service.md-meta.xml',
+    text,
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'TafQueries.Service');
+  assert.strictEqual(refs[0].fieldName, 'pkg__TAF_Apex_Class_Name__c');
+}
+
+// Metadata relationship values may be emitted as either a bare record name
+// or Type.Record. The schema-known TAF context fields accept the qualified
+// form so resolver.js can join it by the final record segment.
+{
+  const text = src([
+    '<CustomMetadata xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <values>',
+    '        <field>After_Update__c</field>',
+    '        <value xsi:type="xsd:string">sObject_Trigger_Setting.Record_Setting</value>',
+    '    </values>',
+    '</CustomMetadata>',
+  ]);
+  const refs = parseMetaFile({
+    path: 'customMetadata/Trigger_Action.Validate_Record.md-meta.xml',
+    text,
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'sObject_Trigger_Setting.Record_Setting');
+  assert.strictEqual(refs[0].fieldName, 'After_Update__c');
 }
 
 // 16h. Non-identifier-shaped values (spaces, dots, pure numeric, empty) are

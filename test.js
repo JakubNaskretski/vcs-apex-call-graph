@@ -889,6 +889,24 @@ const lwcFile = {
 const lwcMetaRefs = metascan.parseMetaFile(lwcFile).map((ref) => Object.assign(ref, { path: lwcFile.path }));
 resolver.attachMetaCallers(index, lwcMetaRefs);
 
+// Class authorization is parsed from real Permission Set XML, attached to
+// the same index, and kept distinct from runtime callers by via='access'.
+const permissionSetFile = {
+  path: '/ws/force-app/main/default/permissionsets/Acme_Read.permissionset-meta.xml',
+  text: [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '  <classAccesses>',
+    '    <apexClass>MetaTarget2</apexClass>',
+    '    <enabled>true</enabled>',
+    '  </classAccesses>',
+    '</PermissionSet>',
+  ].join('\n'),
+};
+const permissionSetMetaRefs = metascan.parseMetaFile(permissionSetFile)
+  .map((ref) => Object.assign(ref, { path: permissionSetFile.path }));
+resolver.attachMetaCallers(index, permissionSetMetaRefs);
+
 // v0.4.0 TRANSACTION-STORY: LWC leg (link 1's caller) -- imperative
 // '@salesforce/apex' import into TxStoryController.submitStory.
 const txStoryLwcFile = {
@@ -1273,6 +1291,21 @@ function findChild(tree, label) {
   assert.strictEqual(metaChild.label, 'acmeWidget');
   assert.strictEqual(metaChild.path, lwcFile.path, 'meta child carries the path stamped onto the MetaRef');
   assert.strictEqual(metaChild.children.length, 0, 'metadata caller is a terminal node, no further callers');
+  assert(!tree.root.children.some((c) => c.kind === 'permissionset'),
+    'class-access metadata must not appear on an exact method trace');
+}
+
+// --- class-level metadata rollup + authorization access -------------------
+{
+  const tree = callers('metatarget2', null);
+  const lwcChild = tree.root.children.find((c) => c.kind === 'lwc');
+  const accessChild = tree.root.children.find((c) => c.kind === 'permissionset');
+  assert(lwcChild, 'class trace should roll up method-specific LWC imports');
+  assert.strictEqual(lwcChild.path, lwcFile.path);
+  assert(accessChild, 'class trace should surface enabled Permission Set class access');
+  assert.strictEqual(accessChild.via, 'access');
+  assert.deepStrictEqual(accessChild.entries, ['Permission Set Apex access']);
+  assert.strictEqual(accessChild.path, permissionSetFile.path);
 }
 
 // =========================================================================
@@ -1358,6 +1391,56 @@ function findChild(tree, label) {
     /customMetadata/.test(globsBlock) && /md-meta\.xml/.test(globsBlock),
     'META_GLOBS must include a customMetadata/**/*.md-meta.xml pattern -- otherwise F4b (Custom Metadata linkage) is unreachable from a real workspace scan even though metascan.js/resolver.js implement it correctly'
   );
+}
+
+// =========================================================================
+// Path Map bulk frontier expansion wiring. The webview must send one
+// expandMany request and extension.js must rebuild once per configured
+// expansion step, not once per visible branch.
+// =========================================================================
+{
+  const extSrc = fs.readFileSync(path.join(__dirname, 'extension.js'), 'utf8');
+  assert(
+    extSrc.includes("msg.type === 'expandMany'") && extSrc.includes('Array.isArray(msg.keys)'),
+    'extension host handles only array-shaped expandMany messages'
+  );
+  assert(
+    extSrc.includes('function expandFrontierKeys(') && extSrc.includes('expandFrontierKeys(lastRender.index'),
+    'expandMany delegates to the plural one-rebuild-per-step helper'
+  );
+  assert(
+    extSrc.includes('key.length <= 512') && extSrc.includes('slice(0, 2000)'),
+    'expandMany keys are length-checked, deduplicated, and count-bounded before resolver work'
+  );
+  assert(
+    extSrc.includes('return expandFrontierKeys(index, target, dir, settings, expandedKeys, [clickedKey])'),
+    'the existing per-node expansion path is preserved through the singular wrapper'
+  );
+}
+
+// =========================================================================
+// Path Map command routing. "Show" is selection-sensitive and must never
+// prefer a stale lastTarget; the view-title "Refresh" command owns the
+// deliberate retrace-last-target behavior.
+// =========================================================================
+{
+  const extSrc = fs.readFileSync(path.join(__dirname, 'extension.js'), 'utf8');
+  const showBlock = extSrc.match(/registerCommand\('apexTrace\.showPathMap',[\s\S]*?registerCommand\('apexTrace\.refreshPathMap'/);
+  assert(showBlock, 'showPathMap and refreshPathMap command registrations are present');
+  assert(
+    showBlock[0].includes('captureInteractiveTargetContext(`pathmap:${direction}`)') &&
+      showBlock[0].includes('computeTrace(direction, targetContext)'),
+    'showPathMap resolves the current editor/QuickPick target in the current direction'
+  );
+  assert(
+    !showBlock[0].includes('lastTarget ? retraceLastTarget()') && !showBlock[0].includes('lastTarget ? null'),
+    'showPathMap cannot silently substitute the previous target'
+  );
+  const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+  const titleCommands = packageJson.contributes.menus['view/title'].map((item) => item.command);
+  const editorCommands = packageJson.contributes.menus['editor/context'].map((item) => item.command);
+  assert(titleCommands.includes('apexTrace.refreshPathMap'), 'Call Graph view title uses refreshPathMap');
+  assert(editorCommands.includes('apexTrace.showPathMap'), 'Apex editor context uses selection-sensitive showPathMap');
 }
 
 // =========================================================================
@@ -1635,34 +1718,10 @@ function findChild(tree, label) {
   );
   const headerLines = uitree.shapeHeaderLines(tree);
   assert.strictEqual(headerLines[0], 'No callers found — this is likely an entry point or unused code.', 'H4 e2e: the note reaches the rendered header line via the real uitree.shapeHeaderLines step, and comes first');
-  // This corpus also carries genuine workspace-wide unresolved/external
-  // counts. Round 2.5 deliberately keeps them on TreeResult.stats for Scan
-  // Stats diagnostics while removing them from this target-specific header.
-  // v0.7.1: was pinned at 1 pre-round; the Ns071Caller.probe() fixture below
-  // (R1 e2e) used to add exactly one more real unresolved site (the
-  // namespaced zenq.Ns071Target.run() reference), pinning this at 2.
-  // v0.8/N1(a)/N2: that reference is now a 3-segment dotted call whose Head
-  // ('zenq') is not a local var/class -- it is promoted to an EXTERNAL node
-  // (zenq.Ns071Target, method run) per REGRESSION POLICY category (a)
-  // ("references previously counted unresolved/metaUnresolved that match N1
-  // shapes become external edges/nodes"). It is therefore REMOVED from the
-  // unresolved tally (N5) and this pin moves back down to 1 (the original,
-  // pre-R1 contributor -- see that fixture's own comment above, still
-  // unaffected by v0.8 since it is a denylisted System.debug(...) body, not
-  // a namespaced call). The reference is NOT silently dropped, though: it
-  // now surfaces via the NEW externalRefs/externalNamespaces half of this
-  // same header line (N5) instead of the plain unresolved-count sentence.
-  // v0.11/B2: V11UnitOfWork.commitBoth()'s TWO `pending.add(new
-  // Concrete__c(...))` calls are ordinary DOT calls on a `List<SObject>`-
-  // typed local -- `List` is not a locally declared class, so each of
-  // these stays an ORDINARY unresolved call site (B2 narrows the DML
-  // STATEMENT's own trigger linkage, never the .add()/.addAll() method
-  // dispatch itself -- exactly the same "stays unresolved as an ordinary
-  // call" invariant the pre-existing KappaUnitOfWork.commitWork fixture
-  // already established for this shape, per test-resolver.js's own B2
-  // suite). This is a genuine, expected +2 (not a regression to guard
-  // against), pinning the count at 1 -> 3 for this round.
-  assert.strictEqual(tree.stats.unresolvedSites, 3, 'sanity: this corpus has exactly 3 real unresolved call sites elsewhere (see resolver.js contract -- global to the index); zenq.Ns071Target.run() moved to externalRefs under v0.8, +2 for v0.11/B2\'s V11UnitOfWork.commitBoth() add() calls (ordinary dispatch, unaffected by DML narrowing)');
+  // Known platform calls (`System.debug`, `List.add`) are no longer treated
+  // as unresolved Apex dispatch. The namespaced call remains represented as
+  // an external reference, so this corpus has no ordinary unresolved sites.
+  assert.strictEqual(tree.stats.unresolvedSites, 0, 'known platform calls do not inflate workspace unresolved diagnostics');
   assert.strictEqual(tree.stats.externalRefs, 1, 'v0.8/N5: zenq.Ns071Target.run() is the corpus\'s one managed-package (external) reference');
   assert.deepStrictEqual(tree.stats.externalNamespaces, ['zenq'], 'v0.8/N5: externalNamespaces lists the one namespace this corpus references');
   assert.deepStrictEqual(
@@ -2856,6 +2915,84 @@ const v08Index = resolver.buildSemanticIndex(v08Files);
   assert.strictEqual(untouched.breaks.length, 0);
   assert.strictEqual(untouched.mightBreak.length, 0);
   assert.strictEqual(uitree.shapeImpactReport(untouched).length, 5, 'e2e/impact: an empty honest report still renders every section');
+}
+
+// ---------------------------------------------------------------------------
+// Trigger Actions Framework e2e: real Apex + real CMDT XML -> metascan ->
+// semantic join -> caller tree -> Path Map. This pins the invisible
+// TriggerAction.AfterUpdate edge all the way through the shipped pipeline.
+// ---------------------------------------------------------------------------
+{
+  const actionPath = '/ws/taf/classes/TafE2EAfterUpdate.cls';
+  const triggerPath = '/ws/taf/triggers/TafE2ERecordTrigger.trigger';
+  const actionMetaPath = '/ws/taf/customMetadata/Trigger_Action.Validate_Record.md-meta.xml';
+  const settingMetaPath = '/ws/taf/customMetadata/sObject_Trigger_Setting.Taf_Record_Setting.md-meta.xml';
+  const tafFacts = [
+    parser.parseFile({
+      path: actionPath,
+      text: [
+        'public class TafE2EAfterUpdate implements TriggerAction.AfterUpdate {',
+        '  public void afterUpdate(List<Taf_E2E__c> triggerNew, List<Taf_E2E__c> triggerOld) {}',
+        '}',
+      ].join('\n'),
+    }),
+    parser.parseFile({
+      path: triggerPath,
+      text: [
+        'trigger TafE2ERecordTrigger on Taf_E2E__c (before insert, after update) {',
+        '  new MetadataTriggerHandler().run();',
+        '}',
+      ].join('\n'),
+    }),
+  ];
+  assert(tafFacts.every((facts) => !facts.parseError), 'e2e/TAF: Apex action and trigger parse cleanly');
+  const tafIndex = resolver.buildSemanticIndex(tafFacts);
+  const actionRefs = metascan.parseMetaFile({
+    path: actionMetaPath,
+    text: [
+      '<CustomMetadata xmlns="http://soap.sforce.com/2006/04/metadata" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">',
+      '  <values>',
+      '    <field>Apex_Class_Name__c</field>',
+      '    <value xsi:type="xsd:string">TafE2EAfterUpdate</value>',
+      '  </values>',
+      '  <values>',
+      '    <field>After_Update__c</field>',
+      '    <value xsi:type="xsd:string">sObject_Trigger_Setting.Taf_Record_Setting</value>',
+      '  </values>',
+      '</CustomMetadata>',
+    ].join('\n'),
+  }).map((ref) => Object.assign(ref, { path: actionMetaPath }));
+  const settingRefs = metascan.parseMetaFile({
+    path: settingMetaPath,
+    text: [
+      '<CustomMetadata xmlns="http://soap.sforce.com/2006/04/metadata" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">',
+      '  <values>',
+      '    <field>Object_API_Name__c</field>',
+      '    <value xsi:type="xsd:string">Taf_E2E__c</value>',
+      '  </values>',
+      '</CustomMetadata>',
+    ].join('\n'),
+  }).map((ref) => Object.assign(ref, { path: settingMetaPath }));
+  resolver.attachMetaCallers(tafIndex, actionRefs.concat(settingRefs));
+
+  const classTrace = resolver.buildCallerTree(tafIndex, {
+    classLower: 'tafe2eafterupdate', methodLower: null,
+  });
+  const cmdt = classTrace.root.children.find((node) => node.kind === 'cmdt');
+  assert(cmdt, 'e2e/TAF: action class receives the Trigger_Action CMDT caller');
+  assert.deepStrictEqual(cmdt.children.map((node) => node.label), ['TafE2ERecordTrigger']);
+  assert.strictEqual(cmdt.children[0].approximate, false, 'e2e/TAF: canonical MetadataTriggerHandler dispatcher is exact');
+
+  const methodTrace = resolver.buildCallerTree(tafIndex, {
+    classLower: 'tafe2eafterupdate', methodLower: 'afterupdate',
+  });
+  assert(methodTrace.root.children.some((node) => node.kind === 'cmdt'),
+    'e2e/TAF: exact afterUpdate method receives the metadata caller too');
+  const mapData = pathmap.buildPathMapData(classTrace);
+  assert(mapData.nodes.some((node) => node.label === 'Trigger_Action.Validate_Record'),
+    'e2e/TAF: Trigger Action metadata reaches the Path Map');
+  assert(mapData.nodes.some((node) => node.label === 'TafE2ERecordTrigger'),
+    'e2e/TAF: framework trigger reaches the Path Map');
 }
 
 console.log('apex-trace end-to-end self-check: all assertions passed');

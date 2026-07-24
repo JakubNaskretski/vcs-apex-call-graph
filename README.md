@@ -39,8 +39,9 @@ calls, chains deeper than 12 segments), instead of staying silent about it.
 3. Before changing a method signature, run **Apex Call Graph: Impact of Changing
    This Method** to inventory direct breaks, uncertain callers, contracts, metadata,
    and sibling overloads.
-4. Run **Apex Call Graph: Show Path Map** for the same trace as an interactive graph
-   instead of a tree.
+4. Put the cursor on the target you want and run **Apex Call Graph: Show Path Map**
+   for an interactive graph instead of a tree. Re-running it on another target
+   replaces the open map. The Call Graph view's map button refreshes its last trace.
 5. Not sure where to start? Run **Apex Call Graph: Show Entry Points** for a browsable
    index of every trigger, `@AuraEnabled`/`@InvocableMethod`/REST/SOAP method, async job,
    Flow, and anonymous script in the workspace — see [Entry Points view](#entry-points-view).
@@ -140,7 +141,13 @@ small scale, but a framework-common name attracting more than five such sites
 attaches none of them. In a caller trace, unresolved sites that still mention the
 target method are surfaced separately as **“K unresolved sites elsewhere mention
 method( — potential unconfirmed callers”**. They remain inspectable evidence, not
-fabricated call edges.
+fabricated call edges. Calls on known platform receiver types—such as `String`,
+`SObject`, `Map`, `List`, and `Set`—are excluded from this candidate bucket because
+they are platform behavior, not unresolved dispatch to a workspace Apex method.
+Static `@AuraEnabled` and `@InvocableMethod` targets are excluded too: LWC and Flow
+metadata identify their owning class, while valid Apex `Class.method()` and same-class
+calls resolve through exact rules. This keeps common metadata-entry method names from
+obscuring precise LWC imports or Flow actions with workspace-wide name-only matches.
 
 ## Start shallow, expand on click
 
@@ -264,6 +271,26 @@ Procedure** Remote Actions (Vlocity DataPack JSON and `.os-meta.xml`), and
 `actionPoller` — attached to whichever of the page's controller/extensions classes
 actually declares that method; see Limits below).
 
+A class-level **Who Calls This?** trace rolls up the method-specific metadata above,
+so two `@salesforce/apex/Class.method` imports in one LWC appear as one component node
+with two source sites instead of disappearing unless each method is traced separately.
+Enabled `<classAccesses>` entries from **Permission Sets** and **Profiles** also appear
+on a class trace with the `access` badge. These rows describe authorization, not
+runtime calls: they do not appear on method traces and are deliberately omitted from
+the Execution Path Map.
+
+The **Apex Trigger Actions Framework** is joined across its otherwise invisible
+configuration chain. A class implementing `TriggerAction.BeforeInsert`,
+`TriggerAction.AfterUpdate`, or another supported context is connected through its
+`Trigger_Action__mdt` record and related `sObject_Trigger_Setting__mdt` record to the
+matching object/event trigger. A trigger that calls `MetadataTriggerHandler.run()` is
+confirmed; if there is exactly one matching trigger but it uses a custom dispatcher,
+the trigger is retained as an approximate (`~`) edge. The metadata record is also
+attached to the exact context method, so tracing either the class or `afterUpdate()`
+shows the same configuration path. Actions disabled by `Bypass_Execution__c` on
+either the action record or its object-level trigger setting remain inspectable as
+metadata but are not presented as executable trigger paths.
+
 Property accessors are real targets too — `quote.Status = x` is a caller of
 `(set Status)` — and every call site carries a type-resolved `overloadSig` when the
 target has overloads. Fluent chains (`a.b().c()`) resolve through return types up to
@@ -271,13 +298,33 @@ target has overloads. Fluent chains (`a.b().c()`) resolve through return types u
 
 ## Path Map
 
-**Apex Call Graph: Show Path Map** renders the trace as an interactive graph: entry roots
-flow left-to-right into your target, edges are labeled with their resolution kind,
-hovering a node lists its call sites with arguments, clicking jumps to source. A
-[frontier node](#start-shallow-expand-on-click) shows a clickable `+N` pill — separate
-from the node body, so clicking it expands in place while clicking the body still
-jumps to source — and expanding preserves your current pan/zoom position instead of
+**Apex Call Graph: Show Path Map** renders the trace as an interactive, depth-oriented
+tree. Labeled hop lanes and orthogonal arrows make the hierarchy explicit: entry roots
+flow left-to-right into your target, while forward traces mirror from the target into
+its callees. Type chips distinguish Apex, Trigger, Flow, LWC, Aura, Invocable,
+Visualforce, external, and other components; semantic connector colors separate direct
+Apex calls, automation/metadata, DML/events, managed code, exceptions, and approximate
+matches without relying on color alone. Hovering or focusing a node lists its call sites
+with arguments in a dedicated **Path details** inspector beside the canvas, so source
+details never cover the node or branch being inspected. When the map contains multiple
+methods from that node's class, a compact **Same class in this map** frame groups those
+methods in the sidebar; choosing one centers and focuses its existing card without
+adding untraced methods or cluttering the graph. Clicking a node—or pressing
+Enter/Space—jumps to source in a different editor group, reusing the other group when
+available or opening one beside the map so navigation never replaces it. Fit and zoom
+controls complement drag-to-pan and wheel zoom.
+A [frontier node](#start-shallow-expand-on-click) shows a clearly labeled **Expand +N**
+button, and **Expand visible (N)** grows every currently visible frontier branch by the
+configured expansion step in one action. The per-node button remains available when you
+only want to grow one branch. Both controls are separate from the node body, so an
+expansion action grows the map in place while clicking the body still jumps to source —
+and expanding preserves your current pan/zoom position instead of
 re-fitting the view. Fully offline webview, no external resources.
+
+Running **Show Path Map** again resolves the class or method currently under the
+cursor and replaces the existing singleton panel, even when it points at a different
+target. Use **Refresh Path Map** (the Call Graph view-title map button) when you want
+to re-scan and redraw the last traced target instead.
 
 ## Entry Points view
 
@@ -504,21 +551,22 @@ coalesced to the latest request.
 
 Dirty file-backed editors are snapshotted at the start of every scan. Unsaved
 Apex changes participate in parsing and resolution, and unsaved LWC, Aura, Flow,
-OmniScript, Visualforce, and Custom Metadata changes participate in metadata
-edges. These overlays are ephemeral: they never replace the disk-truth in-memory
-cache and are never written to global storage. Saving, reverting, or closing the
-editor therefore makes the next trace fall back to the corresponding disk file.
+OmniScript, Visualforce, Custom Metadata, Permission Set, and Profile changes
+participate in metadata references. These overlays are ephemeral: they never replace
+the disk-truth in-memory cache and are never written to global storage. Saving,
+reverting, or closing the editor therefore makes the next trace fall back to the
+corresponding disk file.
 
 Only declaration-only Apex facts that contain no source lines, argument/receiver
 expressions, DML targets, or literal values are persisted to VS Code's global
 storage, in a versioned `facts-v<engine>-<hash>.json` file per workspace-folder set.
 Files containing those fields (and every syntax-error file) remain memory-only and
 are reparsed after restart rather than writing partial facts that could change graph
-semantics. LWC, Aura, Flow, OmniScript, Visualforce and Custom Metadata source also
-stays memory-only. Legacy source-bearing cache files are removed automatically, and
-safe facts caches expire after 30 days. Run **Apex
-Call Graph: Clear Cache** at any time to remove both in-memory and persisted caches;
-the next trace simply performs a cold scan.
+semantics. LWC, Aura, Flow, OmniScript, Visualforce, Custom Metadata, Permission Set,
+and Profile source also stays memory-only. Legacy source-bearing cache files are
+removed automatically, and safe facts caches expire after 30 days. Run **Apex Call
+Graph: Clear Cache** at any time to remove both in-memory and persisted caches; the
+next trace simply performs a cold scan.
 For performance troubleshooting, open **Apex Call Graph: Scan Stats** or run **Copy
 Diagnostics (counts only)**. The copied JSON contains counts, timings, worker usage,
 resolution-reason totals, and the active display mode — never paths, source text,
@@ -532,7 +580,8 @@ symbols, or call arguments.
 | `Apex Call Graph: What Does This Call?` | Editor context menu (`.cls`/`.trigger`), command palette |
 | `Apex Call Graph: Impact of Changing This Method` | Editor context menu (`.cls`/`.trigger`), command palette |
 | `Apex Call Graph: Switch Trace Direction` | View title button — re-runs the last target the other way |
-| `Apex Call Graph: Show Path Map` | Editor context menu, view title button, command palette |
+| `Apex Call Graph: Show Path Map` | Editor context menu, command palette — resolves the current target |
+| `Apex Call Graph: Refresh Path Map` | Call Graph view title button, command palette — re-scans the last target |
 | `Apex Call Graph: Show Entry Points` | Entry Points view title button, view welcome link, command palette |
 | `Apex Call Graph: Copy Diagnostics (counts only)` | Command palette |
 | `Apex Call Graph: Clear Cache` | Command palette |

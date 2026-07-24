@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.18.0
+
+Keep related methods easy to navigate without adding noise to the execution tree.
+
+- When the Path Map contains multiple methods from the focused node's class, the
+  Path details sidebar now groups them in a compact **Same class in this map**
+  section.
+- Selecting a related method centers and focuses its existing card without adding
+  untraced methods or changing the graph.
+- Increased spacing around node metadata and relationship labels keeps dense cards
+  readable without covering caller details.
+
+## 0.17.0
+
+Trace framework-driven trigger actions and explore execution paths without losing
+the map or the branch you are inspecting.
+
+- Re-running **Show Path Map** from another class or method now resolves that
+  current target and replaces the already-open map; the Call Graph view button
+  remains an explicit refresh of the last trace.
+- Opening a class or call site from the Path Map now targets a different editor
+  group, creating one beside the map when necessary instead of replacing the map.
+- Classes implementing Apex Trigger Actions Framework context interfaces now trace
+  through `Trigger_Action__mdt` and `sObject_Trigger_Setting__mdt` to matching
+  object/event triggers. Canonical `MetadataTriggerHandler.run()` dispatch is exact;
+  a sole custom-dispatcher trigger is shown as approximate, and bypass flags on
+  either the action or object-level setting suppress disabled execution paths.
+- The Path Map now reads as a depth-oriented tree with labeled hop lanes,
+  orthogonal directional connectors, and a visually distinct target lane.
+- Component type chips and a restrained semantic palette distinguish Apex,
+  triggers, Flow/automation, LWC/Aura/Visualforce, data/event transitions,
+  managed code, tests, exceptions, and approximate matches without relying on
+  color alone.
+- Fit and zoom controls, keyboard-activatable nodes, visible focus states, and
+  clearer edge-label placement make dense maps easier to inspect.
+- Call-site details now live in a dedicated responsive inspector instead of a
+  floating tooltip that can cover the referenced branch.
+- Frontier nodes use explicit **Expand +N** buttons, while a bounded **Expand
+  visible (N)** action grows every visible frontier branch in one resolver rebuild
+  per configured expansion step.
+
+## 0.16.0
+
+See every meaningful way an Apex class enters the graph, without noisy guesses.
+
+- Class-level caller traces now roll up method-specific LWC, Aura, Flow,
+  OmniScript, and Visualforce references instead of showing only class-only metadata.
+- Enabled Permission Set and Profile Apex class grants appear as source-linked
+  `access` metadata, clearly separated from runtime call edges and omitted from the
+  Execution Path Map.
+- Calls on known platform receiver types no longer inflate unresolved-caller
+  suggestions for unrelated user methods with common names such as `get` or `contains`.
+- Static `@AuraEnabled` and `@InvocableMethod` methods no longer receive name-only
+  callers or unresolved suggestions from unknown instance receivers; their exact LWC
+  imports and Flow actions stay visible.
+
 ## 0.15.0
 
 Safer, fresher traces while you edit.
@@ -305,8 +361,8 @@ Metadata callers, deeper Apex resolution, and the visual Path Map.
 - **Smarter receivers**: fluent chains resolved through return types (up to 4
   segments, degrading honestly past that), cast receivers `((Type) x).m()`,
   ternary receivers.
-- Ships with a 117-file advanced example org (`adv-org`) as its ground-truth corpus;
-  entire corpus cold-indexes in ~80 ms.
+- Added a 117-file synthetic example workspace for reproducible correctness and
+  performance checks; the complete workspace cold-indexes in ~80 ms.
 
 ## 0.2.0
 

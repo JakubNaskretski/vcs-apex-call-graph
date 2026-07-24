@@ -1,20 +1,10 @@
 'use strict';
-// Semantic (method-level) Apex call-graph engine — rework against the FROZEN
-// contract (see task brief). Pure data-in/data-out: no vscode, no fs. Input
-// is FileFacts[] as produced by parser.js (agent A); this file never depends
+// Semantic method-level Apex call-graph engine. Pure data-in/data-out: no
+// vscode, no fs. Input is FileFacts[] as produced by parser.js; this file never depends
 // on parser.js's implementation, only its documented output shape.
 //
-// ponytail: this replaces the earlier draft that was written against an
-// ad-hoc, self-invented FileFacts shape (parser.js didn't exist yet at the
-// time). That draft's resolution *logic* (type-env lookup, inheritance walk,
-// interface fan-out, unique-name fallback, platform denylist, lexical
-// fallback tokenizing) is salvaged almost verbatim below — only the data
-// shapes and a handful of resolution-order details changed to match the
-// frozen contract exactly.
-//
 // =========================================================================
-// Frozen contract (reproduced here for reference; see task brief for the
-// authoritative text) — this module trusts parser.js to produce:
+// Parser data shape consumed by this module:
 //
 // FileFacts = { path, kind:'class'|'trigger', name, parseError:string|null,
 //               triggerInfo:{object,events}|null, types:[TypeFacts] }
@@ -31,136 +21,50 @@
 // access, pure data-in/data-out). We read `file.text` defensively — present
 // when parser.js echoes its input back on a parse failure, silently skipped
 // (no lexical edges for that file) if absent. This is the only place this
-// module reads a field not listed in the frozen FileFacts shape.
+// module reads a field outside the ordinary FileFacts shape.
 //
 // =========================================================================
-// Interpretive decisions on ambiguous/must-fix points from the adversarial
-// spec review (each grounded in "contract wins; simplest reading; note it"):
+// Resolution notes:
 //
-// 1. For-each / catch-clause locals: parser.js's concern (must add
-//    enterEnhancedForControl / enterCatchClause as extra `locals` sources).
-//    This module treats MethodFacts.locals generically — any local parser.js
-//    hands us (regular declarations, for-each vars, caught exceptions)
-//    participates in TYPE ENV lookup identically. No special-casing needed
-//    here; test-resolver.js's fixtures include a for-each-shaped local to
-//    confirm this falls out for free.
-//
-// 2. Constructor overload identity: kept as an INTENTIONAL merge, per the
-//    review's option A — and this is actually consistent with the whole
-//    Index shape, not just constructors: `methodCallers` is keyed
-//    `lowerQualified#lowerMethod` with NO arity component for ANY method
-//    (the `target` shape passed to buildCallerTree has no arity field
-//    either), so every overload of every method — not only constructors —
-//    already collapses onto one key. `ClassMeta.methods` for a class with
-//    constructors gets exactly ONE synthetic entry named '<init>', built
-//    from the FIRST declared constructor's params/line (arbitrary but
-//    deterministic, first-in-source-order). Individual `new` call sites
-//    still get accurate per-overload argsRendered at *render* time (see
-//    shapeSites) by matching the call's arg count against ALL declared
-//    ctor signatures in `ClassMeta.typeFacts` — that raw data is preserved
-//    specifically so this remains possible despite the merge.
-//
-// 3. isTest cascade: MethodMeta.isTest = classIsTest OR method's own
-//    @isTest/testMethod marker (must-fix #3, implemented literally).
-//
-// 4. Annotation text shape: parser.js is contracted to emit bare lowercased
-//    names, but `annBare()` defensively strips a trailing `(...)` anyway —
-//    cheap, harmless if parser.js already normalizes, load-bearing if not.
-//
-// 5. Property/field accessor scopes ('(get X)'/'(set X)') can only ever be
-//    call SOURCES, never call TARGETS (no CallFacts kind addresses them).
-//    Documented as a permanent limitation; suggestTargets() suppresses them
-//    so users are never offered a target that can never show a caller.
-//
-// 6. Inner-class bare-name self-reference: resolveType() checks the calling
-//    method's own enclosing-scope chain (innermost to outermost) BEFORE the
-//    global once-only bare-simple-name table, so `Inner` resolves correctly
-//    from inside `Outer` regardless of same-named `Inner` types elsewhere.
-//
-// 7. Denylist-vs-shadowing precedence: the platform denylist is checked ONLY
-//    after both rule 5 (receiver-is-a-known-class) and rule 6 (typed local/
-//    param/field) have failed to resolve to an indexed user class. A local
-//    variable named e.g. `database` typed to a real user class always wins.
-//
-// 8. SOQL bind-expression calls: parser.js's concern (grammar walk). Not
-//    reachable from this module's inputs; noted, not handled here.
-//
-// "should"-level items actually implemented because they're cheap and
-// directly improve resolver correctness (not just noted):
-//   - implementsTypes / extendsType normalization (namespace + generics +
-//     case) via normalizeTypeName / lastSegmentLower — required for the
-//     ENTRIES batchable/queueable/schedulable match to ever fire at all.
-//   - Batchable/Queueable/Schedulable execute() is matched by name+arity
-//     and walks the extends chain to find an inherited implementation,
-//     attaching the entry to whichever class actually declares it.
-//   - Cast-expression and `new Type(...).method()` chained receivers get a
-//     lightweight text-pattern typed resolution ahead of the unique-name
-//     fallback (best-effort: CallFacts only gives us receiver text, not an
-//     AST node, so this is a regex heuristic, not a structural check).
-//   - Duplicate qualified-class-name collision: first-parsed file (i.e.
-//     first `FileFacts` in the input array, in order) wins the Map slot;
-//     later same-name types are pushed to `duplicates` and otherwise
-//     ignored for resolution (their calls are never walked).
-//   - classCallers rollup scope: populated ONLY by rule 1 ('new') and the
-//     lexical parse-error fallback — rules 2-7 never touch it. Rule 2
-//     (this()/super() constructor chaining) is additionally routed into
-//     classCallers here (beyond the rule's literal text) so that
-//     buildCallerTree's class-level rollup — which deliberately excludes
-//     the '<init>' bucket from its "methodCallers of ALL its methods" sweep
-//     to avoid double-counting 'new' sites — doesn't silently lose
-//     constructor-chaining callers at the class level. Documented as a
-//     deliberate extension for consistency, not literal-rule-2 text.
-//
-// "should"/"note"-level items intentionally left as-is (documented, not
-// implemented): rule 6's "simple identifier" test is a text regex (no AST
-// node available here); ClassMeta.kind stays 'class'|'trigger'|'anonymous'
-// per the (now G4-extended) shape (no 'interface'|'enum' value) even though
-// TypeFacts carries isInterface/isEnum — interface-ness is read directly off
-// `typeFacts.isInterface` where the resolution rules need it (rule 6's
-// interface fan-out), so nothing is actually lost, just not surfaced on
-// ClassMeta.kind itself. TypeFacts.extendsType stays a single string for
-// backward compat (first extends-list entry, classes only ever have one
-// anyway); G6 added TypeFacts.extendsTypes (full raw list) specifically so
-// interface-extends-interface diamonds fan out to ALL parents, not just the
-// first — see the G6 block below.
+// - All parser-provided locals participate in type lookup uniformly.
+// - Method identities omit arity, so overloads share an index key. Site
+//   rendering still selects the best matching signature from raw TypeFacts.
+// - isTest cascades from class or method markers.
+// - Accessor scopes can be call sources but are not selectable call targets.
+// - Enclosing inner-class scope wins before global bare-name lookup.
+// - User-defined types and typed variables take precedence over the platform
+//   denylist, preserving valid shadowing.
+// - Type normalization covers namespace, generic, and case differences.
+// - Duplicate qualified names preserve all candidates for package-aware
+//   resolution; first-seen order remains deterministic.
+// - Class-level constructor rollups include `new`, `this()`, and `super()`
+//   callers without double-counting method-level constructor buckets.
 // =========================================================================
 
 const apexindex = require('./apexindex');
 
 const DEFAULT_MAX_DEPTH = 8;
-// H1: hard total-node cap for one buildCallerTree call (opts.maxNodes
+// Hard total-node cap for one buildCallerTree call (opts.maxNodes
 // overrides). See buildCallerTree's ctx/queue machinery for how this is
 // enforced breadth-first-fairly rather than by fully draining one branch.
 const DEFAULT_MAX_NODES = 2000;
-// H4: exact TreeResult.note text for a trace that resolved to a real target
+// Exact TreeResult.note text for a trace that resolved to a real target
 // but found zero callers (root.children.length === 0 after both the Apex
 // tree AND any metadata/flow children are folded in).
 const ZERO_CALLER_NOTE = 'No callers found — this is likely an entry point or unused code.';
 
-// v0.10/A1: fluent-chain receiver walk cap (resolveChainedReceiver) -- was a
-// hardcoded 4 pre-v0.10 ("4-segment walk cap"). Module constant so the limit
-// is declared exactly once. BEHAVIOR CHANGE, documented everywhere this
-// constant is used: a receiver chain of 5..12 `.method()` segments, which
-// previously fell through honestly unresolved past segment 4, now WALKS THE
-// FULL CHAIN and resolves (via 'typed') like any in-cap chain always has.
-// Only >12 segments (or a same-chain (type,method) cycle -- see
-// resolveChainedReceiver's own visited-guard doc) still drops honestly, the
-// exact same "fall through to rule 7 unique-name, which may also decline"
-// fate the pre-v0.10 >4 case always had.
+// Fluent-chain receiver walk cap. Longer or cyclic chains fall through to
+// normal unresolved/unique-name handling.
 const CHAIN_MAX = 12;
 
-// v0.10/A3: shared clamp for buildCallerTree/buildExternalCallerTree/
+// Shared clamp for buildCallerTree/buildExternalCallerTree/
 // buildCalleeTree's opts.maxDepth/opts.maxNodes (and, via
 // normalizeProgressiveOpts, opts.initialDepth) -- hardens the walker against
-// a future direct-invocation surface (e.g. a CLI) that might feed it
-// unclamped values; today's only callers are extension.js's own UI-driven
-// call sites, which always pass in-range integers (or omit the field
-// entirely, taking the DEFAULT_* below), so this clamp is a byte-for-byte
-// no-op for every EXISTING call site -- proved by the full suite passing
-// unchanged. `value` is coerced via Number(): a non-finite result (NaN --
+// direct-invocation surfaces that might feed it unclamped values. `value`
+// is coerced via Number(): a non-finite result (NaN --
 // covers both an actual NaN and any non-numeric input like a string that
 // doesn't parse, undefined, null -- Infinity, -Infinity) falls back to
-// `fallback` (the pre-v0.10 DEFAULT_MAX_DEPTH/DEFAULT_MAX_NODES constant, or
+// `fallback` (the DEFAULT_MAX_DEPTH/DEFAULT_MAX_NODES constant, or
 // -- for initialDepth -- the caller's own already-clamped maxDepth). A
 // finite value is truncated to an integer, then clamped into [min, max]
 // inclusive -- an in-range value (e.g. maxDepth:3, maxNodes:10) passes
@@ -173,22 +77,21 @@ function clampInt(value, min, max, fallback) {
   if (truncated > max) return max;
   return truncated;
 }
-// v0.10/A3: the [1, X] upper bounds clampInt enforces for maxDepth/maxNodes
+// The [1, X] upper bounds clampInt enforces for maxDepth/maxNodes
 // specifically (initialDepth's upper bound is the CALLER's own already-
 // clamped maxDepth, not one of these two -- see normalizeProgressiveOpts).
 const MAX_DEPTH_CLAMP = 64;
 const MAX_NODES_CLAMP = 100000;
 
-// P1 (v0.9 progressive depth): shared opts-normalization for
+// Shared progressive-depth option normalization for
 // buildCallerTree/buildExternalCallerTree/buildCalleeTree. initialDepth
-// defaults to maxDepth (== the ENTIRE tree auto-expands, exactly the
-// pre-v0.9 behavior -- the REGRESSION PIN this round is frozen against).
+// defaults to maxDepth, preserving the legacy fully expanded tree.
 // expandedKeys is caller-supplied as an iterable of methodKeyLower strings
 // ('classlower#methodlower', the SAME format buildOneChildNode's own
 // cycleKey already uses) -- normalized into a fresh Set (lowercased
 // defensively) so buildOneChildNode can do an O(1) `.has(cycleKey)` check
 // per node without re-deriving anything from opts on every call.
-// v0.10/A3: `maxDepth` here is ALREADY the caller's own clamped value (see
+// `maxDepth` here is already the caller's own clamped value (see
 // buildCallerTree/buildExternalCallerTree/buildCalleeTree, each of which
 // clamps its local `maxDepth` via clampInt before calling this), so
 // clamping initialDepth into [1, maxDepth] here automatically inherits that
@@ -203,11 +106,11 @@ function normalizeProgressiveOpts(opts, maxDepth) {
   return { initialDepth, userExpandedKeys };
 }
 
-// v0.13/H2: shared opts-normalization for the new apexCallGraph.showUnconfirmed
-// setting -- 'rollup' (default) | 'hide' | 'expand' (old, pre-H2 flat
-// behavior). Any other/missing value normalizes to 'rollup', matching the
+// Shared opts-normalization for apexCallGraph.showUnconfirmed:
+// 'rollup' (default) | 'hide' | 'expand'. Any other/missing value normalizes
+// to 'rollup', matching the
 // setting's own documented default -- so a caller that never touches opts at
-// all (every pre-H2 call site) gets the NEW default, not a silent opt-out;
+// all gets the default, not a silent opt-out;
 // see buildChildrenLevel's own header note for how each mode actually
 // changes the built children array.
 function normalizeShowUnconfirmed(opts) {
@@ -215,7 +118,7 @@ function normalizeShowUnconfirmed(opts) {
   return v === 'hide' || v === 'expand' ? v : 'rollup';
 }
 
-// v0.13/H4: shared by buildCallerTree/buildExternalCallerTree/buildCalleeTree's
+// Shared by buildCallerTree/buildExternalCallerTree/buildCalleeTree's
 // own BFS expansion loops (a SEPARATE call from buildSemanticIndex's own
 // internal opts.shouldCancel guard -- these three functions receive the
 // trace-time `opts`, not the index-build-time one, and are called well after
@@ -224,7 +127,7 @@ function shouldCancelOpt(opts) {
   return !!(opts && typeof opts.shouldCancel === 'function' && opts.shouldCancel());
 }
 
-// Verbatim from the frozen spec's PLATFORM DENYLIST clause.
+// Platform classes that must not be mistaken for workspace types.
 const PLATFORM_DENYLIST = new Set([
   'system', 'database', 'test', 'schema', 'math', 'json', 'string', 'integer',
   'long', 'decimal', 'double', 'boolean', 'date', 'datetime', 'time', 'id',
@@ -239,7 +142,7 @@ const PLATFORM_DENYLIST = new Set([
 // 7's unique-name fallback (resolveDotOther) — by the time that fallback is
 // even reached, EVERY prior resolution rule has already failed to identify
 // the receiver's class (it is, by construction, "collection-typed or
-// unresolved" — see VALIDATION-REPORT.md Tier-2 #4), so a call to one of
+// unresolved"), so a call to one of
 // these extremely common, generic-sounding names must never be allowed to
 // collide with an unrelated, incidentally-unique real method of the same
 // name anywhere else in the workspace (`newRecordsByType.get(tkey)` falsely
@@ -250,6 +153,26 @@ const COLLECTION_ACCESSOR_NAMES = new Set([
   'values', 'keyset', 'entryset', 'size', 'isempty', 'clear', 'clone',
   'deepclone', 'sort', 'iterator', 'set', 'putall', 'getall',
 ]);
+
+// Declared receiver types that belong to the Apex runtime rather than a
+// workspace class. Once ordinary typed resolution has failed, calls on one
+// of these types are known platform behavior: they must not inflate global
+// unresolved counts or become name-only candidate callers of an unrelated
+// user method. The extra schema/runtime result types cover common instance
+// APIs whose names (`get`, `contains`, `size`, ...) otherwise dominate large
+// orgs. A genuine local class still wins first through emitTypedOrInterface.
+const PLATFORM_RECEIVER_TYPES = new Set([
+  // Keep Object out: it is also the conventional declared type for values
+  // whose runtime receiver is genuinely unknown. Suppressing it would hide
+  // real unresolved/dynamic sites instead of only known platform behavior.
+  ...[...PLATFORM_DENYLIST].filter((name) => name !== 'object'),
+  'sobject', 'sobjecttype', 'aggregateresult', 'describefieldresult',
+  'describesobjectresult', 'savepoint', 'exception', 'pattern', 'matcher',
+]);
+
+function isKnownPlatformReceiverType(rawType) {
+  return PLATFORM_RECEIVER_TYPES.has(lastSegmentLower(rawType));
+}
 
 const HTTP_ANNOTATIONS = new Set(['httpget', 'httppost', 'httpput', 'httpdelete', 'httppatch']);
 // v0.4: 'override' (F3 virtual override fan-out) and 'dynamic' (F4a
@@ -401,7 +324,7 @@ function computeExternalStats(externalsMap) {
   return { externalRefs, externalNamespaces: namespaces };
 }
 
-// Round 2.5/H8: counts-only edge histogram for diagnostics. This is
+// Counts-only edge histogram for diagnostics. This is
 // deliberately derived from the finished index rather than maintained by
 // dozens of resolution branches, so cap reconciliation and metadata
 // attachment cannot leave the count drifting from the graph that will
@@ -480,7 +403,7 @@ function splitTopLevelCommas(s) {
   return out;
 }
 
-// v0.11/B1 BUG FIX: paren-depth-aware replacement for the old
+// v0.11/B1: paren-depth-aware replacement for the old
 // TERNARY_LITERAL_RE. The regex's permissive `[\s\S]+?` condition-prefix
 // plus optional trailing `\)?` let it match a ternary NESTED INSIDE an
 // unrelated wrapping call expression -- e.g. Type.forName's single arg
@@ -604,6 +527,20 @@ function annBare(raw) {
   return lc((p === -1 ? s : s.slice(0, p)).trim());
 }
 
+const STATIC_METADATA_BOUND_ANNOTATIONS = new Set(['auraenabled', 'invocablemethod']);
+
+function isStaticMetadataBoundMethod(methodFacts) {
+  if (!methodFacts || !methodFacts.isStatic) return false;
+  // Accept both parser MethodFacts (annotations) and the compact MethodMeta
+  // shape stored on the semantic index (entries). These two annotations are
+  // invoked through exact metadata identities: LWC Class.method imports or
+  // Flow actions resolved to the class's sole invocable method.
+  return (methodFacts.annotations || []).some((a) => STATIC_METADATA_BOUND_ANNOTATIONS.has(annBare(a))) ||
+    (methodFacts.entries || []).some((e) =>
+      String(e).startsWith('@AuraEnabled') || String(e).startsWith('@InvocableMethod')
+    );
+}
+
 function stripGenerics(raw) {
   if (!raw) return '';
   const s = String(raw).trim();
@@ -644,13 +581,13 @@ const SIMPLE_IDENT_RE = /^[A-Za-z_]\w*$/;
 // never by this guard.
 const PLAIN_DOTTED_CHAIN_RE = /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/;
 
-// 'should'-level bonus (see header decision list): cast-expression and
+// Secondary bonus: cast-expression and
 // chained-new receivers get typed resolution via lightweight text patterns.
 // Tolerant of parser.js's getText()-without-whitespace concatenation
 // warning from the cheat sheet (`\s*`, not a required space).
 function castOrNewChainType(receiverRaw) {
   const s = String(receiverRaw || '').trim();
-  // BUG FIX (finding #4): Apex/Java requires an EXTRA outer paren layer to
+  // Apex/Java requires an extra outer parenthesis layer to
   // call a method on a cast expression's result -- `((Type) expr).method()`
   // -- so the sliced receiver text starts with `((`, not a single `(`. The
   // old regex `^\(\s*([A-Za-z_]...)\s*\)` required a letter immediately
@@ -776,7 +713,7 @@ function walkExtendsChain(indexLike, startLower, visitFn) {
 //     by design, not inferred from packageOf's return shape.
 // Both are ignored entirely unless opts.packageOf is an actual function --
 // that single check gates ALL of B2's new behavior (bucket surfacing,
-// stats.duplicateNames, via='ambiguous' edges): see the B5 spec text this
+// stats.duplicateNames, via='ambiguous' edges): this
 // mirrors ("package-bucket surfacing is opt-in, gated entirely on package
 // metadata being discoverable, never on the mere existence of two files
 // sharing a name").
@@ -817,8 +754,8 @@ function buildSemanticIndex(factsList, opts) {
   // whose target reduced to the literal generic `SObject` placeholder (a
   // `List<SObject>`/`SObject` declared type that was never narrowed to a
   // concrete object) -- surfaced as an honest "DML on unresolved SObject
-  // type" leaf instead of silently vanishing (VALIDATION-REPORT.md backlog
-  // #10). Deliberately separate from unresolvedForwardCounts: this is a
+  // type" leaf instead of silently vanishing. Deliberately separate from
+  // unresolvedForwardCounts: this is a
   // DML-target-narrowing gap, not an ordinary unresolved method call.
   const unresolvedDmlForwardCounts = new Map();
   // v0.7.1/R6: set true by resolveDotOther (and its R2 declared-Type variant)
@@ -845,7 +782,7 @@ function buildSemanticIndex(factsList, opts) {
   // EITHER kind of key, with zero special-casing anywhere except the one
   // new B2 resolution branch in resolveDotOther's rule 5 (below).
   const classBuckets = new Map();
-  // MUST-FIX #4: classLower -> earliest {path, line} at which a `new
+  // classLower -> earliest {path, line} at which a `new
   // ClassName(...)` construction of that class was encountered anywhere in
   // pass B's sequential call-site walk. Populated by resolveCall's rule 1
   // ('new') below. Used ONLY by calleeInterfaceFanoutPairs (forward
@@ -966,7 +903,7 @@ function buildSemanticIndex(factsList, opts) {
   // that first observed it.
   const shouldCancel = opts && typeof opts.shouldCancel === 'function' ? opts.shouldCancel : null;
   let cancelled = false;
-  // MUST-FIX #5: whether opts.packageOf ever actually resolved a REAL
+  // Whether opts.packageOf resolved a real
   // (non-null) package label for at least one file, as opposed to merely
   // being a function that was PASSED (and might return null for every
   // path, exactly what extension.js's discoverPackageMap() produces for a
@@ -1069,7 +1006,7 @@ function buildSemanticIndex(factsList, opts) {
     const isTriggerFile = file.kind === 'trigger';
     const isAnonymousFile = file.kind === 'anonymous';
     const pkgLabel = packageOf ? packageOf(file.path) || null : null;
-    if (pkgLabel != null) packageMetadataDiscovered = true; // MUST-FIX #5
+    if (pkgLabel != null) packageMetadataDiscovered = true;
     for (const tf of file.types || []) {
       const qualifiedLower = lc(tf.qualified);
       const isDuplicateSlot = classes.has(qualifiedLower);
@@ -1176,7 +1113,7 @@ function buildSemanticIndex(factsList, opts) {
   // B2: duplicate-name bucket resolution
   // =========================================================================
   // Only ever consulted from resolveDotOther's rule 5 (below) -- the ONE
-  // resolution path the B2/B3 ground truth actually exercises (a literal
+  // resolution path for a literal
   // `ClassName.method()` static reference, the exact shape a qualified-name
   // collision is about). `primaryQualifiedLower` is whatever resolveType()
   // already returned (unchanged, first-wins) for the receiver text; this
@@ -1185,7 +1122,7 @@ function buildSemanticIndex(factsList, opts) {
   // name's same-named candidates should get the edge. Returns
   // { winners: classLower[], via: 'static'|'ambiguous' } -- 'winners' is
   // always non-empty when called with a resolveType() hit. Resolution order
-  // (verbatim per the B2 spec):
+  // is:
   //   1. a candidate in the SAME package as the referring file
   //   2. else a candidate in the DEFAULT package
   //   3. else EVERY remaining candidate, via='ambiguous' (approximate)
@@ -1471,13 +1408,10 @@ function buildSemanticIndex(factsList, opts) {
   // on to produce a resolved edge for the full chain. A genuinely LOCAL
   // (if, today, still unresolved) reference must never be RECLASSIFIED as
   // managed-package code merely because Head also happens to be
-  // identifier-shaped -- caught live against the real gauntlet-org corpus's
-  // `KappaApplication.Service.newInstance(...)` fflib-factory shape (a
-  // static FIELD access chain, deliberately a different, not-yet-covered
-  // receiver shape per that fixture's own header comment -- Corpus F,
-  // explicitly out of THIS round's scope per REGRESSION POLICY: it must
-  // stay exactly as unresolved in v0.8 as it already was in v0.7.1, not
-  // newly promoted to external).
+  // identifier-shaped, including fflib-style factory chains such as
+  // `Application.Service.newInstance(...)` (a
+  // static FIELD access chain, which must remain unresolved rather than be
+  // incorrectly promoted to external).
   function headClassHasMember(headRaw, midRaw) {
     const headLower = lc(headRaw);
     if (!classes.has(headLower)) return false;
@@ -1555,7 +1489,7 @@ function buildSemanticIndex(factsList, opts) {
     });
   }
 
-  // BUG FIX (finding #1): the old findMethodOwner() stopped climbing the
+  // Continue climbing the inheritance chain when the nearest class does not
   // extends chain at the FIRST class declaring ANY same-named method,
   // regardless of arity -- so a subclass overload with a *different* arity
   // than the call site would steal the edge even when an ancestor's
@@ -1564,7 +1498,7 @@ function buildSemanticIndex(factsList, opts) {
   // collects EVERY same-named method visible along the walk (own class
   // first, then ancestors when walkSuper) -- Apex doesn't hide inherited
   // overloads the way it hides overridden same-signature methods -- and
-  // then narrows by call-site arity per the frozen spec's rule 6 text
+  // then narrows by call-site arity
   // ("overloads: prefer matching arity, else edge to ALL same-name
   // methods"). `callArity` undefined preserves the old arity-agnostic
   // behavior (first declared overload wins) for the one caller that
@@ -1615,11 +1549,11 @@ function buildSemanticIndex(factsList, opts) {
   // type match > assignable-subtype (arg class extends the param's class,
   // directly or transitively) > assignable-unknown > wildcard/mismatch, per
   // param, summed across params -- weights are 3/2/1/0 so the ordering
-  // matches the amendment's documented "exact > assignable-unknown >
+  // uses "exact > assignable-unknown >
   // wildcard" tiers with the subtype tier slotted in between exact and
   // unknown). On a score tie, the FIRST candidate in `all`'s original order
   // wins -- i.e. falls back to the pre-A4 "closest-declaring-class wins"
-  // behavior, per the amendment's "on tie keep current arity behavior"
+  // behavior; on a tie it keeps the current arity behavior
   // instruction.
   function pickBestOverload(candidates, call, callerClassLower, methodFacts) {
     if (!call || candidates.length < 2) return Object.assign({}, candidates[0], { overloadPick: 'exact' });
@@ -1717,7 +1651,7 @@ function buildSemanticIndex(factsList, opts) {
   // one entry per possible implementer. The reverse direction is
   // unaffected either way (methodCallers always gets every owner's edge,
   // forwardOpt only gates the ADDITIONAL methodCallees write) -- see A2's
-  // ground truth (chain #7/#8): a call through an interface-typed receiver
+  // intended behavior: a call through an interface-typed receiver
   // forward-resolves to the INTERFACE method's own node as its one and only
   // forward child; the concrete implementers only appear one hop further,
   // as that interface method's OWN forward children (a node-level special
@@ -1744,8 +1678,8 @@ function buildSemanticIndex(factsList, opts) {
   // ... }`, overridden by a concrete subclass) previously never reached the
   // subclass override at all, because F3's override fan-out was only wired
   // into rule 6's TYPED dispatch path -- a real, reachable override method
-  // was reported as having "no callers found" (VALIDATION-REPORT.md Tier-3
-  // #6). Deliberately scoped to exactly these two self-dispatch call shapes
+  // was reported as having "no callers found". Deliberately scoped to
+  // exactly these two self-dispatch call shapes
   // (not a general emitOwners change) so this never fires for an ordinary
   // typed/static/interface call, which already gets its own override
   // fan-out via a different path.
@@ -1838,8 +1772,8 @@ function buildSemanticIndex(factsList, opts) {
       // intact, but the underlying object identity is itself an inference,
       // not a certainty, so the badge must say so). Every pre-existing
       // caller omits this argument -- `approximate` is therefore false on
-      // every site this round didn't touch, byte-identical to before this
-      // field existed (shapeSites/shapeCalleeSites never copy it into the
+      // existing sites remain unchanged (shapeSites/shapeCalleeSites never
+      // copy it into the
       // rendered SiteView, so its mere presence here is invisible to every
       // existing consumer of that output shape).
       approximate: !!approximateOverride,
@@ -1855,7 +1789,7 @@ function buildSemanticIndex(factsList, opts) {
   // time (see its own comment for the full rationale) -- reimplemented here
   // in miniature because forward edges compute argsRendered eagerly, at
   // RECORD time inside this closure (ForwardEdge is a stored, not a
-  // derived-at-render-time, shape per the frozen A1 contract), against the
+  // derived-at-render-time shape), against the
   // LOCAL `classes` Map (identical Map reference `index.classes` will be
   // once this build returns). Falls back to a plain joined-args string
   // whenever the target isn't a known method (dml/publish/async/unresolved
@@ -2023,7 +1957,16 @@ function buildSemanticIndex(factsList, opts) {
     const [onlyClassLower] = owners;
     const ownCm = classes.get(onlyClassLower);
     if (!ownCm) return false;
-    const candidates = ownCm.methods.filter((m) => lc(m.name) === nameLower);
+    // LWC-facing @AuraEnabled and Flow-facing @InvocableMethod methods are
+    // static and referenced through exact metadata identities. Attaching
+    // `unknownService.load()` to the sole static `AccessController.load()`
+    // just because the bare name is unique is therefore a false edge; on a
+    // common name it also creates enormous later magnets. Keep the older
+    // name-only fallback semantics for other methods, whose compatibility
+    // contract predates this rule.
+    const candidates = ownCm.methods.filter((m) =>
+      lc(m.name) === nameLower && !isStaticMetadataBoundMethod(m)
+    );
     if (!candidates.length) return false;
     const callArity = (call.argTexts || []).length;
     const exact = candidates.filter((m) => m.params.length === callArity);
@@ -2075,7 +2018,7 @@ function buildSemanticIndex(factsList, opts) {
       // loop.
       const implementerSet = new Set(implementers);
       for (const implLower of implementers) {
-        // BUG FIX (finding #2): walkSuper=true (was false) -- an implementer
+        // walkSuper=true: an implementer
         // that satisfies the interface via an INHERITED (non-interface)
         // base-class method, without redeclaring it itself, is legal Apex.
         // Walking only the implementer's own directly-declared methods
@@ -2175,7 +2118,7 @@ function buildSemanticIndex(factsList, opts) {
   // Returns { classLower, via } when at least one side resolves to a known
   // user class through the caller's type env, else null (falls through to
   // existing rules). Both sides resolving to the SAME class -> 'typed';
-  // only one side resolving -> 'unique-name' (approximate, per A3 spec).
+  // only one side resolving -> 'unique-name' (approximate).
   function resolveTernaryReceiver(receiverRaw, callerClassLower, methodFacts, cmQualified) {
     const s = String(receiverRaw || '').trim();
     const m = s.match(TERNARY_RE);
@@ -2282,7 +2225,7 @@ function buildSemanticIndex(factsList, opts) {
       if (visited.has(visitKey)) {
         // v0.10/A1: cycle hit -- degrades to no edge, the SAME "dropped
         // call site" treatment (and the SAME H4 counter) as exceeding
-        // CHAIN_MAX, per the amendment's own text.
+        // CHAIN_MAX.
         bumpUnresolvedReason('deep-chain'); // v0.13/H3
         return null;
       }
@@ -2317,7 +2260,7 @@ function buildSemanticIndex(factsList, opts) {
   // A3: tries the cast/new-chain heuristic (unchanged from the pre-A3
   // 'should'-level bonus), then the ternary bonus, then (F2) the plain
   // subscript bonus, then the chained-call bonus, in that order -- all
-  // "applied before the unique-name fallback" per the amendment. Returns
+  // applied before the unique-name fallback. Returns
   // whether an edge was written.
   function resolveComplexReceiver(callerClassLower, callerMethodLabel, cm, methodFacts, call, nameLower, callArity) {
     const receiverRaw = call.receiver;
@@ -2418,11 +2361,11 @@ function buildSemanticIndex(factsList, opts) {
     const callArity = (call.argTexts || []).length;
     const isSimple = SIMPLE_IDENT_RE.test(String(receiverRaw || '').trim());
 
-    // BUG FIX (finding #3): rule 6 (type-env / shadowing local-param-field)
+    // Rule 6 (type-env / shadowing local-param-field)
     // is checked BEFORE rule 5 (class-name match) when the receiver is a
     // simple identifier that names an in-scope variable. Apex/Java identifier
     // scoping means a local/param/field always shadows a same-named class
-    // for the rest of its scope -- the frozen spec lists rule 5 before rule
+    // for the rest of its scope -- resolution checks this before rule
     // 6, but applying that literal ordering misattributes routine
     // camelCase-of-type-named locals (e.g. `OtherType FooTarget = ...;
     // FooTarget.bar();`) to the wrong class via the wrong dispatch kind.
@@ -2439,32 +2382,14 @@ function buildSemanticIndex(factsList, opts) {
         // G3: declared-type resolution failed (the method isn't on that
         // class or its extends chain) -- try the instanceof-narrowing
         // fallback before giving up on this variable entirely. Only reached
-        // when declared-type resolution already failed, per the G3 spec
+        // when declared-type resolution already failed
         // ("never used when declared-type resolution succeeds").
         if (tryNarrowedReceiver(callerClassLower, callerMethodLabel, methodFacts, receiverRaw, nameLower, call, callArity)) return;
-        // v0.7.1/R2: gate the platform denylist on the receiver's DECLARED
-        // TYPE, not its identifier text. `Type handlerType = ...;
-        // handlerType.newInstance()` previously slipped past the
-        // text-based denylist gate below (headLower would be
-        // "handlertype", not "type") and reached rule 7's unique-name
-        // fallback, fabricating an edge to an unrelated globally-unique
-        // `newInstance` method elsewhere in the workspace (plus a spurious
-        // self-referential cyclic edge). A variable whose declared type is
-        // itself `System.Type` is exactly as out-of-scope as a bare
-        // `Type.forName(...)`-style reference -- treat it identically: no
-        // edge, not counted as an H4 dropped site, excluded from the R6
-        // forward-parity count (see VALIDATION-REPORT.md Tier-2 #3).
-        // Deliberately scoped to the single documented token ('type'), NOT
-        // the full PLATFORM_DENYLIST set -- Map/List/Set-typed receivers
-        // already have their own, more precise, method-name-gated handling
-        // (R3, below), and broadening this to every denylisted type name
-        // would also silently swallow (uncounted) any OTHER denylisted-type
-        // receiver's genuinely-unresolved call (e.g. a String/Object-typed
-        // local calling a non-unique method name that rule 7 correctly
-        // declines today) -- an undocumented removal the regression policy
-        // doesn't permit. Confirmed against the real corpus (test.js's H4
-        // sanity count) that the broader form over-removes.
-        if (lastSegmentLower(declaredType) === 'type') {
+        // A declared platform type is as definitive as a platform-named
+        // static receiver. The call may be irrelevant to this graph, but it
+        // is not unresolved Apex dispatch and must never become a name-only
+        // candidate caller of a user method with the same common name.
+        if (isKnownPlatformReceiverType(declaredType)) {
           lastReceiverDenylisted = true;
           return;
         }
@@ -2482,7 +2407,7 @@ function buildSemanticIndex(factsList, opts) {
     // from a reference into a namespace/managed package that was never
     // installed in this workspace (`zenq.Billing.charge()` colliding onto
     // local `Billing.charge`, `kwx.KappaGateway.dispatch()` colliding onto
-    // local `KappaGateway.dispatch`) -- see VALIDATION-REPORT.md Tier-1 #2.
+    // local `KappaGateway.dispatch`).
     // Scoped to a PLAIN dotted identifier chain (no parens/brackets) so
     // cast-expression/ternary/chained-call receivers (handled below by the
     // rule-6-continued bonuses, which already require their own explicit
@@ -2514,7 +2439,7 @@ function buildSemanticIndex(factsList, opts) {
       if (classMatch) {
         // B2: classMatch is resolveType's ordinary first-wins pick -- when
         // opts.packageOf never actually resolved a real package label for
-        // ANY file (MUST-FIX #5: packageMetadataDiscovered, not merely
+        // any file (packageMetadataDiscovered, not merely
         // "packageOf is a function" -- a live packageOf that returns null
         // for every path, exactly what extension.js passes for a workspace
         // with no discoverable sfdx-project.json, must NOT enable this
@@ -2538,7 +2463,7 @@ function buildSemanticIndex(factsList, opts) {
     // receiver bonuses (all "applied before the unique-name fallback").
     if (!isSimple) {
       if (resolveComplexReceiver(callerClassLower, callerMethodLabel, cm, methodFacts, call, nameLower, callArity)) {
-        return; // MUST-FIX: a resolved rule-6 typed shadow is never denylisted (decision #7)
+        return; // A resolved rule-6 typed shadow is never denylisted.
       }
     }
 
@@ -2563,8 +2488,7 @@ function buildSemanticIndex(factsList, opts) {
     // unrelated, incidentally-unique real method of the same name elsewhere
     // in the workspace (`newRecordsByType.get(tkey)` -> `KappaServiceLocator.get`,
     // including a spurious self-referential cyclic edge when the fallback's
-    // own sole candidate is the call's own enclosing method) -- see
-    // VALIDATION-REPORT.md Tier-2 #4.
+    // own sole candidate is the call's own enclosing method).
     // v0.8/N3 fix (defect #1, ghost-remainder rule-7 fabrication):
     // stripOwnNamespacePrefix can turn a dotted, namespace-shaped receiver
     // ('ownx.GhostClass') into a BARE simple identifier ('GhostClass')
@@ -2580,7 +2504,7 @@ function buildSemanticIndex(factsList, opts) {
     // silently downgrade such a reference from "safely quarantined" to
     // "exposed to rule 7", fabricating a confident but false local edge to
     // any unrelated class that happens to declare a globally-unique method
-    // of the same name (dev/gauntlet/repro-n3-ghost-remainder-rule7.js).
+    // of the same name.
     // Deliberately only suppresses rule 7's OWN fallback attempt here --
     // the denylist gate above (e.g. a stripped 'ownx.System' remainder)
     // still runs first and is unaffected, exactly like the pre-existing
@@ -2675,7 +2599,7 @@ function buildSemanticIndex(factsList, opts) {
 
     // H7(b): via walkExtendsChain -- looks for a declared PROPERTY of this
     // name (own class, then ancestors); a plain FIELD match stops the walk
-    // with no edge (A2 spec), same as a property match stops it WITH one.
+    // with no edge, same as a property match stops it WITH one.
     walkExtendsChain(classesLike, targetClassLower, (tcm, cur) => {
       const prop = (tcm.typeFacts.properties || []).find((p) => lc(p.name) === propLower);
       if (prop) {
@@ -2690,7 +2614,7 @@ function buildSemanticIndex(factsList, opts) {
         return true; // stop: handled (edge written)
       }
       const field = (tcm.typeFacts.fields || []).find((f) => lc(f.name) === propLower);
-      if (field) return true; // stop: field-not-property, no edge (A2 spec)
+      if (field) return true; // stop: field-not-property, no edge
       return undefined; // continue up the chain
     });
   }
@@ -2703,7 +2627,7 @@ function buildSemanticIndex(factsList, opts) {
       // Rule 1.
       const targetClassLower = resolveType(call.method, cm.qualified);
       if (!targetClassLower) return; // not a known user class -> no edge
-      // MUST-FIX #4: first-seen construction site for this class, keyed by
+      // First-seen construction site for this class, keyed by
       // its resolved classLower -- see firstConstructedAt's own header note.
       if (!firstConstructedAt.has(targetClassLower)) {
         firstConstructedAt.set(targetClassLower, { path: cm.path, line: call.line || 0 });
@@ -2869,8 +2793,8 @@ function buildSemanticIndex(factsList, opts) {
 
   // F1(a): writes a via='dml' caller edge into methodCallers['<trigger>#(trigger)']
   // for every trigger on objectLower whose events intersect op's mapped
-  // events -- a single upsert/merge statement can (and, per the v0.4 spec,
-  // deliberately does in this corpus) match more than one trigger on the
+  // events -- a single upsert/merge statement can match more than one
+  // trigger on the
   // same object.
   function emitDmlTriggerEdges(callerClassLower, callerMethodLabel, op, objectLower, callLike, approximateOverride) {
     recordDmlSite(op, objectLower, callerClassLower, callerMethodLabel, callLike, approximateOverride);
@@ -2897,8 +2821,7 @@ function buildSemanticIndex(factsList, opts) {
   // their own real names), so this check is unambiguous. Recorded so
   // buildCalleeTree can surface an honest "DML on unresolved SObject type"
   // leaf instead of silently dropping the DML site (no trigger linkage is
-  // attempted -- there is no real object identity to link against). See
-  // VALIDATION-REPORT.md fix backlog #10.
+  // attempted -- there is no real object identity to link against).
   function recordUnresolvedDmlSite(callerClassLower, callerMethodLabel) {
     const callerKey = `${callerClassLower}#${lc(callerMethodLabel)}`;
     unresolvedDmlForwardCounts.set(callerKey, (unresolvedDmlForwardCounts.get(callerKey) || 0) + 1);
@@ -2906,12 +2829,12 @@ function buildSemanticIndex(factsList, opts) {
 
   // v0.11/B2: generic-DML narrowing. Only ever consulted once the DML
   // target has already reduced to the literal `SObject` placeholder above.
-  // Per the frozen B2 CONTRACT: the target must be a LOCAL variable (never
+  // The target must be a LOCAL variable (never
   // a param/field -- findLocalFact, not findReceiverType, so a same-named
   // param/field can never masquerade as narrowing evidence); intra-method
   // `add`/`addAll` DOT calls on that SAME variable name are the only
   // evidence source (cross-method evidence -- params, fields, a callee's
-  // return type -- is explicitly out of scope this round); each qualifying
+  // return type -- is not used as evidence); each qualifying
   // call's single argText is resolved through the SAME
   // resolveDmlTargetObject machinery the DML target itself uses (a `new
   // Concrete__c(...)` construction, or a bare identifier whose type-env
@@ -2928,7 +2851,7 @@ function buildSemanticIndex(factsList, opts) {
   // found -- false means the caller must fall back to the honest marker,
   // exactly as before B2 existed.
   //
-  // BUG FIX: evidence must be a POSITIONAL guarantee, not merely "some
+  // Evidence must be a positional guarantee, not merely "some
   // add()/addAll() call on this variable name exists ANYWHERE in the
   // method" -- an add() call textually AFTER the DML statement already ran
   // cannot possibly describe what was actually in the collection AT insert
@@ -2953,7 +2876,7 @@ function buildSemanticIndex(factsList, opts) {
       if (lc(c.receiver) !== targetLower) continue;
       const ml = lc(c.method);
       if (ml !== 'add' && ml !== 'addall') continue;
-      if (!(c.line < dmlLine)) continue; // BUG FIX: evidence written at/after the DML line never counts
+      if (!(c.line < dmlLine)) continue; // Evidence written at/after the DML line never counts.
       const argTexts = c.argTexts || [];
       if (!argTexts.length) continue;
       const resolvedArg = resolveDmlTargetObject(argTexts[0], callerClassLower, mf);
@@ -3024,7 +2947,7 @@ function buildSemanticIndex(factsList, opts) {
     if (resolved.external) attachExternalDmlSite(resolved.external.ns, resolved.external.className, callerClassLower, callerMethodLabel, call);
   }
 
-  // v0.11/B1(b) BUG FIX: mirrors resolveDotOther rule 5's own
+  // v0.11/B1(b): mirrors resolveDotOther rule 5's own
   // duplicate-bucket handling (resolveDuplicateBucket / classBuckets --
   // same-package, else default-package, else EVERY remaining candidate
   // via='ambiguous') instead of the plain resolveType() this branch used to
@@ -3069,7 +2992,7 @@ function buildSemanticIndex(factsList, opts) {
     return lit != null ? [{ literal: lit, forcedVia: null }] : [];
   }
 
-  // v0.11/B1 BUG FIX: paren-depth-aware ternary matcher (matchTernaryStringLiterals,
+  // v0.11/B1: paren-depth-aware ternary matcher (matchTernaryStringLiterals,
   // defined at module scope near splitTopLevelCommas) replaces a plain regex
   // whose permissive `[\s\S]+?` condition-prefix + optional trailing `)`
   // could match a ternary NESTED INSIDE an unrelated wrapping call
@@ -3080,7 +3003,8 @@ function buildSemanticIndex(factsList, opts) {
   // TypeFacts.constants (the parser's additive contract -- one entry per
   // static final String field with a single-literal initializer; a
   // non-final field, or one whose initializer isn't a single literal,
-  // simply never appears here at all -- see the PARSER CONTRACT). Returns
+  // simply never appears here at all -- see the parser field documentation).
+  // Returns
   // the literal string value, or null when no qualifying constant of that
   // name exists on this exact class (never walks the extends chain --
   // B1's own spec text is "own class or qualified cross-class", never
@@ -3157,8 +3081,7 @@ function buildSemanticIndex(factsList, opts) {
   // 'external' (N2's "the call expression's own syntax is exact"). An
   // own-namespace-prefixed literal is deliberately left unresolved rather
   // than stripped-and-retried locally (N3 parity for THIS shape isn't
-  // pinned by any B1 ground-truth fixture, and the corpus's own B1(d)
-  // fixture uses a genuinely foreign namespace) -- never promoted to an
+  // treated as local here; genuinely foreign namespaces are never promoted to an
   // external either way, so no false managed-package node is ever
   // fabricated for the workspace's own code.
   function tryAttachExternalLiteral(litValue, callerClassLower, callerMethodLabel, call) {
@@ -3206,7 +3129,7 @@ function buildSemanticIndex(factsList, opts) {
     const ccm = classes.get(callerClassLower);
     for (const candidate of candidates) {
       const litValue = candidate.literal;
-      // v0.11/B1(b) BUG FIX: candidate.forcedVia ('ambiguous', set only by
+      // v0.11/B1(b): candidate.forcedVia ('ambiguous', set only by
       // resolveQualifiedConstantCandidates' ambiguous-bucket branch)
       // overrides the default 'dynamic' via below -- but the litValue
       // STILL goes through the exact same resolveType/resolveTypeStrict/
@@ -3218,15 +3141,13 @@ function buildSemanticIndex(factsList, opts) {
       // Handler-bucket class itself here would be a different bug (the
       // literal's VALUE, e.g. 'FromA', names an unrelated class, not
       // 'Handler').
-      // BUG FIX (v0.11/B1(d), found live against the real gauntlet-org
-      // corpus -- resolveType()'s tier-3 bare-LAST-SEGMENT-uniqueness
+      // v0.11/B1(d): resolveType()'s tier-3 bare-LAST-SEGMENT-uniqueness
       // fallback is EXACTLY the mechanism N2/R1 already disabled for
       // ordinary receiver-text resolution (see resolveTypeStrict's own
       // header note and isUnknownNamespacedReceiver's use of it): a
       // literal VALUE like 'zenq.Billing' must not be allowed to alias
       // onto an unrelated local class merely because ITS bare tail
-      // ('Billing') happens to collide -- gauntlet-org genuinely declares
-      // a local `Billing` class (T11's own Billing.charge fixture), so
+      // ('Billing') happens to collide with a local `Billing` class, so
       // plain resolveType() here silently produced a false ctor edge to
       // the WRONG class instead of falling through to the external node
       // the B1(d) CONTRACT text explicitly requires. A literal with no dot
@@ -3287,7 +3208,7 @@ function buildSemanticIndex(factsList, opts) {
   // uses (resolveDmlTargetObject -- type-env lookup for identifiers incl.
   // List<X__e>, or the inline 'new Acme_X__e(...)' pattern). If the
   // resolved type's simple name ends in '__e', every trigger registered on
-  // that object gets a via='publish' caller edge -- per the G1 spec,
+  // that object gets a via='publish' caller edge;
   // platform-event triggers are unconditionally 'after insert' (enforced by
   // the platform itself), so unlike F1's DML op/event matrix there is no
   // op-vs-declared-event intersection to check: every trigger on the object
@@ -3369,7 +3290,7 @@ function buildSemanticIndex(factsList, opts) {
     if (!typeNameRaw && throwSiteFact.varName) {
       typeNameRaw = resolveThrowVarType(mf, throwSiteFact.varName);
     }
-    if (!typeNameRaw) return; // unresolvable rethrow var -> skip, per G2 spec
+    if (!typeNameRaw) return; // unresolvable rethrow var -> skip
     const resolvedLower = resolveType(typeNameRaw, tf.qualified);
     const excKey = resolvedLower || normalizeTypeName(typeNameRaw);
     if (!excKey) return;
@@ -3382,7 +3303,7 @@ function buildSemanticIndex(factsList, opts) {
     // is how buildCalleeTree tells a class-level (kind='exception') forward
     // target apart from an ordinary method target). Only recorded when the
     // thrown type resolves to an INDEXED user class (resolvedLower) -- an
-    // unresolvable rethrow var already bailed out above (per G2 spec), and
+    // unresolvable rethrow var already bailed out above, and
     // a resolved-but-external/platform exception type (bare normalized name
     // fallback, excKey with no matching ClassMeta) has no real node to show
     // as a forward target, so it's silently omitted here exactly the way an
@@ -3410,7 +3331,7 @@ function buildSemanticIndex(factsList, opts) {
 
   // Called ONLY after declared-type resolution has already been tried and
   // failed for a simple-identifier receiver (see resolveDotOther) -- never
-  // when declared-type resolution succeeds, per the G3 spec. For every
+  // when declared-type resolution succeeds. For every
   // 'x instanceof T' narrowing recorded against this receiver var in the
   // current method, tries T as the receiver's type and emits an edge on a
   // hit. Always approximate (via APPROX_VIA) -- branch polarity (whether the
@@ -3450,7 +3371,7 @@ function buildSemanticIndex(factsList, opts) {
   // handleDatabaseMethodDml/handleTypeForName/handleEventBusPublish above):
   // this is purely additive to whatever edges rule 1 ('new', for the inline
   // constructor argument itself) already produced, never a conflicting
-  // resolution. Per the G5 spec, a qualifying call site is one whose
+  // resolution. A qualifying call site is one whose
   // argText LITERALLY contains an inline 'new KnownClass(' creation -- a
   // variable that happens to hold such an instance does not qualify (its
   // value is not statically knowable from the call site's own text, exactly
@@ -3474,7 +3395,7 @@ function buildSemanticIndex(factsList, opts) {
       const targetClassLower = resolveType(m[1], cm ? cm.qualified : null);
       if (!targetClassLower) continue;
       writeMethodEdge(callerClassLower, callerMethodLabel, targetClassLower, ASYNC_METHOD_KEY, call, 'async', 'execute', null);
-      return; // only one inline `new` argument is expected per the G5 spec's examples
+      return; // only one inline `new` argument is supported
     }
   }
 
@@ -3506,7 +3427,7 @@ function buildSemanticIndex(factsList, opts) {
       const cm = entry.cm;
       for (const mf of tf.methods || []) {
         const callerMethodLabel = mf.isCtor ? '<init>' : mf.name;
-        // MUST-FIX #2/#3: this method's callerKey is constant across all
+        // This method's callerKey is constant across all
         // three call/dml/throwsSites loops below -- hoisted so the
         // post-loop source-line sort (see methodStartLen below) can find
         // exactly the slice of methodCallees this ONE method contributed,
@@ -3535,18 +3456,16 @@ function buildSemanticIndex(factsList, opts) {
           //     plain FIELD match (not a dropped/unresolved call at all),
           //     and even a genuinely unresolved receiver here was never a
           //     method-invocation attempt in the first place. Confirmed
-          //     against the real corpus: AcmeOrderUtil.cls#markApproved's
-          //     three prop accesses (one set, two nested gets inside the
+          //     Three property accesses (one set, two nested gets inside a
           //     sendApprovalEmail call's own args) would otherwise inflate
           //     its forward children with a bogus "3 unresolved sites" leaf
-          //     that MANIFEST's ground truth (chain #3, A1) does not have.
+          //     that a method-level call graph must not have.
           //   - 'new' is excluded for the SAME reason isNewSuppressedFromForward
           //     exists one level up: an unresolved 'new' target (e.g.
           //     `new Acme_Note__e(...)` -- a platform-event SObject, never
           //     an indexed Apex class) is a constructor-style fact, not an
-          //     ordinary method-call attempt either, and MANIFEST's own A4
-          //     ground truth (chain #6, AcmeNoteEventPublisher#publishNote)
-          //     confirms this: exactly 2 children (trigger + flow), no
+          //     ordinary method-call attempt either. A publish path has
+          //     exactly two children (trigger + flow), no
           //     unresolved leaf, despite the un-indexable inline
           //     `new Acme_Note__e(...)` argument sitting right there.
           const afterLen = (methodCallees.get(callerKeyStr) || []).length;
@@ -3566,7 +3485,7 @@ function buildSemanticIndex(factsList, opts) {
         for (const throwSiteFact of mf.throwsSites || []) {
           handleThrowSite(ownClassLower, callerMethodLabel, mf, throwSiteFact, tf);
         }
-        // MUST-FIX #2/#3: mf.calls[], then mf.dml[], then mf.throwsSites[]
+        // mf.calls[], mf.dml[], and mf.throwsSites[]
         // are processed as three SEPARATE loops above (call-graph edges,
         // DML/trigger fan-out, and exception fan-out are each their own
         // MethodFacts array with no shared iteration order), so the forward
@@ -3747,7 +3666,7 @@ function buildSemanticIndex(factsList, opts) {
       if (seenLine.has(key)) continue;
       seenLine.add(key);
       const site = {
-        callerClass: callerLabel, // MUST-FIX: FileFacts.name as callerClass identity
+        callerClass: callerLabel, // FileFacts.name is the callerClass identity.
         callerMethod: '(file)',
         callerKey: `${callerLabelLower}#(file)`,
         path: file.path,
@@ -3765,7 +3684,7 @@ function buildSemanticIndex(factsList, opts) {
 
   // B2: index.stats.duplicateNames -- count of DISTINCT qualified names with
   // more than one registered candidate, but ONLY surfaced when package
-  // metadata was ACTUALLY discovered (MUST-FIX #5: packageMetadataDiscovered,
+  // metadata was actually discovered (packageMetadataDiscovered,
   // not merely "opts.packageOf is a function" -- per B5's packageless-
   // identity guarantee: "NEITHER index.stats.duplicateNames nor any
   // via='ambiguous' edge is surfaced" when package metadata isn't
@@ -3788,7 +3707,7 @@ function buildSemanticIndex(factsList, opts) {
   // deliberately NOT folded into unresolvedSitesCount (that counter's
   // established meaning -- "call sites this build positively identified as
   // dropped" -- predates this diagnostics breakdown and stays call-site-only
-  // for every existing consumer, per the regression policy's "engine facts
+  // for every existing consumer; engine facts
   // identical" bar).
   unresolvedByReason['parse-fallback'] = parseFallbacks.length;
 
@@ -3825,7 +3744,7 @@ function buildSemanticIndex(factsList, opts) {
     // previously purely a buildSemanticIndex-internal lookup table, never
     // needed post-build until forward tracing.
     interfaceImplementers,
-    // MUST-FIX #4: exposed so calleeInterfaceFanoutPairs can order an
+    // Exposed so calleeInterfaceFanoutPairs can order an
     // interface's implementer fan-out by construction-site order instead of
     // raw file-scan order -- see firstConstructedAt's own header note above.
     firstConstructedAt,
@@ -3884,7 +3803,7 @@ function buildSemanticIndex(factsList, opts) {
     // this object still has a well-formed (if partial) shape either way, so
     // nothing downstream crashes even if that discipline is ever skipped.
     cancelled,
-    // MUST-FIX #1/#5: exposed so post-build query-time code (suggestTargets,
+    // Exposed so post-build query-time code (suggestTargets,
     // below) can apply the SAME real B2 gate this closure used internally
     // -- true only once opts.packageOf actually resolved a non-null label
     // for at least one file, never merely because opts.packageOf was
@@ -3898,8 +3817,7 @@ function buildSemanticIndex(factsList, opts) {
     // rule the Entry Point Catalog contract calls for, without needing its
     // own opts parameter (buildEntryCatalog(index) takes only the built
     // index, matching every other post-build query function in this file).
-    // Purely additive: nothing before this round ever read
-    // index.defaultPackage, so no existing code path is touched.
+    // Purely additive; existing code paths do not depend on this field.
     defaultPackage,
   };
   refreshIndexDiagnostics(result);
@@ -3919,7 +3837,7 @@ function computeAnnotationEntries(mf) {
 }
 
 function methodIsTest(mf, classIsTest) {
-  if (classIsTest) return true; // MUST-FIX #3: class-level isTest cascades
+  if (classIsTest) return true; // Class-level isTest cascades.
   const anns = (mf.annotations || []).map(annBare);
   if (anns.includes('istest')) return true;
   const mods = (mf.modifiers || []).map(lc);
@@ -3942,7 +3860,7 @@ function methodLevelPairs(index, classLower, methodLower) {
 // ctor-chaining + lexical fallback) UNION methodCallers[class#name] for
 // every OTHER (non-'<init>') declared method name. '<init>' is
 // deliberately excluded from the method sweep here — classCallers already
-// covers it in full — to avoid double-counting (decision list, header).
+// covers it in full, avoiding double-counting.
 function classLevelPairs(index, classLower, cm) {
   const out = [];
   for (const site of index.classCallers.get(classLower) || []) out.push({ site, targetMethodLower: '<init>' });
@@ -4019,8 +3937,7 @@ function calleeItemFromEdge(index, edge) {
       // every resolved callee-direction site row's line wrong (and collapsed
       // genuinely distinct call sites at different lines onto one identical,
       // incorrect line), breaking "click any call site to jump straight to
-      // it" for every resolved forward edge (VALIDATION-REPORT.md "Callee-
-      // tree site-line corruption").
+      // it" for every resolved forward edge.
       line: edge.line || 0,
       col: edge.col || 0,
       lineText: edge.lineText,
@@ -4072,7 +3989,7 @@ function calleeInterfaceFanoutPairs(index, classLower, methodLower) {
     if (!ownerCm || !ownerMm) return;
     const ownerKey = ownerCm.classLower || lc(ownerCm.qualified);
     out.push({
-      _implLower: implLower, // MUST-FIX #4: sort key input only -- stripped below
+      _implLower: implLower, // Sort key input only; stripped below.
       _scanIndex: scanIndex, // stable fallback when no construction site is known
       site: {
         callerClass: ownerCm.qualified,
@@ -4091,7 +4008,7 @@ function calleeInterfaceFanoutPairs(index, classLower, methodLower) {
     });
   });
   if (!out.length) return null;
-  // MUST-FIX #4: order the fan-out by each implementer's earliest known
+  // Order the fan-out by each implementer's earliest known
   // `new ImplClass(...)` construction site in the codebase (file+line),
   // NOT by raw interfaceImplementers scan order -- see firstConstructedAt's
   // header note. An implementer with no known construction site anywhere
@@ -4124,8 +4041,8 @@ function calleeMethodLevelPairs(index, classLower, methodLower) {
     // collapses interface dispatch onto a single node at the call site).
     // Expanding that single node one hop further used to bury the actually
     // resolved implementer(s) two levels down, under a synthetic
-    // non-call-site wrapper -- VALIDATION-REPORT.md fix backlog #9 requires
-    // them to show up as DIRECT children of the calling method instead.
+    // non-call-site wrapper; they must show up as DIRECT children of the
+    // calling method instead.
     // Detected here (rather than changed at record time) so every existing
     // ForwardEdge/methodCallees consumer is unaffected; only the CALLEE
     // TREE'S rendering of this one edge shape changes. The interface
@@ -4435,7 +4352,7 @@ function buildCallerTree(index, target, opts) {
   // caller in the SAME package as the traced target would incorrectly grow
   // a badge (targetPackage staying undefined never matches any node's real
   // package, per packageBadge()'s `node.package === targetPackage` check).
-  // Caught live via dev/smoke.js's v0.7.0 PACKAGE MATRIX B4 case 2 output.
+  // This prevents same-package callers from growing redundant badges.
   if (cm.package != null) root.package = cm.package;
 
   const ancestorPath = new Set(methodLower ? [`${classLower}#${methodLower}`] : []);
@@ -4462,8 +4379,8 @@ function buildCallerTree(index, target, opts) {
     // (via='throws') for the exact same call site. buildOneChild displays
     // whichever via appears FIRST in the group's items (g.items[0]), so
     // ordering throwerPairs first makes the more informative 'throws' via
-    // win for that shared caller, matching the G2 spec's documented
-    // ground truth (a thrower is shown as via='throws', not via='new').
+    // win for that shared caller: a thrower is shown as via='throws', not
+    // via='new'.
     allPairs = throwerPairs.concat(pairs);
   }
 
@@ -4518,8 +4435,17 @@ function buildCallerTree(index, target, opts) {
   // grouping, which only ever applies inside buildChildrenLevel) -- its own
   // children are the individual mention sites, so a user can inspect each
   // one without this file needing to know anything about how the host
-  // actually renders a "collapsed" TreeItem.
-  if (methodLower && !isTrigger && !(isAnonymous && methodLower === '(anonymous)') && ctx.nodeCount < ctx.maxNodes) {
+  // actually renders a "collapsed" TreeItem. Static @AuraEnabled and
+  // @InvocableMethod methods deliberately skip this name-only evidence:
+  // LWC/Flow metadata identifies the owning class, while valid Apex
+  // Class.method()/same-class bare calls were already resolved exactly. An
+  // unrelated unknown instance receiver must not obscure those exact callers
+  // with a workspace-wide common-name bucket.
+  const targetMethodFacts = methodLower
+    ? cm.methods.filter((m) => lc(m.name) === methodLower)
+    : [];
+  const canHaveNameOnlyCandidate = !targetMethodFacts.length || targetMethodFacts.some((m) => !isStaticMetadataBoundMethod(m));
+  if (methodLower && canHaveNameOnlyCandidate && !isTrigger && !(isAnonymous && methodLower === '(anonymous)') && ctx.nodeCount < ctx.maxNodes) {
     const mentions = (index.unresolvedSitesByName && index.unresolvedSitesByName.get(methodLower)) || [];
     if (mentions.length) {
       const targetMm = cm.methods.find((m) => lc(m.name) === methodLower);
@@ -4527,7 +4453,7 @@ function buildCallerTree(index, target, opts) {
       // The info node participates in the same hard maxNodes budget as the
       // rest of the trace. A framework-common name can have tens of
       // thousands of unresolved mentions; materializing all of them here
-      // would defeat the cap this hardening round is meant to protect.
+      // would defeat the cap this guard is meant to protect.
       const childBudget = Math.max(0, ctx.maxNodes - ctx.nodeCount - 1);
       const visibleMentions = mentions.slice(0, childBudget);
       const mentionChildren = visibleMentions.map((s) => ({
@@ -4704,9 +4630,8 @@ function buildCalleeTree(index, target, opts) {
   // Root display shape is direction-agnostic -- identical logic to
   // buildCallerTree's own root construction (deliberately duplicated
   // rather than factored into a shared helper: the two functions' root
-  // blocks are already this file's most heavily fixture-pinned code, and a
-  // shared-helper refactor there risks the exact byte-identical-output
-  // regression bar this round is pinned against for zero benefit -- this
+  // blocks are heavily compatibility-sensitive, and a shared-helper refactor
+  // would add risk for no benefit. This
   // block has no direction-specific branches to share in the first place).
   let rootKind, rootLabel, rootLine, rootEntries, rootIsTest;
   if (isTrigger) {
@@ -4752,8 +4677,7 @@ function buildCalleeTree(index, target, opts) {
   // `AcmeOrderTriggerHandler handler = new AcmeOrderTriggerHandler();`) are
   // parsed under a SEPARATE synthetic '(init)' scope, distinct from
   // '(trigger)' (the rest of the body) -- a pre-existing parser.js/
-  // resolver.js convention, unrelated to v0.7. Confirmed live against the
-  // real corpus's AcmeOrderTrigger.trigger (MANIFEST chain #12): forcing
+  // resolver.js convention. Forcing
   // methodLower to '(trigger)' alone (as buildCallerTree also does for
   // reverse-direction trigger targets) would silently miss the '(init)'-
   // bucketed `new AcmeOrderTriggerHandler()` edge. Forward tracing "the
@@ -4844,11 +4768,10 @@ function indexSitesByCallerKey(sitesByObject) {
 //
 // v0.13/S2: pre-v0.13 this node was UNCONDITIONALLY truncated:true/
 // children:[] -- "terminal in this direction" (A2). It is no longer
-// hardcoded that way: when index/ctx are supplied (every real caller as of
-// this round) and the flow has its own SUBFLOW children (index.flowGraph),
+// hardcoded that way: when index/ctx are supplied and the flow has its own
+// SUBFLOW children (index.flowGraph),
 // those are walked forward here too (buildFlowCalleeChildren,
-// includeApexTargets:false -- see that function's own call site note just
-// below for the [SPEC-OPEN] reasoning on why this ONE node deliberately
+// includeApexTargets:false -- this root deliberately
 // does NOT also expose its own direct apex actions, unlike a proper
 // subflow-reached node one level down). A flow with zero subflow children
 // (the pre-v0.13 norm for every existing fixture) is completely unaffected:
@@ -5107,20 +5030,21 @@ function countTNodes(nodes) {
   return n;
 }
 
-// A6: 'method-target lookups consult metaMethodCallers[targetKey] plus
-// (class-level refs of that class only for class targets)' -- a method-level
-// target only ever sees refs pinned to that exact method; a class-level
-// target (no method filter) only ever sees refs with no methodName (a class-
-// level reference like an Aura `controller="..."` attribute or a Flow
-// actionCalls block that names the class but not a method) -- method-
-// specific refs already surface individually when tracing that method.
+// A6: method targets consult only metaMethodCallers[targetKey], keeping
+// overload/method precision. Class targets use the complete per-class bucket:
+// both class-only refs and method-specific refs are rolled up into the class
+// lens, just as the Apex side unions callers of every declared method.
 function metaLevelPairs(index, classLower, methodLower) {
   if (methodLower) {
     if (!index.metaMethodCallers) return [];
     return index.metaMethodCallers.get(`${classLower}#${methodLower}`) || [];
   }
   if (!index.metaCallers) return [];
-  return (index.metaCallers.get(classLower) || []).filter((r) => !r.methodName);
+  // A class-level Apex rollup already unions every declared method's Apex
+  // callers. Do the same for non-Apex surfaces: include method-specific LWC,
+  // Aura, Flow, OmniScript, and VF refs as well as class-only refs. Method
+  // traces remain exact through metaMethodCallers above.
+  return index.metaCallers.get(classLower) || [];
 }
 
 function metaEntryLabel(kind) {
@@ -5137,6 +5061,10 @@ function metaEntryLabel(kind) {
       return 'VF controller';
     case 'cmdt':
       return 'Custom Metadata record';
+    case 'permissionset':
+      return 'Permission Set Apex access';
+    case 'profile':
+      return 'Profile Apex access';
     default:
       return 'metadata reference';
   }
@@ -5188,7 +5116,50 @@ function buildMetaChildren(index, metaRefs, ctx) {
     } else if (first.kind === 'flow' && first.flowObject && first.flowRecordTriggerType) {
       const matchOps = flowOpsForRecordTriggerType(first.flowRecordTriggerType);
       children = buildFlowChildren(index, lc(first.flowObject), 'dml', matchOps);
+    } else if (first.kind === 'cmdt' && first.triggerAction) {
+      const seenTriggers = new Set();
+      for (const link of first.triggerAction.links || []) {
+        if (!link || seenTriggers.has(link.triggerClassLower)) continue;
+        const triggerCm = index.classes.get(link.triggerClassLower);
+        if (!triggerCm) continue;
+        seenTriggers.add(link.triggerClassLower);
+        const triggerMethod = (triggerCm.methods || []).find((method) => lc(method.name) === '(trigger)');
+        const site = link.site || {
+          path: triggerCm.path || '',
+          line: triggerMethod ? triggerMethod.line : 0,
+          col: 0,
+          lineText: '',
+        };
+        children.push({
+          label: triggerCm.name,
+          kind: 'trigger',
+          className: triggerCm.qualified,
+          methodLower: '(trigger)',
+          path: triggerCm.path || '',
+          line: triggerMethod ? triggerMethod.line : 0,
+          entries: triggerMethod ? triggerMethod.entries : [],
+          isTest: false,
+          via: 'metadata',
+          sites: [{
+            path: site.path || triggerCm.path || '',
+            line: site.line || 0,
+            col: site.col || 0,
+            lineText: site.lineText || '',
+            argsRendered: '',
+            via: 'metadata',
+            overloadSig: null,
+          }],
+          children: [],
+          cyclic: false,
+          truncated: false,
+          approximate: !!link.approximate,
+          seenElsewhere: false,
+        });
+      }
+      children.sort(sortTNodes);
     }
+    const isAccessMetadata = first.kind === 'permissionset' || first.kind === 'profile';
+    const edgeVia = isAccessMetadata ? 'access' : 'metadata';
     const node = {
       label: first.label,
       kind: first.kind,
@@ -5196,16 +5167,21 @@ function buildMetaChildren(index, metaRefs, ctx) {
       methodLower: null,
       path: first.path || '',
       line: first.line || 0,
-      entries: [metaEntryLabel(first.kind)],
+      entries: first.kind === 'cmdt' && first.triggerAction
+        ? [
+          metaEntryLabel(first.kind),
+          ...first.triggerAction.contexts.map((context) => `Trigger action: ${context.event}`),
+        ]
+        : [metaEntryLabel(first.kind)],
       isTest: false,
-      via: 'metadata',
+      via: edgeVia,
       sites: refs.map((r) => ({
         path: r.path || '',
         line: r.line || 0,
         col: 0,
         lineText: r.lineText || '',
         argsRendered: '',
-        via: 'metadata',
+        via: edgeVia,
         overloadSig: null,
       })),
       children,
@@ -5313,13 +5289,11 @@ function buildFlowChildren(index, objectLower, via, matchOps) {
 // v0.13/S2: flow-to-subflow chain recursion (both directions)
 // =========================================================================
 // Cycle-guard/DAG-memoization/maxNodes-cap semantics mirror buildOneChildNode/
-// buildChildrenLevel EXACTLY ("apply to flow nodes exactly like methods" per
-// the GOAL text), keyed by 'flow:'+flowLower (a namespace disjoint from the
+// buildChildrenLevel, keyed by 'flow:'+flowLower (a namespace disjoint from the
 // 'classLower#methodLower' keys ordinary Apex nodes use, so the two schemes
 // share one ancestorPath Set / ctx.expandedKeys Map safely without collision
 // risk). Unlike ordinary Apex nodes, flow-chain recursion is NOT bounded by
-// ctx.maxDepth -- the GOAL text lists "DAG memoization + seenElsewhere +
-// maxNodes cap" as the flow-node contract, deliberately omitting maxDepth;
+// ctx.maxDepth. DAG memoization, seenElsewhere, and maxNodes cap the walk;
 // a flow chain's own bound is cycle-guard + the shared node-count cap below.
 //
 // `budget` ({used, limit}) is a per-fold-in-call soft cap used ONLY to stop
@@ -5338,8 +5312,7 @@ function buildOneFlowNode(index, flowLower, ancestorPath, ctx, direction, budget
     label: info.label, kind: 'flow', className: '', methodLower: null,
     path: info.path || '', line: info.line || 0,
     entries: [metaEntryLabel('flow')], isTest: false,
-    // v0.13/S2 CONTRACT: via='subflow', approximate:false -- "a declared
-    // reference, not a fan-out guess" (GOAL text, verbatim).
+    // A subflow edge is a declared reference, not a fan-out guess.
     via: 'subflow', sites: [], children: [],
     cyclic: false, truncated: false, approximate: false, seenElsewhere: false,
   };
@@ -5358,8 +5331,8 @@ function buildOneFlowNode(index, flowLower, ancestorPath, ctx, direction, budget
   // buildFlowCalleeChildren) after this call returns. A depth-first recursive
   // call only returns once its ENTIRE subtree is built, so incrementing
   // `budget.used` only on return would never let a long NON-branching chain
-  // (one parent/child per level, e.g. this round's 3-deep-chain fixture
-  // extended further) observe its own accumulated depth mid-descent -- only
+  // (one parent/child per level) observe its own accumulated depth
+  // mid-descent -- only
   // BRANCHING (multiple parents/children at the same level) would ever see
   // an updated count. Incrementing here means every level of a pure linear
   // chain re-checks the SAME shared `budget` object one level further along,
@@ -5384,10 +5357,8 @@ function buildOneFlowNode(index, flowLower, ancestorPath, ctx, direction, budget
     node.children = dmlChildren.concat(subflowChildren);
   } else {
     // Callee direction: a proper subflow node (reached via a 'subflow'
-    // edge, unlike the DML/publish-reached root -- see makeCalleeFlowNode's
-    // own note on the [SPEC-OPEN] asymmetry) exposes its OWN apex actions
-    // per the GOAL text ("each subflow expanding to its own apex
-    // actions/DML/subflows"), in addition to its own further subflows.
+    // edge, unlike the DML/publish-reached root) exposes its own Apex actions
+    // in addition to its own further subflows.
     node.children = buildFlowCalleeChildren(index, flowLower, nextPath, ctx, node, budget, true);
   }
   return node;
@@ -5416,13 +5387,9 @@ function buildFlowParentChildren(index, flowLower, ancestorPath, ctx, ownerNode,
   return out;
 }
 
-// Terminal TNode for one of a flow's own outgoing apex-action targets
-// (index.flowApexTargets) -- "the subflow's own apex action, forward-visible
-// for the first time" per this round's GROUND-TRUTH. via='metadata' (this IS
-// the same "flow declares a reference to this apex method" relationship
-// buildMetaChildren already renders in the reverse direction, just walked
-// forward here) -- deliberately NOT a new via value; the only new via this
-// round introduces is 'subflow', for flow-to-flow edges specifically.
+// Terminal TNode for one of a Flow's outgoing Apex-action targets.
+// via='metadata' is the same declared reference buildMetaChildren renders in
+// reverse; 'subflow' remains reserved for Flow-to-Flow edges.
 function buildFlowApexTargetNode(index, target) {
   const ccm = index.classes.get(target.classLower);
   const mm = ccm && target.methodLower ? ccm.methods.find((m) => lc(m.name) === target.methodLower) : null;
@@ -5443,16 +5410,15 @@ function buildFlowApexTargetNode(index, target) {
     children: [],
     // Terminal by design, same convention buildMetaChildren's own flow node
     // and the DML/publish flow-fanout nodes already use for a metadata-
-    // declared (not syntactic-call) edge: this round's forward tracing
-    // stops AT the apex action -- what THAT method itself calls is a
+    // declared (not syntactic-call) edge: forward tracing stops at the Apex
+    // action. What that method itself calls is a
     // separate ordinary trace, not part of this flow-chain walk.
     cyclic: false, truncated: true, approximate: false, seenElsewhere: false,
   };
 }
 
 // Callee direction: builds a flow node's forward children -- its own
-// apex-action targets (only when `includeApexTargets`, see makeCalleeFlowNode's
-// [SPEC-OPEN] note on why the DML/publish-reached root flow node does NOT get
+// apex-action targets (only when `includeApexTargets`; the DML/publish root does not get
 // this) plus its own SUBFLOW children (always, via buildOneFlowNode
 // recursion), in that order.
 function buildFlowCalleeChildren(index, flowLower, ancestorPath, ctx, ownerNode, budget, includeApexTargets) {
@@ -5487,7 +5453,7 @@ function buildFlowCalleeChildren(index, flowLower, ancestorPath, ctx, ownerNode,
 // v0.8/N1(c): given a metascan MetaRef and the (lowercased) own-namespace
 // token, detects whether this ref names a namespace -- normally via the
 // EXPLICIT `namespace` field metascan.js now populates for ALL ref kinds
-// (LWC, Flow, CMDT, os-meta; the same-round metascan update superseded the
+// (LWC, Flow, CMDT, os-meta; metascan superseded the
 // older LWC-only split), with the shape-inference branches below kept as a
 // defensive fallback for refs from any older/partial extraction -- and,
 // if so, whether that namespace IS the workspace's own (isOwn:true, per N3:
@@ -5530,8 +5496,8 @@ function detectMetaRefNamespace(ref, ownNamespaceLower) {
   return null;
 }
 
-// v0.10/A2: the RESOLVER half of the "VF METHOD BINDINGS" amendment.
-// metascan.js's own v0.10/A2 half (already landed -- see its header comment
+// Resolver support for Visualforce method bindings.
+// metascan.js extracts the corresponding references (see its header comment
 // block above extractVf/extractVfActionBinding) emits a SECOND 'vf' MetaRef
 // shape, one per `action="{!singleIdentifier}"` binding, alongside the
 // pre-existing class-level controller=/extensions= refs it has always
@@ -5573,8 +5539,7 @@ function attachVfActionRef(index, ref, metaCallers, metaMethodCallers) {
   }
   // No controller AND no extensions declared at all (e.g. a
   // standardController-only page) -- there is nothing to attach to at any
-  // level. This is the literal "no edge possible" case (VtxAccountSummaryPage
-  // ground truth, v0.10-B3): the ref is dropped entirely, same fate the
+  // level. This is a literal "no edge possible" case: the ref is dropped,
   // page's own (nonexistent) class-level 'vf' refs already have today.
   if (!candidates.length) return;
 
@@ -5584,13 +5549,11 @@ function attachVfActionRef(index, ref, metaCallers, metaMethodCallers) {
     // Exactly one of the page's controller/extensions classes declares this
     // method (own or inherited) -- attach a METHOD-level ref to THAT class.
     // May be an extension, not the controller (the "extension not
-    // controller" ground-truth case, v0.10-B1 L6) -- whichever class
-    // actually declares it wins, no controller-first tie-break needed since
-    // there IS no tie here. Mirrors the pre-existing generic local-attach
-    // pattern exactly (push into BOTH metaCallers[class] -- auto-excluded
-    // from CLASS-level views by metaLevelPairs' own `!r.methodName` filter,
-    // since this ref still carries methodName -- and
-    // metaMethodCallers[class#method]).
+    // controller. Whichever class actually declares it wins, with no
+    // controller-first tie-break needed since
+    // there IS no tie here. Mirrors the generic local-attach pattern exactly:
+    // register it in the complete per-class bucket and in the exact
+    // metaMethodCallers[class#method] bucket.
     const classLower = declaring[0];
     if (!metaCallers.has(classLower)) metaCallers.set(classLower, []);
     metaCallers.get(classLower).push(ref);
@@ -5602,14 +5565,13 @@ function attachVfActionRef(index, ref, metaCallers, metaMethodCallers) {
 
   // Zero matches ("matches no class", v0.10-B1 L13) or more than one match
   // ("ambiguous, declared on both", v0.10-B1 L7) -- no principled way to
-  // pick a single method-level target, so per the amendment's own text:
+  // pick a single method-level target, so:
   // class-level ref to the CONTROLLER only (never an extension -- there's
   // no basis to prefer one extension over another either), with NO method
-  // fabricated. A methodName-bearing ref would be invisible to
-  // metaLevelPairs' class-level `!r.methodName` filter, so a stripped copy
-  // (methodName:null) is what actually gets registered -- this is the "no
-  // method fabrication" clause made concrete, not just a documentation
-  // note. Per v0.10-B1's own framing this "contributes no NEW edge" when
+  // fabricated. Register a stripped copy (methodName:null), preserving the
+  // distinction from an exact method binding even though class-level traces
+  // now roll up exact method refs too. Per v0.10-B1's own framing this
+  // "contributes no NEW edge" when
   // the page already has an ordinary controller= class-level ref (both
   // collapse onto the same metaCallers[controllerLower] list, rendered as
   // one grouped TNode by buildMetaChildren's own (kind,label) grouping).
@@ -5620,6 +5582,202 @@ function attachVfActionRef(index, ref, metaCallers, metaMethodCallers) {
   metaCallers.get(controllerLower).push(classLevelRef);
 }
 
+// Trigger Actions Framework (TAF) metadata join. The framework deliberately
+// hides the executable relationship behind two Custom Metadata records:
+// Trigger_Action__mdt names an Apex class and points to a context-specific
+// sObject_Trigger_Setting__mdt record; that setting supplies the object whose
+// trigger calls MetadataTriggerHandler.run(). Detect the relationship by its
+// field schema AND the class's TriggerAction.<Context> interface, rather than
+// treating every identifier-shaped CMDT value as a trigger configuration.
+const TRIGGER_ACTION_CONTEXTS = [
+  { fieldSuffix: 'before_insert__c', event: 'before insert', iface: 'beforeinsert', method: 'beforeInsert' },
+  { fieldSuffix: 'after_insert__c', event: 'after insert', iface: 'afterinsert', method: 'afterInsert' },
+  { fieldSuffix: 'before_update__c', event: 'before update', iface: 'beforeupdate', method: 'beforeUpdate' },
+  { fieldSuffix: 'after_update__c', event: 'after update', iface: 'afterupdate', method: 'afterUpdate' },
+  { fieldSuffix: 'before_delete__c', event: 'before delete', iface: 'beforedelete', method: 'beforeDelete' },
+  { fieldSuffix: 'after_delete__c', event: 'after delete', iface: 'afterdelete', method: 'afterDelete' },
+  { fieldSuffix: 'after_undelete__c', event: 'after undelete', iface: 'afterundelete', method: 'afterUndelete' },
+];
+
+function cmdtFieldEndsWith(ref, suffix) {
+  return !!(ref && ref.kind === 'cmdt' && lc(ref.fieldName || '').endsWith(lc(suffix)));
+}
+
+function cmdtRefValue(ref) {
+  if (!ref) return '';
+  return ref.namespace ? `${ref.namespace}__${ref.className || ''}` : String(ref.className || '');
+}
+
+function cmdtRecordName(label) {
+  const value = String(label || '');
+  const dot = value.indexOf('.');
+  return dot === -1 ? value : value.slice(dot + 1);
+}
+
+function canonicalTriggerObject(index, rawObject) {
+  let value = String(rawObject || '').trim();
+  const ownNamespace = lc(index && index.ownNamespace);
+  if (ownNamespace) {
+    const split = splitNamespacePrefix(value);
+    if (split && lc(split.ns) === ownNamespace) value = split.rest;
+  }
+  return lc(value);
+}
+
+function classImplementsTriggerActionContext(cm, context) {
+  if (!cm || !context) return false;
+  return (cm.implementsTypes || []).some((raw) => {
+    const segments = normalizeTypeName(raw).split('.');
+    return segments.length >= 2 &&
+      segments[segments.length - 2] === 'triggeraction' &&
+      segments[segments.length - 1] === context.iface;
+  });
+}
+
+// Returns the trigger-source call that proves the canonical dispatcher is
+// present, or null. Raw parser facts remain available on ClassMeta.typeFacts
+// even when MetadataTriggerHandler comes from an installed package and
+// therefore cannot resolve as an ordinary local Apex edge.
+function metadataTriggerDispatcherSite(triggerCm) {
+  const methods = (triggerCm && triggerCm.typeFacts && triggerCm.typeFacts.methods) || [];
+  for (const method of methods) {
+    const calls = method.calls || [];
+    const constructed = calls.some((call) =>
+      call && call.kind === 'new' && lastSegmentLower(call.method) === 'metadatatriggerhandler'
+    );
+    const handlerLocals = new Set(
+      (method.locals || [])
+        .filter((local) => lastSegmentLower(local.type) === 'metadatatriggerhandler')
+        .map((local) => lc(local.name))
+    );
+    const run = calls.find((call) => {
+      if (!call || lc(call.method) !== 'run') return false;
+      const receiver = lc(call.receiver || '');
+      return receiver.includes('metadatatriggerhandler') || handlerLocals.has(receiver) || constructed;
+    });
+    if (run) return run;
+  }
+  return null;
+}
+
+function annotateTriggerActionMetadata(index, metaRefs) {
+  const cmdtRefs = (metaRefs || []).filter((ref) => ref && ref.kind === 'cmdt');
+  if (!cmdtRefs.length || !(index.classes instanceof Map)) return;
+
+  const groups = new Map();
+  for (const ref of cmdtRefs) {
+    const key = lc(ref.label);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(ref);
+  }
+
+  // Setting record lookup accepts both the complete Type.Record label and
+  // the relationship value's ordinary Record-only form.
+  const settings = new Map();
+  for (const refs of groups.values()) {
+    const objectRef = refs.find((ref) => cmdtFieldEndsWith(ref, 'object_api_name__c'));
+    if (!objectRef) continue;
+    const namespaceRef = refs.find((ref) => cmdtFieldEndsWith(ref, 'object_namespace__c'));
+    const bareObject = cmdtRefValue(objectRef);
+    const namespace = namespaceRef ? cmdtRefValue(namespaceRef) : '';
+    const objectApiName = namespace && !lc(bareObject).startsWith(`${lc(namespace)}__`)
+      ? `${namespace}__${bareObject}`
+      : bareObject;
+    const bypassed = refs.some((ref) =>
+      cmdtFieldEndsWith(ref, 'bypass_execution__c') && lc(cmdtRefValue(ref)) === 'true'
+    );
+    const setting = { objectApiName, refs, bypassed };
+    settings.set(lc(refs[0].label), setting);
+    settings.set(lc(cmdtRecordName(refs[0].label)), setting);
+  }
+
+  for (const refs of groups.values()) {
+    const classRef = refs.find((ref) => cmdtFieldEndsWith(ref, 'apex_class_name__c'));
+    if (!classRef) continue;
+    const bypassed = refs.some((ref) =>
+      cmdtFieldEndsWith(ref, 'bypass_execution__c') && lc(cmdtRefValue(ref)) === 'true'
+    );
+    if (bypassed) continue;
+
+    const classLower = lc(classRef.className);
+    const cm = index.classes.get(classLower);
+    if (!cm) continue;
+    const contexts = [];
+    const links = [];
+    for (const context of TRIGGER_ACTION_CONTEXTS) {
+      const relationRef = refs.find((ref) => cmdtFieldEndsWith(ref, context.fieldSuffix));
+      if (!relationRef || !classImplementsTriggerActionContext(cm, context)) continue;
+      const settingValue = cmdtRefValue(relationRef);
+      const setting = settings.get(lc(settingValue)) || settings.get(lc(cmdtRecordName(settingValue)));
+      if (!setting || !setting.objectApiName || setting.bypassed) continue;
+      const objectLower = canonicalTriggerObject(index, setting.objectApiName);
+      const candidates = [];
+      for (const triggerCm of index.classes.values()) {
+        if (!triggerCm || triggerCm.kind !== 'trigger' || !triggerCm.triggerInfo) continue;
+        if (canonicalTriggerObject(index, triggerCm.triggerInfo.object) !== objectLower) continue;
+        if (!(triggerCm.triggerInfo.events || []).map(lc).includes(context.event)) continue;
+        candidates.push({ triggerCm, dispatcherSite: metadataTriggerDispatcherSite(triggerCm) });
+      }
+      const proven = candidates.filter((candidate) => candidate.dispatcherSite);
+      // A canonical dispatcher call is exact. Without one, only a single
+      // object/event trigger is safe enough to surface, and is marked ~.
+      const chosen = proven.length ? proven : candidates.length === 1 ? candidates : [];
+      const contextInfo = {
+        event: context.event,
+        method: context.method,
+        objectApiName: setting.objectApiName,
+      };
+      contexts.push(contextInfo);
+      for (const candidate of chosen) {
+        const site = candidate.dispatcherSite;
+        links.push({
+          triggerClassLower: candidate.triggerCm.classLower || lc(candidate.triggerCm.qualified),
+          event: context.event,
+          method: context.method,
+          objectApiName: setting.objectApiName,
+          approximate: !site,
+          site: site ? {
+            path: candidate.triggerCm.path || '',
+            line: site.line || 0,
+            col: site.col || 0,
+            lineText: site.lineText || '',
+          } : null,
+        });
+      }
+    }
+    if (contexts.length) classRef.triggerAction = { contexts, links };
+  }
+}
+
+function sameMetaRefSource(a, b) {
+  return !!(
+    a && b && a.kind === b.kind && a.label === b.label &&
+    (a.path || '') === (b.path || '') && (a.line || 0) === (b.line || 0) &&
+    (a.fieldName || '') === (b.fieldName || '')
+  );
+}
+
+function attachAnnotatedTriggerActionMethods(index, cmdtRefs, metaCallers, metaMethodCallers) {
+  for (const ref of cmdtRefs || []) {
+    if (!ref || !ref.triggerAction) continue;
+    if (ref.namespace && (!index.ownNamespace || lc(ref.namespace) !== lc(index.ownNamespace))) continue;
+    const classLower = lc(ref.className);
+    if (!index.classes.has(classLower)) continue;
+    const classRefs = metaCallers.get(classLower) || [];
+    const attachedRef = classRefs.find((candidate) => sameMetaRefSource(candidate, ref)) || ref;
+    // An own-namespace attach may have stored a stripped copy before the
+    // setting record arrived in a later attachMetaCallers call.
+    attachedRef.triggerAction = ref.triggerAction;
+    const methodNames = new Set(ref.triggerAction.contexts.map((context) => lc(context.method)));
+    for (const methodName of methodNames) {
+      const key = `${classLower}#${methodName}`;
+      if (!metaMethodCallers.has(key)) metaMethodCallers.set(key, []);
+      const bucket = metaMethodCallers.get(key);
+      if (!bucket.some((candidate) => sameMetaRefSource(candidate, attachedRef))) bucket.push(attachedRef);
+    }
+  }
+}
+
 // A6: attaches metascan.js's MetaRef[] output onto an existing index,
 // mutating it with metaCallers (by class) and metaMethodCallers (by
 // 'classLower#methodLower'). Pure and order-independent: safe to call
@@ -5627,6 +5785,12 @@ function attachVfActionRef(index, ref, metaCallers, metaMethodCallers) {
 // they don't replace).
 function attachMetaCallers(index, metaRefs) {
   if (!index) return index;
+  const triggerActionCmdtRefs = index._triggerActionCmdtRefs instanceof Array
+    ? index._triggerActionCmdtRefs
+    : [];
+  triggerActionCmdtRefs.push(...(metaRefs || []).filter((ref) => ref && ref.kind === 'cmdt'));
+  index._triggerActionCmdtRefs = triggerActionCmdtRefs;
+  annotateTriggerActionMetadata(index, triggerActionCmdtRefs);
   const metaCallers = index.metaCallers instanceof Map ? index.metaCallers : new Map();
   const metaMethodCallers = index.metaMethodCallers instanceof Map ? index.metaMethodCallers : new Map();
   // v0.8/N1/N4: same Map objects buildSemanticIndex's closure builds (see
@@ -5652,11 +5816,8 @@ function attachMetaCallers(index, metaRefs) {
     // null (see attachVfActionRef's own header note just above it), so this
     // MUST be dispatched before the ordinary `!ref.className` skip below,
     // which would otherwise drop it silently.
-    // Namespace detection (detectMetaRefNamespace) deliberately does not
-    // run for this branch -- out of scope for this round (documented gap;
-    // an external/managed-package VF controller is a future round's
-    // concern, same "additive, not required to land in the same pass"
-    // posture v0.8/N1(c) itself used for the OTHER metadata surfaces).
+    // Namespace detection does not run for this branch; managed-package VF
+    // controllers are not resolved by this path.
     if (ref.kind === 'vf' && ref.className == null && ref.methodName) {
       attachVfActionRef(index, ref, metaCallers, metaMethodCallers);
       continue;
@@ -5701,6 +5862,17 @@ function attachMetaCallers(index, metaRefs) {
       const key = `${classLower}#${lc(effectiveRef.methodName)}`;
       if (!metaMethodCallers.has(key)) metaMethodCallers.set(key, []);
       metaMethodCallers.get(key).push(effectiveRef);
+    } else if (effectiveRef.triggerAction) {
+      // TAF metadata identifies the interface context, so attach the same
+      // record to the exact afterUpdate/beforeInsert/etc. method as well as
+      // the class-level bucket. This makes Who Calls This? work from either
+      // the class declaration or the implementation method.
+      const methodNames = new Set(effectiveRef.triggerAction.contexts.map((context) => lc(context.method)));
+      for (const methodName of methodNames) {
+        const key = `${classLower}#${methodName}`;
+        if (!metaMethodCallers.has(key)) metaMethodCallers.set(key, []);
+        metaMethodCallers.get(key).push(effectiveRef);
+      }
     } else if (effectiveRef.kind === 'flow') {
       // Cross-reference: a Flow actionCalls block with a BARE actionName
       // (class only, e.g. <actionName>AcmeDiscountApprovalInvocable</actionName>)
@@ -5721,6 +5893,11 @@ function attachMetaCallers(index, metaRefs) {
       }
     }
   }
+  // Reconcile annotations over the accumulated CMDT set after the ordinary
+  // attach loop. This preserves attachMetaCallers' documented multi-call,
+  // order-independent contract when action and setting records arrive in
+  // separate batches.
+  attachAnnotatedTriggerActionMethods(index, triggerActionCmdtRefs, metaCallers, metaMethodCallers);
   index.metaCallers = metaCallers;
   index.metaMethodCallers = metaMethodCallers;
   index.externals = externals;
@@ -5773,9 +5950,8 @@ function attachMetaCallers(index, metaRefs) {
   //   collectFlowEntries' own index.flowFilePaths file-driven fallback
   //   (resolver.js's pre-existing v0.12 precedent) rather than the
   //   per-actionCalls-ref-only convention flowObject/flowTriggerType used
-  //   pre-v0.13 -- see this round's GROUND-TRUTH "load-bearing stress case"
-  //   note for exactly why a per-ref-only convention here would silently
-  //   lose an apex-less flow's own outgoing subflow reference. The
+  //   A per-ref-only convention would silently lose an Apex-less flow's own
+  //   outgoing subflow reference. The
   //   lowest-line ref's fields win when several refs share a label (same
   //   "best" convention collectFlowEntries already uses).
   // index.flowGraph: Map<flowLower, {parents: string[], children: string[]}>
@@ -5790,8 +5966,7 @@ function attachMetaCallers(index, metaRefs) {
   //   instead of by class: "what apex does THIS flow call" -- forward/callee
   //   subflow expansion has no other way to ask that question. Own-namespace
   //   (or namespace-less) targets only, mirroring metaCallers' local-only
-  //   registration just above; an external target's forward edge is out of
-  //   this round's scope.
+  //   registration just above; external targets are handled separately.
   const flowInfo = index.flowInfo instanceof Map ? index.flowInfo : new Map();
   const flowGraph = index.flowGraph instanceof Map ? index.flowGraph : new Map();
   const flowApexTargets = index.flowApexTargets instanceof Map ? index.flowApexTargets : new Map();
@@ -5873,8 +6048,7 @@ function attachMetaCallers(index, metaRefs) {
   // buildCallerTree/buildCalleeTree/buildEntryCatalog, all three of which
   // only ever run after the full scan-and-attach sequence (incl. the
   // flowFilePaths assignment) has completed. A ref that resolves immediately
-  // (the common case -- the referenced flow already has its own metaRef,
-  // e.g. this round's whole gauntlet-org corpus) is wired into flowGraph
+  // (the common case -- the referenced flow already has its own MetaRef) is wired into flowGraph
   // right here, with zero deferral.
   const pendingSubflowRefs = Array.isArray(index._pendingSubflowRefs) ? index._pendingSubflowRefs : [];
   for (const { parentLower, childLower } of pendingSubflowRefsThisCall) {
@@ -5923,9 +6097,7 @@ function attachMetaCallers(index, metaRefs) {
 // both, never neither, and never counted twice (each pending entry is
 // removed from the list the moment it's decided). Idempotent/cheap to call
 // on every entry into buildCallerTree/buildCalleeTree/buildEntryCatalog:
-// once index._pendingSubflowRefs is empty (the overwhelmingly common case --
-// every reference this round's own gauntlet-org corpus declares resolves
-// immediately inside attachMetaCallers itself), every subsequent call is an
+// once index._pendingSubflowRefs is empty, every subsequent call is an
 // instant no-op.
 //
 // Folds index.flowFilePaths (if present at THIS moment -- by real-pipeline
@@ -6066,7 +6238,7 @@ function groupPairsByKey(pairs) {
 // collapsed 'rollup' pseudo-node, controlled by ctx.showUnconfirmed:
 //   - 'expand' (old, pre-H2 behavior): `nodes` returned completely
 //     unchanged -- this is the literal flatten(rollup children)+confirmed
-//     == old child set baseline the regression policy's H2 equivalence
+//     == the legacy child-set baseline
 //     proof is checked against.
 //   - 'hide': approximate nodes are dropped entirely (not even a count).
 //   - 'rollup' (default): confirmed nodes pass through untouched; every
@@ -6114,7 +6286,7 @@ function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower,
       // genuine zero-children leaf, and downstream root/leaf badge logic
       // (uitree.js/pathmap.js's isRootNode()) mislabels it a terminal
       // dead-end -- the single strongest possible false signal a
-      // call-graph tool can give. See VALIDATION-REPORT.md Tier-3 #5.
+      // call-graph tool can give.
       if (ownerNode) ownerNode.truncated = true;
       break;
     }
@@ -6145,8 +6317,8 @@ function buildChildrenLevel(index, pairs, depth, ancestorPath, targetClassLower,
 // terminal, unrelated to the DAG-memoization keying below; (2) cyclic --
 // this exact classLower#methodLower is already on the CURRENT root-to-node
 // ancestor path (unchanged pre-H1 semantics, and still wins over (3) per
-// the H1 spec: "cyclic flag still wins over seenElsewhere on ancestor-path
-// hits"); (3) seenElsewhere (NEW) -- this identity's subtree was ALREADY
+// cycle detection still wins over seenElsewhere on ancestor-path hits;
+// (3) seenElsewhere -- this identity's subtree was already
 // expanded once elsewhere in this tree (ctx.expandedKeys), so its own
 // children are shown as [] here rather than re-walking (and re-materializing
 // nodes for) a subtree this call has already built in full; (4) truncated --
@@ -6162,8 +6334,8 @@ function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excC
   // pre-existing APPROX_VIA-membership check, OR'd per site -- this is the
   // ONE place a via='dml' edge can ever be approximate, without adding a
   // new via value or disturbing every other via's pre-existing byte-
-  // identical APPROX_VIA-only behavior (every site this round didn't touch
-  // carries approximate:false/undefined, so `|| it.site.approximate ===
+  // identical APPROX_VIA-only behavior (ordinary sites carry
+  // approximate:false/undefined, so `|| it.site.approximate ===
   // true` is a no-op for them).
   const approximate = g.items.length > 0 && g.items.every((it) => APPROX_VIA.has(it.site.via) || it.site.approximate === true);
 
@@ -6183,11 +6355,10 @@ function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excC
 
   // A3: class-level (no method) forward target -- currently only the
   // throw-forward exception-class node (calleeItemFromEdge flags it via
-  // kindOverride). Always terminal per the A2 spec ("exception-class node
-  // ... TERMINAL") -- it does not expand into the exception class's own
+  // kindOverride). Always terminal: it does not expand into the exception
+  // class's own
   // (nonexistent, for a plain exception subclass) outbound calls.
-  // Reconciled against MANIFEST.md's v0.7 A3 ground truth and the top-level
-  // contract's APPROX_VIA set (declared once, at this file's top): 'throws'
+  // The top-level APPROX_VIA set deliberately excludes 'throws': it
   // is deliberately NOT a member -- a throw site genuinely does raise that
   // exact exception type, the same "platform genuinely does this" reasoning
   // already applied to via='dml'/'publish'/'async' elsewhere in this file.
@@ -6266,11 +6437,7 @@ function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excC
   // thrower's own enclosing catch clause (the "catch (X e) { ...; throw
   // e; }" rethrow shape) matches syntactically, but it isn't an ancestor
   // intercepting propagation from the traced throw site -- it's the throw
-  // site's own frame, already surfaced via via='throws'. Confirmed against
-  // MANIFEST.md's v0.5 G2 tally (AcmeShipmentService.reprocessFailedShipment
-  // is documented as a thrower leaf with zero callers, and is explicitly
-  // NOT one of the 4 counted caughtHere-badge classifications, unlike the 3
-  // ordinary ancestor catchers + 1 documented-absence negative that are).
+  // site's own frame, already surfaced via via='throws'.
   if (excCtx && !isTriggerCaller && node.via !== 'throws') {
     const rawMethod = (ccm.typeFacts.methods || []).find((m) => !m.isCtor && lc(m.name) === methodLower2);
     if (rawMethod && (rawMethod.catches || []).some((c) => catchMatchesException(index, c, excCtx.lower))) {
@@ -6381,7 +6548,7 @@ function buildOneChildNode(index, g, depth, ancestorPath, targetClassLower, excC
 
 function suggestTargets(index) {
   const out = [];
-  // MUST-FIX #1: only stamp a `package` field when B2's real gate is active
+  // Only stamp a `package` field when B2's gate is active
   // (package metadata was actually discovered somewhere -- see
   // packageMetadataDiscovered's own header note in buildSemanticIndex).
   // Matches targets.js's own contract: an item with NO `package` property
@@ -6389,7 +6556,7 @@ function suggestTargets(index) {
   // byte-identical to pre-v0.7 (see targets.js's B3 addendum).
   const stampPackage = !!index.packageMetadataDiscovered;
   for (const cm of index.classes.values()) {
-    // MUST-FIX #1: use THIS ClassMeta's own registration key (cm.classLower
+    // Use this ClassMeta's registration key (cm.classLower
     // -- the real key it lives under in index.classes, which for a B2
     // duplicate-slot candidate is a synthetic '~dupN~pkg' key, NOT the
     // plain lc(cm.qualified) every same-named candidate shares) instead of
@@ -6409,7 +6576,7 @@ function suggestTargets(index) {
       const nl = lc(m.name);
       if (seen.has(nl)) continue;
       seen.add(nl);
-      // MUST-FIX #5: accessor scopes are call-graph sources only, never
+      // Accessor scopes are call-graph sources only, never
       // valid trace targets — suppressed here so users never pick a target
       // guaranteed to show zero callers.
       if (nl.startsWith('(get ') || nl.startsWith('(set ')) continue;
@@ -6424,7 +6591,7 @@ function suggestTargets(index) {
   // once at least one local site references it -- see getOrCreateExternal's
   // own callers, all of which increment refCount in the same breath) gets
   // ONE class-level-shaped item, `kind:'external'`, bare `label` (targets.js's
-  // refineTargets(), out of this file's ownership, is the one that appends
+  // refineTargets() appends
   // the ' (managed)' suffix -- see its own N4/N6 header note; resolver.js
   // hands it the raw '<ns>.<Class>' label unmodified, matching the same
   // "each layer owns its own transform" division targets.js's constructor-
@@ -6491,7 +6658,7 @@ const ENTRY_LABEL_TO_KIND = {
   'Finalizer (async)': 'platform',
 };
 
-// C1 CONTRACT: rest detail is "the @HttpX verb(s)" -- the literal annotation
+// REST detail is "the @HttpX verb(s)" -- the literal annotation
 // text (e.g. '@HttpGet'), NOT the generic '@HttpX (REST)' badge label
 // computeAnnotationEntries() already produced (that label is what routes the
 // method to kind:'rest' in the first place; the verb itself has to be
@@ -6529,18 +6696,15 @@ function restDetailFor(cm, mm) {
   return verbs.length ? verbs.join(', ') : '@HttpX';
 }
 
-// metascan.js (frozen) only ever emits a MetaRef for a Flow file that has at
+// metascan.js emits a MetaRef for a Flow file that has at
 // least one apex <actionCalls> block -- a Screen/Autolaunched Flow with zero
 // such blocks (e.g. UI-only, or every action non-Apex) produces NOTHING at
-// all today, so it's otherwise invisible to this index (confirmed against
-// real fixtures in both gauntlet-org and adv-org). Per the GOAL text
-// ("every distinct flow file seen by metascan") this catalog still has to
-// list it. Since resolver.js has no fs access and metascan.js/extension.js
-// are out of THIS round's scope, this is read from an OPTIONAL, purely
+// all, so it is otherwise invisible to this index. The catalog still lists
+// every distinct Flow file seen by metascan. Since resolver.js has no fs
+// access, this is read from an optional, purely
 // additive new index field -- index.flowFilePaths: string[] -- the raw
 // '.flow-meta.xml' paths seen during the metadata scan, regardless of
-// content. It is NOT populated by any code in this file today (attachMetaCallers
-// is unchanged); a future extension.js round is expected to set
+// content. extension.js sets
 // `index.flowFilePaths = <every .flow-meta.xml path from its own meta scan>`
 // before calling buildEntryCatalog, mirroring how it already sets
 // opts.packageOf/opts.defaultPackage for buildSemanticIndex. Absent (today's
@@ -6548,7 +6712,7 @@ function restDetailFor(cm, mm) {
 // what metaCallers/externalMetaRefs already carry -- never throws, never
 // double-counts (see collectFlowEntries's own dedupe-by-label note).
 //
-// This mirrors metascan.js's own (frozen) stemOf() -- strip directory, strip
+// This mirrors metascan.js's stemOf() -- strip directory, strip
 // the compound '.flow-meta.xml' extension -- reproduced here (not imported;
 // metascan.js exports no such helper) because it is pure filename text
 // manipulation, not Apex/Flow semantic analysis.
@@ -6571,7 +6735,7 @@ function flowStemOf(rawPath) {
 // ref is used for path/line (arbitrary but deterministic -- every ref
 // sharing a label was stamped from the SAME file's SAME <start> block, so
 // flowObject/flowTriggerType never differ across them). Detail: the
-// GOAL-text-ruled fallback ('screen or autolaunched') whenever no
+// fallback ('screen or autolaunched') whenever no
 // start-trigger info was extracted (covers real Screen Flows, record-
 // agnostic Autolaunched Flows, AND Scheduled-Path Flows alike -- metascan's
 // own <start> extraction cannot tell these apart, and this catalog performs
@@ -6581,11 +6745,9 @@ function flowStemOf(rawPath) {
 // v0.13/S2: additive detail-suffix for a flow that is ONLY ever referenced
 // as a subflow of other flows -- "no <start> trigger info (hasStartInfo
 // false -- the pre-existing 'screen or autolaunched' fallback branch) AND at
-// least one parent" (GOAL text, verbatim). Returns '' (no suffix) otherwise,
+// least one parent. Returns '' (no suffix) otherwise,
 // so `detail + subflowSuffixFor(...)` is always safe to concatenate.
-// Multiple-parent format is UNSPECIFIED by the GOAL text and untested by
-// either reference corpus (documented gap, GROUND-TRUTH's own "not covered"
-// note) -- ", "-joined canonical labels (flowInfo's own display casing,
+// Multiple parents use ", "-joined canonical labels (flowInfo's display casing,
 // falling back to the raw lowercased key if a parent was somehow never
 // registered into flowInfo) is a deterministic, readable choice for that
 // unexercised case.
@@ -6626,20 +6788,15 @@ function collectFlowEntries(index, addEntry) {
     for (const r of list) {
       if ((r.line || 0) < (best.line || 0)) best = r;
     }
-    // v0.12/C1 fix (integrator pass): the C1 contract's Entry.detail comment
+    // Entry.detail
     // enumerates the platform-event flow shape as the LITERAL, human-
     // readable 'platform event on <Object>' string (lowercase, spaced) --
     // NOT the generic '<triggerType> on <Object>' pattern, which would
     // otherwise render the raw metascan.js constant verbatim as
     // 'PlatformEvent on <Object>' (see PLATFORM_EVENT_TRIGGER_TYPE in
     // metascan.js / the lc(...)==='platformevent' check buildMetaChildren
-    // already uses to detect this same shape). Confirmed against adv-org's
-    // MANIFEST.md 'Entry catalog' section, whose 'Additional flow details'
-    // list documents `AcmeNoteEventFlow` -> `platform event on
-    // Acme_Note__e` verbatim -- every OTHER record-triggered shape in that
-    // same list (RecordAfterSave/RecordBeforeSave/etc.) DOES use the raw
-    // triggerType text unchanged, so only this one shape needed a special
-    // case.
+    // already uses to detect this same shape). Other record-triggered shapes
+    // use the raw triggerType text unchanged.
     const baseDetail = !best.flowObject
       ? 'screen or autolaunched'
       : lc(best.flowTriggerType) === 'platformevent'
@@ -6687,10 +6844,10 @@ function collectFlowEntries(index, addEntry) {
   // v0.13/S2: index.flowInfo (built by attachMetaCallers, see its own header
   // note) is a THIRD, independent fallback -- it registers a flow's label
   // from ANY flow-kind ref it ever saw, including the bare/synthetic
-  // (className:null) ref metascan.js's S1 amendment emits for a flow that
+  // (className:null) ref metascan.js emits for a flow that
   // has >=1 <subflows> element but ZERO apex actionCalls of its own (a
-  // subflow-only orchestration node -- e.g. this round's `Vtx_FlowChainTop`
-  // fixture). That shape never reaches metaCallers/externalMetaRefs at all
+  // subflow-only orchestration node. That shape never reaches
+  // metaCallers/externalMetaRefs at all
   // (attachMetaCallers' own local-attach loop skips any ref with no
   // className), so without this fallback such a flow would be invisible
   // here unless the CALLER separately populated index.flowFilePaths (the
@@ -6730,7 +6887,7 @@ function buildEntryCatalog(index) {
   let excludedTestEntries = 0;
   const defaultPackage = index && index.defaultPackage != null ? index.defaultPackage : null;
 
-  // C1 CONTRACT: "package|null, only when != default package". cm.package
+  // Package is included only when it differs from the default. cm.package
   // is already null whenever opts.packageOf was inactive/didn't cover the
   // file (see buildClassMeta's own header note) -- this only additionally
   // nulls out the ONE package that's actually the workspace default, so a
@@ -6743,13 +6900,13 @@ function buildEntryCatalog(index) {
 
   function addEntry(kind, dedupeKey, entry) {
     const m = groupsByKind.get(kind);
-    if (!m || m.has(dedupeKey)) return; // C1 CONTRACT: dedupe within kind -- first (pass-A registration order) wins, matching this file's existing first-parsed-wins convention
+    if (!m || m.has(dedupeKey)) return; // Dedupe within kind; first registration wins.
     m.set(dedupeKey, entry);
     if (entry.package != null) packageLabelsSeen.add(entry.package);
   }
 
   // A method whose entries[] carries a real catalog-kind label but whose
-  // owning class/method is isTest is EXCLUDED (C1 CONTRACT), counted once
+  // owning class/method is isTest is excluded, counted once
   // per (label that would have mapped to a kind) -- not once per method --
   // so a dual-annotation isTest method still counts as 2, matching how a
   // non-excluded dual-annotation method produces 2 real Entries.
@@ -6758,7 +6915,7 @@ function buildEntryCatalog(index) {
     const nameLower = lc(mm.name);
     // Constructors are never entry points (already entries:[] by
     // construction -- see buildClassMeta); accessor scopes are call-graph
-    // SOURCES only, same MUST-FIX #5 suppression suggestTargets() already
+    // sources only, matching the suppression suggestTargets() already
     // applies -- defensive here too, since entries[] should never actually
     // be populated for either shape.
     if (nameLower === '<init>' || nameLower === '(init)' || nameLower.startsWith('(get ') || nameLower.startsWith('(set ')) return;
@@ -6770,7 +6927,7 @@ function buildEntryCatalog(index) {
         continue;
       }
       let detail;
-      if (label === '@future (async)') detail = '@future'; // C1 CONTRACT: bare '@future', not the internal ' (async)'-suffixed label
+      if (label === '@future (async)') detail = '@future'; // Public label omits the internal suffix.
       else if (label === '@HttpX (REST)') detail = restDetailFor(cm, mm);
       else detail = label; // Batchable/Queueable/Schedulable and every 'others' kind: the entry annotation label verbatim, per contract
       addEntry(kind, `${cm.qualified}#${nameLower}`, {
@@ -6837,7 +6994,7 @@ function buildEntryCatalog(index) {
 
   const groups = ENTRY_KIND_ORDER.map((kind) => {
     const entries = Array.from(groupsByKind.get(kind).values());
-    entries.sort((a, b) => a.label.localeCompare(b.label)); // C1 CONTRACT: stable sort by label
+    entries.sort((a, b) => a.label.localeCompare(b.label)); // Stable sort by label.
     return { kind, label: ENTRY_KIND_GROUP_LABEL[kind], entries };
   });
 

@@ -3,8 +3,7 @@
 // workerpool.js's runWorkerChunk() (new Worker(WORKER_SCRIPT, ...)); never
 // require()'d directly by extension.js. Receives exactly one message per
 // worker lifetime: a chunk `[{ path, text }]` array. Requires the SAME
-// parser.js this file lives next to (frozen this round -- never touched,
-// just called) and returns FileFacts[] in the SAME order the chunk arrived
+// adjacent parser.js module and returns FileFacts[] in the SAME order the chunk arrived
 // in, so workerpool.js's caller can reassemble the full ordered facts list
 // by simple chunk concatenation.
 //

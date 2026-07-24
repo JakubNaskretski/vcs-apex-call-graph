@@ -1328,13 +1328,13 @@ attachMetaCallers(index, metaRefs);
   assert.strictEqual(flowChildren[0].label, 'AcmeMetaScreenFlow');
   assert.ok(flowChildren[0].entries.includes('Flow apex action'));
 
-  // ---- class-level target: only the class-level (no methodName) refs, i.e.
-  // the Aura controller="..." attribute and the CMDT record value -- the
-  // method-pinned lwc/flow refs must NOT reappear here (they already surface
-  // at their own method target).
+  // ---- class-level target: roll up every metadata surface for every method
+  // plus class-only refs, mirroring the Apex caller rollup itself.
   const classTree = buildCallerTree(index, { classLower: 'acmemetatarget', methodLower: null });
   const classMetaChildren = classTree.root.children.filter((n) => n.via === 'metadata');
-  assert.strictEqual(classMetaChildren.length, 2, 'class-level target should show the class-level (methodName-less) aura controller ref and the cmdt ref');
+  assert.strictEqual(classMetaChildren.length, 4, 'class-level target should show LWC, Flow, Aura, and CMDT references');
+  assert.ok(classMetaChildren.some((n) => n.kind === 'lwc'));
+  assert.ok(classMetaChildren.some((n) => n.kind === 'flow'));
   const auraChild = classMetaChildren.find((n) => n.kind === 'aura');
   assert.ok(auraChild, 'expected the aura class-level ref');
   assert.strictEqual(auraChild.label, 'AcmeMetaPanel');
@@ -1349,6 +1349,159 @@ attachMetaCallers(index, metaRefs);
   assert.deepStrictEqual(cmdtChild.entries, ['Custom Metadata record'], `metaEntryLabel('cmdt') must return 'Custom Metadata record' per MANIFEST F4b, got ${JSON.stringify(cmdtChild.entries)}`);
   assert.strictEqual(cmdtChild.via, 'metadata');
   assert.deepStrictEqual(cmdtChild.children, [], 'cmdt nodes are terminal');
+}
+
+// =========================================================================
+// Trigger Actions Framework: Action class <- Trigger_Action__mdt <- trigger
+// =========================================================================
+{
+  const TafAfterUpdateAction = ty('TafAfterUpdateAction', 'TafAfterUpdateAction', {
+    implementsTypes: ['TriggerAction.AfterUpdate'],
+    methods: [mth('afterUpdate', { line: 2 })],
+  });
+  const TafRecordTrigger = ty('TafRecordTrigger', 'TafRecordTrigger', {
+    methods: [mth('(trigger)', {
+      line: 1,
+      calls: [
+        cl('dot', 'run', {
+          receiver: 'new MetadataTriggerHandler()',
+          line: 2,
+          lineText: 'new MetadataTriggerHandler().run();',
+        }),
+        cl('new', 'MetadataTriggerHandler', {
+          line: 2,
+          lineText: 'new MetadataTriggerHandler().run();',
+        }),
+      ],
+    })],
+  });
+  const UnrelatedRecordTrigger = ty('UnrelatedRecordTrigger', 'UnrelatedRecordTrigger', {
+    methods: [mth('(trigger)', { line: 1 })],
+  });
+  const tafIndex = buildSemanticIndex([
+    mkFile(TafAfterUpdateAction),
+    file(PT('TafRecordTrigger'), 'trigger', [TafRecordTrigger], {
+      triggerInfo: { object: 'Taf_Record__c', events: ['after update'] },
+    }),
+    file(PT('UnrelatedRecordTrigger'), 'trigger', [UnrelatedRecordTrigger], {
+      triggerInfo: { object: 'Taf_Record__c', events: ['after update'] },
+    }),
+  ]);
+  attachMetaCallers(tafIndex, [
+    {
+      kind: 'cmdt', label: 'Trigger_Action.Validate_Record',
+      className: 'TafAfterUpdateAction', methodName: null,
+      fieldName: 'Apex_Class_Name__c', path: '/ws/customMetadata/Trigger_Action.Validate_Record.md-meta.xml',
+      line: 4, lineText: '<value xsi:type="xsd:string">TafAfterUpdateAction</value>',
+    },
+    {
+      kind: 'cmdt', label: 'Trigger_Action.Validate_Record',
+      className: 'Taf_Record_Setting', methodName: null,
+      fieldName: 'After_Update__c', path: '/ws/customMetadata/Trigger_Action.Validate_Record.md-meta.xml',
+      line: 8, lineText: '<value xsi:type="xsd:string">Taf_Record_Setting</value>',
+    },
+  ]);
+  // The setting arrives in a later batch to pin attachMetaCallers' existing
+  // order-independent multi-call contract.
+  attachMetaCallers(tafIndex, [
+    {
+      kind: 'cmdt', label: 'sObject_Trigger_Setting.Taf_Record_Setting',
+      className: 'Taf_Record__c', methodName: null,
+      fieldName: 'Object_API_Name__c', path: '/ws/customMetadata/sObject_Trigger_Setting.Taf_Record_Setting.md-meta.xml',
+      line: 4, lineText: '<value xsi:type="xsd:string">Taf_Record__c</value>',
+    },
+  ]);
+
+  const classTree = buildCallerTree(tafIndex, { classLower: 'tafafterupdateaction', methodLower: null });
+  const actionMetadata = classTree.root.children.find((node) => node.kind === 'cmdt');
+  assert(actionMetadata, 'TAF action class trace includes its Trigger_Action__mdt record');
+  assert(actionMetadata.entries.includes('Trigger action: after update'));
+  assert.deepStrictEqual(actionMetadata.children.map((node) => node.label), ['TafRecordTrigger'],
+    'only the object/event trigger proven to call MetadataTriggerHandler is linked');
+  assert.strictEqual(actionMetadata.children[0].via, 'metadata');
+  assert.strictEqual(actionMetadata.children[0].approximate, false);
+  assert.strictEqual(actionMetadata.children[0].sites[0].lineText, 'new MetadataTriggerHandler().run();');
+
+  const methodTree = buildCallerTree(tafIndex, { classLower: 'tafafterupdateaction', methodLower: 'afterupdate' });
+  const methodMetadata = methodTree.root.children.find((node) => node.kind === 'cmdt');
+  assert(methodMetadata, 'TAF context metadata also attaches to the exact afterUpdate implementation method');
+  assert.deepStrictEqual(methodMetadata.children.map((node) => node.label), ['TafRecordTrigger']);
+}
+
+// A single matching object/event trigger without a recognizable canonical
+// dispatcher is useful evidence but remains explicitly approximate.
+{
+  const TafFallbackAction = ty('TafFallbackAction', 'TafFallbackAction', {
+    implementsTypes: ['TriggerAction.BeforeInsert'],
+    methods: [mth('beforeInsert', { line: 2 })],
+  });
+  const TafCustomTrigger = ty('TafCustomTrigger', 'TafCustomTrigger', {
+    methods: [mth('(trigger)', { line: 1 })],
+  });
+  const fallbackIndex = buildSemanticIndex([
+    mkFile(TafFallbackAction),
+    file(PT('TafCustomTrigger'), 'trigger', [TafCustomTrigger], {
+      triggerInfo: { object: 'Taf_Fallback__c', events: ['before insert'] },
+    }),
+  ]);
+  attachMetaCallers(fallbackIndex, [
+    { kind: 'cmdt', label: 'Trigger_Action.Fallback', className: 'TafFallbackAction', methodName: null, fieldName: 'Apex_Class_Name__c', path: '/ws/action.xml', line: 1 },
+    { kind: 'cmdt', label: 'Trigger_Action.Fallback', className: 'Fallback_Setting', methodName: null, fieldName: 'Before_Insert__c', path: '/ws/action.xml', line: 2 },
+    { kind: 'cmdt', label: 'sObject_Trigger_Setting.Fallback_Setting', className: 'Taf_Fallback__c', methodName: null, fieldName: 'Object_API_Name__c', path: '/ws/setting.xml', line: 1 },
+  ]);
+  const tree = buildCallerTree(fallbackIndex, { classLower: 'taffallbackaction', methodLower: null });
+  const cmdt = tree.root.children.find((node) => node.kind === 'cmdt');
+  assert(cmdt && cmdt.children.length === 1);
+  assert.strictEqual(cmdt.children[0].label, 'TafCustomTrigger');
+  assert.strictEqual(cmdt.children[0].approximate, true, 'custom-dispatcher fallback must be visibly approximate');
+}
+
+// Disabled Trigger Actions Framework records remain visible as ordinary CMDT
+// references at class level, but must not advertise executable trigger paths.
+// Both the action-level and object-setting-level bypass flags are authoritative.
+{
+  const TafBypassAction = ty('TafBypassAction', 'TafBypassAction', {
+    implementsTypes: ['TriggerAction.AfterUpdate'],
+    methods: [mth('afterUpdate', { line: 2 })],
+  });
+  const TafBypassTrigger = ty('TafBypassTrigger', 'TafBypassTrigger', {
+    methods: [mth('(trigger)', {
+      line: 1,
+      calls: [
+        cl('dot', 'run', { receiver: 'MetadataTriggerHandler', line: 2 }),
+      ],
+    })],
+  });
+  const bypassIndex = buildSemanticIndex([
+    mkFile(TafBypassAction),
+    file(PT('TafBypassTrigger'), 'trigger', [TafBypassTrigger], {
+      triggerInfo: { object: 'Taf_Bypass__c', events: ['after update'] },
+    }),
+  ]);
+  attachMetaCallers(bypassIndex, [
+    { kind: 'cmdt', label: 'Trigger_Action.Action_Bypassed', className: 'TafBypassAction', methodName: null, fieldName: 'Apex_Class_Name__c', path: '/ws/action-bypassed.xml', line: 1 },
+    { kind: 'cmdt', label: 'Trigger_Action.Action_Bypassed', className: 'Active_Setting', methodName: null, fieldName: 'After_Update__c', path: '/ws/action-bypassed.xml', line: 2 },
+    { kind: 'cmdt', label: 'Trigger_Action.Action_Bypassed', className: 'true', methodName: null, fieldName: 'Bypass_Execution__c', path: '/ws/action-bypassed.xml', line: 3 },
+    { kind: 'cmdt', label: 'Trigger_Action.Setting_Bypassed', className: 'TafBypassAction', methodName: null, fieldName: 'Apex_Class_Name__c', path: '/ws/setting-bypassed-action.xml', line: 1 },
+    { kind: 'cmdt', label: 'Trigger_Action.Setting_Bypassed', className: 'Bypassed_Setting', methodName: null, fieldName: 'After_Update__c', path: '/ws/setting-bypassed-action.xml', line: 2 },
+    { kind: 'cmdt', label: 'sObject_Trigger_Setting.Active_Setting', className: 'Taf_Bypass__c', methodName: null, fieldName: 'Object_API_Name__c', path: '/ws/active-setting.xml', line: 1 },
+    { kind: 'cmdt', label: 'sObject_Trigger_Setting.Bypassed_Setting', className: 'Taf_Bypass__c', methodName: null, fieldName: 'Object_API_Name__c', path: '/ws/bypassed-setting.xml', line: 1 },
+    { kind: 'cmdt', label: 'sObject_Trigger_Setting.Bypassed_Setting', className: 'true', methodName: null, fieldName: 'Bypass_Execution__c', path: '/ws/bypassed-setting.xml', line: 2 },
+  ]);
+
+  const classTree = buildCallerTree(bypassIndex, { classLower: 'tafbypassaction', methodLower: null });
+  const disabledActions = classTree.root.children.filter((node) =>
+    node.kind === 'cmdt' && (node.label === 'Trigger_Action.Action_Bypassed' || node.label === 'Trigger_Action.Setting_Bypassed')
+  );
+  assert.strictEqual(disabledActions.length, 2, 'both bypassed action records remain inspectable at class level');
+  for (const node of disabledActions) {
+    assert.deepStrictEqual(node.children, [], `${node.label} must not link to a trigger while bypassed`);
+    assert(!node.entries.some((entry) => entry.startsWith('Trigger action:')),
+      `${node.label} must not be presented as an executable trigger action`);
+  }
+  const methodTree = buildCallerTree(bypassIndex, { classLower: 'tafbypassaction', methodLower: 'afterupdate' });
+  assert(!methodTree.root.children.some((node) => node.kind === 'cmdt'),
+    'bypassed actions must not attach to the exact TriggerAction context method');
 }
 
 // =========================================================================
@@ -3770,24 +3923,128 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
   });
   const index = buildSemanticIndex([mkFile(G71ServiceLocator), mkFile(G71UnitOfWork)]);
   const tree = buildCallerTree(index, { classLower: 'g71servicelocator', methodLower: 'get' });
-  // v0.13/H3: root.children is no longer unconditionally [] here -- the
-  // SAME collection-accessor-poisoned call site that R3 correctly refuses
-  // to attach as a caller EDGE now legitimately surfaces as an H3 "K
-  // unresolved sites elsewhere mention get(" info node (H3's mention count
-  // is arity/receiver-agnostic BY NAME ONLY, exactly like rule 7 itself --
-  // it doesn't know or care that THIS particular "get" mention came from a
-  // Map accessor rather than a genuine unresolvable dispatch attempt). R3's
-  // real invariant -- no FABRICATED CALLER EDGE to G71ServiceLocator.get --
-  // is what the filter below actually proves; the one remaining child is
-  // the informational mentions node, not a caller.
-  const realCallerEdges = tree.root.children.filter((n) => n.kind !== 'unresolved-mentions');
   assert.deepStrictEqual(
-    realCallerEdges,
+    tree.root.children,
     [],
-    "v0.7.1/R3: a Map-typed receiver's .get(...) call must not fabricate an edge to an unrelated globally-unique .get() method elsewhere -- collection-accessor names must never reach rule 7"
+    "a known Map.get(...) call is platform behavior: it must neither fabricate an edge nor pollute a user method's unresolved-caller suggestions"
   );
-  assert.strictEqual(tree.root.children.length, 1, 'v0.13/H3: the ONLY child is the new unresolved-mentions info node, not a fabricated caller edge');
-  assert.strictEqual(tree.root.children[0].kind, 'unresolved-mentions');
+  assert.strictEqual(index.stats.unresolvedSites, 0, 'known collection calls are not unresolved Apex dispatch');
+  assert.strictEqual(index.unresolvedSitesByName.has('get'), false);
+  assert.strictEqual(index.unresolvedForwardCounts.get('g71unitofwork#registernew') || 0, 0);
+}
+
+// Known non-collection platform receivers are equally non-candidates. An
+// unresolved receiver with the same method name still remains inspectable.
+{
+  const PlatformContainsTarget = ty('PlatformContainsTarget', 'PlatformContainsTarget', {
+    methods: [mth('contains', { params: [{ name: 'value', type: 'String' }] })],
+  });
+  const OtherContainsTarget = ty('OtherContainsTarget', 'OtherContainsTarget', {
+    methods: [mth('contains', { params: [{ name: 'value', type: 'String' }] })],
+  });
+  const PlatformAndUnknownCaller = ty('PlatformAndUnknownCaller', 'PlatformAndUnknownCaller', {
+    methods: [mth('run', {
+      locals: [{ name: 'message', type: 'String', line: 1 }],
+      calls: [
+        cl('dot', 'contains', { receiver: 'message', argTexts: ["'x'"], line: 2, lineText: "message.contains('x');" }),
+        cl('dot', 'contains', { receiver: 'mystery', argTexts: ["'x'"], line: 3, lineText: "mystery.contains('x');" }),
+      ],
+    })],
+  });
+  const index = buildSemanticIndex([
+    mkFile(PlatformContainsTarget), mkFile(OtherContainsTarget), mkFile(PlatformAndUnknownCaller),
+  ]);
+  const mentions = index.unresolvedSitesByName.get('contains') || [];
+  assert.strictEqual(mentions.length, 1, 'only the genuinely unknown receiver remains a potential caller');
+  assert.strictEqual(mentions[0].line, 3);
+  assert.strictEqual(index.stats.unresolvedSites, 1);
+}
+
+// Class-level caller rollups include method-specific LWC imports plus
+// class-level access metadata. Method traces remain exact and do not inherit
+// permission/profile grants, which authorize the class rather than call one
+// method. Unknown instance-style calls with the same bare name are not
+// candidates for a static @AuraEnabled method.
+{
+  const AccessTarget = ty('AccessTarget', 'AccessTarget', {
+    methods: [
+      mth('load', { annotations: ['auraenabled'], isStatic: true }),
+      mth('save', { annotations: ['auraenabled'], isStatic: true }),
+    ],
+  });
+  const UnrelatedLoadCaller = ty('UnrelatedLoadCaller', 'UnrelatedLoadCaller', {
+    methods: [mth('run', {
+      calls: [cl('dot', 'load', {
+        receiver: 'unknownService', line: 7, lineText: 'unknownService.load();',
+      })],
+    })],
+  });
+  const index = buildSemanticIndex([mkFile(AccessTarget), mkFile(UnrelatedLoadCaller)]);
+  attachMetaCallers(index, [
+    { kind: 'lwc', label: 'acmeAccessPanel', className: 'AccessTarget', methodName: 'load', path: '/ws/lwc/acmeAccessPanel/acmeAccessPanel.js', line: 2, lineText: "import load from '@salesforce/apex/AccessTarget.load';" },
+    { kind: 'lwc', label: 'acmeAccessPanel', className: 'AccessTarget', methodName: 'save', path: '/ws/lwc/acmeAccessPanel/acmeAccessPanel.js', line: 3, lineText: "import save from '@salesforce/apex/AccessTarget.save';" },
+    { kind: 'permissionset', label: 'Acme_Portal_Access', className: 'AccessTarget', methodName: null, path: '/ws/permissionsets/Acme_Portal_Access.permissionset-meta.xml', line: 4, lineText: '<apexClass>AccessTarget</apexClass>' },
+    { kind: 'profile', label: 'Acme_Consultant', className: 'AccessTarget', methodName: null, path: '/ws/profiles/Acme_Consultant.profile-meta.xml', line: 4, lineText: '<apexClass>AccessTarget</apexClass>' },
+  ]);
+
+  const methodTree = buildCallerTree(index, { classLower: 'accesstarget', methodLower: 'load' });
+  assert.deepStrictEqual(methodTree.root.children.map((n) => n.kind), ['lwc'],
+    'static @AuraEnabled trace shows its exact LWC import without unrelated name-only noise');
+  assert.strictEqual(methodTree.root.children[0].sites.length, 1);
+  assert.strictEqual((index.methodCallers.get('accesstarget#load') || []).length, 0,
+    'unknown instance receiver must not attach to a static target through unique-name fallback');
+  assert.strictEqual((index.unresolvedSitesByName.get('load') || []).length, 1,
+    'the unknown call remains represented in workspace diagnostics');
+
+  const classTree = buildCallerTree(index, { classLower: 'accesstarget', methodLower: null });
+  const lwc = classTree.root.children.find((n) => n.kind === 'lwc');
+  assert.ok(lwc, 'class-level trace rolls up method-specific LWC imports');
+  assert.strictEqual(lwc.sites.length, 2, 'two method imports in one component group into one LWC node with two sites');
+  const permissionSet = classTree.root.children.find((n) => n.kind === 'permissionset');
+  const profile = classTree.root.children.find((n) => n.kind === 'profile');
+  assert.ok(permissionSet && profile, 'class-level access metadata is visible');
+  assert.strictEqual(permissionSet.via, 'access');
+  assert.strictEqual(profile.via, 'access');
+  assert.deepStrictEqual(permissionSet.entries, ['Permission Set Apex access']);
+  assert.deepStrictEqual(profile.entries, ['Profile Apex access']);
+}
+
+// Static @InvocableMethod entry points have the same exact-metadata rule as
+// LWC-facing @AuraEnabled methods. A Flow's bare action name resolves through
+// the sole invocable annotation; an unrelated unknown receiver sharing the
+// method name is neither a caller edge nor a target-specific suggestion.
+{
+  const InvocableTarget = ty('InvocableTarget', 'InvocableTarget', {
+    methods: [mth('dispatch', {
+      annotations: ['invocablemethod'], isStatic: true,
+      params: [{ name: 'requests', type: 'List<String>' }],
+    })],
+  });
+  const UnrelatedDispatchCaller = ty('UnrelatedDispatchCaller', 'UnrelatedDispatchCaller', {
+    methods: [mth('run', {
+      calls: [cl('dot', 'dispatch', {
+        receiver: 'unknownRouter', argTexts: ['requests'], line: 8,
+        lineText: 'unknownRouter.dispatch(requests);',
+      })],
+    })],
+  });
+  const index = buildSemanticIndex([mkFile(InvocableTarget), mkFile(UnrelatedDispatchCaller)]);
+  attachMetaCallers(index, [{
+    kind: 'flow', label: 'Acme_Action_Flow', className: 'InvocableTarget', methodName: null,
+    path: '/ws/flows/Acme_Action_Flow.flow-meta.xml', line: 12,
+    lineText: '<actionName>InvocableTarget</actionName>', namespace: null,
+    flowObject: null, flowRecordTriggerType: null, flowTriggerType: null, subflows: [],
+  }]);
+
+  const tree = buildCallerTree(index, { classLower: 'invocabletarget', methodLower: 'dispatch' });
+  assert.deepStrictEqual(tree.root.children.map((n) => n.kind), ['flow'],
+    'static @InvocableMethod trace shows its exact Flow action without unrelated name-only noise');
+  assert.strictEqual(tree.root.children[0].label, 'Acme_Action_Flow');
+  assert.strictEqual(tree.root.children[0].via, 'metadata');
+  assert.strictEqual((index.methodCallers.get('invocabletarget#dispatch') || []).length, 0,
+    'unknown instance receiver must not attach to a static invocable target');
+  assert.strictEqual((index.unresolvedSitesByName.get('dispatch') || []).length, 1,
+    'the unrelated unknown site remains represented in workspace diagnostics');
 }
 
 // ---- v0.7.1/R4: template-method self-dispatch override fan-out -----------
@@ -5495,15 +5752,10 @@ function buildV9ChainCallee5() {
   const shipmentTriggerChild = findChild(bothTypesTree.root.children, 'KappaShipmentTrigger');
   assert.ok(shipmentTriggerChild, 'v0.11/B2: commitBothTypes ALSO narrows to Kappa_Shipment__c -> KappaShipmentTrigger (before insert, after insert -- matches)');
   assert.strictEqual(shipmentTriggerChild.approximate, true);
-  // B2 only touches DML/trigger narrowing -- it does NOT change ordinary
-  // call resolution of the two evidence-gathering .add(...) calls
-  // themselves (neither is a real method on any indexed class), so the
-  // pre-existing "N unresolved sites" aggregate leaf still legitimately
-  // co-occurs alongside the narrowed trigger edges -- asserted explicitly
-  // here so this isn't mistaken for an overlooked side effect.
-  const bothTypesUnresolved = findChild(bothTypesTree.root.children, '2 unresolved sites');
-  assert.ok(bothTypesUnresolved, 'the 2 .add(...) calls stay unresolved as ORDINARY calls -- B2 narrows the DML/trigger relationship, not method-call resolution');
-  assert.strictEqual(bothTypesTree.root.children.length, 4, 'exactly 3 narrowed trigger edges + 1 aggregated unresolved-calls leaf, nothing else');
+  // The two evidence-gathering List.add(...) calls are known platform calls,
+  // so they neither become Apex edges nor unresolved-call noise.
+  assert.strictEqual(findChild(bothTypesTree.root.children, '2 unresolved sites'), undefined);
+  assert.strictEqual(bothTypesTree.root.children.length, 3, 'exactly 3 narrowed trigger edges, nothing else');
 
   // Same 3 edges, symmetric caller-direction check (who calls each trigger).
   const orderTriggerCallerTree = buildCallerTree(index, { classLower: 'v11kappaordertrigger', methodLower: null });
@@ -5528,8 +5780,8 @@ function buildV9ChainCallee5() {
   const addAllOrderUowTrigger = findChild(addAllTree.root.children, 'V11KappaOrderUowTrigger');
   assert.ok(addAllOrderUowTrigger);
   assert.strictEqual(findChild(addAllTree.root.children, 'KappaShipmentTrigger'), undefined, 'must NOT ALSO narrow to Kappa_Shipment__c -- only Kappa_Order__c evidence exists in this method');
-  assert.ok(findChild(addAllTree.root.children, '1 unresolved site'), 'the addAll(...) call itself stays unresolved as an ORDINARY call, same reasoning as commitBothTypes');
-  assert.strictEqual(addAllTree.root.children.length, 3, 'exactly 2 narrowed trigger edges + 1 unresolved-call leaf, nothing else');
+  assert.strictEqual(findChild(addAllTree.root.children, '1 unresolved site'), undefined, 'known List.addAll(...) is not unresolved Apex dispatch');
+  assert.strictEqual(addAllTree.root.children.length, 2, 'exactly 2 narrowed trigger edges, nothing else');
 
   // commitWithNoInMethodEvidence: zero evidence -> marker stays exactly as
   // today, DML-verb-independent (this one is `update`, not `insert`).
@@ -5548,7 +5800,7 @@ function buildV9ChainCallee5() {
   const complexExprTree = buildCalleeTree(index, { classLower: 'vtxunitofworknarrowing', methodLower: 'commitWithComplexExpressionEvidence' });
   assert.ok(findChild(complexExprTree.root.children, 'DML on unresolved SObject type'), 'v0.11/B2: a method-call-result add() argument must NOT count as narrowing evidence');
   assert.strictEqual(findChild(complexExprTree.root.children, 'V11KappaOrderTrigger'), undefined, 'must NOT narrow to Kappa_Order__c even though locateExistingOrder() happens to RETURN that type -- cross-method inference is out of scope');
-  assert.strictEqual(complexExprTree.root.children.length, 2, 'the honest marker + 1 unresolved-call leaf (the add(locateExistingOrder()) call itself, an ordinary unresolved call) -- nothing narrowed');
+  assert.strictEqual(complexExprTree.root.children.length, 1, 'only the honest DML marker remains; known List.add(...) is not unresolved Apex dispatch');
 
   // B2-ii promoted regression: real pre-existing-shaped commitWork, zero
   // in-method evidence (the real add() lives in the sibling registerNew)

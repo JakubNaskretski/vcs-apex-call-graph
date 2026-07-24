@@ -1,15 +1,13 @@
 'use strict';
 // targets.js — H5(b) suggestTargets picker-hygiene post-filter.
 //
-// Pure function, no vscode/fs dependency, and deliberately does NOT require
-// resolver.js (owned by another agent this round, and this module's whole
-// point is to be a decoupled post-filter layered on top of whatever shape
-// resolver.suggestTargets() returns today).
+// Pure function with no vscode/fs dependency. It is a decoupled post-filter
+// layered on top of whatever shape resolver.suggestTargets() returns.
 //
 // Contract:
 //
 //   refineTargets(list) -> [{ label, classLower, methodLower }]
-//   (v0.7 / B3: an output item ALSO carries `package` iff its source item
+//   (an output item ALSO carries `package` iff its source item
 //   did -- see the B3 addendum below the H5(b) rules.)
 //
 //   `list` is expected to be resolver.js's suggestTargets(index) output --
@@ -26,15 +24,14 @@
 //   Any other item shape/methodLower value passes through unchanged (aside
 //   from the dedupe/sort passes below).
 //
-// INTEGRATION NOTE for extension.js's owner (not applied here -- targets.js
-// owns only this file): call refineTargets() on the result of
+// extension.js calls refineTargets() on the result of
 // resolver.suggestTargets(index) wherever resolveTarget()'s QuickPick is
 // built (currently `const picks = resolver.suggestTargets(index);` right
 // before the showQuickPick() call) -- i.e.
 //   const picks = targets.refineTargets(resolver.suggestTargets(index));
 // The returned items keep the same { label, classLower, methodLower } shape
 // the QuickPick/`chosen.target.*` code already reads (plus an optional
-// `package` field, v0.7 / B3 -- see below), so no other change is required
+// `package` field; see below), so no other change is required
 // at that call site beyond forwarding `package` onto `target` when present.
 //
 // H5(b) rules, applied in order:
@@ -47,7 +44,7 @@
 //      label changes).
 //   3. Dedupe: after step 2, two entries can end up with the identical
 //      (classLower, label) pair even though their methodLower differs --
-//      e.g. in the real adv-org corpus a trigger's class-level entry
+//      e.g. a trigger's class-level entry
 //      ({methodLower:null, label:'AcmeOrderTrigger'}) and its '(trigger)'
 //      pseudo-method entry ({methodLower:'(trigger)', label:
 //      'AcmeOrderTrigger'}) both render the exact same bare trigger name.
@@ -69,22 +66,21 @@
 // malformed items -- missing/non-string label or classLower -- (dropped,
 // never throws).
 //
-// v0.7 / B3 contract addition (additive, fully backward compatible):
+// Package-aware target labels (additive and backward compatible):
 //   Each input item MAY now also carry an optional `package` field --
 //   string | null -- mirroring TNode's own optional `package` field.
-//   resolver.js's suggestTargets(), once it lands B2's duplicate-name
-//   buckets + packageOf plumbing, is expected to stamp this on every item.
+//   resolver.js's package-aware suggestTargets() stamps this on every item.
 //   When an input item has NO `package` property at all (today's shape,
 //   and every pre-v0.7 fixture in test-targets.js), refineTargets()'s
 //   output for that item is untouched -- no `package` key appears on the
-//   output object either, so a packageless workspace (or a resolver.js
-//   that hasn't landed B2 yet) is BYTE-IDENTICAL to pre-v0.7 output. This
+//   output object either, so a packageless workspace (or an older resolver)
+//   is BYTE-IDENTICAL to pre-v0.7 output. This
 //   file never itself decides "there is no package here"; it only ever
 //   reacts to what's actually present on the item.
 //
 //   When 2+ items share the same classLower AND carry 2+ DISTINCT
-//   `package` values between them -- exactly "a duplicate qualified name,
-//   surfaced across packages" per resolver.js's B2 (index.stats
+//   `package` values between them -- a duplicate qualified name surfaced
+//   across packages (index.stats
 //   .duplicateNames counts these at the classLower/qualified-name level,
 //   not per display label) -- EVERY item in that classLower group gets its
 //   label suffixed ' (pkgLabel)', using that item's OWN package (a
@@ -96,7 +92,7 @@
 //   classes both display as bare "AcmeOrderUtil") distinguishable in the
 //   QuickPick, which is the actual bug this closes -- without it, rule 3's
 //   same-(classLower,label) dedupe below would silently collapse them into
-//   one, exactly the "first-wins-dropped" behavior B2/B3 exist to end. A
+//   one, recreating the old first-wins behavior. A
 //   classLower whose items all carry the SAME package (the overwhelmingly
 //   common case -- a class that isn't duplicated) is left alone: no
 //   suffix, matching "ONLY for duplicated names" from the spec.
@@ -108,32 +104,26 @@
 //   suffixed output never double-appends the same suffix (mirroring
 //   ctorLabel's ALREADY_RELABELED_RE guard above).
 //
-// v0.8 / N4/N6 contract addition (additive, forward-compat -- resolver.js
-// does not produce external-target items yet, a different phase's job; see
-// the CONTRACT AMENDMENTS' own N1/N2/N4 text): each input item MAY now also
+// Managed-reference addition: each input item MAY also
 // carry an optional `kind` field -- mirroring TNode.kind's new 'external'
-// value (v0.8 N1) -- once resolver.js's suggestTargets() lands its N4
-// addition ("suggestTargets includes externals that have >=1 local ref").
+// value -- resolver.js includes external targets that have at least one
+// local reference.
 // This file reacts to it exactly the way it already reacts to the optional
 // `package` field (B3, above): an item with NO `kind` property at all
 // (today's shape, and every pre-v0.8 fixture in test-targets.js) is
 // COMPLETELY untouched -- no code path here even looks at `item.kind`
-// unless it's present, so a resolver.js that hasn't landed the N4 change
+// unless it's present, so a resolver.js without external target support
 // yet keeps this file byte-identical to pre-v0.8 output.
 //
 //   When an item's `kind === 'external'`, its (post steps 1-3) label gets a
-//   ' (managed)' suffix appended -- per N4's CONTRACT AMENDMENT text
-//   ("suggestTargets includes externals ... labeled 'zenq.Billing
-//   (managed)')") and N6's own text ("QuickPick '(managed)' suffix
-//   entries") -- idempotent (mirrors ctorLabel's ALREADY_RELABELED_RE
+//   ' (managed)' suffix appended. The transform is idempotent (mirrors
+//   ctorLabel's ALREADY_RELABELED_RE
 //   guard), applied in the SAME per-item pass as rule 2's constructor
 //   relabel, so it participates correctly in rule 3's dedupe key and rule
 //   4's final re-sort exactly like every other label transform here.
 //   `kind` itself is carried through onto the output item (mirroring how
 //   `package` is carried through) whenever the source item had one, so a
-//   downstream caller (extension.js's buildSuggestPicks, wiring left for
-//   that file's own owner to land -- see targets.js's established
-//   INTEGRATION NOTE convention above) can distinguish an external pick
+//   downstream caller can distinguish an external pick
 //   from a local one without re-deriving it from the suffixed label text.
 //
 //   External items never carry a `package` field in N4's design (they are
@@ -146,7 +136,7 @@ const FIELD_INIT_METHOD = '(init)';
 const CTOR_SUFFIX_RE = /\.?<init>\s*$/;
 const ALREADY_RELABELED_RE = / \(constructor\)$/;
 const LEFTOVER_CTOR_TOKEN_RE = /<init>/;
-// v0.8 (N4/N6): exact suffix text per N4/N6's CONTRACT AMENDMENT text.
+// Managed-reference display suffix.
 const MANAGED_SUFFIX = ' (managed)';
 const ALREADY_MANAGED_RE = / \(managed\)$/;
 
@@ -172,7 +162,7 @@ function ctorLabel(rawLabel) {
   return stripped + ' (constructor)';
 }
 
-// v0.8 (N4/N6): 'zenq.Billing' -> 'zenq.Billing (managed)'. Idempotent
+// 'zenq.Billing' -> 'zenq.Billing (managed)'. Idempotent
 // (calling it again on an already-suffixed string is a no-op), same
 // convention as ctorLabel above.
 function managedLabel(rawLabel) {
@@ -216,18 +206,18 @@ function refineTargets(list) {
     // Rule 2: relabel the merged-constructor synthetic method.
     let label = methodLower === CTOR_METHOD ? ctorLabel(item.label) : item.label;
 
-    // v0.8 (N4/N6): a suggestTargets entry for an external (managed-package)
+    // A suggestTargets entry for an external (managed-package)
     // target gets a ' (managed)' suffix -- see the header comment above for
     // the full contract. Applied right after rule 2's constructor relabel,
     // BEFORE the dedupe key below is built, so it participates correctly in
     // rule 3's dedupe/rule 4's sort exactly like the constructor relabel
     // does. `item.kind` is read directly (not defaulted) -- absent on every
     // pre-v0.8 item, which is what keeps this a complete no-op until
-    // resolver.js's owner actually starts stamping kind:'external' on
+    // resolver.js starts stamping kind:'external' on
     // suggestTargets() output.
     if (item.kind === 'external') label = managedLabel(label);
 
-    // v0.7 / B3: only items whose SOURCE actually carried a 'package'
+    // Only items whose SOURCE actually carried a 'package'
     // property participate in package-aware dedupe/suffixing below --
     // hasPkg is false for every item in a packageless workspace (or
     // against a pre-B2 resolver.js), which is exactly what keeps that case
@@ -248,10 +238,9 @@ function refineTargets(list) {
 
     const outItem = { label, classLower: item.classLower, methodLower };
     if (hasPkg) outItem.package = pkg;
-    // v0.8 (N4/N6): carry `kind` through onto the output item, same
+    // Carry `kind` through onto the output item, same
     // "only when the source actually had it" convention as `package`
-    // above -- see the header comment's INTEGRATION NOTE for why this file
-    // stops at carrying the field through rather than wiring it into
+    // above. This file stops at carrying the field through rather than wiring it into
     // extension.js's `target` object itself.
     if (typeof item.kind === 'string' && item.kind) outItem.kind = item.kind;
     out.push(outItem);

@@ -5,59 +5,55 @@
 // that knows how a TNode/SiteView (produced by resolver.js) turns into
 // something extension.js can hand to vscode.TreeItem.
 //
-// Input shapes, copied verbatim from the frozen "=== CONTRACT: resolver.js
-// ===" section (this file must not change them):
+// Input shapes produced by resolver.js:
 //
 //   TNode = {
 //     label,        // 'Cls.method' | 'TriggerName' | 'Cls' | metadata label
-//                   // | 'N unresolved sites' (v0.7 A6: aggregated leaf)
+//                   // | 'N unresolved sites' (aggregated leaf)
 //     kind,         // 'method' | 'trigger' | 'class' |
-//                   // 'lwc' | 'aura' | 'flow' | 'omniscript' | 'vf' (A6:
+//                   // 'lwc' | 'aura' | 'flow' | 'omniscript' | 'vf'
 //                   // metadata-caller nodes attached via resolver.js's
-//                   // attachMetaCallers/buildMetaChildren) | 'cmdt' (v0.4
-//                   // F4b: Custom Metadata record, same family as the A6
+//                   // attachMetaCallers/buildMetaChildren) | 'cmdt' (Custom
+//                   // Metadata record, same family as the other metadata
 //                   // kinds -- always terminal today, but this file does
 //                   // not assume that; see the children note below) |
-//                   // 'anonymous' (v0.5 G4: an anonymous-Apex-script
+//                   // 'anonymous' (an anonymous-Apex-script
 //                   // (.apex) pseudo-type/method node -- Apex-source family
 //                   // like 'method'/'trigger'/'class', NOT a metadata-
-//                   // caller kind; always a pure root, per the G4 spec) |
-//                   // 'exception' (v0.7 A3: forward-traced throw target --
+//                   // caller kind; always a pure root) |
+//                   // 'exception' (forward-traced throw target --
 //                   // the exception class reached by a `throw` site, always
-//                   // terminal) | 'unresolved' (v0.7 A6: one aggregated,
+//                   // terminal) | 'unresolved' (one aggregated,
 //                   // always-terminal, always-approximate leaf per method
 //                   // summarizing every forward call site that couldn't be
-//                   // resolved to an indexed target) | 'external' (v0.8 N1/
-//                   // N4, forward-compat -- resolver.js does not produce
-//                   // this kind yet, same status as seenElsewhere below: a
+//                   // resolved to an indexed target) | 'external' (a
 //                   // reference into MANAGED-PACKAGE code this workspace has
 //                   // no source for, e.g. `zenq.Billing.charge(...)` or a
 //                   // DML target naming a managed object like
 //                   // `kwx__Ledger__c`. Always carries via:'external' (see
-//                   // the `via` field doc below) and, per N1's ExternalMeta
-//                   // shape, a `ns` field naming its namespace (e.g. 'zenq')
+//                   // the `via` field doc below) and a `ns` field naming its
+//                   // namespace (e.g. 'zenq')
 //                   // -- read by externalNamespace()/managedBadge() below,
 //                   // with a label-derived fallback for a TNode that arrives
 //                   // without `ns` (see externalNamespace's own comment).
 //                   // TERMINAL in the callees direction (no source to
 //                   // recurse into); in the callers direction its children
 //                   // are the ordinary local caller subtree of every site
-//                   // that references it (per N4) -- this file needs no
+//                   // that references it -- this file needs no
 //                   // special-casing for either case, since it already
 //                   // renders whatever `children` array it is given
 //                   // generically, exactly like the 'flow' note just above) --
-//                   // NOTE (v0.4 F1b): 'flow' nodes are no longer
+//                   // NOTE: 'flow' nodes are not
 //                   // guaranteed terminal -- a record-triggered flow's
 //                   // children are the DML sites on its object
 //                   // (resolver.js's doing; this file already renders
 //                   // ANY node's children generically, so no special-
-//                   // casing was needed here for that). Per the A2 spec, a
+//                   // casing was needed here for that). A
 //                   // 'flow' node IS always terminal specifically in the
 //                   // forward (callees) direction -- still no special-
 //                   // casing needed here, since a terminal TNode simply
 //                   // arrives with an empty `children` array either way.
-//                   // v0.13 (S2/S3): that A2 terminality is no longer
-//                   // absolute -- a 'flow' node's children may now ALSO be
+//                   // A 'flow' node's children may ALSO be
 //                   // its own subflow chain (via:'subflow', both
 //                   // directions: parent flows when tracing callers, child
 //                   // flows when tracing callees), recursing arbitrarily
@@ -65,7 +61,7 @@
 //                   // it is given generically" posture applies -- no
 //                   // special-casing needed here for this either.
 //     className, path, line,   // line = decl line for jump
-//     package,      // string|null|undefined (v0.7 B3): the sfdx package
+//     package,      // string|null|undefined: the sfdx package
 //                    // label (packageDirectories' `package` name, or the
 //                    // path segment when a directory has none) that this
 //                    // node's file lives under; undefined/null in a
@@ -75,28 +71,27 @@
 //                    // threading below, which turns it into a "(label)"
 //                    // badge ONLY when it differs from the traced target's
 //                    // own package (root.package).
-//     ns,           // string|undefined (v0.8 N1/N4, forward-compat): ONLY
+//     ns,           // string|undefined: ONLY
 //                    // meaningful on a kind:'external' node -- its managed-
 //                    // package namespace (e.g. 'zenq'), mirroring
-//                    // ExternalMeta.ns from N1's index contract. Rendered as
+//                    // ExternalMeta.ns from the semantic index. Rendered as
 //                    // the 'managed: <ns>' badge (see managedBadge() below),
 //                    // never on any other kind.
 //     entries: [string], isTest,
 //     via: string|null,        // 'typed'|'static'|'new'|'this'|'super'|
 //                               // 'interface'|'unique-name'|'lexical'|
 //                               // 'metadata'|'dml'|'dynamic'|'override'
-//                               // (v0.4 adds the last three)|'publish'|
-//                               // 'throws'|'narrowed'|'async' (v0.5 G1/G2/
-//                               // G3/G5 add these four -- only 'narrowed' is
-//                               // approximate)|'ambiguous' (v0.7 B2: a
+//                               // 'publish'|'throws'|'narrowed'|'async'
+//                               // (only 'narrowed' is approximate)|
+//                               // 'ambiguous' (a
 //                               // duplicate-named class reference that
 //                               // neither same-package nor default-package
 //                               // preference could resolve -- approximate)|
-//                               // 'external' (v0.8 N1/N2/N4, forward-compat:
+//                               // 'external' (
 //                               // a reference into managed-package code --
-//                               // NOT approximate, per N2's precedence rule
-//                               // 3: a genuine namespace match is exact, not
-//                               // a guess)|'subflow' (v0.13 S2/S3: a declared
+//                               // NOT approximate: a genuine namespace match
+//                               // is exact, not
+//                               // a guess)|'subflow' (a declared
 //                               // <subflows> reference between two Flow
 //                               // files -- NOT approximate, a declared
 //                               // reference, same "genuine, not a guess"
@@ -109,7 +104,7 @@
 //     sites: [SiteView],
 //     children: [TNode],
 //     cyclic, truncated, approximate,
-//     caughtHere,   // boolean, v0.5 G2: an ancestor catch clause (exact
+//     caughtHere,   // boolean: an ancestor catch clause (exact
 //                    // type, an ancestor in the USER exception hierarchy, or
 //                    // bare 'Exception') catches the exception being traced
 //                    // AT THIS NODE. Always paired with a matching entries
@@ -118,8 +113,7 @@
 //                    // badge for it (see badgesForNode). Traversal continues
 //                    // past a caughtHere node (rethrow is unknowable), so
 //                    // this is purely an informational marker, not a leaf.
-//     seenElsewhere,  // boolean, v0.6 H1 (forward-compat -- resolver.js does
-//                     // not produce this yet): this method's caller subtree
+//     seenElsewhere,  // boolean: this method's caller subtree
 //                     // was already expanded once elsewhere in the SAME
 //                     // buildCallerTree run (per-run DAG dedup), so
 //                     // `children` is forced empty here even though real
@@ -130,8 +124,7 @@
 //                     // 'root' badge (a seenElsewhere node is emphatically
 //                     // NOT "no known caller", it is "caller already shown
 //                     // above").
-//     expandable,   // boolean, v0.9 P1 (forward-compat -- resolver.js does
-//                    // not produce this yet): this node hit the PROGRESSIVE
+//     expandable,   // boolean: this node hit the PROGRESSIVE
 //                    // depth frontier (depth >= opts.initialDepth and its
 //                    // methodKey is not in opts.expandedKeys) -- real
 //                    // callers/callees exist (pendingCount > 0 says exactly
@@ -152,13 +145,13 @@
 //                    // seenElsewhere), excluded from the 'root' badge
 //                    // (isRootNode below) and from entry-first's
 //                    // `_entryFirstRoot` stamp (see rerootEntryFirst).
-//     pendingCount,  // number|undefined, v0.9 P1 (forward-compat): ONLY
+//     pendingCount,  // number|undefined: ONLY
 //                    // meaningful alongside expandable:true -- the count of
 //                    // DIRECT distinct caller/callee groups this node has
 //                    // that were not expanded. Read by frontierBadge/
 //                    // shapeNode below to render '+N'; absent/non-number is
 //                    // treated as "count unknown" (renders a bare '+').
-//     methodKey,     // string|undefined, v0.9 P1 (forward-compat): ONLY
+//     methodKey,     // string|undefined: ONLY
 //                    // meaningful alongside expandable:true -- the exact
 //                    // `methodKeyLower` identity (resolver.js's own
 //                    // `${classLower}#${methodLower}` composite, or a bare
@@ -180,13 +173,13 @@
 //     path, line, col, lineText,
 //     argsRendered: string|null,  // params zipped with args, or raw args
 //     via,
-//     overloadSig: string|null,  // A4: 'name(TypeHead, ...)' when the call
+//     overloadSig: string|null,  // 'name(TypeHead, ...)' when the call
 //                                // site pinned a specific overload out of a
 //                                // true overload family; null otherwise.
-//                                // v0.6 (H3): previously carried by
+//                                // previously carried by
 //                                // resolver.js's SiteView but never rendered
-//                                // anywhere in this file -- confirmed bug,
-//                                // fixed by siteLabel/siteDetailLine below.
+//                                // anywhere in this file; now rendered by
+//                                // siteLabel/siteDetailLine below.
 //   }
 //
 // LINE-NUMBERING CONVENTION (not pinned down explicitly by the contract,
@@ -210,14 +203,14 @@
 //     jump: { path, line, col } | null,   // line still 1-based, see above
 //     collapsible,    // boolean
 //     children: [UiNode],
-//     loadMore,       // boolean, v0.9 P1/P3 -- ONLY present (true) on the
+//     loadMore,       // boolean -- ONLY present (true) on the
 //                      // one synthetic child shapeNode appends to an
 //                      // expandable node (see shapeNode/shapeLoadMoreChild
 //                      // below); every ordinary UiNode simply omits this
 //                      // field, so `uiNode.loadMore` is the extension.js-
 //                      // side test for "this TreeItem is the click-to-
 //                      // expand affordance, not a real caller/callee".
-//     expandKey,      // string|null, v0.9 P1/P3 -- ONLY present alongside
+//     expandKey,      // string|null -- ONLY present alongside
 //                      // loadMore:true -- the methodKeyLower extension.js
 //                      // must add to opts.expandedKeys (see
 //                      // frontierMethodKey below) when this item is
@@ -242,23 +235,21 @@ const ICON_ENTRIES = 'plug';
 const ICON_METHOD = 'symbol-method';
 const ICON_CLASS = 'symbol-class';
 
-// v0.5 (G4): anonymous-Apex-script node icon -- Apex-source family, checked
+// Anonymous-Apex-script node icon -- Apex-source family, checked
 // alongside ICON_TRIGGER below, NOT part of META_ICON_BY_KIND (that map is
 // for the non-Apex metadata-caller kinds only).
 const ICON_ANONYMOUS = 'terminal';
 
-// v0.7 (A3): forward-tracing-only node kinds -- neither is part of the A6/A7
-// metadata-caller family (both are Apex-source-adjacent concepts: a thrown
+// Forward-tracing-only node kinds are separate from the metadata-caller
+// family (both are Apex-source-adjacent concepts: a thrown
 // exception CLASS, or a summary of unresolved Apex call sites), so each gets
 // its own icon, checked alongside ICON_TRIGGER/ICON_ANONYMOUS below rather
 // than folded into META_ICON_BY_KIND.
 const ICON_EXCEPTION = 'flame';
 const ICON_UNRESOLVED = 'question';
 
-// v0.8 (N6, forward-compat -- see the TNode.kind doc above): an EXTERNAL
-// node, a reference into managed-package code this workspace has no source
-// for. The spec text offered a choice of two vscode Codicon ids
-// ('package'/'globe'); 'package' is picked here since it echoes "managed
+// An EXTERNAL node is a reference into managed-package code this workspace
+// has no source for. The 'package' Codicon echoes "managed
 // PACKAGE" directly and is visually distinct from every icon already used
 // above -- 'globe' would read more like a network/URL concept. Checked
 // alongside ICON_EXCEPTION/ICON_UNRESOLVED below (same "the kind alone
@@ -266,7 +257,7 @@ const ICON_UNRESOLVED = 'question';
 // entries and must not fall back to the generic ICON_ENTRIES 'plug' glyph.
 const ICON_EXTERNAL = 'package';
 
-// v0.13 (Round 2.5, H2 — rendering half): a 'rollup' pseudo-node -- the
+// v0.13: a 'rollup' pseudo-node -- the
 // approximate-callers/callees GROUPING itself is resolver.js's job
 // (buildChildrenLevel's applyShowUnconfirmed, per the apexCallGraph.
 // showUnconfirmed setting: 'rollup' default | 'hide' | 'expand'); this file
@@ -277,7 +268,7 @@ const ICON_EXTERNAL = 'package';
 // kind alone decides the icon" tier), since a rollup node could in
 // principle carry entries and must not fall back to ICON_ENTRIES.
 const ICON_ROLLUP = 'layers';
-// v0.13 (Round 2.5, H3 — header half): the caller-direction "K unresolved
+// v0.13: the caller-direction "K unresolved
 // sites elsewhere mention <method>(" info node resolver.js's buildCallerTree
 // now appends as one more child of the traced target (kind:
 // 'unresolved-mentions', label already fully formatted -- see
@@ -297,6 +288,8 @@ const ICON_AURA = 'browser';
 const ICON_OMNISCRIPT = 'json';
 const ICON_VF = 'file-code';
 const ICON_CMDT = 'gear';
+const ICON_PERMISSION_SET = 'shield';
+const ICON_PROFILE = 'account';
 
 const META_ICON_BY_KIND = {
   flow: ICON_FLOW,
@@ -305,6 +298,8 @@ const META_ICON_BY_KIND = {
   omniscript: ICON_OMNISCRIPT,
   vf: ICON_VF,
   cmdt: ICON_CMDT,
+  permissionset: ICON_PERMISSION_SET,
+  profile: ICON_PROFILE,
 };
 
 // v0.7.1: the two orientation values. 'target-first' is today's default
@@ -329,22 +324,22 @@ const ORIENTATION_ENTRY_FIRST = 'entry-first';
 function iconForNode(node) {
   if (node.kind === 'trigger') return ICON_TRIGGER;
   if (node.kind === 'anonymous') return ICON_ANONYMOUS;
-  // v0.7 (A3): same priority tier as trigger/anonymous -- the kind alone
+  // Same priority tier as trigger/anonymous -- the kind alone
   // decides the icon, ahead of isTest/entries, since a node of either kind
   // could in principle carry entries (e.g. an unresolved-sites leaf) and
   // must not fall back to the generic ICON_ENTRIES 'plug' glyph.
   if (node.kind === 'exception') return ICON_EXCEPTION;
-  // v0.7.1 (U3, R8): confirmed against resolver.js's real buildCalleeTree
+  // buildCalleeTree
   // implementation (buildForwardExtras' unresolvedDmlForwardCounts branch)
   // -- the generic-typed-DML marker reuses kind:'unresolved' verbatim (via
   // 'dml-unresolved' is what distinguishes it; see the VIA_GLOSSARY entry
   // below), so no separate kind/icon branch is needed here at all.
   if (node.kind === 'unresolved') return ICON_UNRESOLVED;
-  // v0.8 (N6, forward-compat): same "the kind alone decides the icon" tier
+  // Same "the kind alone decides the icon" tier
   // as exception/unresolved just above -- an external node could in
   // principle carry entries too and must not collapse onto ICON_ENTRIES.
   if (node.kind === 'external') return ICON_EXTERNAL;
-  // v0.13 (Round 2.5, H2/H3): same "the kind alone decides the icon" tier --
+  // The kind alone decides the icon for these synthetic nodes.
   // see ICON_ROLLUP/the comment just above it for the full rationale.
   if (node.kind === 'rollup') return ICON_ROLLUP;
   if (node.kind === 'unresolved-mentions') return ICON_UNRESOLVED;
@@ -360,7 +355,7 @@ function labelForNode(node) {
   return prefix + (node && node.label != null ? node.label : '');
 }
 
-// v0.8 (N1/N4/N6, forward-compat -- see the TNode.kind/ns doc above):
+// See the TNode.kind/ns documentation above:
 // this EXTERNAL node's own namespace, or null when the node isn't external
 // (or carries no derivable namespace at all). Reads `node.ns` when present
 // (the natural mirror of N1's ExternalMeta.ns), and otherwise DERIVES it
@@ -381,9 +376,8 @@ function externalNamespace(node) {
   return null;
 }
 
-// v0.8 (N4, forward-compat): the 'managed: <ns>' badge text for an EXTERNAL
-// node, or null when none applies -- exact wording per N4's CONTRACT
-// AMENDMENT text ("badge 'managed: <ns>'"). Kept as its own tiny helper
+// The 'managed: <ns>' badge text for an EXTERNAL node, or null when none
+// applies. Kept as its own tiny helper
 // (rather than inlined into badgesForNode) so it is independently unit-
 // testable against a bare `{ kind, ns }`/`{ kind, label }` fixture, same
 // rationale as packageBadge()/isRootNode() below.
@@ -392,7 +386,7 @@ function managedBadge(node) {
   return ns ? `managed: ${ns}` : null;
 }
 
-// v0.9 (P1/P3, forward-compat): the methodKeyLower identity a click-to-
+// The methodKeyLower identity a click-to-
 // expand affordance for this node must hand back to
 // opts.expandedKeys/buildCallerTree/buildCalleeTree -- see the TNode.
 // methodKey field doc above for the full "explicit field wins, else derive"
@@ -408,7 +402,7 @@ function frontierMethodKey(node) {
   return method ? `${cls}#${method}` : cls;
 }
 
-// v0.9 (P1/P3, forward-compat): the '+N' frontier badge text for an
+// The '+N' frontier badge text for an
 // expandable node, or null when the node isn't a frontier at all. `N` is
 // `pendingCount` when it's a real number; an expandable node that (for
 // whatever reason) arrives without a usable pendingCount still renders a
@@ -421,7 +415,7 @@ function frontierBadge(node) {
   return n != null ? `+${n}` : '+';
 }
 
-// v0.9 (P3): the noun a frontier marker's text should use -- 'callees' only
+// The noun a frontier marker's text should use -- 'callees' only
 // for an explicit callees-direction trace, 'callers' for absent/'callers'
 // (mirrors every other direction-aware noun swap already in this file, e.g.
 // shapeHeaderLines' `cappedNoun`).
@@ -430,26 +424,25 @@ function frontierNoun(direction) {
 }
 
 // Badge order per contract: entries · caughtHere (shield) · test · via ·
-// managed:<ns> (v0.8 N4) · package (v0.7 B3) · '~' when approximate ·
-// '↺ cycle' · '… capped' · '+N' frontier (v0.9 P3) · '↪ seen elsewhere'.
+// managed:<ns> · package · '~' when approximate · '↺ cycle' · '… capped' ·
+// '+N' frontier · '↪ seen elsewhere'.
 // (The 'root' badge is NOT added here -- see isRootNode/shapeNode below: it
 // depends on the shaped `children` count, which this per-node-flags
 // function deliberately does not compute, so it stays cheaply unit-testable
 // against partial TNode fixtures.)
-// v0.5 (G2): caughtHere gets its own shield-glyph badge, IN ADDITION to the
+// caughtHere gets its own shield-glyph badge, IN ADDITION to the
 // 'catches <ExcName>' text resolver.js already stamps into `entries` for the
 // same node (see the TNode.caughtHere doc above) -- the glyph is a quick
 // visual flag, the entries text (already rendered by the line above) is the
 // actual exception name.
 //
-// v0.7 (B3): `pkgBadge` is an OPTIONAL second argument -- the pre-computed
+// `pkgBadge` is an OPTIONAL second argument -- the pre-computed
 // '(pkgLabel)' string from packageBadge() below, or falsy when the node has
 // no package or matches the traced target's own package. It is threaded in
 // by the caller (shapeNode, which alone has the tree-wide `targetPackage`
 // context this per-node function deliberately does not compute) rather than
 // looked up here, so every EXISTING call site that invokes
-// `badgesForNode(node)` with just one argument -- including every fixture
-// in test-uitree.js written before this round -- keeps behaving exactly as
+// `badgesForNode(node)` with just one argument keeps behaving exactly as
 // before (pkgBadge undefined is simply falsy, so no badge is pushed).
 //
 // v0.7.1: `orientation` is an OPTIONAL third argument, same
@@ -457,7 +450,7 @@ function frontierNoun(direction) {
 // seenElsewhere badge's wording (see below); every other badge is
 // orientation-agnostic.
 //
-// v0.9 (P3): the frontier '+N' badge (see below) is direction-agnostic on
+// The frontier '+N' badge (see below) is direction-agnostic on
 // purpose -- it never spells out "callers"/"callees", just a bare count --
 // so it needs no new parameter here; the direction-aware NOUN only shows up
 // in the longer glossary tooltip line (see glossaryLinesForNode/
@@ -469,7 +462,7 @@ function badgesForNode(node, pkgBadge, orientation) {
   if (node.caughtHere) badges.push('🛡');
   if (node.isTest) badges.push('test');
   if (node.via) badges.push(node.via);
-  // v0.8 (N4, forward-compat): the managed-package badge -- computed
+  // The managed-package badge -- computed
   // directly from `node` here (unlike pkgBadge, it needs no tree-wide
   // context, just this node's own kind/ns/label), positioned right after
   // `via` since it further qualifies the same "this is an external
@@ -479,7 +472,7 @@ function badgesForNode(node, pkgBadge, orientation) {
   if (pkgBadge) badges.push(pkgBadge);
   if (node.approximate) badges.push('~');
   if (node.cyclic) badges.push('↺ cycle');
-  // v0.7.1 (U2, gauntlet Tier-3 #5 / fix-backlog #2): resolver.js's
+  // v0.7.1: resolver.js's
   // `truncated` flag now fires for TWO distinct causes that share one
   // boolean -- the pre-existing per-branch depth cap (maxDepth) AND the
   // whole-tree maxNodes cap (R5's fix stamps `truncated=true` on the
@@ -491,7 +484,7 @@ function badgesForNode(node, pkgBadge, orientation) {
   // isRootNode below: a truncated node is (and was already) excluded from
   // the '◉ root' badge regardless of which cap fired.
   if (node.truncated) badges.push('… capped');
-  // v0.9 (P1/P3, forward-compat): the progressive-depth frontier badge --
+  // The progressive-depth frontier badge --
   // see the TNode.expandable/pendingCount field docs above and
   // frontierBadge's own comment. Slotted right after '… capped': both
   // badges mean "there is more here that isn't shown", truncated being the
@@ -504,8 +497,7 @@ function badgesForNode(node, pkgBadge, orientation) {
   // assumption either way -- both simply render if both happen to be true.
   const frontier = frontierBadge(node);
   if (frontier) badges.push(frontier);
-  // v0.6 (H1 forward-compat, H5 rendering): resolver.js does not produce
-  // TNode.seenElsewhere yet -- this is purely additive and a no-op today.
+  // seenElsewhere is rendered when present.
   // v0.7.1: in the entry-first orientation the SAME flag reads
   // '↪ continues above' -- the reference node now anchors the START of its
   // own chain, and the deeper entry chain it points at was expanded in
@@ -517,7 +509,7 @@ function badgesForNode(node, pkgBadge, orientation) {
   return badges;
 }
 
-// v0.7 (B3): the node's package badge text, or null when none applies --
+// The node's package badge text, or null when none applies --
 // null whenever the node carries no package at all, OR its package matches
 // `targetPackage` (the traced target's OWN package, i.e. root.package --
 // see shapeResult below). Kept as a small standalone helper, same rationale
@@ -530,7 +522,7 @@ function packageBadge(node, targetPackage) {
   return '(' + node.package + ')';
 }
 
-// v0.6 (H3): explicit 'root' badge for a node with NO known caller in this
+// Explicit 'root' badge for a node with NO known caller in this
 // trace -- an entry point or unused/dead code, per the README's promise.
 // Deliberately excludes cyclic/truncated/seenElsewhere: all three mean
 // "there IS more above this node, we just didn't show/expand it", the exact
@@ -540,13 +532,13 @@ function packageBadge(node, targetPackage) {
 // callers that need the root badge call this from shapeNode instead, where
 // the real children array is always present.
 //
-// v0.9 (P1/P3, forward-compat): `expandable` joins the exclusion list for
+// `expandable` joins the exclusion list for
 // the exact same reason -- a frontier node has an empty `children` array
 // purely because the engine chose not to expand it THIS pass (see the
 // TNode.expandable field doc above), not because it genuinely has no known
 // caller/callee. Purely additive: `node.expandable` is undefined on every
 // pre-v0.9 fixture, so `!undefined` is `true` and this check is a no-op
-// there -- the REGRESSION PIN (initialDepth === maxDepth && expandedKeys
+// there. When initialDepth === maxDepth and expandedKeys
 // empty -> output byte-identical to v0.8) holds because a v0.8-shaped
 // resolver.js never sets `expandable` at all.
 function isRootNode(node) {
@@ -555,7 +547,7 @@ function isRootNode(node) {
   return !hasChildren && !node.cyclic && !node.truncated && !node.seenElsewhere && !node.expandable;
 }
 
-// v0.6 (H3): the site's marquee data -- overloadSig and argsRendered -- used
+// The site's marquee data -- overloadSig and argsRendered -- used
 // to be tooltip-only (argsRendered) or rendered NOWHERE at all (overloadSig
 // -- confirmed bug). This builds the second, visible '-> ...' line: both
 // present join with ' · ' (overloadSig first, since it's the shorter,
@@ -583,12 +575,10 @@ function siteLabel(site) {
   return detail ? `${base}\n${detail}` : base;
 }
 
-// Tooltip is argsRendered per the contract ("site items ... with tooltip
-// argsRendered"); when there's nothing to render (null/empty — e.g. a
+// Tooltip uses argsRendered; when there's nothing to render (null/empty — e.g. a
 // zero-arg call) fall back to the source location so the tooltip is never
-// blank. Unchanged by H3: the detail line now ALSO shows this inline (see
-// siteLabel/siteDetailLine above), but the tooltip stays as documented —
-// "Keep tooltips too" per the H3 spec.
+// blank. The detail line also shows this inline (see
+// siteLabel/siteDetailLine above), while the tooltip remains available.
 function siteTooltip(site) {
   if (site && site.argsRendered) return site.argsRendered;
   if (site && site.path) return `${site.path}:${typeof site.line === 'number' ? site.line : '?'}`;
@@ -623,6 +613,7 @@ const VIA_GLOSSARY = {
   'unique-name': 'no receiver type available; matched by a codebase-unique method name (approximate)',
   lexical: 'parse-error fallback, matched by text mention only (approximate)',
   metadata: 'caller is LWC, Aura, Flow, OmniScript, VF, or Custom Metadata, not Apex source',
+  access: 'Permission Set or Profile grants access to this Apex class; it does not invoke Apex and is not a runtime caller',
   dml: 'a DML statement whose target object has a trigger, or that matches a record-triggered flow',
   dynamic: "Type.forName('LiteralClassName') or a Custom Metadata field naming a class (approximate)",
   override: "fan-out edge to a subclass's override of a virtual/abstract method (approximate)",
@@ -630,18 +621,18 @@ const VIA_GLOSSARY = {
   throws: 'a throw statement, shown when tracing the thrown exception type itself',
   narrowed: "an 'x instanceof T' narrowing found in the same method as the fallback receiver type (approximate)",
   async: 'System.enqueueJob / Database.executeBatch / System.schedule call to a known class',
-  // v0.7 (B2): duplicate-named-class fan-out -- neither same-package nor
+  // Duplicate-named-class fan-out -- neither same-package nor
   // default-package preference could disambiguate, so every remaining
   // candidate gets its own edge.
   ambiguous: "a class name duplicated across sfdx packages that neither the referring file's own package nor the default package could resolve -- every remaining candidate gets an edge (approximate)",
-  // v0.7 (A6): pre-existing gap closed here -- the aggregated "N unresolved
+  // Aggregated "N unresolved
   // sites" leaf (kind:'unresolved') has carried via:'unresolved' since v0.7
   // shipped, but this table never had a matching entry, so its tooltip
   // silently dropped the via line. Purely additive: a node with this via
   // already rendered correctly (the label text itself is self-explanatory
   // plain English), it just gained an explanation line it was missing.
   unresolved: 'aggregated leaf: one or more forward call sites in this method could not be resolved to an indexed target (dynamic/platform call, deep/unknown-type chain, etc.) — approximate',
-  // v0.7.1 (U3, R8): the gauntlet's "generic-typed DML loses trigger
+  // v0.7.1: the "generic-typed DML loses trigger
   // linkage" fix (KappaUnitOfWork.commitWork() -- `List<SObject> records;
   // insert records;` can't be narrowed to a concrete SObject type, so no
   // DML->trigger/flow edge can be emitted). Confirmed against resolver.js's
@@ -654,17 +645,14 @@ const VIA_GLOSSARY = {
   // (or 'N DML sites on unresolved SObject type' when N > 1), always
   // approximate + truncated (terminal).
   'dml-unresolved': "DML on unresolved SObject type — the DML statement's target could not be narrowed to a concrete SObject (e.g. a generic List<SObject>/SObject-typed variable), so no trigger or flow linkage could be traced (approximate)",
-  // v0.8 (N4/N6, forward-compat): exact tooltip wording per N4's CONTRACT
-  // AMENDMENT text ("tooltip 'managed package code — source not
-  // analyzable'"). This one entry alone satisfies N6's "glossary tooltip"
-  // requirement for the 'external' kind -- glossaryLinesForNode below
+  // Tooltip wording for the external kind. glossaryLinesForNode below
   // already renders a `${via}: ${VIA_GLOSSARY[via]}` line for ANY node
   // carrying a recognized via, with zero extra code needed here, exactly
   // like every other via value in this table. NOT approximate (see the
   // TNode.via field doc above), so this via never co-occurs with the '~'
   // marker glossary line.
   external: 'managed package code — source not analyzable',
-  // v0.13 (S2/S3): flow-to-flow subflow chains -- a declared `<subflows>`
+  // Flow-to-flow subflow chains -- a declared `<subflows>`
   // reference between two Flow files metascan actually saw (never a
   // fan-out guess, unlike interface/unique-name/dynamic/etc. above), so
   // this via is deliberately absent from resolver.js's APPROX_VIA set and
@@ -673,7 +661,7 @@ const VIA_GLOSSARY = {
   // flow's own PARENT flow (the parent invokes it as a subflow); in the
   // callees direction it's the flow's own SUBFLOW (it invokes the child).
   subflow: 'a declared <subflows> reference between two Flow files — not an Apex call, a parent/child flow-orchestration edge',
-  // v0.13 (Round 2.5, H3 — header half): via values on a kind:
+  // Via values on a kind:
   // 'unresolved-mentions' node's individual mention-site children (see
   // resolver.js's buildCallerTree -- each mentionChildren entry carries
   // `via: s.reason || 'unresolved'`, one of resolver.js's own
@@ -692,7 +680,7 @@ const MARKER_GLOSSARY = {
   approximate: '~ — approximate resolution: this edge may be wrong or one of several candidates',
   caughtHere: '🛡 caughtHere — an ancestor catch clause here catches the exception being traced; traversal still continues past it (rethrow is unknowable)',
   cyclic: '↺ cycle — this call chain recurses back on itself here',
-  // v0.7.1 (U2): cause-agnostic wording -- see the badgesForNode comment
+  // Cause-agnostic wording -- see the badgesForNode comment
   // above for why this can no longer say "depth cap" specifically now that
   // the node-count (maxNodes) cap stamps the same flag on the one node its
   // own expansion was cut off at.
@@ -709,19 +697,19 @@ const MARKER_GLOSSARY = {
   // entry-first node that carries an incoming edge (via and/or sites).
   entryFirstEdge: "entry-first: this node's via badge and call-site rows describe how the node ABOVE calls it — the site lines live in that caller's source file",
   root: '◉ root — no known caller in this trace: an entry point or unused/dead code',
-  // v0.7 (B3): explains the '(pkgLabel)' badge -- the actual label text is
+  // Explains the '(pkgLabel)' badge -- the actual label text is
   // dynamic (the package name itself), so this is appended as a suffix onto
   // that literal badge string in glossaryLinesForNode below, rather than
   // being a single fixed lookup string like the other entries here.
   package: "this node's file lives in a different sfdx package directory than the traced target's",
-  // v0.13 (Round 2.5, H2 — rendering half): explains the GROUPING itself --
+  // Explains the grouping itself --
   // distinct from the generic 'approximate' line above (which every rolled-
   // up MEMBER also carries individually, describing its own edge), this one
   // is about the collapsed CONTAINER. Keyed off node.kind in
   // glossaryLinesForNode below, not a via lookup (the rollup node's own
   // via is null -- see resolver.js's applyShowUnconfirmed).
   rollup: 'grouped for clarity — every approximate caller/callee of this node is collected here instead of cluttering the list above; expand to inspect each one individually (its own via badge explains exactly how IT was matched)',
-  // v0.13 (Round 2.5, H3 — header half): explains the caller-direction
+  // v0.13: explains the caller-direction
   // scoped-mentions info node (kind:'unresolved-mentions') -- keyed off
   // node.kind, same rationale as 'rollup' just above. Its own via
   // ('unresolved', or per-child reason via VIA_GLOSSARY) already explains
@@ -730,9 +718,7 @@ const MARKER_GLOSSARY = {
     "these call sites use this exact method name on a receiver that couldn't be resolved, but were deliberately NOT wired up as confirmed callers (arity mismatch, a name too common workspace-wide to trust, dynamic dispatch, or a parse failure -- see each child's own via badge) — worth a manual look if you suspect one of these really does call this method",
 };
 
-// v0.9 (P1/P3, forward-compat): the frontier glossary line, exact wording
-// per the CONTRACT AMENDMENT text ("tooltip 'N more direct callers/callees
-// — expand to load'") -- direction-resolved via frontierNoun since a real
+// The frontier glossary line is direction-resolved via frontierNoun since a real
 // trace always knows which direction it's tracing (the contract's own
 // slash-separated phrasing is describing the two possible renderings, not a
 // literal string to emit verbatim). Built here rather than as a single
@@ -747,7 +733,7 @@ function frontierGlossaryLine(node, direction) {
   return `${badge} — ${countText} — expand to load`;
 }
 
-// v0.7 (B3): `pkgBadge` is the same optional pre-computed '(pkgLabel)'
+// `pkgBadge` is the same optional pre-computed '(pkgLabel)'
 // string threaded through badgesForNode above -- see that function's
 // comment for why it is a parameter here rather than computed locally.
 //
@@ -760,14 +746,14 @@ function frontierGlossaryLine(node, direction) {
 // re-rooting (every branch TIP is childless there, and tips are the traced
 // target, the exact opposite of "no known caller").
 //
-// v0.9 (P1/P3): `direction` optional fourth argument, same
+// `direction` is an optional fourth argument with the same
 // omitted-means-'callers' convention as badgesForNode/frontierNoun. Only
 // feeds the new frontier line below; every other line is direction-agnostic.
 function glossaryLinesForNode(node, pkgBadge, orientation, direction) {
   const entryFirst = orientation === ORIENTATION_ENTRY_FIRST;
   const lines = [];
   if (node && node.via && VIA_GLOSSARY[node.via]) lines.push(`${node.via}: ${VIA_GLOSSARY[node.via]}`);
-  // v0.13 (Round 2.5, H2/H3): kind-based lines for the two new synthetic
+  // Kind-based lines for the synthetic
   // container kinds -- see MARKER_GLOSSARY.rollup/unresolvedMentions' own
   // comments for why these are keyed off `kind`, not `via`.
   if (node && node.kind === 'rollup') lines.push(MARKER_GLOSSARY.rollup);
@@ -793,12 +779,12 @@ function glossaryLinesForNode(node, pkgBadge, orientation, direction) {
 // caller relied on the node tooltip being exactly `node.path` (only site
 // tooltips are pinned by contract/tests), so this is a pure addition.
 //
-// v0.7 (B3): `pkgBadge` optional second argument, same rationale/threading
+// `pkgBadge` is an optional second argument, with the same rationale/threading
 // as badgesForNode/glossaryLinesForNode above -- omitted (undefined), every
 // EXISTING call site (including every pre-v0.7 test fixture) is unaffected.
 // v0.7.1: `orientation` optional third argument, passed straight through to
 // glossaryLinesForNode.
-// v0.9 (P1/P3): `direction` optional fourth argument, passed straight
+// `direction` is an optional fourth argument, passed straight
 // through to glossaryLinesForNode.
 function nodeTooltip(node, pkgBadge, orientation, direction) {
   const lines = [];
@@ -811,10 +797,10 @@ function nodeTooltip(node, pkgBadge, orientation, direction) {
   return lines.join('\n');
 }
 
-// v0.9 (P1/P3): the synthetic "load more" UiNode shapeNode appends as the
+// The synthetic "load more" UiNode shapeNode appends as the
 // sole child of an `expandable` node (see the TNode.expandable field doc
 // and the UiNode.loadMore/expandKey field docs at the top of this file).
-// NATIVE LAZY TREE rendering (per the P2 CONTRACT AMENDMENT): this item is
+// In native lazy-tree rendering, this item is
 // what makes an expandable node with ZERO real TNode.children still render
 // Collapsed with something to expand into -- `collapsible` downstream comes
 // from `kids.length > 0` exactly like every other node (see shapeNode
@@ -847,13 +833,13 @@ function shapeLoadMoreChild(node, direction) {
 // sites at this node come first, then the deeper callers of this caller) —
 // order within each group is preserved from resolver.js's output.
 //
-// v0.7 (B3): `targetPackage` is an OPTIONAL second argument -- the traced
+// `targetPackage` is an OPTIONAL second argument -- the traced
 // target's own `.package` (computed once in shapeResult from the tree
 // root, then threaded down through every recursive call so each descendant
 // can compare its own `.package` against it). Every EXISTING call site that
 // invokes `shapeNode(node)` with just one argument -- including every
-// fixture in test-uitree.js written before this round -- keeps behaving
-// exactly as before: `targetPackage` is undefined, so packageBadge() below
+// existing one-argument callers remain unchanged: `targetPackage` is
+// undefined, so packageBadge() below
 // returns null for every node UNLESS that node happens to carry a
 // `.package` of its own (no pre-v0.7 fixture does), in which case it would
 // still show a badge (there being no target package to match against) --
@@ -872,7 +858,7 @@ function shapeLoadMoreChild(node, direction) {
 // truthfully have "no known caller" (their children below are their
 // CALLEES in this orientation), and boundary roots (cyclic/truncated/
 // seenElsewhere) stay excluded, same rule as target-first.
-// v0.9 (P1/P3): `direction` is an OPTIONAL fourth argument, threaded down
+// `direction` is an OPTIONAL fourth argument, threaded down
 // every recursive call exactly like targetPackage/orientation. Omitted
 // (every pre-v0.9 call site), the frontier machinery below is a pure no-op
 // (see isRootNode/badgesForNode's own `node.expandable` guards -- undefined
@@ -885,7 +871,7 @@ function shapeLoadMoreChild(node, direction) {
 // either expands a node's children fully or not at all, never partially),
 // so this is the only source of a non-empty `kids` array for such a node.
 //
-// v0.13 (Round 2.5, H2 — rendering half): the APPROXIMATE ROLLUP grouping
+// Approximate-edge rollup grouping
 // itself is resolver.js's job now (buildChildrenLevel's applyShowUnconfirmed,
 // gated by the apexCallGraph.showUnconfirmed setting) -- by the time a TNode
 // reaches this file, its `children` array is ALREADY grouped/hidden/flat per
@@ -906,7 +892,7 @@ function shapeNode(node, targetPackage, orientation, direction) {
   if (node.expandable) kids = kids.concat([shapeLoadMoreChild(node, direction)]);
   const pkgBadge = packageBadge(node, targetPackage);
   const badges = badgesForNode(node, pkgBadge, orientation);
-  // v0.6 (H3): appended last -- root is mutually exclusive with
+  // Appended last -- root is mutually exclusive with
   // cyclic/truncated/seenElsewhere by construction (isRootNode), so its
   // position relative to those is moot; this ordering matches the README's
   // own 'entries · via · root' example exactly whenever nothing else fires.
@@ -982,11 +968,11 @@ function shapeNode(node, targetPackage, orientation, direction) {
 // 'entry-first' whenever treeResult.direction === 'callees'; extension.js
 // additionally hides/no-ops the toggle in that direction.
 //
-// v0.9 (P1/P3) FRONTIER NODES, DOCUMENTED CHOICE: a progressive-depth
+// FRONTIER NODES: a progressive-depth
 // frontier node (TNode.expandable:true, see the field doc up top) has an
 // EMPTY `children` array by construction -- the engine chose not to expand
 // it this pass -- so walk()'s existing "no children -> path ends here"
-// rule (unchanged by this round) already treats it exactly like a genuine
+// rule already treats it exactly like a genuine
 // target-first LEAF: it terminates every path that reaches it, and (via
 // makeNode below) becomes the entry-first ROOT of its own chain, the same
 // way a cyclic/truncated/seenElsewhere boundary leaf already does. This is
@@ -1065,7 +1051,7 @@ function rerootEntryFirst(root) {
       !!src.cyclic,
       !!src.truncated,
       !!src.seenElsewhere,
-      // v0.9 (P1/P3, forward-compat): `expandable` joins the identity key
+      // `expandable` joins the identity key
       // alongside the pre-existing boundary flags above -- see the FRONTIER
       // NODES doc paragraph in the ORIENTATION section above for why. Kept
       // as three separate entries (rather than folding pendingCount/
@@ -1100,7 +1086,7 @@ function rerootEntryFirst(root) {
     cyclic: src.cyclic,
     truncated: src.truncated,
     seenElsewhere: src.seenElsewhere,
-    // v0.9 (P1/P3, forward-compat): carried through unchanged -- see the
+    // Carried through unchanged -- see the
     // FRONTIER NODES doc paragraph above -- so a frontier boundary root's
     // own badge/synthetic-child rendering (shapeNode/shapeLoadMoreChild)
     // works identically in entry-first as it does target-first.
@@ -1157,9 +1143,9 @@ function rerootEntryFirst(root) {
 }
 
 // =========================================================================
-// v0.13 (Round 2.5, H3 — header half): SCOPED HEADERS.
+// Scoped trace headers.
 //
-// Pre-Round-2.5, shapeHeaderLines surfaced three WORKSPACE-GLOBAL counters
+// Older builds surfaced three workspace-global counters
 // (stats.unresolvedSites, stats.externalRefs/externalNamespaces, stats.
 // metaUnresolved -- see the v0.6/v0.8/v0.7.1 comments still on
 // shapeHeaderLines below) on every single trace, regardless of which
@@ -1167,8 +1153,7 @@ function rerootEntryFirst(root) {
 // to the ONE target being looked at right now -- H3 removes it from the
 // per-trace header (stats itself is UNCHANGED: resolver.js keeps computing
 // every one of those fields exactly as before, they simply move to being
-// exclusively an H8 "Scan Stats" output-channel concern, a different file's
-// job this round).
+// exclusively a Scan Stats output-channel concern).
 //
 // In its place, the CALLER direction only gains ONE new, genuinely SCOPED
 // header line: resolver.js's buildCallerTree already computes the "K
@@ -1196,12 +1181,12 @@ function rerootEntryFirst(root) {
 // `.label` VERBATIM.
 // =========================================================================
 
-// Finds resolver.js's H3 info node (kind:'unresolved-mentions') among the
+// Finds resolver.js's unresolved-mentions info node among the
 // traced target's DIRECT children, or null when absent -- absent covers
-// every pre-Round-2.5 TreeResult (no such kind existed), a callee-direction
+// every legacy TreeResult (no such kind existed), a callee-direction
 // TreeResult (resolver.js never adds this kind there -- its existing
-// per-method kind:'unresolved' aggregate leaf is "already scoped", per the
-// H3 spec), and a genuine K=0 caller-direction trace (resolver.js's own
+// per-method kind:'unresolved' aggregate leaf is already scoped), and a
+// genuine K=0 caller-direction trace (resolver.js's own
 // `if (mentions.length)` guard means the node simply isn't added at all).
 function findUnresolvedMentionsNode(treeResult) {
   const children = treeResult && treeResult.root && Array.isArray(treeResult.root.children) ? treeResult.root.children : [];
@@ -1223,8 +1208,8 @@ function unresolvedMentionsHeaderLine(treeResult) {
 // a single-element array (the traced target as the sole top-level item, its
 // callers nested underneath) or [] when there's no root to show.
 //
-// v0.7 (B3): the traced target IS `treeResult.root` regardless of direction
-// (buildCalleeTree's root is the traced method too, per the A2 contract --
+// The traced target IS `treeResult.root` regardless of direction
+// (buildCalleeTree's root is the traced method too --
 // only its `children` mean something different), so `root.package` is
 // unambiguously "the target's package" in both directions. This is the one
 // and only place `targetPackage` is derived; every descendant node's badge
@@ -1237,7 +1222,7 @@ function unresolvedMentionsHeaderLine(treeResult) {
 // `targetPackage` is STILL the traced target's package (the target sits at
 // the branch tips there, but "which package is home" doesn't move).
 //
-// v0.9 (P1/P3): `treeResult.direction` is read here (not a new parameter --
+// `treeResult.direction` is read here (not a new parameter --
 // it is already ON treeResult, unlike orientation which is a display-only
 // choice extension.js tracks separately) and threaded down through every
 // shapeNode call, so a frontier node's badge/glossary/synthetic child use
@@ -1246,7 +1231,7 @@ function unresolvedMentionsHeaderLine(treeResult) {
 // default already reads 'callers', so this is a no-op for every pre-v0.9
 // TreeResult shape.
 //
-// v0.13 (Round 2.5, H2/H3): resolver.js owns grouping and produces both
+// resolver.js owns grouping and produces both
 // rollup and unresolved-mentions TNodes. In target-first mode they flow
 // through structurally like every other child. Entry-first is the one
 // exception: an unresolved-mentions node is informational, not a caller
@@ -1260,89 +1245,41 @@ function shapeResult(treeResult, orientation) {
   const targetPackage = treeResult.root.package || null;
   const direction = treeResult.direction;
   if (effectiveOrientation(treeResult, orientation) === ORIENTATION_ENTRY_FIRST) {
-    const mentionNodes = (treeResult.root.children || []).filter((c) => c && c.kind === 'unresolved-mentions');
-    const executionRoot = mentionNodes.length
-      ? { ...treeResult.root, children: (treeResult.root.children || []).filter((c) => !c || c.kind !== 'unresolved-mentions') }
+    const informationalNodes = (treeResult.root.children || []).filter((c) =>
+      c && (c.kind === 'unresolved-mentions' || c.kind === 'permissionset' || c.kind === 'profile')
+    );
+    const executionRoot = informationalNodes.length
+      ? {
+          ...treeResult.root,
+          children: (treeResult.root.children || []).filter((c) =>
+            !c || (c.kind !== 'unresolved-mentions' && c.kind !== 'permissionset' && c.kind !== 'profile')
+          ),
+        }
       : treeResult.root;
     const roots = rerootEntryFirst(executionRoot).map((r) =>
       shapeNode(r, targetPackage, ORIENTATION_ENTRY_FIRST, direction)
     );
-    for (const node of mentionNodes) roots.push(shapeNode(node, targetPackage, undefined, direction));
+    // Access metadata is informational, just like unresolved-name mentions:
+    // keep it inspectable but never reverse it into a fabricated execution
+    // path in entry-first orientation.
+    for (const node of informationalNodes) roots.push(shapeNode(node, targetPackage, undefined, direction));
     return roots;
   }
   return [shapeNode(treeResult.root, targetPackage, undefined, direction)];
 }
 
-// v0.6 (H1/H4, H5a rendering): plain-string header lines for extension.js to
-// surface above the tree (via TreeView.message), alongside (or instead of)
-// the existing note toast. Every field checked here is OPTIONAL (a
-// not-found target's TreeResult, or an older/synthetic TreeResult, may omit
-// stats entirely), so this degrades gracefully rather than throwing:
-//   - treeResult.note                 (H4: e.g. 'No callers found — this is
-//                                      likely an entry point or unused code.')
-//   - treeResult.direction            (v0.7 A3: 'callers'|'callees' -- see
-//                                      directionHeaderLine below)
-//   - treeResult.stats.duplicateNames (v0.7 B3: workspace-wide count of
-//                                      class names bucketed across packages)
-//   - treeResult.stats.capped         (H1: buildCallerTree's node cap fired)
-//   - treeResult.root.children        (v0.13 Round 2.5 H3: scanned for
-//                                      resolver.js's kind:'unresolved-
-//                                      mentions' info node -- see the
-//                                      SCOPED HEADERS section above
-//                                      shapeResult for the full contract;
-//                                      NOT a new TreeResult/stats field)
-//
-// v0.13 (Round 2.5, H3) REMOVED: stats.unresolvedSites, stats.externalRefs/
-// externalNamespaces, and stats.metaUnresolved USED to each surface their
-// own workspace-global header line here (see the CHANGELOG/git history for
-// the exact pre-Round-2.5 wording, still pinned as REGRESSION assertions in
-// test-uitree.js proving they no longer fire). Per the H3 spec, a per-trace
-// header has no business reporting workspace-wide totals unrelated to the
-// ONE method being traced -- `stats` itself is untouched (resolver.js keeps
-// computing every one of those fields exactly as before; H8's "Scan Stats"
-// output channel, a different file's job this round, is their only
-// remaining consumer). The one thing that DOES belong in a trace header is
-// the new, genuinely scoped unresolvedMentionsHeaderLine below.
-//
-
-// v0.7 (A3) INTERPRETIVE DECISION on the pinned "callers-direction render is
-// byte-identical to today" bar: resolver.js's buildCallerTree now stamps
-// `direction: 'callers'` on EVERY TreeResult it returns, unconditionally --
-// see resolver.js's own comment at the not-found-target shell: "direction is
-// now present on EVERY TreeResult ... a brand-new field no pre-v0.7 caller
-// could have been reading." Since 'callers' is therefore the universal,
-// unconditional state of every real caller-direction TreeResult (not an
-// opt-in tag some callers set and others don't), "byte-identical to today"
-// can only be satisfied by treating 'callers' -- exactly like an absent
-// field -- as the silent, no-new-header-text case. This is also the literal
-// mechanism behind the hard-pinned `shapeHeaderLines({ root: {}, targetLabel:
-// 'x', note: null })` -> `[]` assertion below (which predates this round)
-// AND behind test.js's real end-to-end H4 assertion (a genuine
-// buildCallerTree() TreeResult, which now always carries
-// `direction: 'callers'`, must still produce exactly the same 2 header
-// lines it did before this round) -- both would break if 'callers' surfaced
-// new text. Only 'callees' (the genuinely NEW v0.7 capability, and the only
-// direction value that did NOT exist before this round) gets an explicit
-// sign-post, 'What Does This Call?', mirroring the apexTrace.traceCallees
-// command title verbatim (see package.json, not owned by this file) so the
-// two names never drift apart -- "who calls this" stays the well-known,
-// unlabeled default; "what this calls" is the one new thing worth calling
-// out. Only shapeHeaderLines reads `direction` at all -- shapeNode/
-// shapeResult (the actual tree content) never look at it, so the tree
-// portion of a render is ALWAYS identical regardless of direction tagging
-// (see test-uitree.js's own byte-identical assertion for the proof).
+// Plain-string header lines for extension.js to surface above the tree.
+// Every field is optional, so not-found and synthetic TreeResults degrade
+// gracefully. Workspace-wide scan totals stay in Scan Stats; this header
+// reports only trace-scoped information. Callers is the unlabeled default,
+// while callees gets an explicit direction signpost.
 function directionHeaderLine(direction) {
   if (direction === 'callees') return 'What Does This Call?';
   return null;
 }
 
-// v0.7.1: `orientation` optional second argument, same omitted-means-
-// unchanged convention as everywhere else in this file. Only the effective
-// 'entry-first' state (never 'callers'+'target-first', which is the
-// universal default and must stay byte-identical -- same interpretive rule
-// as directionHeaderLine's 'callers' case above) adds a header line
-// stating the active orientation, slotted after the note/direction lines
-// and before the stats lines.
+// `orientation` is optional. Only the effective 'entry-first' state adds a
+// header line; target-first remains the silent default.
 function shapeHeaderLines(treeResult, orientation) {
   const lines = [];
   const note = treeResult && treeResult.note;
@@ -1359,16 +1296,16 @@ function shapeHeaderLines(treeResult, orientation) {
     );
   }
   if (stats && stats.capped) {
-    // v0.7 (A3): the pre-existing wording said "caller" unconditionally --
+    // The earlier wording said "caller" unconditionally --
     // correct for the only direction that existed pre-v0.7, but misleading
-    // once the SAME cap/DAG-memoization machinery (per the A2 contract:
-    // "REUSE it, do not fork") also runs in the callees direction. Absent/
+    // once the same cap/DAG-memoization machinery also runs in the callees
+    // direction. Absent/
     // 'callers' keeps the exact original wording (byte-identical, see the
     // note above directionHeaderLine); only 'callees' swaps the noun.
     const cappedNoun = (treeResult && treeResult.direction) === 'callees' ? 'callee' : 'caller';
     lines.push(`Result capped -- not every ${cappedNoun} could be expanded.`);
   }
-  // v0.13 (Round 2.5, H3): the ONE new scoped line -- see the SCOPED HEADERS
+  // The scoped unresolved-mentions line; see the scoped-headers
   // section ahead of shapeResult above for the full contract/rationale and
   // unresolvedMentionsHeaderLine's own doc for the exact gating (K > 0,
   // caller direction only).
@@ -1378,12 +1315,8 @@ function shapeHeaderLines(treeResult, orientation) {
 }
 
 // =========================================================================
-// v0.12.0 / C2 (Entry-Point Catalog): pure shaping of resolver.js's NEW
-// buildEntryCatalog(index) export (C1, may still be in flight this round --
-// this section and its tests in test-uitree.js are written against the
-// documented contract shape only, never against resolver.js's actual
-// source, same "code against the frozen contract" discipline this whole
-// file already follows for TNode/SiteView above). Feeds the SECOND Explorer
+// Entry-Point Catalog: pure shaping of resolver.js's
+// buildEntryCatalog(index) export. Feeds the second Explorer
 // view ('apexTraceEntriesView', extension.js's job) -- a flat two-level
 // tree (kind group -> entries), NOT a recursive call tree, so this reuses
 // the UiNode shape (label/description/tooltip/iconId/jump/collapsible/
@@ -1391,7 +1324,7 @@ function shapeHeaderLines(treeResult, orientation) {
 // dedicated toEntryCatalogTreeItem reads them; the ordinary trace-tree
 // toTreeItem/shapeResult path never sees them):
 //   - isGroup: true on a kind-group node, undefined on an entry leaf.
-//   - expanded: boolean, ONLY on a group node -- per the C2 contract every
+//   - expanded: boolean, ONLY on a group node -- every
 //     group starts collapsed except 'trigger' and 'flow' (EXPANDED_KINDS
 //     below); an EMPTY group (zero entries) is additionally rendered
 //     non-collapsible at all (`collapsible: false`) -- nothing to expand,
@@ -1403,26 +1336,23 @@ function shapeHeaderLines(treeResult, orientation) {
 //     buildSuggestPicks() already produce for the interactive QuickPick
 //     path. Derived generically from Entry.className/methodLower (both
 //     present -> a real Apex target; classLower is the lowercased
-//     className, methodLower passed through as-is since the C1 contract's
-//     Entry.methodLower is already lowercase, matching every existing
+//     className, methodLower passed through as-is since Entry.methodLower
+//     is already lowercase, matching every existing
 //     pseudo-method convention in this codebase: '(trigger)' for trigger
 //     entries, '(anonymous)' for anonymous-script entries, an ordinary
 //     lowercased method name for everything else). null whenever EITHER is
-//     null -- per the C1 contract text this is flow entries ALWAYS
+//     null -- this is always true for flow entries
 //     ("flow: ... className|null, methodLower|null"), since a Flow is not
 //     an Apex class/method buildCalleeTree can target; extension.js's
-//     inline-action handler degrades that case to a no-op toast, per the
-//     C2 contract's "flows: run the callee trace only when the flow has
-//     traceable children -- else no-op toast, documented" text (documented
-//     here: today's C1 contract never gives a flow entry a target at all,
+//     inline-action handler degrades that case to a no-op toast. The current
+//     catalog never gives a flow entry a target at all,
 //     so the "has traceable children" case is a no-op right now for every
-//     entry this file shapes -- if a future resolver.js round ever DOES
+//     entry this file shapes -- if a future resolver.js version does
 //     attach a real Apex target to some flow entries, this same generic
 //     className+methodLower derivation picks it up automatically, no
 //     uitree.js change needed).
 //
-// Copied verbatim from the frozen "=== CONTRACT: resolver.js ===" C1 text
-// this round:
+// Catalog data shape:
 //
 //   Catalog = { groups: [Group], stats: { total, byKind: {kind: n}, packages: [labels] } }
 //   Group = { kind, label, entries: [Entry] }
@@ -1443,14 +1373,14 @@ function shapeHeaderLines(treeResult, orientation) {
 //   of any group, workspace-wide).
 // =========================================================================
 
-// v0.12.0 (C2): group kinds that render pre-expanded (TreeItemCollapsible-
+// Group kinds that render pre-expanded (TreeItemCollapsible-
 // State.Expanded) the first time the catalog is shown -- triggers and flows
 // are the two kinds a Salesforce developer orienting on "how does the org
 // get entered" most wants to see without an extra click; every other kind
 // starts collapsed. `label`/`invocable`/etc. never appear here.
 const ENTRY_CATALOG_EXPANDED_KINDS = new Set(['trigger', 'flow']);
 
-// v0.12.0 (C2): one icon per Group.kind, in the SAME display order the C1
+// One icon per Group.kind, in the SAME display order the catalog
 // contract pins (trigger, aura, invocable, rest, soap, async, email,
 // platform, flow, anonymous) -- purely so a reader scanning this table can
 // check it against that order at a glance. 'trigger'/'flow'/'anonymous'
@@ -1477,10 +1407,9 @@ const ENTRY_CATALOG_ICON_BY_KIND = {
   anonymous: ICON_ANONYMOUS,
 };
 
-// v0.12.0 (C2): one-line "what is this kind" explanation per Group.kind --
-// the glossary/tooltip text the C2 contract asks this file to own (group
-// label wording itself comes verbatim from resolver.js's Group.label, per
-// the contract; this is the ADDITIONAL explanatory line uitree.js adds on
+// One-line "what is this kind" explanation per Group.kind.
+// Group label wording comes verbatim from resolver.js's Group.label; this
+// is the additional explanatory line uitree.js adds on
 // top, exactly like VIA_GLOSSARY/MARKER_GLOSSARY do for the caller/callee
 // tree above). Rendered on both the group node's own tooltip and appended
 // to every entry leaf's tooltip within that group (see entryTooltip below).
@@ -1498,7 +1427,7 @@ const ENTRY_CATALOG_KIND_GLOSSARY = {
 };
 
 // Fallback display label, used ONLY when a Group arrives with a falsy
-// `label` (defensive -- the C1 contract always supplies one; this just
+// `label` (defensive -- the normal shape always supplies one; this just
 // keeps a malformed/partial fixture from rendering a blank tree row instead
 // of throwing, same defensive spirit as this file's other `|| fallback`
 // idioms, e.g. externalNamespace's label-derived fallback).
@@ -1515,7 +1444,7 @@ const ENTRY_CATALOG_KIND_FALLBACK_LABEL = {
   anonymous: 'Anonymous Scripts',
 };
 
-// v0.12.0 (C2): derives the {classLower, methodLower} extension.js's inline
+// Derives the {classLower, methodLower} extension.js's inline
 // "What Does This Call?" action hands to resolver.buildCalleeTree, or null
 // when this entry carries no traceable Apex target -- see the section
 // header above for the full rationale (generic derivation, not
@@ -1527,13 +1456,13 @@ function entryCatalogTarget(entry) {
   return { classLower: String(entry.className).toLowerCase(), methodLower: entry.methodLower };
 }
 
-// v0.12.0 (C2): entry leaf description badge -- `detail` (the kind-specific
-// one-liner the C1 contract documents, e.g. 'on Account (before insert,
+// Entry leaf description badge: `detail` (the kind-specific
+// one-liner, e.g. 'on Account (before insert,
 // after update)') plus a '(pkgLabel)' badge when `package` is present,
 // mirroring packageBadge's own '(...)' formatting elsewhere in this file
 // (deliberately NOT reusing packageBadge() itself -- that function compares
 // against a tree-wide `targetPackage` this flat catalog has no equivalent
-// of; Entry.package is already contract-documented as "only when != the
+// of; Entry.package is already filtered to "only when != the
 // default package", i.e. pre-filtered by resolver.js, so every non-null
 // value here is meant to render).
 function entryCatalogDescription(entry) {
@@ -1543,7 +1472,7 @@ function entryCatalogDescription(entry) {
   return parts.join(' · ');
 }
 
-// v0.12.0 (C2): entry leaf tooltip -- source location, the detail line
+// Entry leaf tooltip -- source location, the detail line
 // again (in full, in case the description badge above got visually
 // truncated by a narrow Explorer pane), the kind glossary line, and the
 // package explainer (reusing MARKER_GLOSSARY.package's exact wording, same
@@ -1561,9 +1490,9 @@ function entryCatalogEntryTooltip(kind, entry) {
   return lines.join('\n');
 }
 
-// v0.12.0 (C2): shapes ONE Entry into a leaf UiNode. `kind` is threaded in
+// Shapes one Entry into a leaf UiNode. `kind` is threaded in
 // by the caller (shapeEntryCatalogGroup) rather than read off `entry`
-// itself -- Entry per the C1 contract carries no `kind` field of its own,
+// itself -- Entry carries no `kind` field of its own,
 // only its enclosing Group does.
 function shapeEntryCatalogEntry(kind, entry) {
   const hasLine = entry && typeof entry.line === 'number' && entry.line > 0;
@@ -1581,7 +1510,7 @@ function shapeEntryCatalogEntry(kind, entry) {
   };
 }
 
-// v0.12.0 (C2): shapes ONE Group into a group UiNode whose `children` are
+// Shapes one Group into a group UiNode whose `children` are
 // its shaped Entry leaves, stable-sorted exactly as resolver.js's C1
 // contract already promises ("stable sort by label" -- this file trusts
 // that ordering and does not re-sort, same "resolver.js is the sorting
@@ -1609,11 +1538,11 @@ function shapeEntryCatalogGroup(group) {
   };
 }
 
-// v0.12.0 (C2): Catalog -> UiNode[] (one root per Group, in the C1
-// contract's fixed kind order -- this file trusts and preserves
+// Catalog -> UiNode[] (one root per Group, in the catalog's fixed kind
+// order -- this file trusts and preserves
 // `catalog.groups`' own order, it never reorders). Defensive against a
-// malformed/absent catalog (e.g. a resolver.js build that hasn't landed C1
-// yet -- extension.js's own `typeof resolver.buildEntryCatalog === 'function'`
+// malformed/absent catalog (e.g. a resolver.js build without catalog
+// support -- extension.js's own `typeof resolver.buildEntryCatalog === 'function'`
 // guard is the first line of defense there, but this stays cheap and safe
 // to call standalone too, same "never throw on a shape it wasn't handed"
 // discipline as shapeResult above).
@@ -1622,7 +1551,7 @@ function shapeEntryCatalog(catalog) {
   return catalog.groups.map(shapeEntryCatalogGroup);
 }
 
-// v0.12.0 (C2): one-line, human-readable summary of Catalog.stats --
+// One-line, human-readable summary of Catalog.stats --
 // extension.js sets this as the entry-catalog view's persistent banner
 // (TreeView.message, the SAME mechanism renderTraceResult already uses for
 // the caller/callee view's header lines above), satisfying the C2
@@ -1800,7 +1729,7 @@ module.exports = {
   labelForNode,
   badgesForNode,
   packageBadge,
-  // v0.8 (N4/N6): external-node badge helpers, exported so test-uitree.js
+  // External-node badge helpers, exported so test-uitree.js
   // can unit-test them directly against bare fixtures, same rationale as
   // packageBadge/isRootNode above.
   externalNamespace,
@@ -1817,13 +1746,13 @@ module.exports = {
   // v0.7.1 orientation surface (see the ORIENTATION section above).
   effectiveOrientation,
   rerootEntryFirst,
-  // v0.9 (P1/P3): progressive-depth frontier helpers, exported so
+  // Progressive-depth frontier helpers, exported so
   // test-uitree.js can unit-test them directly against bare fixtures, same
   // rationale as externalNamespace/managedBadge above.
   frontierMethodKey,
   frontierBadge,
   shapeLoadMoreChild,
-  // v0.12.0 (C2): Entry-Point Catalog shaping surface -- see the section
+  // Entry-Point Catalog shaping surface -- see the section
   // header above shapeEntryCatalog for the full contract. Granular helpers
   // (shapeEntryCatalogEntry/Group, entryCatalogTarget) exported so
   // test-uitree.js can unit-test them directly against bare fixtures, same
@@ -1836,7 +1765,7 @@ module.exports = {
   shapeImpactSite,
   shapeImpactReport,
   shapeImpactHeaderLine,
-  // v0.13 (Round 2.5, H3 -- header half): SCOPED HEADERS surface, exported
+  // Scoped-header surface, exported
   // so test-uitree.js can unit-test these directly against bare fixtures,
   // same rationale as externalNamespace/managedBadge/frontierMethodKey
   // above. (H2's rollup grouping has no dedicated export here -- it needs

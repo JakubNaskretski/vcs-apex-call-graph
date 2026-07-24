@@ -1,5 +1,5 @@
 'use strict';
-// scanflow.js -- pure, vscode-free control-flow helpers for Round 2.5's H5
+// scanflow.js -- pure, vscode-free control-flow helpers for
 // (single-flight + same-target coalescing + one-pending-queue) and H6
 // (watcher dirty-set with fullSweepNeeded fallback). Also carries H8's
 // counts-only diagnostics payload builder, since it is pure data shaping
@@ -647,8 +647,8 @@ function createExcludeTracker() {
 // `raw` is a best-effort, duck-typed grab-bag of whatever the rest of the
 // engine (resolver.js's index, workerpool.js's stats, extension.js's own
 // phase timers) happened to produce this run -- every field is read
-// defensively with a fallback so a resolver.js build that hasn't landed
-// H1/H2/H3's own stats fields yet still produces a valid (just sparser)
+// defensively with a fallback so a resolver.js build without newer stats
+// fields still produces a valid (just sparser)
 // payload instead of throwing.
 // Fixed, small, engine-internal vocabularies -- never workspace-derived --
 // for the two duck-typed count-by-key maps below. Anything outside these
@@ -658,7 +658,7 @@ function createExcludeTracker() {
 // up as an object KEY in the payload (a name-shaped value is already
 // caught generically; a name-shaped KEY needs its own check, since
 // Object.keys() are exactly where a careless caller could leak one).
-// unresolved-by-reason: H8's own spec text names these five reasons.
+// Fixed unresolved-by-reason vocabulary.
 const KNOWN_UNRESOLVED_REASONS = new Set([
   'unknown-receiver',
   'deep-chain',
@@ -668,8 +668,7 @@ const KNOWN_UNRESOLVED_REASONS = new Set([
 ]);
 // via-kind histogram: resolver.js's own existing `via` value vocabulary
 // (static/ambiguous/external/override/dml/interface/typed/unique-name/
-// dynamic/publish/throws/lexical/new) plus this round's additions
-// (narrowed via B2, rollup via H2).
+// dynamic/publish/throws/lexical/new) plus narrowed and rollup edges.
 const KNOWN_VIA_KINDS = new Set([
   'static',
   'this',
@@ -704,9 +703,8 @@ function buildDiagnosticsPayload(raw) {
   const boolOrNull = (v) => (typeof v === 'boolean' ? v : null);
   const enumOrNull = (v, allowed) => (typeof v === 'string' && allowed.indexOf(v) !== -1 ? v : null);
 
-  // unresolvedByReason / viaHistogram / magnetSuppressed: read whatever
-  // resolver.js's index exposes (H1/H3, a different phase this round) via
-  // duck typing, but re-emit ONLY as a reason-string -> count map, and ONLY
+  // unresolvedByReason / viaHistogram / magnetSuppressed are read through
+  // duck typing, then re-emitted ONLY as a reason-string -> count map and ONLY
   // for keys in the known vocabularies above -- never passing through any
   // key or nested object that might carry a workspace-derived name.
   const reasonCounts = {};
