@@ -5,6 +5,7 @@ test.js
 test-*.js
 dev/**
 test-fixtures/**
+samples/**
 .npmignore
 **/.DS_Store
 node_modules/**/*.d.ts

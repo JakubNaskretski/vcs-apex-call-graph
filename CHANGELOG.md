@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.19.0
+
+The extension now has its own home in the Activity Bar instead of renting space
+in the Explorer.
+
+- The **Trace** and **Entry Points** views moved from the Explorer sidebar into a
+  dedicated **Apex Call Graph** Activity Bar container with its own icon. Running
+  a trace still reveals the view automatically — it now opens the panel instead.
+- The views are renamed to the shorter **Trace** and **Entry Points**, since the
+  container itself now carries the Apex Call Graph name.
+- Prefer the old layout? Drag either view back into the Explorer — VS Code
+  remembers your placement.
+
 ## 0.18.0
 
 Keep related methods easy to navigate without adding noise to the execution tree.

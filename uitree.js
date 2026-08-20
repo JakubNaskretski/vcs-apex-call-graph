@@ -1316,7 +1316,7 @@ function shapeHeaderLines(treeResult, orientation) {
 
 // =========================================================================
 // Entry-Point Catalog: pure shaping of resolver.js's
-// buildEntryCatalog(index) export. Feeds the second Explorer
+// buildEntryCatalog(index) export. Feeds the second sidebar
 // view ('apexTraceEntriesView', extension.js's job) -- a flat two-level
 // tree (kind group -> entries), NOT a recursive call tree, so this reuses
 // the UiNode shape (label/description/tooltip/iconId/jump/collapsible/
@@ -1474,7 +1474,7 @@ function entryCatalogDescription(entry) {
 
 // Entry leaf tooltip -- source location, the detail line
 // again (in full, in case the description badge above got visually
-// truncated by a narrow Explorer pane), the kind glossary line, and the
+// truncated by a narrow sidebar pane), the kind glossary line, and the
 // package explainer (reusing MARKER_GLOSSARY.package's exact wording, same
 // glossary line the caller/callee tree's own package badge uses -- one
 // consistent explanation for what a '(pkgLabel)' badge means anywhere in

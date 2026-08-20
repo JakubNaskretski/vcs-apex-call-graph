@@ -429,7 +429,7 @@ class TraceProvider {
 }
 
 // The Entry-Point Catalog's own TreeDataProvider, backing the
-// second Explorer view ('apexTraceEntriesView', see activate() below). A
+// second sidebar view ('apexTraceEntriesView', see activate() below). A
 // flat two-level tree (kind group -> entries, uitree.js's
 // shapeEntryCatalog output) rather than a recursive call tree, so this is
 // deliberately simpler than TraceProvider above -- no traceId/progressive-
@@ -1856,7 +1856,7 @@ async function activate(context) {
   const view = vscode.window.createTreeView('apexTraceView', { treeDataProvider: provider });
   context.subscriptions.push(view);
 
-  // The Entry-Point Catalog's own second Explorer view --
+  // The Entry-Point Catalog's own second sidebar view --
   // always visible (no `when` clause, same as apexTraceView), shows
   // a viewsWelcome (package.json) until apexTrace.showEntryCatalog is run
   // at least once this session.

@@ -33,7 +33,8 @@ calls, chains deeper than 12 segments), instead of staying silent about it.
 1. Put your cursor on a method or class name (or open nothing, for a QuickPick over
    every class/method) and run **Apex Call Graph: Who Calls This?** (callers) or
    **Apex Call Graph: What Does This Call?** (callees).
-2. Results land in the **Apex Call Graph** view (Explorer sidebar) — click any call
+2. Results land in the **Apex Call Graph** panel (its own Activity Bar icon, which
+   opens automatically) — click any call
    site to jump straight to it. The view title's swap-arrow button re-runs the same
    target in the other direction.
 3. Before changing a method signature, run **Apex Call Graph: Impact of Changing
@@ -41,7 +42,7 @@ calls, chains deeper than 12 segments), instead of staying silent about it.
    and sibling overloads.
 4. Put the cursor on the target you want and run **Apex Call Graph: Show Path Map**
    for an interactive graph instead of a tree. Re-running it on another target
-   replaces the open map. The Call Graph view's map button refreshes its last trace.
+   replaces the open map. The Trace view's map button refreshes its last trace.
 5. Not sure where to start? Run **Apex Call Graph: Show Entry Points** for a browsable
    index of every trigger, `@AuraEnabled`/`@InvocableMethod`/REST/SOAP method, async job,
    Flow, and anonymous script in the workspace — see [Entry Points view](#entry-points-view).
@@ -329,7 +330,7 @@ to re-scan and redraw the last traced target instead.
 ## Entry Points view
 
 **Apex Call Graph: Show Entry Points** scans the workspace and lists every way into
-the org in a second Explorer view — a browsable index built from the same data the
+the org in a second view of the Apex Call Graph panel — a browsable index built from the same data the
 call-graph engine already computes, not a new kind of analysis. Entries are grouped by
 kind (**Triggers**, **Aura / LWC**, **Invocable Actions**, **REST Endpoints**, **SOAP
 Web Services**, **Async** — Batchable/Queueable/Schedulable/`@future`, **Email
@@ -567,7 +568,7 @@ and Profile source also stays memory-only. Legacy source-bearing cache files are
 removed automatically, and safe facts caches expire after 30 days. Run **Apex Call
 Graph: Clear Cache** at any time to remove both in-memory and persisted caches; the
 next trace simply performs a cold scan.
-For performance troubleshooting, open **Apex Call Graph: Scan Stats** or run **Copy
+For performance troubleshooting, open the **Apex Call Graph: Scan Stats** output channel or run **Copy
 Diagnostics (counts only)**. The copied JSON contains counts, timings, worker usage,
 resolution-reason totals, and the active display mode — never paths, source text,
 symbols, or call arguments.
@@ -581,7 +582,7 @@ symbols, or call arguments.
 | `Apex Call Graph: Impact of Changing This Method` | Editor context menu (`.cls`/`.trigger`), command palette |
 | `Apex Call Graph: Switch Trace Direction` | View title button — re-runs the last target the other way |
 | `Apex Call Graph: Show Path Map` | Editor context menu, command palette — resolves the current target |
-| `Apex Call Graph: Refresh Path Map` | Call Graph view title button, command palette — re-scans the last target |
+| `Apex Call Graph: Refresh Path Map` | Trace view title button, command palette — re-scans the last target |
 | `Apex Call Graph: Show Entry Points` | Entry Points view title button, view welcome link, command palette |
 | `Apex Call Graph: Copy Diagnostics (counts only)` | Command palette |
 | `Apex Call Graph: Clear Cache` | Command palette |

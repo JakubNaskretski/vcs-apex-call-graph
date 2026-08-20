@@ -2,7 +2,7 @@
   "name": "apex-call-graph",
   "displayName": "Apex Call Graph",
   "description": "Trace callers and callees of Apex methods, inspect arguments, and assess signature-change impact across Apex, Flow, LWC, Aura and Visualforce. Offline static analysis: real Apex parser, no org connection, no language server.",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "publisher": "Skrety",
   "license": "MIT",
   "icon": "plugin-icon.png",
@@ -141,16 +141,25 @@
         }
       ]
     },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "apex-call-graph",
+          "title": "Apex Call Graph",
+          "icon": "activitybar-icon.svg"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "apex-call-graph": [
         {
           "id": "apexTraceView",
-          "name": "Apex Call Graph: Callers",
+          "name": "Trace",
           "contextualTitle": "Apex Call Graph"
         },
         {
           "id": "apexTraceEntriesView",
-          "name": "Apex Call Graph: Entry Points",
+          "name": "Entry Points",
           "contextualTitle": "Apex Call Graph"
         }
       ]
