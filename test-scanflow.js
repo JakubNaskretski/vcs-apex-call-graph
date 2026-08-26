@@ -16,6 +16,7 @@ const {
   matchesExcludeGlobs,
   excludeGlobsFingerprint,
   createExcludeTracker,
+  indexMemoFingerprint,
   buildDiagnosticsPayload,
   assertCountsOnly,
 } = require('./scanflow');
@@ -464,6 +465,52 @@ async function run() {
     assert.strictEqual(tracker.requiresFullSweep(['**/generated/**']), true, 'a real policy change invalidates cached path sets');
     tracker.commit(['**/generated/**']);
     assert.strictEqual(tracker.requiresFullSweep(['**/generated/**']), false, 'a successful full sweep commits the new policy');
+  }
+
+  // --- v0.2x/M2W: whole-index memoization fingerprint -------------------
+  // A COLLISION here is a stale-index-served-as-fresh wrong answer, so this
+  // pins both halves: identical state must fingerprint identically, and
+  // each of the three components must be able to change the result on its
+  // own.
+  {
+    const globs = ['**/generated/**', '**/*.spec.cls'];
+    assert.strictEqual(
+      indexMemoFingerprint(3, globs, 'file:///ws/A.cls@2'),
+      indexMemoFingerprint(3, globs, 'file:///ws/A.cls@2'),
+      'the same (epoch, excludeGlobs, overlay) triple always fingerprints identically'
+    );
+    assert.notStrictEqual(
+      indexMemoFingerprint(3, globs, 'file:///ws/A.cls@2'),
+      indexMemoFingerprint(4, globs, 'file:///ws/A.cls@2'),
+      'a cache-epoch bump (Clear Cache) must never fingerprint-match a pre-reset index'
+    );
+    assert.strictEqual(
+      indexMemoFingerprint(3, ['**/generated/**', '**/generated/**'], ''),
+      indexMemoFingerprint(3, ['**/generated/**'], ''),
+      'the exclude component composes excludeGlobsFingerprint (dedup/sort), not the raw array'
+    );
+    assert.notStrictEqual(
+      indexMemoFingerprint(3, ['**/generated/**'], ''),
+      indexMemoFingerprint(3, ['**/build/**'], ''),
+      'a real exclude-policy change must change the fingerprint'
+    );
+    assert.notStrictEqual(
+      indexMemoFingerprint(3, globs, 'file:///ws/A.cls@2'),
+      indexMemoFingerprint(3, globs, 'file:///ws/A.cls@3'),
+      'an edited unsaved buffer must change the fingerprint'
+    );
+    assert.notStrictEqual(
+      indexMemoFingerprint(3, globs, ''),
+      indexMemoFingerprint(3, globs, 'file:///ws/A.cls@1'),
+      'a newly-dirty buffer must change the fingerprint'
+    );
+    // JSON quoting, not a fixed separator: no free-text component can forge
+    // a neighbouring one's value across the boundary.
+    assert.notStrictEqual(
+      indexMemoFingerprint(3, ['**/a/**'], 'x'),
+      indexMemoFingerprint(3, ['**/a/**", "x'], ''),
+      'component boundaries are unforgeable (JSON-quoted, never join()ed)'
+    );
   }
 
   // === H8: buildDiagnosticsPayload / assertCountsOnly ======================

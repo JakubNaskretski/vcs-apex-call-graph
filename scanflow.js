@@ -637,6 +637,39 @@ function createExcludeTracker() {
 }
 
 // =========================================================================
+// v0.2x/M2W: whole-index memoization fingerprint
+// =========================================================================
+//
+// The three independent facts that must ALL still match the state a
+// previously-built resolver.js index was produced under for that index to
+// be safely REUSED verbatim on a later scanAndBuildIndexForEpoch call: the
+// cache epoch (a Clear Cache bump must never serve a pre-reset index), the
+// exclude-glob fingerprint (a settings edit must never silently keep
+// serving the old file-selection policy's index), and a fingerprint of the
+// live unsaved-editor-overlay snapshot (a dirty buffer's content can change
+// the effective factsList/metaRefs even when nothing on disk or in the
+// watcher's dirty set moved). This function does NOT itself decide whether
+// a memo hit is safe -- extension.js additionally requires BOTH the Apex
+// and metadata scans that round to have taken their 'skipped' fast path
+// (see scanAndParse/scanMetaFiles's own sweepKind contract) before trusting
+// a fingerprint match; see extension.js's own call site for why that
+// extra condition cannot be folded in here (it is derived from the SAME
+// scan round the fingerprint below describes, not from state this pure
+// function has access to).
+//
+// JSON.stringify over the triple, deliberately NOT a `.join(separator)`: two
+// of the three components are workspace-derived free text (a user-authored
+// exclude glob, and resource keys that on some URI schemes contain colons),
+// so any fixed separator is in principle forgeable across component
+// boundaries -- and a fingerprint COLLISION here is exactly the
+// stale-index-served-as-fresh wrong-answer bug this whole mechanism must
+// never produce (see Risks). JSON's own quoting/escaping makes the boundary
+// unambiguous for free, at no readability cost.
+function indexMemoFingerprint(cacheEpoch, excludeGlobs, overlayFingerprint) {
+  return JSON.stringify([cacheEpoch, excludeGlobsFingerprint(excludeGlobs), overlayFingerprint]);
+}
+
+// =========================================================================
 // H8: counts-only diagnostics payload (apexTrace.copyDiagnostics)
 // =========================================================================
 //
@@ -837,6 +870,7 @@ module.exports = {
   matchesExcludeGlobs,
   excludeGlobsFingerprint,
   createExcludeTracker,
+  indexMemoFingerprint,
   buildDiagnosticsPayload,
   assertCountsOnly,
   // v0.20/K1: exported for test-kindparity.js's vocabulary-subset assertions.

@@ -1424,6 +1424,49 @@ function findChild(tree, label) {
 }
 
 // =========================================================================
+// v0.2x/M2W: whole-index memoization wiring. A memo HIT returns a
+// previously-built index BY REFERENCE, so the two things that must never
+// regress are (a) the hit-check sitting AHEAD of the index build it skips
+// and (b) attachMetaCallers keeping exactly ONE call site -- its multi-call
+// contract ACCUMULATES metaCallers buckets, so a second call against an
+// already-attached index would silently double every metadata-caller count.
+// extension.js requires the 'vscode' module and cannot be require()'d
+// outside the extension host, so this pins its source text, same convention
+// as the META_GLOBS/expandMany blocks above.
+// =========================================================================
+{
+  const extSrc = fs.readFileSync(path.join(__dirname, 'extension.js'), 'utf8');
+  assert(
+    extSrc.includes('let indexMemo = null;'),
+    'the memo is activation-scoped state declared inside activate(), never persisted'
+  );
+  assert(
+    extSrc.includes("const sweepsWereNoOp = scan.sweepKind === 'skipped' && metaScan.sweepKind === 'skipped';"),
+    'a memo hit requires BOTH sweeps to have taken their zero-I/O skipped path this round'
+  );
+  assert(
+    extSrc.includes('const overlayFingerprint = editoroverlay.overlaySnapshotFingerprint(editorOverlays);') &&
+      extSrc.includes('scanflow.indexMemoFingerprint(scanCacheEpoch, settings.excludeMatcher, overlayFingerprint)'),
+    'the memo key must include the unsaved-overlay snapshot -- without it an edited dirty buffer HITS and serves a stale index'
+  );
+  assert(
+    extSrc.indexOf('indexMemo.fingerprint === memoFingerprint') <
+      extSrc.indexOf('resolver.buildSemanticIndex(scan.factsList'),
+    'the memo check must precede the semantic-index build it exists to skip'
+  );
+  assert.strictEqual(
+    extSrc.split('resolver.attachMetaCallers(index, strippedMetaRefs);').length - 1,
+    1,
+    'attachMetaCallers has exactly ONE call site -- a second one (e.g. on the memo-hit path) would double every metadata-caller bucket'
+  );
+  assert(
+    extSrc.indexOf('indexMemo = { fingerprint: memoFingerprint, index };') >
+      extSrc.indexOf('resolver.attachMetaCallers(index, strippedMetaRefs);'),
+    'only a fully-built, fully-attached index is ever stored in the memo'
+  );
+}
+
+// =========================================================================
 // Path Map command routing. "Show" is selection-sensitive and must never
 // prefer a stale lastTarget; the view-title "Refresh" command owns the
 // deliberate retrace-last-target behavior.

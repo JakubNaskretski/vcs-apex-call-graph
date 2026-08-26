@@ -4810,6 +4810,8 @@ function makeCalleeFlowNode(flow, via, siteEntry, index, ctx) {
     line: flow.line,
     entries: [metaEntryLabel('flow')],
     isTest: false,
+    flowStatus: flow.flowStatus || null, // v0.2x/M2W
+    flowHasScheduledPaths: !!flow.flowHasScheduledPaths, // v0.2x/M2W
     via,
     sites: [{
       path: siteEntry.path,
@@ -5178,6 +5180,8 @@ function buildMetaChildren(index, metaRefs, ctx) {
         ]
         : [metaEntryLabel(first.kind)],
       isTest: false,
+      flowStatus: first.flowStatus || null, // v0.2x/M2W
+      flowHasScheduledPaths: !!first.flowHasScheduledPaths, // v0.2x/M2W
       via: edgeVia,
       sites: refs.map((r) => ({
         path: r.path || '',
@@ -5316,6 +5320,8 @@ function buildOneFlowNode(index, flowLower, ancestorPath, ctx, direction, budget
     label: info.label, kind: 'flow', className: '', methodLower: null,
     path: info.path || '', line: info.line || 0,
     entries: [metaEntryLabel('flow')], isTest: false,
+    flowStatus: info.flowStatus || null, // v0.2x/M2W
+    flowHasScheduledPaths: !!info.flowHasScheduledPaths, // v0.2x/M2W
     // A subflow edge is a declared reference, not a fan-out guess.
     via: 'subflow', sites: [], children: [],
     cyclic: false, truncated: false, approximate: false, seenElsewhere: false,
@@ -5937,6 +5943,8 @@ function attachMetaCallers(index, metaRefs) {
       line: ref.line || 0,
       flowRecordTriggerType: ref.flowRecordTriggerType || null,
       flowTriggerType: ref.flowTriggerType || null,
+      flowHasScheduledPaths: !!ref.flowHasScheduledPaths, // v0.2x/M2W
+      flowStatus: ref.flowStatus || null, // v0.2x/M2W
     });
   }
   index.flowRefsByObject = flowRefsByObject;
@@ -5998,6 +6006,13 @@ function attachMetaCallers(index, metaRefs) {
         flowObject: ref.flowObject || (existing && existing.flowObject) || null,
         flowTriggerType: ref.flowTriggerType || (existing && existing.flowTriggerType) || null,
         flowRecordTriggerType: ref.flowRecordTriggerType || (existing && existing.flowRecordTriggerType) || null,
+        // v0.2x/M2W: both fields are a per-FILE fact (identical across
+        // every ref from the same flow), so this merge rule's outcome is
+        // the same regardless of which ref happens to win the line-based
+        // pick -- kept in this same shape purely for structural
+        // consistency with the four fields above.
+        flowHasScheduledPaths: !!(ref.flowHasScheduledPaths || (existing && existing.flowHasScheduledPaths)),
+        flowStatus: ref.flowStatus || (existing && existing.flowStatus) || null,
       });
     }
 
@@ -6126,7 +6141,10 @@ function finalizeFlowSubflowRefs(index) {
     if (!label) continue;
     const flowLower = lc(label);
     if (!flowInfo.has(flowLower)) {
-      flowInfo.set(flowLower, { label, path: p, line: 0, flowObject: null, flowTriggerType: null, flowRecordTriggerType: null });
+      flowInfo.set(flowLower, {
+        label, path: p, line: 0, flowObject: null, flowTriggerType: null, flowRecordTriggerType: null,
+        flowHasScheduledPaths: false, flowStatus: null, // v0.2x/M2W
+      });
     }
   }
 
@@ -6731,12 +6749,21 @@ function flowStemOf(rawPath) {
 // sharing a label was stamped from the SAME file's SAME <start> block, so
 // flowObject/flowTriggerType never differ across them). Detail: the
 // fallback ('screen or autolaunched') whenever no
-// start-trigger info was extracted (covers real Screen Flows, record-
-// agnostic Autolaunched Flows, AND Scheduled-Path Flows alike -- metascan's
-// own <start> extraction cannot tell these apart, and this catalog performs
-// no new analysis to do so either), otherwise '<flowTriggerType> on
-// <flowObject>' (covers both record-triggered and platform-event-triggered
-// shapes, which both carry that same field pair).
+// start-trigger info was extracted (covers real Screen Flows and record-
+// agnostic Autolaunched Flows -- metascan's own <start> extraction cannot
+// tell those two apart, and this catalog performs no new analysis to do so
+// either), otherwise '<flowTriggerType> on <flowObject>' (covers both
+// record-triggered and platform-event-triggered shapes, which both carry
+// that same field pair).
+// v0.2x/M2W: a THIRD case now splits out of that fallback -- an object-less
+// flow whose <start><triggerType> is 'Scheduled' reads 'Scheduled', not
+// 'screen or autolaunched' (a scheduled flow IS distinguishable from the
+// other two now that metascan recognizes the value; see
+// SCHEDULED_TRIGGER_TYPE there). Two further additive suffixes, both '' by
+// default, follow the subflow suffix below: flowStatusSuffixFor (a
+// non-Active <status>) and scheduledPathsSuffixFor (a <scheduledPaths>
+// branch). Suffix order is load-bearing and pinned by test-resolver.js:
+// base, subflow, status, async-path.
 // v0.13/S2: additive detail-suffix for a flow that is ONLY ever referenced
 // as a subflow of other flows -- "no <start> trigger info (hasStartInfo
 // false -- the pre-existing 'screen or autolaunched' fallback branch) AND at
@@ -6757,6 +6784,25 @@ function subflowSuffixFor(index, label, hasStartInfo) {
     return info && info.label ? info.label : p;
   });
   return ` (subflow of ${parentLabels.join(', ')})`;
+}
+
+// v0.2x/M2W: Draft/Obsolete/InvalidDraft flows stay visible in the catalog
+// instead of being silently indistinguishable from a healthy Active one --
+// badge, never hide. '' for a flow with no known (or Active) status, so
+// `detail + flowStatusSuffixFor(...)` is always safe to concatenate, same
+// contract as subflowSuffixFor's own ' (subflow of ...)' pattern just
+// above. Raw status text rendered verbatim inside the parenthetical --
+// Draft/Obsolete/InvalidDraft all read clearly on their own; no attempt to
+// prettify a status value this engine has never needed to second-guess.
+function flowStatusSuffixFor(flowStatus) {
+  if (!flowStatus || lc(flowStatus) === 'active') return '';
+  return ` (${flowStatus})`;
+}
+
+// v0.2x/M2W: same additive-suffix contract as flowStatusSuffixFor just
+// above, for the OTHER new v0.2x/M2W fact.
+function scheduledPathsSuffixFor(flowHasScheduledPaths) {
+  return flowHasScheduledPaths ? ' (async path)' : '';
 }
 
 function collectFlowEntries(index, addEntry) {
@@ -6793,7 +6839,13 @@ function collectFlowEntries(index, addEntry) {
     // already uses to detect this same shape). Other record-triggered shapes
     // use the raw triggerType text unchanged.
     const baseDetail = !best.flowObject
-      ? 'screen or autolaunched'
+      // v0.2x/M2W: an object-less Scheduled flow (the common case -- a
+      // plain cron schedule, no "for records matching" mode) must NOT
+      // collapse into the generic 'screen or autolaunched' fallback --
+      // that was the mislabel this fix corrects. An object-less flow of
+      // any OTHER/unrecognized triggerType is unaffected (still the
+      // pre-existing fallback).
+      ? (lc(best.flowTriggerType) === 'scheduled' ? 'Scheduled' : 'screen or autolaunched')
       : lc(best.flowTriggerType) === 'platformevent'
         ? `platform event on ${best.flowObject}`
         : best.flowTriggerType
@@ -6802,7 +6854,10 @@ function collectFlowEntries(index, addEntry) {
     // v0.13/S2: additive suffix only -- see subflowSuffixFor's own header
     // note. `!best.flowObject` is the exact same "no <start> trigger info"
     // condition baseDetail's own fallback branch above just used.
-    const detail = baseDetail + subflowSuffixFor(index, label, !!best.flowObject);
+    const detail = baseDetail
+      + subflowSuffixFor(index, label, !!best.flowObject)
+      + flowStatusSuffixFor(best.flowStatus) // v0.2x/M2W
+      + scheduledPathsSuffixFor(best.flowHasScheduledPaths); // v0.2x/M2W
     addEntry('flow', `flow:${label}`, {
       label,
       className: null,
@@ -6850,7 +6905,7 @@ function collectFlowEntries(index, addEntry) {
     if (!info || typeof info.label !== 'string' || !info.label || seenLabels.has(info.label)) continue;
     seenLabels.add(info.label);
     const baseDetail = !info.flowObject
-      ? 'screen or autolaunched'
+      ? (lc(info.flowTriggerType) === 'scheduled' ? 'Scheduled' : 'screen or autolaunched')
       : lc(info.flowTriggerType) === 'platformevent'
         ? `platform event on ${info.flowObject}`
         : info.flowTriggerType
@@ -6862,7 +6917,10 @@ function collectFlowEntries(index, addEntry) {
       methodLower: null,
       path: info.path || '',
       line: info.line || 0,
-      detail: baseDetail + subflowSuffixFor(index, info.label, !!info.flowObject),
+      detail: baseDetail
+        + subflowSuffixFor(index, info.label, !!info.flowObject)
+        + flowStatusSuffixFor(info.flowStatus) // v0.2x/M2W
+        + scheduledPathsSuffixFor(info.flowHasScheduledPaths), // v0.2x/M2W
       package: null,
     });
   }
@@ -7159,6 +7217,8 @@ function impactParentFlows(index, flowLabel) {
       label: info ? info.label : flowLower,
       path: info ? info.path : '',
       line: info ? info.line : 0,
+      flowStatus: info ? (info.flowStatus || null) : null, // v0.2x/M2W
+      flowHasScheduledPaths: info ? !!info.flowHasScheduledPaths : false, // v0.2x/M2W
     });
     const graph = index.flowGraph.get(flowLower);
     if (graph && Array.isArray(graph.parents)) queue.push(...graph.parents);
@@ -7185,6 +7245,8 @@ function impactMetadataSites(index, classLower, methodLower) {
       className: ref.className || null,
       methodName: ref.methodName || null,
       parentFlows: ref.kind === 'flow' ? impactParentFlows(index, ref.label) : [],
+      flowStatus: ref.kind === 'flow' ? (ref.flowStatus || null) : null, // v0.2x/M2W
+      flowHasScheduledPaths: ref.kind === 'flow' ? !!ref.flowHasScheduledPaths : false, // v0.2x/M2W
     });
   }
   out.sort((a, b) => a.kind.localeCompare(b.kind) || a.label.localeCompare(b.label) || a.path.localeCompare(b.path) || a.line - b.line);

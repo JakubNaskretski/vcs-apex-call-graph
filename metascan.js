@@ -390,6 +390,68 @@
 //     stemOf('Vtx_Sample.' + ext) === 'Vtx_Sample'). Its behavior is
 //     untouched.
 //
+// v0.2x/M2W: Visualforce $RemoteAction (JS Remoting) method-level
+// extraction. Purely additive -- the pre-existing class-level
+// ({className, methodName:null}) and action-binding ({className:null,
+// methodName}) 'vf' shapes are completely unchanged, byte-for-byte. New: a
+// THIRD 'vf' shape, one per {!$RemoteAction.ClassName.methodName} merge
+// field found ANYWHERE in the file's raw text (not restricted to inside a
+// <script> tag, and deliberately NOT anchored to physical adjacency with an
+// invokeAction(...) call site -- see VF_REMOTE_ACTION_RE's own header note
+// for why):
+//
+//   { kind:'vf', label, className: <ClassName>, methodName: <methodName>,
+//     line, lineText, namespace: string|null }
+//
+//   - UNLIKE the two pre-existing 'vf' shapes, BOTH className AND
+//     methodName are non-null here -- the merge field spells out the exact
+//     target class and method text, so there is no controller/extensions-
+//     list ambiguity to defer to resolver.js's attachVfActionRef. This ref
+//     flows through the ordinary (has className) local-or-external attach
+//     path every Aura/Flow ref already uses.
+//   - namespace-dotted form ({!$RemoteAction.ns.Class.method}) folds every
+//     leading segment before the trailing Class.method pair into
+//     `namespace`, verbatim -- the exact same convention LWC specifiers and
+//     Flow actionNames already use (splitDottedNamespace, tailCount 2). A
+//     bare 2-segment merge field leaves namespace: null.
+//   - Extraction is gated on the SAME VF_ROOT_RE root-tag match the rest of
+//     this extractor already requires -- a file with no recognizable
+//     apex:page/apex:component opening yields nothing at all, for this
+//     shape too.
+//
+// v0.2x/M2W: two additive fields on the MetaRef 'flow' shape (every
+// pre-existing field above keeps its exact meaning):
+//
+//   - flowHasScheduledPaths: boolean, always present. true when a
+//     RECORD-TRIGGERED flow's <start> block contains at least one
+//     <scheduledPaths> element (an asynchronous "N days/hours after
+//     <field>" branch), false otherwise (the overwhelming majority,
+//     including every flow shape that predates this field). The
+//     record-triggered restriction is exact, not incidental: Scheduled
+//     Paths are a record-trigger-only Flow feature, so the check runs on
+//     that branch of extractFlowStart alone -- a Scheduled or
+//     PlatformEvent flow always reports false, even in the malformed case
+//     of an XML file that carries the element anyway. Presence-only --
+//     this file does NOT
+//     attempt to attribute individual <actionCalls> blocks to a specific
+//     scheduled-path branch vs. the immediate path (that would require
+//     following the <connector><targetReference> element graph, outside
+//     this file's flat regex-based extraction).
+//   - flowStatus: string|null, always present. The flow's own top-level
+//     <status> element text verbatim (Draft/Active/Obsolete/InvalidDraft,
+//     or any other value Salesforce ever emits there -- this file does not
+//     validate against a fixed enum), or null if no <status> element was
+//     found at all. A file-level fact (exactly one <status> per Flow,
+//     never inside <start>) stamped onto every ref this file produces for
+//     that flow, same convention as flowObject/flowTriggerType.
+//   - Also: <start><triggerType>Scheduled</triggerType> (a cron-like
+//     Autolaunched Flow) is now a FIFTH recognized triggerType, alongside
+//     the pre-existing three record-triggered values and PlatformEvent --
+//     see SCHEDULED_TRIGGER_TYPE's own header note above. flowObject is
+//     populated when (the optional) <object> is present, exactly like the
+//     PlatformEvent shape; flowRecordTriggerType stays null always (a
+//     scheduled flow never carries <recordTriggerType>).
+//
 // Design notes:
 //
 // - `label` is the file's stem (its Salesforce API name) — see stemOf()
@@ -754,6 +816,37 @@ const RECORD_TRIGGERED_TYPES = new Set(['RecordBeforeSave', 'RecordAfterSave', '
 // RecordBefore*/RecordAfterSave shapes above).
 const PLATFORM_EVENT_TRIGGER_TYPE = 'PlatformEvent';
 
+// v0.2x/M2W: the fifth recognized <start><triggerType> value -- a
+// Schedule-Triggered (cron-like) Autolaunched Flow. Like a platform-event
+// flow, its <start> block never carries <recordTriggerType> (that element
+// is exclusive to the three RecordBefore*/RecordAfterSave shapes above) --
+// but UNLIKE a platform-event flow, <object> is OPTIONAL here: the
+// overwhelming majority of scheduled flows have no <object> at all (a plain
+// cron schedule), while a "run for records matching criteria" scheduled
+// flow does carry one. Either way flowRecordTriggerType stays null, which
+// is what keeps this shape OUT of the DML-fan-out matching resolver.js's
+// RECORD_TRIGGERED_TYPES-driven wiring performs (out of scope here,
+// unchanged) -- a scheduled flow is never treated as if it ran
+// synchronously inside a save.
+const SCHEDULED_TRIGGER_TYPE = 'Scheduled';
+
+// v0.2x/M2W: presence-only check for <scheduledPaths> elements inside a
+// record-triggered flow's <start> block (Scheduled Paths -- asynchronous
+// branches like "3 days after LastModifiedDate"). Deliberately a single
+// boolean FLAG, not per-path/per-action attribution: correlating which
+// <actionCalls> blocks live on which scheduled-path branch vs. the
+// immediate path would require following the <connector><targetReference>
+// element graph, which this file's flat regex-based extraction does not
+// attempt (same "text extraction only, never structural graph-walking"
+// posture the rest of this file already keeps -- see e.g. the header note
+// on why metascan has no file index). A record-triggered flow with >=1
+// <scheduledPaths> element anywhere in its <start> block gets
+// flowHasScheduledPaths:true on every ref it produces (mirroring the
+// flowObject/flowTriggerType file-level-fact convention); every other flow
+// (the overwhelming majority) gets false, byte-identical in every other
+// respect to pre-v0.2x output.
+const FLOW_SCHEDULED_PATHS_RE = /<scheduledPaths>/;
+
 // A Flow's own <subflows> blocks each name a child Flow (its
 // <flowName>), never an Apex action. Structurally a repeatable, non-nested
 // top-level block under the Flow root, same shape <actionCalls> already has
@@ -811,7 +904,7 @@ function extractFlowSubflows(text) {
 
 function extractFlowStart(text) {
   const startMatch = FLOW_START_RE.exec(text);
-  if (!startMatch) return { flowObject: null, flowRecordTriggerType: null, flowTriggerType: null, anchorIdx: -1 };
+  if (!startMatch) return { flowObject: null, flowRecordTriggerType: null, flowTriggerType: null, anchorIdx: -1, flowHasScheduledPaths: false };
   const block = startMatch[1];
   const triggerTypeMatch = FLOW_START_TRIGGER_TYPE_RE.exec(block);
   const triggerType = triggerTypeMatch ? triggerTypeMatch[1].trim() : null;
@@ -829,11 +922,24 @@ function extractFlowStart(text) {
       flowRecordTriggerType: null,
       flowTriggerType: PLATFORM_EVENT_TRIGGER_TYPE,
       anchorIdx,
+      flowHasScheduledPaths: false,
+    };
+  }
+
+  // v0.2x/M2W -- see SCHEDULED_TRIGGER_TYPE's own header note.
+  if (triggerType === SCHEDULED_TRIGGER_TYPE) {
+    const objectMatch = FLOW_START_OBJECT_RE.exec(block);
+    return {
+      flowObject: objectMatch ? objectMatch[1].trim() : null,
+      flowRecordTriggerType: null,
+      flowTriggerType: SCHEDULED_TRIGGER_TYPE,
+      anchorIdx,
+      flowHasScheduledPaths: false,
     };
   }
 
   if (!triggerType || !RECORD_TRIGGERED_TYPES.has(triggerType)) {
-    return { flowObject: null, flowRecordTriggerType: null, flowTriggerType: null, anchorIdx: -1 };
+    return { flowObject: null, flowRecordTriggerType: null, flowTriggerType: null, anchorIdx: -1, flowHasScheduledPaths: false };
   }
   const objectMatch = FLOW_START_OBJECT_RE.exec(block);
   const recordTriggerTypeMatch = FLOW_START_RECORD_TRIGGER_TYPE_RE.exec(block);
@@ -842,12 +948,29 @@ function extractFlowStart(text) {
     flowRecordTriggerType: recordTriggerTypeMatch ? recordTriggerTypeMatch[1].trim() : null,
     flowTriggerType: triggerType,
     anchorIdx,
+    // v0.2x/M2W -- see FLOW_SCHEDULED_PATHS_RE's own header note.
+    flowHasScheduledPaths: FLOW_SCHEDULED_PATHS_RE.test(block),
   };
+}
+
+// v0.2x/M2W: <status> is a file-level fact (a Flow has exactly one
+// <status> element), computed once per file -- same "one <start> block is a
+// file-level fact, not a per-ref one" convention F1(b) established for
+// flowObject/flowTriggerType. First match only (a well-formed Flow file
+// never has more than one); a file with no <status> element at all (never
+// seen in a real fixture, but this file never assumes well-formed input)
+// leaves it null.
+const FLOW_STATUS_RE = /<status>([^<]+)<\/status>/;
+
+function extractFlowStatus(text) {
+  const m = FLOW_STATUS_RE.exec(text);
+  return m ? m[1].trim() : null;
 }
 
 function extractFlow(path, text, lineStarts, out) {
   const label = stemOf(path);
   const start = extractFlowStart(text);
+  const flowStatus = extractFlowStatus(text); // v0.2x/M2W
   // Computed once per file, using the same file-level-fact convention
   // extractFlowStart already established for <start> -- stamped onto every
   // apex-actionCalls ref below, and (see the zero-actionCalls branch at the
@@ -893,6 +1016,8 @@ function extractFlow(path, text, lineStarts, out) {
     ref.flowObject = start.flowObject;
     ref.flowRecordTriggerType = start.flowRecordTriggerType;
     ref.flowTriggerType = start.flowTriggerType;
+    ref.flowHasScheduledPaths = start.flowHasScheduledPaths; // v0.2x/M2W
+    ref.flowStatus = flowStatus; // v0.2x/M2W
     // Each ref gets its OWN copy of the subflows list -- never a
     // shared mutable array a caller could accidentally corrupt for a sibling
     // ref -- same posture this file already takes for extensionClasses (A2).
@@ -912,7 +1037,8 @@ function extractFlow(path, text, lineStarts, out) {
   // see the top-of-file flow-reference note for the full shape rationale.
   // v0.20/D1: this branch now has a SECOND firing condition -- a flow whose
   // <start> carries a RECOGNIZED <triggerType> (one of
-  // RECORD_TRIGGERED_TYPES, or PLATFORM_EVENT_TRIGGER_TYPE) and ZERO apex
+  // RECORD_TRIGGERED_TYPES, PLATFORM_EVENT_TRIGGER_TYPE, or -- as of
+  // v0.2x/M2W -- SCHEDULED_TRIGGER_TYPE) and ZERO apex
   // actionCalls, even with no <subflows> element at all. Such a flow (purely
   // declarative record-triggered work: assignments/recordUpdates only)
   // previously emitted NOTHING, so its flowObject/flowTriggerType facts
@@ -926,6 +1052,8 @@ function extractFlow(path, text, lineStarts, out) {
     ref.flowObject = start.flowObject;
     ref.flowRecordTriggerType = start.flowRecordTriggerType;
     ref.flowTriggerType = start.flowTriggerType;
+    ref.flowHasScheduledPaths = start.flowHasScheduledPaths; // v0.2x/M2W
+    ref.flowStatus = flowStatus; // v0.2x/M2W
     ref.subflows = subflows.slice();
     out.push(ref);
   }
@@ -1214,6 +1342,21 @@ const VF_ACTION_ATTR_RE = /\baction\s*=\s*["']([^"']*)["']/;
 // file does not attempt).
 const VF_ACTION_SINGLE_IDENT_RE = /^\{!\s*([A-Za-z_]\w*)\s*\}$/;
 
+// v0.2x/M2W: $RemoteAction merge-field extraction (JS Remoting) --
+// {!$RemoteAction.ClassName.methodName}, wherever it appears in the page's
+// raw text (almost always inside an inline <script> block, as the string
+// argument to Visualforce.remoting.Manager.invokeAction(...) or a
+// locally-aliased invokeAction(...) call -- but deliberately NOT anchored to
+// that call site: assigning the merge field to a variable first, then
+// passing the variable to invokeAction(), is a common real-world style this
+// file's regex/text-based design has no way to see through, so the merge
+// field TOKEN ITSELF -- unambiguous VF syntax reserved exclusively for this
+// purpose -- is the extraction anchor instead). Namespace-dotted form
+// tolerated exactly like an LWC specifier (see LWC_IMPORT_RE above):
+// className/methodName are always the LAST TWO dot-separated segments, any
+// leading segment(s) fold into `namespace` verbatim.
+const VF_REMOTE_ACTION_RE = /\{!\s*\$RemoteAction\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\s*\}/g;
+
 // Given one already-isolated tag-text substring (and its start
 // offset in the full file), extracts its `action="{!singleIdentifier}"`
 // binding (if any) into a method-level MetaRef, stamping the page-level
@@ -1284,6 +1427,22 @@ function extractVf(path, text, lineStarts, out) {
   let am;
   while ((am = VF_ACTION_TAG_RE.exec(text))) {
     extractVfActionBinding(am[0], am.index, text, lineStarts, label, controllerClass, extensionClasses, out);
+  }
+
+  // v0.2x/M2W: $RemoteAction merge fields, searched over the WHOLE file
+  // text (not just the root tag or its child action= tags -- these live in
+  // <script> blocks anywhere in the page body). Unlike every other 'vf'
+  // shape, className AND methodName are BOTH known directly from the merge
+  // field text -- no controller/extensions-list linking needed -- so this
+  // ref flows through the SAME generic (has className) attach path every
+  // Aura/Flow dotted-actionName ref already uses; zero resolver.js changes.
+  VF_REMOTE_ACTION_RE.lastIndex = 0;
+  let rm;
+  while ((rm = VF_REMOTE_ACTION_RE.exec(text))) {
+    const split = splitDottedNamespace(rm[1], 2);
+    const ref = makeRef('vf', label, split.tail[0], split.tail[1], text, lineStarts, rm.index);
+    ref.namespace = split.namespace;
+    out.push(ref);
   }
 }
 

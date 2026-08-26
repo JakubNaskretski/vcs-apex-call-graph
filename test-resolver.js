@@ -5568,6 +5568,70 @@ function buildV9ChainCallee5() {
   assert.strictEqual(sawNoControllerPage, false, 'v0.10/A2: a standardController-only page (no controllerClass, no extensionClasses) has NO edge possible at any level -- the ref is dropped entirely, not just left unresolved at the method level');
 }
 
+// ---- v0.2x/M2W: VF $RemoteAction attach (resolver half) ----------------
+// This new 'vf' shape carries a non-null className (unlike the A2
+// action-binding shape's className:null), so it must fall through to the
+// ORDINARY (has className) local-or-external attach path -- not the
+// A2-specific attachVfActionRef branch. Model: the existing
+// namespaced-Flow-actionName / aura-external-attach blocks.
+{
+  const AcmeQuoteRemoteController = ty('AcmeQuoteRemoteController', 'AcmeQuoteRemoteController', {
+    methods: [mth('getQuoteSummary', { line: 1 })],
+  });
+  const index = buildSemanticIndex([mkFile(AcmeQuoteRemoteController)]);
+  const localRemoteRef = {
+    kind: 'vf',
+    label: 'AcmeQuotePage',
+    className: 'AcmeQuoteRemoteController',
+    methodName: 'getQuoteSummary',
+    namespace: null,
+    path: '/ws/pages/AcmeQuotePage.page',
+    line: 12,
+    lineText: "Visualforce.remoting.Manager.invokeAction('{!$RemoteAction.AcmeQuoteRemoteController.getQuoteSummary}', cb);",
+  };
+  attachMetaCallers(index, [localRemoteRef]);
+  const tree = buildCallerTree(index, { classLower: 'acmequoteremotecontroller', methodLower: 'getquotesummary' });
+  const page = findChild(tree.root.children, 'AcmeQuotePage');
+  assert.ok(page, 'v0.2x/M2W: $RemoteAction ref attaches as a caller of the target method');
+  assert.strictEqual(page.kind, 'vf');
+  assert.strictEqual(page.via, 'metadata');
+}
+{
+  const externalRemoteRef = {
+    kind: 'vf',
+    label: 'AcmeGatewayPage',
+    className: 'AcmeGatewayRemote',
+    methodName: 'dispatch',
+    namespace: 'zenq',
+    path: '/ws/pages/AcmeGatewayPage.page',
+    line: 4,
+    lineText: 'Visualforce.remoting.Manager.invokeAction("{!$RemoteAction.zenq.AcmeGatewayRemote.dispatch}", cb);',
+  };
+  const index = buildSemanticIndex([]);
+  attachMetaCallers(index, [externalRemoteRef]);
+  const ext = index.externals.get('zenq.acmegatewayremote');
+  assert.ok(ext, 'v0.2x/M2W: a namespaced $RemoteAction ref attaches to an external node, not a local class');
+  assert.strictEqual(index.metaCallers.size, 0, 'must not also (or instead) land in the ordinary metaCallers bucket');
+}
+{
+  const V8OwnZenqGateway = ty('AcmeGatewayRemote', 'AcmeGatewayRemote', { methods: [mth('dispatch', { line: 1 })] });
+  const index = buildSemanticIndex([mkFile(V8OwnZenqGateway)], { ownNamespace: 'zenq' });
+  const ownRemoteRef = {
+    kind: 'vf',
+    label: 'AcmeGatewayPage',
+    className: 'AcmeGatewayRemote',
+    methodName: 'dispatch',
+    namespace: 'zenq',
+    path: '/ws/pages/AcmeGatewayPage.page',
+    line: 4,
+    lineText: 'Visualforce.remoting.Manager.invokeAction("{!$RemoteAction.zenq.AcmeGatewayRemote.dispatch}", cb);',
+  };
+  attachMetaCallers(index, [ownRemoteRef]);
+  const tree = buildCallerTree(index, { classLower: 'acmegatewayremote', methodLower: 'dispatch' });
+  const page = findChild(tree.root.children, 'AcmeGatewayPage');
+  assert.ok(page, "v0.2x/M2W: own-namespace $RemoteAction ref attaches LOCALLY -- N3 routing applies unmodified");
+}
+
 // =========================================================================
 // v0.11/B1: literal-flow Type.forName dynamic dispatch -- extends the
 // pre-existing (F4a) single-inline-string-literal-only rule to three
@@ -7459,6 +7523,175 @@ function v13FlattenRollup(nodes) {
   });
   assert(empty && empty.breaks.length === 0 && empty.mightBreak.length === 0 && empty.metadata.length === 0, 'private uncalled method produces an honest empty report');
   assert.strictEqual(buildImpactReport(impactIndex, { classLower: 'missing', methodLower: 'change' }), null);
+}
+
+// =========================================================================
+// v0.2x/M2W: Scheduled triggerType, scheduledPaths flag, and flow <status>
+// propagation
+// =========================================================================
+
+// 1. Scheduled catalog label, object-less.
+{
+  const index = buildSemanticIndex([]);
+  attachMetaCallers(index, [{
+    kind: 'flow', label: 'AcmeNightlySync', className: 'AcmeSyncAction', methodName: 'run',
+    namespace: null, flowObject: null, flowRecordTriggerType: null, flowTriggerType: 'Scheduled',
+    flowHasScheduledPaths: false, flowStatus: 'Active', subflows: [],
+    path: '/ws/flows/AcmeNightlySync.flow-meta.xml', line: 1, lineText: '',
+  }]);
+  const catalog = buildEntryCatalog(index);
+  const entry = findEntry(catalog, 'flow', 'AcmeNightlySync');
+  assert.ok(entry, 'v0.2x/M2W: the Scheduled flow must appear in the flow catalog group');
+  assert.strictEqual(entry.detail, 'Scheduled', "v0.2x/M2W: pinned proof of the mislabel fix -- NOT 'screen or autolaunched'");
+}
+
+// 2. Scheduled catalog label, with object.
+{
+  const index = buildSemanticIndex([]);
+  attachMetaCallers(index, [{
+    kind: 'flow', label: 'AcmeLedgerSync', className: 'AcmeSyncAction', methodName: 'run',
+    namespace: null, flowObject: 'Acme_Ledger__c', flowRecordTriggerType: null, flowTriggerType: 'Scheduled',
+    flowHasScheduledPaths: false, flowStatus: 'Active', subflows: [],
+    path: '/ws/flows/AcmeLedgerSync.flow-meta.xml', line: 1, lineText: '',
+  }]);
+  const catalog = buildEntryCatalog(index);
+  const entry = findEntry(catalog, 'flow', 'AcmeLedgerSync');
+  assert.strictEqual(entry.detail, 'Scheduled on Acme_Ledger__c');
+}
+
+// 3. Async-path + status badge, combined, via DML fan-out.
+{
+  const AcmeOrderWriter = ty('AcmeOrderWriter', 'AcmeOrderWriter', {
+    methods: [
+      mth('save', {
+        line: 1,
+        locals: [{ name: 'ord', type: 'Acme_Order__c', line: 2 }],
+        dml: [dmlFact('update', 'ord', { line: 3, lineText: 'update ord;' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(AcmeOrderWriter)]);
+  const syntheticRef = {
+    kind: 'flow', label: 'AcmeOrderFollowUpFlow', className: 'AcmeFollowUpAction', methodName: 'run',
+    namespace: null, flowObject: 'Acme_Order__c', flowRecordTriggerType: 'Update', flowTriggerType: 'RecordAfterSave',
+    flowHasScheduledPaths: true, flowStatus: 'Draft', subflows: [],
+    path: '/ws/flows/AcmeOrderFollowUpFlow.flow-meta.xml', line: 9, lineText: '',
+  };
+  attachMetaCallers(index, [syntheticRef]);
+
+  const tree = buildCalleeTree(index, { classLower: 'acmeorderwriter', methodLower: 'save' });
+  const flow = findChild(tree.root.children, 'AcmeOrderFollowUpFlow');
+  assert.ok(flow, 'v0.2x/M2W: D1+D4 wiring -- the flow must still appear as a dml fan-out child');
+  assert.strictEqual(flow.flowStatus, 'Draft');
+  assert.strictEqual(flow.flowHasScheduledPaths, true);
+
+  const catalog = buildEntryCatalog(index);
+  const entry = findEntry(catalog, 'flow', 'AcmeOrderFollowUpFlow');
+  assert.strictEqual(
+    entry.detail,
+    'RecordAfterSave on Acme_Order__c (Draft) (async path)',
+    'v0.2x/M2W: D7 suffix ordering -- base, subflow, status, async-path'
+  );
+}
+
+// 4. Impact report propagation.
+{
+  const AcmeBillingService = ty('AcmeBillingService', 'AcmeBillingService', {
+    methods: [mth('recalc', { line: 1 })],
+  });
+  const index = buildSemanticIndex([mkFile(AcmeBillingService)]);
+  const refChild = {
+    kind: 'flow', label: 'AcmeOrderFollowUpFlow',
+    className: 'AcmeBillingService', methodName: 'recalc', namespace: null,
+    path: '/ws/flows/AcmeOrderFollowUpFlow.flow-meta.xml', line: 6, lineText: '',
+    flowObject: null, flowRecordTriggerType: null, flowTriggerType: null,
+    flowHasScheduledPaths: true, flowStatus: 'Draft', subflows: [],
+  };
+  const refParent = {
+    kind: 'flow', label: 'AcmeRootFlow',
+    className: 'AcmeBillingService', methodName: 'recalc', namespace: null,
+    path: '/ws/flows/AcmeRootFlow.flow-meta.xml', line: 2, lineText: '',
+    flowObject: null, flowRecordTriggerType: null, flowTriggerType: null,
+    flowHasScheduledPaths: false, flowStatus: 'Obsolete',
+    subflows: ['AcmeOrderFollowUpFlow'],
+  };
+  attachMetaCallers(index, [refChild, refParent]);
+
+  const report = buildImpactReport(index, { classLower: 'acmebillingservice', methodLower: 'recalc' });
+  const flowRow = report.metadata.find((m) => m.label === 'AcmeOrderFollowUpFlow');
+  assert.ok(flowRow, 'v0.2x/M2W: D8 impactMetadataSites wiring');
+  assert.strictEqual(flowRow.flowStatus, 'Draft');
+  assert.strictEqual(flowRow.flowHasScheduledPaths, true);
+  assert.strictEqual(flowRow.parentFlows.length, 1);
+  assert.strictEqual(flowRow.parentFlows[0].label, 'AcmeRootFlow');
+  assert.strictEqual(flowRow.parentFlows[0].flowStatus, 'Obsolete', 'v0.2x/M2W: D8 impactParentFlows wiring, reading through index.flowInfo');
+  assert.strictEqual(flowRow.parentFlows[0].flowHasScheduledPaths, false);
+}
+
+// 5. Scheduled catalog label, purely declarative (className:null) shape --
+// the common real-world scheduled flow: zero apex actionCalls. Blocks 1-4
+// above all use a className-carrying ref, which lands in index.metaCallers
+// and renders through collectFlowEntries' byLabel loop. A className:null
+// ref never enters metaCallers (attachMetaCallers' local-attach loop skips
+// any ref with no className) -- it is registered into index.flowInfo only,
+// so this pins the SEPARATE flowInfoMap loop's ternary and its two suffix
+// appends (flowStatusSuffixFor / scheduledPathsSuffixFor).
+{
+  const index = buildSemanticIndex([]);
+  attachMetaCallers(index, [{
+    kind: 'flow', label: 'AcmeNightlyDeclarative', className: null, methodName: null,
+    namespace: null, flowObject: null, flowRecordTriggerType: null, flowTriggerType: 'Scheduled',
+    flowHasScheduledPaths: false, flowStatus: 'Draft', subflows: [],
+    path: '/ws/flows/AcmeNightlyDeclarative.flow-meta.xml', line: 4, lineText: '',
+  }]);
+  const catalog = buildEntryCatalog(index);
+  const entry = findEntry(catalog, 'flow', 'AcmeNightlyDeclarative');
+  assert.ok(entry, 'v0.2x/M2W: a purely declarative Scheduled flow must still surface via the flowInfoMap loop');
+  assert.strictEqual(entry.detail, 'Scheduled (Draft)', 'v0.2x/M2W: flowInfoMap loop must apply the same Scheduled label plus status suffix as the byLabel loop');
+}
+
+// 6. D5+D6 TNode field propagation through buildCallerTree, both flow-node
+// constructors. Blocks 3-5 above only exercise makeCalleeFlowNode and
+// hand-built node literals -- neither buildMetaChildren's flow branch (D6,
+// the flow-as-caller node folded in at the root, via='metadata') nor
+// buildOneFlowNode (D5, the subflow-chain node reached through
+// buildFlowParentChildren, via='subflow') is pinned anywhere else. Both are
+// correct today, but a future field-allowlist edit at either constructor
+// could silently drop the badge in these tree surfaces (acceptance
+// criterion 4) without failing any gate -- the same silent-drop class E2
+// (rerootEntryFirst) was already pinned against.
+{
+  const AcmeFlowHost = ty('AcmeFlowHost', 'AcmeFlowHost', {
+    methods: [mth('run', { line: 1 })],
+  });
+  const index = buildSemanticIndex([mkFile(AcmeFlowHost)]);
+  attachMetaCallers(index, [
+    {
+      kind: 'flow', label: 'AcmeChildFlow', className: 'AcmeFlowHost', methodName: 'run',
+      namespace: null, flowObject: null, flowRecordTriggerType: null, flowTriggerType: null,
+      flowHasScheduledPaths: true, flowStatus: 'Draft', subflows: [],
+      path: '/ws/flows/AcmeChildFlow.flow-meta.xml', line: 3, lineText: '',
+    },
+    {
+      kind: 'flow', label: 'AcmeParentFlow', className: 'AcmeFlowHost', methodName: 'run',
+      namespace: null, flowObject: null, flowRecordTriggerType: null, flowTriggerType: null,
+      flowHasScheduledPaths: false, flowStatus: 'Obsolete', subflows: ['AcmeChildFlow'],
+      path: '/ws/flows/AcmeParentFlow.flow-meta.xml', line: 2, lineText: '',
+    },
+  ]);
+
+  const t = buildCallerTree(index, { classLower: 'acmeflowhost', methodLower: 'run' });
+  const child = findChild(t.root.children, 'AcmeChildFlow');
+  assert.ok(child, 'v0.2x/M2W: the child flow must attach as a metadata caller of the target method');
+  assert.strictEqual(child.via, 'metadata');
+  assert.strictEqual(child.flowStatus, 'Draft', "v0.2x/M2W: D6 -- buildMetaChildren's flow branch must carry flowStatus onto the TNode");
+  assert.strictEqual(child.flowHasScheduledPaths, true, "v0.2x/M2W: D6 -- buildMetaChildren's flow branch must carry flowHasScheduledPaths onto the TNode");
+
+  const sub = findChild(child.children, 'AcmeParentFlow');
+  assert.ok(sub, 'v0.2x/M2W: the declared <subflows> parent must appear as a nested subflow-chain node under the child');
+  assert.strictEqual(sub.via, 'subflow');
+  assert.strictEqual(sub.flowStatus, 'Obsolete', 'v0.2x/M2W: D5 -- buildOneFlowNode must carry flowStatus onto the subflow-chain TNode');
+  assert.strictEqual(sub.flowHasScheduledPaths, false);
 }
 
 console.log('test-resolver.js: all assertions passed.');

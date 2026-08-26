@@ -416,8 +416,20 @@ function frontierNoun(direction) {
   return direction === 'callees' ? 'callees' : 'callers';
 }
 
+// v0.2x/M2W: Draft/Obsolete/InvalidDraft flows stay visible in the trace
+// tree instead of reading identically to a healthy Active one -- badge,
+// never hide. null for a flow with no known (or Active) status; the raw
+// Salesforce status text verbatim otherwise (Draft/Obsolete/InvalidDraft
+// all read clearly on their own, matching the file's plain-word badge
+// convention -- 'test', via names, etc.).
+function flowStatusBadge(flowStatus) {
+  if (!flowStatus || String(flowStatus).toLowerCase() === 'active') return null;
+  return String(flowStatus);
+}
+
 // Badge order per contract: entries · caughtHere (shield) · test · via ·
-// managed:<ns> · package · '~' when approximate · '↺ cycle' · '… capped' ·
+// managed:<ns> · package · flow <status> (v0.2x/M2W, non-Active only) ·
+// 'async path' (v0.2x/M2W) · '~' when approximate · '↺ cycle' · '… capped' ·
 // '+N' frontier · '↪ seen elsewhere'.
 // (The 'root' badge is NOT added here -- see isRootNode/shapeNode below: it
 // depends on the shaped `children` count, which this per-node-flags
@@ -463,6 +475,13 @@ function badgesForNode(node, pkgBadge, orientation) {
   const managed = managedBadge(node);
   if (managed) badges.push(managed);
   if (pkgBadge) badges.push(pkgBadge);
+  // v0.2x/M2W: node-inherent flow facts (like isTest/entries above, not an
+  // edge property) -- positioned here so each reads as a qualifier on an
+  // already-established via/package identity ("this Flow -- via subflow,
+  // Draft").
+  const fsBadge = flowStatusBadge(node.flowStatus);
+  if (fsBadge) badges.push(fsBadge);
+  if (node.flowHasScheduledPaths) badges.push('async path');
   if (node.approximate) badges.push('~');
   if (node.cyclic) badges.push('↺ cycle');
   // v0.7.1: resolver.js's
@@ -1041,6 +1060,8 @@ function rerootEntryFirst(root) {
       !!src.isTest,
       src.entries || [],
       !!src.caughtHere,
+      src.flowStatus != null ? src.flowStatus : null, // v0.2x/M2W
+      !!src.flowHasScheduledPaths, // v0.2x/M2W
       !!src.cyclic,
       !!src.truncated,
       !!src.seenElsewhere,
@@ -1076,6 +1097,8 @@ function rerootEntryFirst(root) {
     entries: src.entries,
     isTest: src.isTest,
     caughtHere: src.caughtHere,
+    flowStatus: src.flowStatus, // v0.2x/M2W
+    flowHasScheduledPaths: src.flowHasScheduledPaths, // v0.2x/M2W
     cyclic: src.cyclic,
     truncated: src.truncated,
     seenElsewhere: src.seenElsewhere,
@@ -1665,18 +1688,31 @@ function shapeImpactContract(report) {
 
 function shapeImpactMetadata(metadata) {
   return (metadata || []).map((site) => {
-    const parents = (site.parentFlows || []).map((flow) => ({
-      label: flow.label,
-      description: 'parent flow',
-      tooltip: flow.path ? `${flow.path}${flow.line ? `:${flow.line}` : ''}` : 'Parent flow in the invocation chain',
-      iconId: 'symbol-event',
-      jump: flow.path && flow.line ? { path: flow.path, line: flow.line, col: 0 } : null,
-      collapsible: false,
-      children: [],
-    }));
+    const parents = (site.parentFlows || []).map((flow) => {
+      const parentBadge = flowStatusBadge(flow.flowStatus); // v0.2x/M2W
+      return {
+        label: flow.label,
+        description: [
+          'parent flow',
+          parentBadge,
+          flow.flowHasScheduledPaths ? 'async path' : null, // v0.2x/M2W
+        ].filter(Boolean).join(' · '),
+        tooltip: flow.path ? `${flow.path}${flow.line ? `:${flow.line}` : ''}` : 'Parent flow in the invocation chain',
+        iconId: 'symbol-event',
+        jump: flow.path && flow.line ? { path: flow.path, line: flow.line, col: 0 } : null,
+        collapsible: false,
+        children: [],
+      };
+    });
+    const siteBadge = flowStatusBadge(site.flowStatus); // v0.2x/M2W
     return {
       label: site.label,
-      description: [site.kind, parents.length ? `${parents.length} parent flow${parents.length === 1 ? '' : 's'}` : null].filter(Boolean).join(' · '),
+      description: [
+        site.kind,
+        siteBadge,
+        site.flowHasScheduledPaths ? 'async path' : null, // v0.2x/M2W
+        parents.length ? `${parents.length} parent flow${parents.length === 1 ? '' : 's'}` : null,
+      ].filter(Boolean).join(' · '),
       tooltip: site.path ? `${site.path}${site.line ? `:${site.line}` : ''}` : 'Metadata contract surface',
       iconId: META_ICON_BY_KIND[site.kind] || 'references',
       jump: site.path && site.line ? { path: site.path, line: site.line, col: 0 } : null,
@@ -1729,6 +1765,9 @@ module.exports = {
   // packageBadge/isRootNode above.
   externalNamespace,
   managedBadge,
+  // v0.2x/M2W: flow-status badge helper, exported for the same
+  // unit-test-against-bare-fixtures reason as the two helpers above.
+  flowStatusBadge,
   isRootNode,
   siteLabel,
   siteDetailLine,

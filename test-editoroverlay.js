@@ -12,6 +12,7 @@ const {
   fileBackedSourcePath,
   createDidSaveHandler,
   captureDirtyDocumentOverlays,
+  overlaySnapshotFingerprint,
   applyApexOverlays,
   applyMetadataOverlays,
 } = require('./editoroverlay');
@@ -194,6 +195,61 @@ assert.strictEqual(fileBackedSourcePath(document('/ws/Saved.txt', 'x', { isDirty
   assert.strictEqual(applied.overlaid, 1);
   assert.strictEqual(applied.factsList[0].types[0].name, 'AlphaOnly');
   assert.ok(!JSON.stringify(applied.factsList).includes('BetaOnly'));
+}
+
+// v0.2x/M2W: overlaySnapshotFingerprint -- the unsaved-buffer component of
+// extension.js's whole-index memo key. Order-independent (Map iteration
+// order must never decide a memo hit) and version-sensitive (an edited
+// buffer must always look different from its previous state).
+{
+  assert.strictEqual(overlaySnapshotFingerprint(new Map()), '', 'an empty overlay set fingerprints as the empty string');
+  assert.strictEqual(overlaySnapshotFingerprint(null), '', 'an absent overlay set fingerprints as the empty string');
+  assert.strictEqual(overlaySnapshotFingerprint(undefined), '');
+
+  const forward = new Map([
+    ['a', { key: 'a', version: 3 }],
+    ['b', { key: 'b', version: 1 }],
+  ]);
+  const reversed = new Map([
+    ['b', { key: 'b', version: 1 }],
+    ['a', { key: 'a', version: 3 }],
+  ]);
+  assert.strictEqual(
+    overlaySnapshotFingerprint(forward),
+    overlaySnapshotFingerprint(reversed),
+    'insertion order must never change the fingerprint'
+  );
+
+  const edited = new Map([
+    ['a', { key: 'a', version: 4 }],
+    ['b', { key: 'b', version: 1 }],
+  ]);
+  assert.notStrictEqual(
+    overlaySnapshotFingerprint(forward),
+    overlaySnapshotFingerprint(edited),
+    'a re-edited buffer (same key, bumped version) must change the fingerprint'
+  );
+
+  const added = new Map([
+    ['a', { key: 'a', version: 3 }],
+    ['b', { key: 'b', version: 1 }],
+    ['c', { key: 'c', version: 1 }],
+  ]);
+  assert.notStrictEqual(
+    overlaySnapshotFingerprint(forward),
+    overlaySnapshotFingerprint(added),
+    'an added dirty buffer must change the fingerprint'
+  );
+
+  const missingVersion = new Map([['a', { key: 'a', version: null }]]);
+  assert.strictEqual(overlaySnapshotFingerprint(missingVersion), 'a@?', 'a null version is rendered, never dropped');
+
+  // A real snapshot fingerprints off the same key/version pair the overlay
+  // Map itself is built from.
+  const live = captureDirtyDocumentOverlays([document('/ws/classes/Live.cls', 'public class Live {}')]);
+  assert.strictEqual(live.size, 1);
+  const only = live.values().next().value;
+  assert.strictEqual(overlaySnapshotFingerprint(live), `${only.key}@${only.version}`);
 }
 
 console.log('apex-call-graph editoroverlay.js self-check: all assertions passed');

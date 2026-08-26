@@ -21,6 +21,7 @@ const {
   rerootEntryFirst,
   externalNamespace,
   managedBadge,
+  flowStatusBadge,
   frontierMethodKey,
   frontierBadge,
   shapeLoadMoreChild,
@@ -78,6 +79,24 @@ assert.deepStrictEqual(badgesForNode({ cyclic: true }), ['↺ cycle']);
 // (see uitree.js's badgesForNode/MARKER_GLOSSARY comments) -- one boolean,
 // one badge, regardless of which cap actually fired.
 assert.deepStrictEqual(badgesForNode({ truncated: true }), ['… capped']);
+
+// --- badgesForNode: v0.2x/M2W flow status / async-path badges ---
+assert.deepStrictEqual(badgesForNode({ kind: 'flow', flowStatus: 'Draft' }), ['Draft']);
+assert.deepStrictEqual(badgesForNode({ kind: 'flow', flowStatus: 'Active' }), [], 'Active is the healthy default -- no badge');
+assert.deepStrictEqual(badgesForNode({ kind: 'flow', flowStatus: null }), [], 'no known status -- never fabricate a badge');
+assert.deepStrictEqual(badgesForNode({ kind: 'flow', flowHasScheduledPaths: true }), ['async path']);
+assert.deepStrictEqual(
+  badgesForNode({ kind: 'flow', via: 'subflow', flowStatus: 'Obsolete', flowHasScheduledPaths: true }),
+  ['subflow', 'Obsolete', 'async path'],
+  'badge ordering: via, then status, then async-path, then approximate/cyclic/truncated'
+);
+
+// --- flowStatusBadge: direct-export unit (mirrors the managedBadge precedent) ---
+assert.strictEqual(flowStatusBadge('Draft'), 'Draft');
+assert.strictEqual(flowStatusBadge('Active'), null);
+assert.strictEqual(flowStatusBadge('active'), null, 'case-insensitive');
+assert.strictEqual(flowStatusBadge(null), null);
+assert.strictEqual(flowStatusBadge(''), null);
 
 // --- iconForNode: contract priority (trigger, test, entries, method, class) ---
 assert.strictEqual(iconForNode({ kind: 'trigger', isTest: false, entries: [] }), 'zap');
@@ -1358,6 +1377,36 @@ assert.deepStrictEqual(
 assert.strictEqual(efTargetRoot.children[0].via, 'typed', 'the transform never mutates its input tree');
 assert.deepStrictEqual(rerootEntryFirst(null), [], 'null root -> no entry-first roots');
 
+// v0.2x/M2W: E2 regression -- makeNode is an explicit field allowlist, not
+// a spread/clone, so flowStatus/flowHasScheduledPaths would be SILENTLY
+// DROPPED on re-root unless explicitly copied. Pinned proof they survive.
+{
+  const leaf = {
+    label: 'AcmeObsoleteFlow', kind: 'flow', className: '', methodLower: null,
+    path: '/ws/flows/AcmeObsoleteFlow.flow-meta.xml', line: 2,
+    entries: ['Flow apex action'], isTest: false,
+    flowStatus: 'Obsolete', flowHasScheduledPaths: true,
+    via: 'metadata', sites: [], children: [],
+    cyclic: false, truncated: false, approximate: false, seenElsewhere: false,
+  };
+  const root = {
+    label: 'AcmeBillingService.recalc', kind: 'method', className: 'AcmeBillingService',
+    methodLower: 'recalc', path: '/ws/AcmeBillingService.cls', line: 4,
+    entries: [], isTest: false, via: null, sites: [], children: [leaf],
+    cyclic: false, truncated: false, approximate: false, seenElsewhere: false,
+  };
+  const out = rerootEntryFirst(root);
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].label, 'AcmeObsoleteFlow');
+  assert.strictEqual(out[0].flowStatus, 'Obsolete', 'E2: flow status must survive the entry-first field copy');
+  assert.strictEqual(out[0].flowHasScheduledPaths, true, 'E2: async-path flag must survive the entry-first field copy');
+  assert.deepStrictEqual(
+    badgesForNode(out[0], undefined, 'entry-first'),
+    ['Flow apex action', 'Obsolete', 'async path'],
+    'E2: the re-rooted node renders the same two badges (via is null at a path start)'
+  );
+}
+
 // Shaped end to end.
 const efShaped = shapeResult({ root: efTargetRoot, targetLabel: 'OppService.applyDiscount', note: null, direction: 'callers' }, 'entry-first');
 assert.strictEqual(efShaped.length, 1);
@@ -2505,6 +2554,35 @@ function hardeningNode(overrides) {
   );
   assert.deepStrictEqual(shapeImpactReport(null), []);
   assert.strictEqual(shapeImpactHeaderLine(null), '');
+}
+
+// v0.2x/M2W: E3 -- shapeImpactMetadata badges both the site row and each
+// parent-flow row with the new flow status / async-path facts.
+{
+  const report = {
+    target: { label: 'AcmeBillingService.recalc()' },
+    metadata: [{
+      kind: 'flow',
+      label: 'AcmeFollowUpFlow',
+      path: '/ws/flows/AcmeFollowUpFlow.flow-meta.xml',
+      line: 3,
+      flowStatus: 'Draft',
+      flowHasScheduledPaths: true,
+      parentFlows: [{
+        label: 'AcmeRootFlow',
+        path: '/ws/flows/AcmeRootFlow.flow-meta.xml',
+        line: 4,
+        flowStatus: 'Obsolete',
+        flowHasScheduledPaths: false,
+      }],
+    }],
+  };
+  const roots = shapeImpactReport(report);
+  const metadataSection = roots[3]; // fixed five-section order, uitree.js:1709-1715
+  assert.strictEqual(metadataSection.label, 'METADATA');
+  const site = metadataSection.children[0];
+  assert.strictEqual(site.description, 'flow · Draft · async path · 1 parent flow');
+  assert.strictEqual(site.children[0].description, 'parent flow · Obsolete');
 }
 
 console.log('apex-trace uitree self-check: all assertions passed');

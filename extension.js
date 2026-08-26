@@ -1932,6 +1932,25 @@ async function activate(context) {
   context.subscriptions.push(scanStatsChannel);
   const scanFlow = scanflow.createScanFlow();
   const excludeTracker = scanflow.createExcludeTracker();
+  // v0.2x/M2W: the last successfully-built resolver.js index this
+  // activation produced, keyed by scanflow.indexMemoFingerprint's 3-way
+  // state (cache epoch / exclude fingerprint / overlay snapshot) -- see
+  // scanAndBuildIndexForEpoch's own memo-check comment for the full hit
+  // contract. Declared alongside excludeTracker because it is the same
+  // family of "did anything actually change since the last successful
+  // scan" per-activation state. Never explicitly cleared, because a Clear
+  // Cache already invalidates it THREE independent ways: (1) cacheCoordinator
+  // .reset() bumps the epoch, so the fingerprint can no longer match; (2)
+  // resetMemoryCaches() nulls lastApexUriSet/lastMetaUriSet, which forces
+  // `useFullSweep` in both scans; (3) resetMemoryCaches() also calls
+  // dirtyTracker.markFullSweepNeeded(), which sets the one-way
+  // fullSweepNeeded latch and forces `useFullSweep` again on its own. (2)
+  // and (3) each independently push the next scan's sweepKind away from
+  // 'skipped', so the hit-gate fails even before the fingerprint is
+  // consulted. Adding an explicit `indexMemo = null;` would be a fourth,
+  // redundant source of truth that could silently drift out of sync with
+  // the fingerprint-based invalidation this actually relies on.
+  let indexMemo = null; // { fingerprint: string, index: Index } | null
   let pickerRequestNonce = 0;
 
   // Freeze the editor/position that initiated an interactive command before
@@ -2259,6 +2278,46 @@ async function activate(context) {
           return { cancelled: true, scan };
         }
 
+        // v0.2x/M2W: whole-index memoization. A memo HIT requires BOTH
+        // scans above to have taken their 'skipped' fast path this round
+        // (scanAndParse/scanMetaFiles -- see their own sweepKind headers):
+        // only then is this round's factsList/metaRefs PROVEN identical to
+        // the build the stored index came from. On a hit, `indexMemo.index`
+        // is returned BY REFERENCE, skipping discoverPackageMap/
+        // buildSemanticIndex/attachMetaCallers entirely for this call --
+        // this is what makes apexTrace.toggleDirection (retraceLastTarget:
+        // same target/scan, opposite direction) and any repeated trace
+        // against an unchanged workspace effectively free instead of
+        // re-walking the whole call graph.
+        //
+        // NEVER re-attach on a hit: attachMetaCallers has a documented
+        // multi-call ACCUMULATE contract (metaCallers/metaMethodCallers
+        // buckets grow, they never replace -- resolver.js's own A6 note), so
+        // a second call against the SAME already-built index would silently
+        // double every metadata-caller count. Reusing the object by
+        // reference and skipping that call is what keeps this correct.
+        // (finalizeFlowSubflowRefs, resolver.js, is separately proven
+        // idempotent/safe to call repeatedly against one persisted index --
+        // see its own "cheap to call on every entry into buildCallerTree/
+        // buildCalleeTree/buildEntryCatalog" header note -- so a memoized
+        // index being walked by several successive tree builds was already
+        // an anticipated pattern on the resolver.js side of this contract.)
+        //
+        // The fingerprint is computed once here and stored UNCONDITIONALLY
+        // after every successful (non-cancelled, non-empty) build below,
+        // regardless of whether THIS round itself was a hit or did real
+        // work: it captures the state a NEXT call will observe if nothing
+        // changes further (dirtyTracker.consume(), below, clears this
+        // round's dirty snapshot, so a truly-unchanged follow-up call WILL
+        // see 'skipped' on both scans) -- exactly the condition the
+        // hit-check re-derives from scratch on every call.
+        const overlayFingerprint = editoroverlay.overlaySnapshotFingerprint(editorOverlays);
+        const memoFingerprint = scanflow.indexMemoFingerprint(scanCacheEpoch, settings.excludeMatcher, overlayFingerprint);
+        const sweepsWereNoOp = scan.sweepKind === 'skipped' && metaScan.sweepKind === 'skipped';
+        if (sweepsWereNoOp && indexMemo && indexMemo.fingerprint === memoFingerprint) {
+          return { scan, metaScan, index: indexMemo.index };
+        }
+
         progress.report({ message: 'building semantic index…' });
 
         // Keep package discovery + semantic indexing inside this SAME
@@ -2297,6 +2356,15 @@ async function activate(context) {
         resolver.attachMetaCallers(index, strippedMetaRefs);
         index.flowFilePaths = flowFilePaths;
         phaseMs.index = Date.now() - tIndex0;
+
+        // v0.2x/M2W: store this build so a later no-op scan can reuse it
+        // (see the memo-check comment above this function's own
+        // `progress.report('building semantic index…')` call for the full
+        // contract). Unreached on any cancelled path -- both early returns
+        // above this line (scan.cancelled/metaScan.cancelled/
+        // index.cancelled/token.isCancellationRequested) return before here
+        // -- so indexMemo only ever holds a fully-built, non-cancelled index.
+        indexMemo = { fingerprint: memoFingerprint, index };
 
         return { scan, metaScan, index };
       }

@@ -1119,8 +1119,13 @@ function refsOf(kind, refs) {
 // 16l. flowTriggerType is also stamped (additively) onto the pre-existing
 // record-triggered shapes from 16a/16b/16e, and stays null for the
 // non-record-triggered shapes from 16c/16d -- re-verified here directly
-// against extractFlowStart's four-way branch (record-triggered / platform-
-// event / recognized-but-absent / unrecognized) in one place.
+// against extractFlowStart's branches (record-triggered / platform-event /
+// scheduled / recognized-but-absent / unrecognized) in one place.
+// v0.2x/M2W: the "unrecognized triggerType" sub-case below used to use
+// 'Scheduled' as its example value -- 'Scheduled' is now a RECOGNIZED
+// triggerType (see SCHEDULED_TRIGGER_TYPE / test 60n-60r in the flow
+// <subflows>/<status> suite below), so this sub-case now uses a genuinely
+// still-unrecognized value instead.
 {
   const recordAfterSave = parseMetaFile({
     path: 'flows/AcmeOrderStatusRecordTriggeredFlow.flow-meta.xml',
@@ -1185,7 +1190,7 @@ function refsOf(kind, refs) {
       '    <start>',
       '        <connector><targetReference>Go</targetReference></connector>',
       '        <object>Acme_Order__c</object>',
-      '        <triggerType>Scheduled</triggerType>',
+      '        <triggerType>SomeFutureTriggerType</triggerType>',
       '    </start>',
       '    <actionCalls>',
       '        <name>Go</name>',
@@ -1198,7 +1203,7 @@ function refsOf(kind, refs) {
   assert.strictEqual(
     unrecognizedTriggerType[0].flowTriggerType,
     null,
-    'unrecognized triggerType (e.g. Scheduled) is not one of the four metascan recognizes -- degrades to null, never throws'
+    'unrecognized triggerType is not one of the five metascan recognizes -- degrades to null, never throws'
   );
   assert.strictEqual(unrecognizedTriggerType[0].flowObject, null);
 }
@@ -2192,6 +2197,61 @@ function refsOf(kind, refs) {
   );
 }
 
+// 59a. v0.2x/M2W: $RemoteAction merge field inside a <script> block,
+//      textually adjacent to invokeAction( -- the common idiom.
+{
+  const text = '<apex:page controller="AcmeQuoteController"><script>Visualforce.remoting.'
+    + "Manager.invokeAction('{!$RemoteAction.AcmeQuoteRemoteController.getQuoteSummary}', recordId, cb);"
+    + '</script></apex:page>';
+  const refs = parseMetaFile({ path: 'pages/AcmeQuotePage.page', text });
+  assert.strictEqual(refs.length, 2, '59a: class-level controller= ref + the new $RemoteAction method-level ref');
+  const remoteRef = refs.find((r) => r.methodName === 'getQuoteSummary');
+  assert.ok(remoteRef, '59a: the $RemoteAction merge field must be extracted');
+  assert.strictEqual(remoteRef.kind, 'vf');
+  assert.strictEqual(remoteRef.className, 'AcmeQuoteRemoteController');
+  assert.strictEqual(remoteRef.namespace, null);
+}
+
+// 59b. v0.2x/M2W: the variable-assignment idiom -- the merge field is NOT
+//      textually adjacent to invokeAction( at all. Proves the deliberate
+//      non-adjacency design (the merge field token itself is the anchor).
+{
+  const text = '<apex:page controller="AcmeAssistController"><script>'
+    + "var actionName = '{!$RemoteAction.AcmeAssistRemote.runAssist}';"
+    + 'Visualforce.remoting.Manager.invokeAction(actionName, cb);</script></apex:page>';
+  const refs = parseMetaFile({ path: 'pages/AcmeAssistPage.page', text });
+  const remoteRef = refs.find((r) => r.methodName === 'runAssist');
+  assert.ok(remoteRef, '59b: the method-level ref must still be extracted even when not adjacent to invokeAction(');
+  assert.strictEqual(remoteRef.className, 'AcmeAssistRemote');
+}
+
+// 59c. v0.2x/M2W: namespace-dotted form -- a leading segment before the
+//      Class.method pair folds into `namespace`. Root tag deliberately has
+//      NO controller=/extensions= so the count assertion is unambiguous
+//      (standardController= is not read by extractVf -- pre-existing
+//      "literal no-edge" shape).
+{
+  const refs = parseMetaFile({
+    path: 'pages/AcmeGatewayPage.page',
+    text: '<apex:page standardController="Account"><script>Visualforce.remoting.Manager.'
+      + 'invokeAction("{!$RemoteAction.zenq.AcmeGatewayRemote.dispatch}", cb);</script></apex:page>',
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].kind, 'vf');
+  assert.strictEqual(refs[0].className, 'AcmeGatewayRemote');
+  assert.strictEqual(refs[0].methodName, 'dispatch');
+  assert.strictEqual(refs[0].namespace, 'zenq');
+}
+
+// 59d. v0.2x/M2W: negative -- no apex:page/apex:component root at all, same
+//      defensive gate every other extractVf shape already honors.
+{
+  assert.deepStrictEqual(
+    parseMetaFile({ path: 'pages/AcmeNotVfRemotePage.page', text: '<div>{!$RemoteAction.AcmeGhostRemote.run}</div>' }),
+    []
+  );
+}
+
 console.log('metascan.js inline-fixture self-check: all assertions passed');
 
 // ===========================================================================
@@ -2584,10 +2644,12 @@ console.log('metascan.js inline-fixture self-check: all assertions passed');
   assert.deepStrictEqual(refs[0].subflows, []);
 }
 
-// 60n. Negative -- an UNRECOGNIZED <triggerType> (Scheduled) with zero apex
-//      actionCalls and zero <subflows> still yields nothing at all:
-//      'Scheduled' stays deliberately unrecognized in this package (see the
-//      plan's Non-goals).
+// 60n. v0.2x/M2W: 'Scheduled' is now a RECOGNIZED <triggerType> (was the
+//      unrecognized/fallback case pre-v0.2x -- see the retracted comment
+//      this replaces). An object-less Scheduled flow with zero apex
+//      actionCalls and zero <subflows> now emits exactly ONE synthetic ref,
+//      anchored at the <triggerType> element itself (no <subflows> element
+//      exists to anchor at).
 {
   const text = src([
     '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
@@ -2597,7 +2659,18 @@ console.log('metascan.js inline-fixture self-check: all assertions passed');
     '    </start>',
     '</Flow>',
   ]);
-  assert.deepStrictEqual(parseMetaFile({ path: 'flows/AcmeScheduledSweepFlow.flow-meta.xml', text }), []);
+  const refs = parseMetaFile({ path: 'flows/AcmeScheduledSweepFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1, "60n: v0.2x/M2W -- 'Scheduled' is recognized now, so this flow is no longer invisible");
+  assert.strictEqual(refs[0].kind, 'flow');
+  assert.strictEqual(refs[0].className, null);
+  assert.strictEqual(refs[0].methodName, null);
+  assert.strictEqual(refs[0].flowObject, null);
+  assert.strictEqual(refs[0].flowRecordTriggerType, null);
+  assert.strictEqual(refs[0].flowTriggerType, 'Scheduled');
+  assert.strictEqual(refs[0].flowHasScheduledPaths, false);
+  assert.deepStrictEqual(refs[0].subflows, []);
+  assert.strictEqual(refs[0].line, 4, 'anchors at the <triggerType> element -- no <subflows> element exists to anchor at instead');
+  assert.strictEqual(refs[0].lineText, '<triggerType>Scheduled</triggerType>');
 }
 
 // 60o. Precedence -- when a record-triggered flow has BOTH a recognized
@@ -2628,6 +2701,176 @@ console.log('metascan.js inline-fixture self-check: all assertions passed');
   assert.deepStrictEqual(refs[0].subflows, ['AcmeWidgetChildFlow']);
   assert.strictEqual(refs[0].line, 10, 'anchors at <flowName>, not <triggerType>, when a <subflows> element exists');
   assert.strictEqual(refs[0].lineText, '<flowName>AcmeWidgetChildFlow</flowName>');
+}
+
+// APEX_ACTION -- one apex actionCalls block; guarantees a real (non-
+// synthetic) ref, so flowTriggerType/flowStatus assertions read off the
+// ordinary emission site rather than the zero-actionCalls synthetic one.
+const APEX_ACTION_LINES = [
+  '    <actionCalls>',
+  '        <name>RunSync</name>',
+  '        <actionName>AcmeSyncAction.run</actionName>',
+  '        <actionType>apex</actionType>',
+  '    </actionCalls>',
+];
+
+// SCHEDULED_PATH -- one <scheduledPaths> element, a sibling of <object>/
+// <recordTriggerType>/<triggerType> INSIDE <start>.
+const SCHEDULED_PATH_LINES = [
+  '        <scheduledPaths>',
+  '            <name>ThreeDaysLater</name>',
+  '            <offsetNumber>3</offsetNumber>',
+  '            <offsetUnit>Days</offsetUnit>',
+  '            <timeSource>RecordTriggerEvent</timeSource>',
+  '        </scheduledPaths>',
+];
+
+// 60p. v0.2x/M2W: Scheduled, no object.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <triggerType>Scheduled</triggerType>',
+    '    </start>',
+    ...APEX_ACTION_LINES,
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeNightlySweepFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].flowTriggerType, 'Scheduled');
+  assert.strictEqual(refs[0].flowObject, null);
+  assert.strictEqual(refs[0].flowRecordTriggerType, null);
+  assert.strictEqual(refs[0].flowHasScheduledPaths, false);
+}
+
+// 60q. v0.2x/M2W: Scheduled, with object (batch-mode scheduled flow -- "run
+//      for records matching criteria").
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <object>Acme_Ledger__c</object>',
+    '        <triggerType>Scheduled</triggerType>',
+    '    </start>',
+    ...APEX_ACTION_LINES,
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeLedgerSweepFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].flowTriggerType, 'Scheduled');
+  assert.strictEqual(refs[0].flowObject, 'Acme_Ledger__c');
+  assert.strictEqual(refs[0].flowRecordTriggerType, null);
+}
+
+// 60r. v0.2x/M2W: negative regression -- an <object> present but an
+//      UNRECOGNIZED <triggerType> (distinct from Scheduled) still yields
+//      the hardcoded all-null triple regardless of what else <start>
+//      carries; pins that the Scheduled branch did not accidentally widen
+//      the fallback.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <object>Acme_Ledger__c</object>',
+    '        <triggerType>Screen</triggerType>',
+    '    </start>',
+    ...APEX_ACTION_LINES,
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeLedgerScreenFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].flowTriggerType, null);
+  assert.strictEqual(refs[0].flowObject, null);
+  assert.strictEqual(refs[0].flowHasScheduledPaths, false);
+}
+
+// 60s. v0.2x/M2W: scheduledPaths presence -- a real record-triggered flow
+//      carrying a <scheduledPaths> element. The new field is additive: the
+//      pre-existing three facts read exactly as they would without it.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <object>Acme_Widget__c</object>',
+    '        <recordTriggerType>Update</recordTriggerType>',
+    '        <triggerType>RecordAfterSave</triggerType>',
+    ...SCHEDULED_PATH_LINES,
+    '    </start>',
+    ...APEX_ACTION_LINES,
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeWidgetAsyncPathFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].flowHasScheduledPaths, true);
+  assert.strictEqual(refs[0].flowTriggerType, 'RecordAfterSave');
+  assert.strictEqual(refs[0].flowRecordTriggerType, 'Update');
+  assert.strictEqual(refs[0].flowObject, 'Acme_Widget__c');
+}
+
+// 60t. v0.2x/M2W: scheduledPaths absence, on the SYNTHETIC ref shape --
+//      the zero-actionCalls emission site is the one most likely to be
+//      forgotten when a new field is added (the previous tests all cover
+//      the ordinary actionCalls emission site). Reuses 60k's fixture text
+//      verbatim under a new label.
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <connector><targetReference>Notify</targetReference></connector>',
+    '        <object>Acme_Widget__c</object>',
+    '        <recordTriggerType>Create</recordTriggerType>',
+    '        <triggerType>RecordAfterSave</triggerType>',
+    '    </start>',
+    '    <subflows>',
+    '        <name>Notify</name>',
+    '        <flowName>AcmeWidgetNotifySubflow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeWidgetParentFlowNoPaths.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].flowHasScheduledPaths, false);
+}
+
+// 60u. v0.2x/M2W: status extraction. <status> sits BEFORE <start>, matching
+//      every real fixture's layout (e.g.
+//      test-fixtures/gauntlet-org/.../Vtx_FlowCycleA.flow-meta.xml:6).
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <status>Draft</status>',
+    '    <start>',
+    '        <object>Acme_Widget__c</object>',
+    '        <recordTriggerType>Update</recordTriggerType>',
+    '        <triggerType>RecordAfterSave</triggerType>',
+    ...SCHEDULED_PATH_LINES,
+    '    </start>',
+    ...APEX_ACTION_LINES,
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeWidgetDraftFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].flowStatus, 'Draft');
+}
+
+// 60v. v0.2x/M2W: status absence -- the 60u fixture with the <status> line
+//      removed (tolerant-input regression pin; this file never assumes
+//      well-formed input).
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <object>Acme_Widget__c</object>',
+    '        <recordTriggerType>Update</recordTriggerType>',
+    '        <triggerType>RecordAfterSave</triggerType>',
+    ...SCHEDULED_PATH_LINES,
+    '    </start>',
+    ...APEX_ACTION_LINES,
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeWidgetNoStatusFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].flowStatus, null);
 }
 
 console.log('metascan.js v0.13 subflow-extraction inline self-check: all assertions passed');

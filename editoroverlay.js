@@ -73,6 +73,28 @@ function captureDirtyDocumentOverlays(documents) {
   return overlays;
 }
 
+// v0.2x/M2W: cheap, deterministic fingerprint of a
+// captureDirtyDocumentOverlays() snapshot -- every overlay already carries
+// the document's own monotonically increasing `version` (vscode bumps it on
+// every edit, including an edit that is later undone back to the original
+// text -- this fingerprint is deliberately conservative: it may report
+// "changed" when the content actually round-tripped back to its previous
+// text, never the reverse, which is the safe direction to be wrong in), so
+// 'key@version' pairs are sufficient to detect an added, removed, or
+// re-edited dirty buffer without hashing full text on every scan. Sorted so
+// Map iteration order never affects the result. Consumed by extension.js's
+// whole-index memoization (see scanflow.indexMemoFingerprint) -- an
+// empty/absent overlay set fingerprints as ''.
+function overlaySnapshotFingerprint(overlays) {
+  if (!(overlays instanceof Map) || overlays.size === 0) return '';
+  const parts = [];
+  for (const overlay of overlays.values()) {
+    parts.push(`${overlay.key}@${overlay.version == null ? '?' : overlay.version}`);
+  }
+  parts.sort();
+  return parts.join('|');
+}
+
 function applyApexOverlays(factsList, eligiblePaths, overlays, parseFile) {
   const facts = Array.isArray(factsList) ? factsList.slice() : [];
   if (!(overlays instanceof Map) || typeof parseFile !== 'function') return { factsList: facts, overlaid: 0 };
@@ -132,6 +154,7 @@ module.exports = {
   fileBackedSourcePath,
   createDidSaveHandler,
   captureDirtyDocumentOverlays,
+  overlaySnapshotFingerprint,
   applyApexOverlays,
   applyMetadataOverlays,
 };
