@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.20.0
+
+More accurate answers from metadata: this release fixes four cases where traces
+silently missed or mislabeled real callers, and cleans up rough edges in the views.
+
+- Record-triggered flows that do purely declarative work (no Apex actions, no
+  subflows) now appear in DML fan-out and are labeled correctly in **Entry
+  Points** — previously they were invisible.
+- Aura controller calls are now recognized whatever the receiver variable is
+  called (`cmp.get('c.save')`, not just `component.get(...)`), so "who calls
+  this `@AuraEnabled` method" no longer answers "nobody" for those components.
+- Multi-file LWC bundles now show as a single component named after the bundle
+  folder instead of splitting into one node per file.
+- Namespaced Aura controllers (`controller="ns.Class"`) now resolve like their
+  unqualified counterparts.
+- Commented-out XML and JavaScript in metadata files no longer produces phantom
+  callers: comments are blanked before extraction, with line numbers preserved.
+- **Entry Points** polish: the inline trace button now appears only on rows that
+  can actually start a trace, and a dedicated **Refresh Entry Points** button
+  replaces the old dual-purpose icon.
+- The editor context menu now works in anonymous `.apex` script files too.
+- The target picker groups workspace classes and managed-package entries under
+  separators with icons, and package qualifiers moved out of the name so fuzzy
+  matching stays clean.
+- **Switch Trace Direction** stays out of the Command Palette until a trace
+  exists; per-type icons are now consistent across the Trace view, Entry Points,
+  and the Path Map legend, removing two icon collisions.
+
 ## 0.19.0
 
 The extension now has its own home in the Activity Bar instead of renting space

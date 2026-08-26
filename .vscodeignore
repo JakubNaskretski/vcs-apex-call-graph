@@ -19,6 +19,8 @@ node_modules/@apexdevtools/apex-parser/dist/browser/**
 node_modules/@apexdevtools/apex-parser/dist/esm/**
 node_modules/@apexdevtools/apex-parser/node_modules/antlr4/README.md
 *.local.md
+**/*.local.md
+plans/**
 CLAUDE.md
 MEMORY.md
 CONTRACT.md
