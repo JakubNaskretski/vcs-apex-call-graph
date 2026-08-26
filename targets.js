@@ -130,6 +130,24 @@
 //   not local files living under an sfdx package directory), so this never
 //   interacts with rule 3's B3 duplicate-package suffixing pass -- the two
 //   suffixes are independent and never compound in practice.
+//
+// presentTarget() -- QuickPick presentation split, additive and downstream
+// of everything above. refineTargets() bakes two kinds of suffix into a
+// label: IDENTITY suffixes (' (constructor)', rule 2) which ARE part of the
+// target's name, and QUALIFIER suffixes (' (managed)' from the N4 rule
+// above, ' (pkgLabel)' from B3's duplicate-name pass) which merely
+// disambiguate. presentTarget() splits one refineTargets() OUTPUT item into
+// { label, description }: identity stays in the label, qualifiers move to
+// `description` so a fuzzy filter over the label is no longer polluted by
+// qualifier text (the caller sets matchOnDescription, so qualifier text
+// still matches, just at lower rank). Stripping is FIELD-driven, never
+// guessed from label text: ' (managed)' comes off only when
+// item.kind === 'external' (the exact condition that appended it), and a
+// package suffix comes off only when the item carries a `package` property
+// AND the label ends with that item's own ' (pkgLabel)' rendering. A
+// non-duplicated packaged item was never suffixed, so it simply has nothing
+// to strip and gets `description: null`. refineTargets() itself, and every
+// other consumer of its output, is untouched by this function.
 
 const CTOR_METHOD = '<init>';
 const FIELD_INIT_METHOD = '(init)';
@@ -274,4 +292,45 @@ function refineTargets(list) {
   return out;
 }
 
-module.exports = { refineTargets, methodSignature, findDeclarationOverload };
+// QuickPick presentation split. Takes ONE
+// refineTargets() output item and returns { label, description } for
+// display: the ' (managed)' and duplicate-package ' (pkgLabel)' QUALIFIER
+// suffixes refineTargets() bakes into the label move into `description`
+// (so VS Code's fuzzy filter over the label is no longer polluted by
+// qualifier text -- the caller sets matchOnDescription so qualifier text
+// still matches, just at lower rank), while IDENTITY suffixes --
+// ' (constructor)' -- stay in the label untouched. Detection is
+// field-driven, never guessed from label text alone: the ' (managed)'
+// suffix is only stripped when item.kind === 'external' (the exact
+// condition under which refineTargets() appended it), and a package suffix
+// is only stripped when the item carries a `package` property AND the
+// label ends with that item's own ' (pkgLabel)' rendering (refineTargets()
+// suffixes only duplicated names, so a non-duplicated packaged item simply
+// has nothing to strip and gets description null). External items never
+// carry `package` (see the N4 note above), so the two qualifiers never
+// compound. `description` is null when there is no qualifier. Tolerant:
+// a malformed item degrades to { label: '', description: null }, never
+// throws. This function deliberately does NOT touch refineTargets() or its
+// label contract -- downstream consumers of refineTargets() output (and
+// the planned typed-target ' (Kind)' suffix convention) are unaffected.
+function presentTarget(item) {
+  if (!item || typeof item !== 'object' || typeof item.label !== 'string') {
+    return { label: '', description: null };
+  }
+  let label = item.label;
+  let description = null;
+  if (item.kind === 'external' && label.endsWith(MANAGED_SUFFIX)) {
+    label = label.slice(0, -MANAGED_SUFFIX.length);
+    description = 'managed';
+  } else if (Object.prototype.hasOwnProperty.call(item, 'package')) {
+    const pkgLabel = item.package === null ? 'no package' : String(item.package);
+    const suffix = ' (' + pkgLabel + ')';
+    if (label.endsWith(suffix)) {
+      label = label.slice(0, -suffix.length);
+      description = pkgLabel;
+    }
+  }
+  return { label, description };
+}
+
+module.exports = { refineTargets, methodSignature, findDeclarationOverload, presentTarget };

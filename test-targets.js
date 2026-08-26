@@ -16,7 +16,7 @@
 // {methodLower:null} and a '(trigger)' pseudo-method entry both rendering
 // the exact same bare trigger name).
 const assert = require('assert');
-const { refineTargets, methodSignature, findDeclarationOverload } = require('./targets');
+const { refineTargets, methodSignature, findDeclarationOverload, presentTarget } = require('./targets');
 
 // ===========================================================================
 // Rule 1: '(init)' suppressed entirely
@@ -548,6 +548,96 @@ const { refineTargets, methodSignature, findDeclarationOverload } = require('./t
   assert.strictEqual(findDeclarationOverload(methods, 'change', 12), null, 'non-declaration line never guesses an overload');
   assert.strictEqual(findDeclarationOverload(methods, 'other', 8), null);
   assert.strictEqual(findDeclarationOverload(null, 'change', 8), null);
+}
+
+// ===========================================================================
+// presentTarget -- QuickPick presentation split (M1 UI hygiene)
+// ===========================================================================
+// Fixture construction, one way only (do not hand-build the output shapes):
+// every fixture below is built by running refineTargets over the INPUT shown
+// and asserting presentTarget on the result. That also pins the
+// refineTargets-label facts presentTarget strips against, so a future
+// refineTargets change cannot silently desynchronize the two.
+
+// 30. Plain item.
+{
+  const out = refineTargets([{ label: 'AcmeOrderUtil.applyDiscount', classLower: 'acmeorderutil', methodLower: 'applydiscount' }]);
+  assert.deepStrictEqual(presentTarget(out[0]), { label: 'AcmeOrderUtil.applyDiscount', description: null });
+}
+
+// 31. Constructor item -- identity suffix never stripped.
+{
+  const out = refineTargets([{ label: 'AcmeOrderUtil.<init>', classLower: 'acmeorderutil', methodLower: '<init>' }]);
+  assert.strictEqual(out[0].label, 'AcmeOrderUtil (constructor)'); // refineTargets rule 2
+  assert.deepStrictEqual(presentTarget(out[0]), { label: 'AcmeOrderUtil (constructor)', description: null });
+}
+
+// 32. External item.
+{
+  const out = refineTargets([{ label: 'zenq.Billing', classLower: 'zenq.billing', methodLower: null, kind: 'external' }]);
+  assert.strictEqual(out[0].label, 'zenq.Billing (managed)');
+  assert.deepStrictEqual(presentTarget(out[0]), { label: 'zenq.Billing', description: 'managed' });
+}
+
+// 33. Duplicated-package pair -- both the named-package and the null-package
+// half, in ONE refineTargets call (the B3 suffixing pass only fires when a
+// classLower group has >1 distinct package bucket).
+{
+  const out = refineTargets([
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: 'nova-billing' },
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: null },
+  ]);
+  const pkg = out.find((o) => o.package === 'nova-billing');
+  const nul = out.find((o) => o.package === null);
+  assert.strictEqual(pkg.label, 'AcmeOrderUtil (nova-billing)');
+  assert.strictEqual(nul.label, 'AcmeOrderUtil (no package)');
+  assert.deepStrictEqual(presentTarget(pkg), { label: 'AcmeOrderUtil', description: 'nova-billing' });
+  assert.deepStrictEqual(presentTarget(nul), { label: 'AcmeOrderUtil', description: 'no package' });
+}
+
+// 34. Packaged but NOT suffixed (non-duplicated name) -- nothing to strip.
+{
+  const out = refineTargets([{ label: 'AcmeQuoteSvc', classLower: 'acmequotesvc', methodLower: null, package: 'force-app' }]);
+  assert.strictEqual(out[0].label, 'AcmeQuoteSvc');
+  assert.deepStrictEqual(presentTarget(out[0]), { label: 'AcmeQuoteSvc', description: null });
+}
+
+// 35. Malformed input -- the only test that does not go through
+// refineTargets, because refineTargets cannot produce these.
+{
+  assert.deepStrictEqual(presentTarget(null), { label: '', description: null });
+  assert.deepStrictEqual(presentTarget(undefined), { label: '', description: null });
+  assert.deepStrictEqual(presentTarget({}), { label: '', description: null });
+  assert.deepStrictEqual(presentTarget({ label: 42 }), { label: '', description: null });
+}
+
+// 36. Purity guard: presentTarget returns only {label, description} and
+// never mutates its input, so classLower/methodLower/package survive the
+// call untouched.
+{
+  const out = refineTargets([
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: 'nova-billing' },
+    { label: 'AcmeOrderUtil', classLower: 'acmeorderutil', methodLower: null, package: null },
+    { label: 'zenq.Billing', classLower: 'zenq.billing', methodLower: null, kind: 'external' },
+  ]);
+  for (const item of out) {
+    const before = JSON.stringify(item);
+    presentTarget(item);
+    assert.strictEqual(JSON.stringify(item), before, 'presentTarget never mutates its input item');
+  }
+}
+
+// 37. Compound-suffix guard -- the one case where an identity suffix and a
+// qualifier suffix stack. The package qualifier comes off, the constructor
+// identity does not.
+{
+  const out = refineTargets([
+    { label: 'AcmeOrderUtil.<init>', classLower: 'acmeorderutil', methodLower: '<init>', package: 'nova-billing' },
+    { label: 'AcmeOrderUtil.<init>', classLower: 'acmeorderutil', methodLower: '<init>', package: null },
+  ]);
+  const pkg = out.find((o) => o.package === 'nova-billing');
+  assert.strictEqual(pkg.label, 'AcmeOrderUtil (constructor) (nova-billing)');
+  assert.deepStrictEqual(presentTarget(pkg), { label: 'AcmeOrderUtil (constructor)', description: 'nova-billing' });
 }
 
 console.log('apex-trace targets.js self-check: all assertions passed');

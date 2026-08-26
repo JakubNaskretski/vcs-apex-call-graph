@@ -346,9 +346,9 @@ of silently looking exhaustive.
 Click any entry to jump to its source. Every entry also carries an inline **What Does
 This Call?** action — the same forward-trace command the main view uses — so you can go
 straight from "here's an entry point" to "here's everything it reaches" without
-re-resolving a target by hand. (A Flow entry runs this only when the Flow's engine data
-gives it a traceable Apex target; otherwise it's a no-op with an explanatory toast — a
-Flow itself isn't an Apex class/method the tracer can target.) The view title's refresh
+re-resolving a target by hand. (The inline action appears only on entries with a
+traceable Apex target — a Flow entry doesn't carry one yet, so Flow rows show no trace
+button rather than a button that can't work.) The view title's refresh
 button re-runs the scan, reusing the same caches a normal trace does.
 
 ## The transaction story
@@ -407,7 +407,8 @@ counted in a header line separate from the ordinary unresolved-call-site count.
 - **Async hops**: `enqueueJob` / `executeBatch` / `schedule` edge to the job's
   `execute` method (`via: async`).
 - **Anonymous Apex** (`.apex` scripts) are scanned as root callers; `instanceof`-
-  narrowed calls are kept and labeled `~ narrowed`.
+  narrowed calls are kept and labeled `~ narrowed`; the editor
+  context menu works in `.apex` files too.
 
 ## Multi-package projects
 
@@ -577,15 +578,23 @@ symbols, or call arguments.
 
 | Command | Where |
 |---|---|
-| `Apex Call Graph: Who Calls This?` | Editor context menu (`.cls`/`.trigger`), command palette |
-| `Apex Call Graph: What Does This Call?` | Editor context menu (`.cls`/`.trigger`), command palette |
-| `Apex Call Graph: Impact of Changing This Method` | Editor context menu (`.cls`/`.trigger`), command palette |
-| `Apex Call Graph: Switch Trace Direction` | View title button — re-runs the last target the other way |
+| `Apex Call Graph: Who Calls This?` | Editor context menu (`.cls`/`.trigger`/`.apex`), command palette |
+| `Apex Call Graph: What Does This Call?` | Editor context menu (`.cls`/`.trigger`/`.apex`), command palette |
+| `Apex Call Graph: Impact of Changing This Method` | Editor context menu (`.cls`/`.trigger`/`.apex`), command palette |
+| `Apex Call Graph: Switch Trace Direction` | View title button, command palette (after a first trace) — re-runs the last target the other way |
 | `Apex Call Graph: Show Path Map` | Editor context menu, command palette — resolves the current target |
 | `Apex Call Graph: Refresh Path Map` | Trace view title button, command palette — re-scans the last target |
-| `Apex Call Graph: Show Entry Points` | Entry Points view title button, view welcome link, command palette |
+| `Apex Call Graph: Show Entry Points` | View welcome link, command palette |
+| `Apex Call Graph: Refresh Entry Points` | Entry Points view title button |
 | `Apex Call Graph: Copy Diagnostics (counts only)` | Command palette |
 | `Apex Call Graph: Clear Cache` | Command palette |
+
+Internal identifiers are frozen for compatibility: command ids use the
+historical `apexTrace.*` prefix, settings use `apexCallGraph.*`, and the
+Activity Bar container id is `apex-call-graph`. The mismatch is deliberate
+and permanent — renaming a shipped command id silently breaks user
+keybindings — so new commands join the existing `apexTrace.*` prefix
+instead of "fixing" it.
 
 ## Reference: how edges are resolved
 

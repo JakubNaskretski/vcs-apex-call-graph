@@ -1444,6 +1444,115 @@ function findChild(tree, label) {
 }
 
 // =========================================================================
+// M1 UI hygiene contributions
+// =========================================================================
+{
+  const extSrc = fs.readFileSync(path.join(__dirname, 'extension.js'), 'utf8');
+  const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+
+  // 20. All four editor/context when-clauses contain resourceExtname == .apex
+  // (and still .cls and .trigger).
+  const editorCtxEntries = packageJson.contributes.menus['editor/context'];
+  assert.strictEqual(editorCtxEntries.length, 4, 'editor/context still has exactly the four Apex Call Graph entries');
+  for (const entry of editorCtxEntries) {
+    assert(entry.when.includes('resourceExtname == .cls'), `${entry.command} when-clause keeps .cls`);
+    assert(entry.when.includes('resourceExtname == .trigger'), `${entry.command} when-clause keeps .trigger`);
+    assert(entry.when.includes('resourceExtname == .apex'), `${entry.command} when-clause gains .apex`);
+  }
+
+  // 21. resolveTarget's enclosing-file detection recognizes .apex. Do NOT
+  // assert an occurrence COUNT of /\.(cls|trigger|apex)$/i -- that literal
+  // already exists in the tree as APEX_EXT_RE, so a count-based assertion is
+  // either vacuous or silently satisfied by only one of the two edits.
+  // Assert the two exact substrings instead.
+  assert(extSrc.includes("if (fileName && /\\.(cls|trigger|apex)$/i.test(fileName))"));
+  assert(extSrc.includes(".replace(/\\.(cls|trigger|apex)$/i, '')"));
+
+  // 22. The view/item/context entry for apexTrace.traceCallees has
+  // when === 'view == apexTraceEntriesView && viewItem ==
+  // apexTraceEntryCatalogEntryTraceable' (exact equality, not includes --
+  // '...EntryTraceable' CONTAINS '...Entry', so a substring check cannot
+  // distinguish the two values).
+  const itemCtxEntries = packageJson.contributes.menus['view/item/context'];
+  const traceCalleesInline = itemCtxEntries.find((e) => e.command === 'apexTrace.traceCallees');
+  assert(traceCalleesInline, 'view/item/context still has a traceCallees inline entry');
+  assert.strictEqual(
+    traceCalleesInline.when,
+    'view == apexTraceEntriesView && viewItem == apexTraceEntryCatalogEntryTraceable'
+  );
+  // For the same reason, assert the surviving fallback value in extSrc on
+  // the QUOTED literal including its closing quote ("'apexTraceEntryCatalogEntry'"
+  // is NOT a substring of "'apexTraceEntryCatalogEntryTraceable'", so this
+  // second assertion is real; the unquoted form would be vacuous).
+  assert(extSrc.includes("'apexTraceEntryCatalogEntryTraceable'"));
+  assert(extSrc.includes("'apexTraceEntryCatalogEntry'"), 'fallback contextValue must survive');
+
+  // 23. menus.commandPalette exists; toggleDirection is gated on
+  // apexTrace.hasResults; refreshEntryCatalog is gated 'false'; NO
+  // commandPalette entry exists for refreshPathMap or toggleOrientation
+  // (pins the adjusted-verdict decision).
+  const paletteEntries = packageJson.contributes.menus.commandPalette;
+  assert(Array.isArray(paletteEntries), 'menus.commandPalette exists');
+  const toggleDirectionPalette = paletteEntries.find((e) => e.command === 'apexTrace.toggleDirection');
+  assert(toggleDirectionPalette, 'toggleDirection has a commandPalette entry');
+  assert.strictEqual(toggleDirectionPalette.when, 'apexTrace.hasResults');
+  const refreshEntryCatalogPalette = paletteEntries.find((e) => e.command === 'apexTrace.refreshEntryCatalog');
+  assert(refreshEntryCatalogPalette, 'refreshEntryCatalog has a commandPalette entry');
+  assert.strictEqual(refreshEntryCatalogPalette.when, 'false');
+  assert(
+    !paletteEntries.some((e) => e.command === 'apexTrace.refreshPathMap'),
+    'refreshPathMap is deliberately NOT gated'
+  );
+  assert(
+    !paletteEntries.some((e) => e.command === 'apexTrace.toggleOrientation'),
+    'toggleOrientation is deliberately NOT gated'
+  );
+
+  // 24. Commands list: apexTrace.refreshEntryCatalog exists with title
+  // 'Refresh Entry Points' and icon '$(refresh)'; apexTrace.showEntryCatalog
+  // icon is '$(list-flat)'; apexTrace.toggleOrientation title is
+  // 'Toggle Orientation (Target-First / Entry-First)'.
+  const commands = packageJson.contributes.commands;
+  const refreshEntryCatalogCmd = commands.find((c) => c.command === 'apexTrace.refreshEntryCatalog');
+  assert(refreshEntryCatalogCmd, 'apexTrace.refreshEntryCatalog is registered as a command');
+  assert.strictEqual(refreshEntryCatalogCmd.title, 'Refresh Entry Points');
+  assert.strictEqual(refreshEntryCatalogCmd.icon, '$(refresh)');
+  const showEntryCatalogCmd = commands.find((c) => c.command === 'apexTrace.showEntryCatalog');
+  assert.strictEqual(showEntryCatalogCmd.icon, '$(list-flat)');
+  const toggleOrientationCmd = commands.find((c) => c.command === 'apexTrace.toggleOrientation');
+  assert.strictEqual(toggleOrientationCmd.title, 'Toggle Orientation (Target-First / Entry-First)');
+
+  // 25. view/title contains apexTrace.refreshEntryCatalog gated on
+  // view == apexTraceEntriesView, and no longer contains
+  // apexTrace.showEntryCatalog; the viewsWelcome contents for
+  // apexTraceEntriesView still reference command:apexTrace.showEntryCatalog.
+  const titleEntries = packageJson.contributes.menus['view/title'];
+  const refreshEntryCatalogTitle = titleEntries.find((e) => e.command === 'apexTrace.refreshEntryCatalog');
+  assert(refreshEntryCatalogTitle, 'refreshEntryCatalog has a view/title entry');
+  assert.strictEqual(refreshEntryCatalogTitle.when, 'view == apexTraceEntriesView');
+  assert(
+    !titleEntries.some((e) => e.command === 'apexTrace.showEntryCatalog'),
+    'showEntryCatalog no longer owns the view/title button'
+  );
+  const entriesWelcome = packageJson.contributes.viewsWelcome.find((w) => w.view === 'apexTraceEntriesView');
+  assert(entriesWelcome, 'apexTraceEntriesView still has a viewsWelcome entry');
+  assert(entriesWelcome.contents.includes('command:apexTrace.showEntryCatalog'));
+
+  // 26. extSrc contains matchOnDescription: true within the resolveTarget
+  // region -- match on the full substring, NOT the bare
+  // 'matchOnDescription: true', which already exists at the overload picker
+  // and would make the assertion vacuous -- and contains
+  // QuickPickItemKind.Separator.
+  assert(extSrc.includes('showQuickPick(picks, { placeHolder, matchOnDescription: true })'));
+  assert(extSrc.includes('QuickPickItemKind.Separator'));
+
+  // 26b. extSrc contains the "separators only when BOTH groups are
+  // non-empty" guard, pinning the decision so a later edit cannot quietly
+  // reintroduce an empty section header.
+  assert(extSrc.includes('if (!locals.length || !managed.length) return locals.concat(managed);'));
+}
+
+// =========================================================================
 // v0.5.0 EXCEPTION-STORY: end-to-end assertions, node by node -- see the
 // fixture block near the top of this file for the shape of the story.
 // =========================================================================

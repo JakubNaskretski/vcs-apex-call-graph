@@ -2617,6 +2617,265 @@ console.log('metascan.js inline-fixture self-check: all assertions passed');
 console.log('metascan.js v0.13 subflow-extraction inline self-check: all assertions passed');
 
 // ===========================================================================
+// Comment-blanking pre-pass
+// ===========================================================================
+
+// 61. Flow XML, commented-out actionCalls. The line === 12 assertion depends
+//     on the exact layout, so the fixture is pinned verbatim.
+{
+  const text = src([
+    '<?xml version="1.0" encoding="UTF-8"?>',                   // 1
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',   // 2
+    '    <!-- <actionCalls>',                                   // 3
+    '        <name>DeadCall</name>',                            // 4
+    '        <actionType>apex</actionType>',                    // 5
+    '        <actionName>Vtx_DeadSvc.runDead</actionName>',     // 6
+    '    </actionCalls>',                                       // 7
+    '    -->',                                                  // 8
+    '    <actionCalls>',                                        // 9
+    '        <name>LiveCall</name>',                            // 10
+    '        <actionType>apex</actionType>',                    // 11
+    '        <actionName>Vtx_LiveSvc.runLive</actionName>',     // 12
+    '    </actionCalls>',                                       // 13
+    '</Flow>',                                                  // 14
+  ]);
+  const refs = parseMetaFile({ path: 'flows/Vtx_Live_Flow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'Vtx_LiveSvc');
+  assert.strictEqual(refs[0].methodName, 'runLive');
+  assert.strictEqual(refs[0].line, 12, 'proves newline preservation across the blanked comment span');
+  assert.strictEqual(refs[0].lineText, '<actionName>Vtx_LiveSvc.runLive</actionName>');
+}
+
+// 62. Flow XML, unterminated comment: <!-- opened before the only apex
+//     actionCalls block, never closed -> [], and never throws.
+{
+  const text = src([
+    '<Flow>',
+    '    <!--',
+    '    <actionCalls>',
+    '        <actionType>apex</actionType>',
+    '        <actionName>Vtx_DeadSvc.runDead</actionName>',
+    '    </actionCalls>',
+    '</Flow>',
+  ]);
+  let refs;
+  assert.doesNotThrow(() => { refs = parseMetaFile({ path: 'flows/Vtx_Unterminated.flow-meta.xml', text }); });
+  assert.deepStrictEqual(refs, []);
+}
+
+// 63. Flow XML, trailing same-line comment -- pins the documented
+//     lineText-from-blanked-text behavior.
+{
+  const text = src([
+    '<Flow>',
+    '    <actionCalls>',
+    '        <actionType>apex</actionType>',
+    '        <actionName>Vtx_LiveSvc.runLive</actionName> <!-- approved -->',
+    '    </actionCalls>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/Vtx_Trailing.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].lineText, '<actionName>Vtx_LiveSvc.runLive</actionName>');
+}
+
+// 64. LWC JS, commented imports. line === 6 depends on the layout, so the
+//     fixture is pinned verbatim.
+{
+  const text = src([
+    "import { LightningElement } from 'lwc';",                                  // 1
+    "// import getDead from '@salesforce/apex/VtxDeadCtrl.getDead';",           // 2
+    '/*',                                                                       // 3
+    "import getAlsoDead from '@salesforce/apex/VtxAlsoDeadCtrl.getAlsoDead';",  // 4
+    '*/',                                                                       // 5
+    "import getLive from '@salesforce/apex/VtxLiveCtrl.getLive';",              // 6
+  ]);
+  const refs = parseMetaFile({ path: 'lwc/vtxLivePanel/vtxLivePanel.js', text });
+  assert.strictEqual(refs.length, 1, 'neither commented specifier survives');
+  assert.strictEqual(refs[0].className, 'VtxLiveCtrl');
+  assert.strictEqual(refs[0].methodName, 'getLive');
+  assert.strictEqual(refs[0].line, 6);
+}
+
+// 65. LWC JS, string skip -- the '//' inside the URL string must NOT blank,
+//     the trailing '//' comment MUST.
+{
+  const text = src([
+    "const VTX_HELP_URL = 'https://vtx.example/help'; // dead: import x from '@salesforce/apex/VtxDeadCtrl.x'",
+    "import getLive from '@salesforce/apex/VtxLiveCtrl.getLive';",
+  ]);
+  const refs = parseMetaFile({ path: 'lwc/vtxHelpPanel/vtxHelpPanel.js', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'VtxLiveCtrl');
+}
+
+// 66. LWC JS, template literal: a multi-line backtick string containing '/*'
+//     (NOT '//' -- a '//' inside a template literal only ever blanks to the
+//     end of its own line, so that fixture would pass even against a
+//     completely string-unaware blanker and pin nothing). GUARD pin: passes
+//     in both trees, regression guard against a mis-implemented blanker.
+{
+  const text = src([
+    'const TPL = `vtx /* not a comment',                            // 1
+    'still inside the literal`;',                                   // 2
+    "import getLive from '@salesforce/apex/VtxLiveCtrl.getLive';",  // 3
+  ]);
+  const refs = parseMetaFile({ path: 'lwc/vtxTplPanel/vtxTplPanel.js', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'VtxLiveCtrl');
+  assert.strictEqual(refs[0].line, 3);
+}
+
+// 67. Aura markup, commented-out root -- this was a WRONG root match before
+//     (AURA_ROOT_RE found the commented tag first), not merely an extra ref.
+{
+  const text = src([
+    '<!-- <aura:component controller="VtxDeadCtrl"> -->',
+    '<aura:component controller="VtxLiveCtrl">',
+    '</aura:component>',
+  ]);
+  const refs = parseMetaFile({ path: 'aura/VtxLiveCmp/VtxLiveCmp.cmp', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'VtxLiveCtrl');
+}
+
+// 68. Aura bundle JS via scanBundle -- the receiver MUST be the literal
+//     'component' (not 'cmp'): cmp.get is m1-defects' territory and would
+//     make this test depend on which package landed first.
+{
+  const cmp = '<aura:component controller="VtxOrderCtrl"></aura:component>';
+  const js = src([
+    '({',
+    "  a: function(component) { // component.get('c.deadAction')",
+    "    var u = 'https://vtx.example'; component.get('c.liveAction');",
+    "    /* component.get('c.alsoDead') */",
+    '  }',
+    '})',
+  ]);
+  const refs = scanBundle([
+    { path: 'aura/VtxOrderCmp/VtxOrderCmp.cmp', text: cmp },
+    { path: 'aura/VtxOrderCmp/VtxOrderCmpController.js', text: js },
+  ]);
+  assert.deepStrictEqual(refs.filter((r) => r.methodName).map((r) => r.methodName), ['liveAction']);
+}
+
+// 69. VF, commented-out root.
+{
+  const text = src([
+    '<!-- <apex:page controller="VtxOldCtrl"> -->',                 // 1
+    '<apex:page controller="VtxPageCtrl" action="{!bootstrap}">',   // 2
+    '</apex:page>',                                                 // 3
+  ]);
+  const refs = parseMetaFile({ path: 'pages/VtxPage.page', text });
+  assert.strictEqual(refs.length, 2);
+  // refs[0]: the class-level ref. Do not assert a non-null className on the
+  // action-binding ref -- metascan deliberately leaves it null on that shape
+  // (extractVfActionBinding's own comment + makeRef('vf', label, null, ...)
+  // call, metascan.js's v0.10/A2 contract) and carries the page's controller
+  // in controllerClass instead.
+  assert.strictEqual(refs[0].className, 'VtxPageCtrl');
+  assert.strictEqual(refs[0].methodName, null);
+  assert.strictEqual(refs[0].line, 2);
+  // refs[1]: the action binding.
+  assert.strictEqual(refs[1].className, null);
+  assert.strictEqual(refs[1].methodName, 'bootstrap');
+  assert.strictEqual(refs[1].controllerClass, 'VtxPageCtrl');
+  assert.strictEqual(refs[1].line, 2);
+}
+
+// 70a. CMDT (.md-meta.xml) commented-out block -- asserts only on the
+//      extracted className list (no line assertion, so only content
+//      matters). Both <value>s MUST be bare-identifier-shaped or
+//      extractCmdt skips them for an unrelated reason and the test proves
+//      nothing.
+{
+  const text = src([
+    '<CustomMetadata>',
+    '    <!-- <values>',
+    '        <field>Apex_Class__c</field>',
+    '        <value xsi:type="xsd:string">Vtx_Dead_Handler</value>',
+    '    </values> -->',
+    '    <values>',
+    '        <field>Apex_Class__c</field>',
+    '        <value xsi:type="xsd:string">Vtx_Live_Handler</value>',
+    '    </values>',
+    '</CustomMetadata>',
+  ]);
+  const refs = parseMetaFile({ path: 'customMetadata/Vtx_Trigger_Action.Live.md-meta.xml', text });
+  assert.deepStrictEqual(refs.map((r) => r.className), ['Vtx_Live_Handler']);
+}
+
+// 70b. Permission Set (.permissionset-meta.xml) commented-out block -- the
+//      real block MUST be enabled, or a disabled block yields nothing and
+//      the test would pass vacuously.
+{
+  const text = src([
+    '<PermissionSet>',
+    '    <!-- <classAccesses>',
+    '        <apexClass>Vtx_DeadSvc</apexClass>',
+    '        <enabled>true</enabled>',
+    '    </classAccesses> -->',
+    '    <classAccesses>',
+    '        <apexClass>Vtx_LiveSvc</apexClass>',
+    '        <enabled>true</enabled>',
+    '    </classAccesses>',
+    '</PermissionSet>',
+  ]);
+  const refs = parseMetaFile({ path: 'permissionsets/Vtx_Ops.permissionset-meta.xml', text });
+  assert.deepStrictEqual(refs.map((r) => r.className), ['Vtx_LiveSvc']);
+}
+
+// 71a. Never-throws / linearity, XML side (GUARD pin, passes in both trees):
+//      a long run of unclosed comment opens must remain linear.
+{
+  const malformed = '<!--'.repeat(20000);
+  const started = process.hrtime.bigint();
+  const refs = parseMetaFile({ path: 'flows/Vtx_Malformed_Comment.flow-meta.xml', text: malformed });
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.deepStrictEqual(refs, []);
+  assert.ok(elapsedMs < 250, `malformed <!-- scan must stay linear; took ${elapsedMs.toFixed(1)}ms`);
+}
+
+// 71b. Never-throws / linearity, JS side (FLIP pin): an unterminated /* in a
+//      .js file -> [], no throw. The fixture MUST contain a real import
+//      inside the unterminated block, or it proves nothing (a comment-free
+//      empty file also yields []).
+{
+  const text = src([
+    '/*',
+    "import getDead from '@salesforce/apex/VtxDeadCtrl.getDead';",
+  ]);
+  let refs;
+  assert.doesNotThrow(() => { refs = parseMetaFile({ path: 'lwc/vtxDead/vtxDead.js', text }); });
+  assert.deepStrictEqual(refs, []);
+}
+
+// 72. Regex-literal limitation (deliberate pin): a .js Aura-style scanBundle
+//     fixture where the regex literal /a\/*b/ precedes
+//     component.get('c.liveAction') on the SAME line -> 0 method refs. This
+//     pins the documented header-contract limitation; if the blanker ever
+//     learns regex literals, this test flips intentionally. Escaping
+//     matters -- the fixture line is a JS string literal inside this file,
+//     so the backslash must be doubled or the regex literal that reaches the
+//     blanker is not the documented shape.
+{
+  const cmp = '<aura:component controller="VtxRegexCtrl"></aura:component>';
+  const js = src([
+    '({',
+    "  a: function(component) { var re = /a\\/*b/; component.get('c.liveAction'); }",
+    '})',
+  ]);
+  const refs = scanBundle([
+    { path: 'aura/VtxRegexCmp/VtxRegexCmp.cmp', text: cmp },
+    { path: 'aura/VtxRegexCmp/VtxRegexCmpController.js', text: js },
+  ]);
+  assert.deepStrictEqual(refs.filter((r) => r.methodName).map((r) => r.methodName), []);
+}
+
+console.log('metascan.js v0.20 comment-blanking inline self-check: all assertions passed');
+
+// ===========================================================================
 // REAL CORPUS PASS — test-fixtures/adv-org (read-only)
 // Asserts the exact refs MANIFEST.md's "UI / metadata callers" ground-truth
 // section promises: LWC class.method pairs, dotted + bare Flow actionNames,

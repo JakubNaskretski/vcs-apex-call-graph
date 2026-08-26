@@ -324,6 +324,52 @@
 //     aura refs too -- it always keyed off the `namespace` field; aura
 //     simply never carried one before.
 //
+// v0.20 comment-blanking pre-pass, purely SUBTRACTIVE -- the one documented
+// change in this file's history that removes output rather than adding it:
+// every ref extracted from real (non-commented) source text is byte-
+// identical to pre-v0.20 output, but text inside a comment no longer
+// produces refs at all (previously a commented-out <actionCalls> block, a
+// commented-out <aura:component controller="..."> root tag, or an LWC
+// import inside a /* */ block yielded confident phantom refs with real
+// path/line that survived all the way into impact analysis downstream).
+//
+//   - parseMetaFile()/scanBundle() blank comments BEFORE dispatching to the
+//     per-surface extractors, with the same newline-preserving space-
+//     blanking technique apexindex.strip() established (the technique only
+//     -- nothing is imported from apexindex.js, and the two differ on the
+//     one policy that matters here, see below): blanked text has the
+//     SAME length and the SAME newline positions as the raw text, so every
+//     offset/line computed against it (buildLineIndex/lineForIndex) is
+//     valid against the original file. XML surfaces (.cmp/.app,
+//     .flow-meta.xml, .os-meta.xml, .md-meta.xml, .permissionset-meta.xml,
+//     .profile-meta.xml, .page/.component) blank <!-- ... --> spans; an
+//     unterminated <!-- blanks to end-of-file -- tolerant, never throws.
+//     JS surfaces (.js LWC modules here, Aura bundle JS in scanBundle())
+//     blank // and /* */ comments while SKIPPING (never blanking) the
+//     contents of '...'/"..."/`...` string literals -- the extraction
+//     targets themselves ('@salesforce/apex/...' specifiers, 'c.method'
+//     arguments) live inside string literals, and a comment marker inside
+//     a string (an https:// URL) must never blank real code after it.
+//     *.json (DataPack) files are NOT blanked at all: JSON has no comment
+//     syntax and extractOmniscriptJson()'s raw-text '"remoteClass"' needle
+//     search must see the file verbatim.
+//   - lineText is extracted from the BLANKED text: a surviving ref whose
+//     line also carried a comment shows that comment's characters as
+//     spaces (an edge-of-line comment disappears entirely under the
+//     existing trim). Deliberate: sharing one text keeps every offset
+//     single-sourced; the alternative (raw lineText beside blanked match
+//     text) would widen every extractor signature for a cosmetic
+//     difference on comment-sharing lines only.
+//   - KNOWN LIMITATION (documented, pinned by its own test in
+//     test-metascan.js): the JS blanker does not model regex literals. A
+//     regex literal containing '//' or an unescaped '/*' (e.g. /a\/*b/)
+//     over-blanks from that point (to end of line, or to the next '*/' or
+//     end-of-file); one containing a lone quote character (e.g. /'/) opens
+//     a spurious string skip that runs to the next matching quote or, for
+//     ' and ", to end of line. Never throws; degrades to a MISSING ref
+//     -- the same honest-miss posture as every other tolerance in this
+//     file. Revisit only with evidence of a real corpus hit.
+//
 // Design notes:
 //
 // - `label` is the file's stem (its Salesforce API name) — see stemOf()
@@ -428,6 +474,87 @@ function makeRef(kind, label, className, methodName, text, lineStarts, idx) {
     line: lineForIndex(lineStarts, idx),
     lineText: lineTextForIndex(text, lineStarts, idx),
   };
+}
+
+// --- comment-blanking pre-pass ---------------------------------------------
+// Every extractor below runs regexes over raw text, so a commented-out
+// <actionCalls> block, a commented-out <aura:component controller="...">
+// root tag, or an LWC import inside a /* */ block used to yield confident
+// phantom refs (real path/line, rendered downstream as real inbound
+// callers). parseMetaFile()/scanBundle() therefore blank comments BEFORE
+// dispatching, with the same newline-preserving space-blanking technique
+// apexindex.strip() established: blanked text has the SAME length and the
+// SAME newline positions as the raw text, so every offset/line computed
+// against it is valid against the original file. See the header contract's
+// own comment-blanking section for the full behavioral notes.
+
+// XML surfaces: blank <!-- ... --> spans (an unterminated <!-- blanks to
+// end-of-file -- tolerant, never throws). Attribute values never contain a
+// raw '<' in well-formed Salesforce metadata, so no string-awareness is
+// needed on this surface.
+function blankXmlComments(text) {
+  let idx = text.indexOf('<!--');
+  if (idx === -1) return text; // fast path: comment-free file, zero allocation
+  const out = text.split('');
+  const n = text.length;
+  while (idx !== -1) {
+    let end = text.indexOf('-->', idx + 4);
+    end = end === -1 ? n : end + 3;
+    for (let k = idx; k < end; k++) if (out[k] !== '\n') out[k] = ' ';
+    idx = end >= n ? -1 : text.indexOf('<!--', end);
+  }
+  return out.join('');
+}
+
+// JS surfaces (LWC modules, Aura bundle controller/helper JS): blank // and
+// /* */ comments while SKIPPING (never blanking) the contents of
+// '...'/"..."/`...` string literals -- the extraction targets themselves
+// ('@salesforce/apex/...' import specifiers, 'c.method' arguments) live
+// INSIDE string literals, and a comment marker inside a string (an https://
+// URL) must not blank real code after it. This is apexindex.strip()'s shape
+// with the opposite string policy -- strip() blanks string contents (Apex
+// call analysis wants them gone); this must preserve them.
+function blankJsComments(text) {
+  if (text.indexOf('//') === -1 && text.indexOf('/*') === -1) return text;
+  const out = text.split('');
+  const n = text.length;
+  const blank = (from, to) => {
+    for (let k = from; k < to && k < n; k++) if (out[k] !== '\n') out[k] = ' ';
+  };
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    const d = i + 1 < n ? text[i + 1] : '';
+    if (c === '/' && d === '/') {
+      let j = i;
+      while (j < n && text[j] !== '\n') j++;
+      blank(i, j);
+      i = j;
+    } else if (c === '/' && d === '*') {
+      let j = text.indexOf('*/', i + 2);
+      j = j === -1 ? n : j + 2;
+      blank(i, j);
+      i = j;
+    } else if (c === "'" || c === '"' || c === '`') {
+      // Skip the literal verbatim. Backslash escapes are honored; a ' or "
+      // string left unterminated at end-of-line stops there (tolerant --
+      // real single/double-quoted JS strings cannot span lines); a template
+      // literal may span lines and stops only at its closing backtick (a
+      // backtick inside a ${} expression ends the skip early -- tolerated,
+      // never throws, same best-effort posture as the rest of this file).
+      const quote = c;
+      let j = i + 1;
+      while (j < n && text[j] !== quote) {
+        if (text[j] === '\\') j++;
+        else if (quote !== '`' && text[j] === '\n') break;
+        j++;
+      }
+      i = j + 1;
+    } else {
+      i++;
+    }
+  }
+  return out.join('');
 }
 
 // --- namespace-splitting helpers -------------------------------------------
@@ -1171,24 +1298,29 @@ function parseMetaFile(file) {
   const lineStarts = buildLineIndex(text);
 
   try {
+    // Comment blanking is length- and newline-preserving, so `lineStarts`
+    // (built from the raw text above) is valid against the blanked text too.
     if (/\.js$/i.test(path)) {
-      extractLwc(path, text, lineStarts, out);
+      extractLwc(path, blankJsComments(text), lineStarts, out);
     } else if (/\.(cmp|app)$/i.test(path)) {
-      extractAuraClassLevel(path, text, lineStarts, out);
+      extractAuraClassLevel(path, blankXmlComments(text), lineStarts, out);
     } else if (/\.flow-meta\.xml$/i.test(path)) {
-      extractFlow(path, text, lineStarts, out);
+      extractFlow(path, blankXmlComments(text), lineStarts, out);
     } else if (/\.os-meta\.xml$/i.test(path)) {
-      extractOmniscriptXml(path, text, lineStarts, out);
+      extractOmniscriptXml(path, blankXmlComments(text), lineStarts, out);
     } else if (/\.md-meta\.xml$/i.test(path)) {
-      extractCmdt(path, text, lineStarts, out);
+      extractCmdt(path, blankXmlComments(text), lineStarts, out);
     } else if (/\.permissionset-meta\.xml$/i.test(path)) {
-      extractClassAccess(path, text, lineStarts, out, 'permissionset');
+      extractClassAccess(path, blankXmlComments(text), lineStarts, out, 'permissionset');
     } else if (/\.profile-meta\.xml$/i.test(path)) {
-      extractClassAccess(path, text, lineStarts, out, 'profile');
+      extractClassAccess(path, blankXmlComments(text), lineStarts, out, 'profile');
     } else if (/\.json$/i.test(path)) {
+      // Raw, deliberately: JSON has no comment syntax, and
+      // extractOmniscriptJson's raw-text '"remoteClass"' needle search must
+      // see the file verbatim.
       extractOmniscriptJson(path, text, lineStarts, out);
     } else if (/\.(page|component)$/i.test(path)) {
-      extractVf(path, text, lineStarts, out);
+      extractVf(path, blankXmlComments(text), lineStarts, out);
     }
   } catch (e) {
     // defensive: parseMetaFile must never throw, mirroring parser.js's
@@ -1244,8 +1376,9 @@ function scanBundle(files) {
   for (const g of groups.values()) {
     if (!g.markup) continue;
 
+    const markupText = blankXmlComments(g.markup.text);
     const classRefs = [];
-    extractAuraClassLevel(g.markup.path, g.markup.text, buildLineIndex(g.markup.text), classRefs);
+    extractAuraClassLevel(g.markup.path, markupText, buildLineIndex(markupText), classRefs);
     for (const ref of classRefs) out.push(ref);
     if (classRefs.length === 0) continue; // no controller declared -> nothing to attribute method-level refs to
 
@@ -1254,11 +1387,12 @@ function scanBundle(files) {
     const label = classRefs[0].label;
 
     for (const jsFile of g.jsFiles) {
-      const lineStarts = buildLineIndex(jsFile.text);
+      const jsText = blankJsComments(jsFile.text);
+      const lineStarts = buildLineIndex(jsText);
       AURA_GET_RE.lastIndex = 0;
       let m;
-      while ((m = AURA_GET_RE.exec(jsFile.text))) {
-        const ref = makeRef('aura', label, controllerClass, m[2], jsFile.text, lineStarts, m.index);
+      while ((m = AURA_GET_RE.exec(jsText))) {
+        const ref = makeRef('aura', label, controllerClass, m[2], jsText, lineStarts, m.index);
         ref.namespace = controllerNamespace;
         out.push(ref);
       }

@@ -538,6 +538,11 @@ function openCommand(sourcePath, line, col) {
 // of which ever pass a TreeItem argument, so `item` is undefined there and
 // the check is false by construction, leaving that command's original
 // behavior byte-identical.
+// As of the M1 UI-hygiene batch the contextValue is CONDITIONAL: only a row
+// whose `_entryTarget` is non-null gets 'apexTraceEntryCatalogEntryTraceable',
+// the value package.json's inline action is gated on. That makes the command's
+// no-target toast branch (registered below, the `if (!item._entryTarget)` arm)
+// defensive-only rather than user-reachable -- it stays exactly where it is.
 function toEntryCatalogTreeItem(uiNode) {
   const collapsibleState = uiNode.isGroup
     ? (uiNode.collapsible
@@ -551,13 +556,19 @@ function toEntryCatalogTreeItem(uiNode) {
   const kids = (uiNode.children || []).map((n) => toEntryCatalogTreeItem(n));
   it._uiChildren = kids;
   if (!uiNode.isGroup) {
-    // contextValue is what package.json's "view/item/context" `when` clause
-    // (viewItem == apexTraceEntryCatalogEntry) matches against, so the
-    // inline "What Does This Call?" action renders on entry rows only,
-    // never on a kind-group header row.
-    it.contextValue = 'apexTraceEntryCatalogEntry';
     it._entryTarget = uiNode.entryTarget || null;
     it._entryLabel = uiNode.label;
+    // contextValue is what package.json's "view/item/context" `when` clause
+    // matches against. Rows WITH a traceable Apex target get the
+    // '...Traceable' value the inline "What Does This Call?" action is
+    // gated on; rows without one (today: every Flow entry -- see uitree's
+    // entryCatalogTarget doc) keep the plain value, so the action never
+    // renders as a guaranteed no-op button. Entries that later gain a
+    // target (typed targets, a future milestone) light the button up with
+    // zero further UI work here.
+    it.contextValue = it._entryTarget
+      ? 'apexTraceEntryCatalogEntryTraceable'
+      : 'apexTraceEntryCatalogEntry';
     if (uiNode.jump) {
       const line = Math.max(0, (uiNode.jump.line || 1) - 1);
       const col = Math.max(0, uiNode.jump.col || 0);
@@ -1579,24 +1590,61 @@ async function resolveCursorAmbiguity(index, enclosingCls, word, wordLower, encl
 // then reshape into the { label, picked, target } shape showQuickPick/the
 // chosen.target.* read below expects.
 //
-// v0.7 / B3: targets.refineTargets() now ALSO suffixes a duplicated class
-// name's label with ' (pkgLabel)' and (only when the underlying
+// v0.7 / B3: targets.refineTargets() suffixes a duplicated class name's
+// label with ' (pkgLabel)' and (only when the underlying
 // resolver.suggestTargets() item actually carried one) keeps a `package`
-// field on its output. When present, that field is carried through onto
-// `target` too -- so a QuickPick pick of e.g. "AcmeOrderUtil (nova-billing)"
+// field on its output. That field is still carried through onto `target`
+// verbatim -- so a QuickPick pick of e.g. "AcmeOrderUtil (nova-billing)"
 // resolves to a target resolver.js's buildCallerTree/buildCalleeTree can use
 // to pick the RIGHT one of the duplicated ClassMeta candidates, not just
 // whichever one happens to be bucketed first. In a packageless workspace
 // (or against a resolver.js without package-aware targets), refineTargets()
 // never attaches `package` at all, so `target` keeps its pre-v0.7 two-field
 // shape exactly.
+//
+// M1 UI hygiene: the DISPLAY split changed, the target mapping did not.
+// targets.presentTarget() moves refineTargets()' QUALIFIER suffixes
+// (' (managed)', ' (pkgLabel)') out of the label and into `description`,
+// leaving IDENTITY suffixes (' (constructor)') in the label; the picker sets
+// matchOnDescription so qualifier text still matches, just at lower rank.
+// Items are partitioned into local and managed groups with a
+// QuickPickItemKind.Separator header each -- but only when BOTH groups are
+// non-empty, so a single-group workspace never renders a lone or empty
+// section header. The returned array is therefore HETEROGENEOUS: pick
+// objects carry `target`, separator objects carry `label`+`kind` and no
+// `target` at all. showQuickPick can never return a separator, so the
+// chosen.target reads below stay safe; any future map/filter over this
+// return value must guard on hasOwnProperty('target') first.
 function buildSuggestPicks(index) {
   const refined = targets.refineTargets(resolver.suggestTargets(index));
-  return refined.map((t) => {
+  const locals = [];
+  const managed = [];
+  for (const t of refined) {
+    const pres = targets.presentTarget(t);
+    // Codicon = target-type identity: class-level, method-level, or
+    // managed-external. Deliberately hardcoded here (not a kind-registry
+    // read): these are picker-surface icons, outside the tree/catalog icon
+    // identity domain.
+    const icon = t.kind === 'external'
+      ? '$(package) '
+      : t.methodLower ? '$(symbol-method) ' : '$(symbol-class) ';
     const target = { classLower: t.classLower, methodLower: t.methodLower };
     if (Object.prototype.hasOwnProperty.call(t, 'package')) target.package = t.package;
-    return { label: t.label, picked: false, target };
-  });
+    const pick = { label: icon + pres.label, picked: false, target };
+    if (pres.description) pick.description = pres.description;
+    (t.kind === 'external' ? managed : locals).push(pick);
+  }
+  // Separators only when BOTH groups are non-empty. A lone section header
+  // over a single-group list is noise -- and an EMPTY 'Classes & methods'
+  // header above a managed-only list (a metadata-only workspace with zero
+  // .cls files can produce exactly that) is worse than no header at all.
+  if (!locals.length || !managed.length) return locals.concat(managed);
+  return [
+    { label: 'Classes & methods', kind: vscode.QuickPickItemKind.Separator },
+    ...locals,
+    { label: 'Managed', kind: vscode.QuickPickItemKind.Separator },
+    ...managed,
+  ];
 }
 
 // Cursor resolution per contract: word == method of enclosing file's class
@@ -1629,8 +1677,8 @@ async function resolveTarget(index, direction, targetContext) {
   const wordLower = word ? word.toLowerCase() : null;
 
   let enclosingLower = null;
-  if (fileName && /\.(cls|trigger)$/i.test(fileName)) {
-    const base = fileName.split(/[\\/]/).pop().replace(/\.(cls|trigger)$/i, '');
+  if (fileName && /\.(cls|trigger|apex)$/i.test(fileName)) {
+    const base = fileName.split(/[\\/]/).pop().replace(/\.(cls|trigger|apex)$/i, '');
     if (index.classes.has(base.toLowerCase())) enclosingLower = base.toLowerCase();
   }
 
@@ -1666,7 +1714,7 @@ async function resolveTarget(index, direction, targetContext) {
     : direction === 'impact'
       ? 'Analyze the impact of changing which Apex method?'
       : 'Trace callers of which Apex method or class?';
-  const chosen = await vscode.window.showQuickPick(picks, { placeHolder });
+  const chosen = await vscode.window.showQuickPick(picks, { placeHolder, matchOnDescription: true });
   if (!chosen) return null;
   const target = { classLower: chosen.target.classLower, methodLower: chosen.target.methodLower || null };
   if (Object.prototype.hasOwnProperty.call(chosen.target, 'package')) target.package = chosen.target.package;
@@ -2615,6 +2663,11 @@ async function activate(context) {
     mapPanel.reveal(vscode.ViewColumn.Beside, true);
   }
 
+  // Command ids are FROZEN at the historical 'apexTrace.*' prefix (settings
+  // use 'apexCallGraph.*', the Activity Bar container 'apex-call-graph').
+  // The three-way mismatch is deliberate and permanent: renaming a shipped
+  // command id silently breaks user keybindings. Document, never rename;
+  // new commands join the same 'apexTrace.*' prefix.
   context.subscriptions.push(
     vscode.commands.registerCommand('apexTrace.traceCallers', async () => {
       // Single-flighted; see scanFlow's header for the
@@ -2782,6 +2835,17 @@ async function activate(context) {
       if (result && result.superseded) return;
       if (result) await vscode.commands.executeCommand('apexTraceEntriesView.focus');
     }),
+    // The Entry Points view-title button's REFRESH affordance gets its own
+    // command id and title, so the button reads as 'Refresh Entry Points'
+    // instead of borrowing 'Show Entry Points' -- a first-run user has
+    // nothing to "show" from a title bar they can only reach after the view
+    // exists. Forwarding (not a second handler) keeps the 'catalog'
+    // single-flight key and every side effect identical; hidden from the
+    // palette via package.json's commandPalette when:false entry, since the
+    // palette already offers 'Show Entry Points' with the same effect.
+    vscode.commands.registerCommand('apexTrace.refreshEntryCatalog', () =>
+      vscode.commands.executeCommand('apexTrace.showEntryCatalog')
+    ),
     // v0.7 / A3: apexTraceView title-bar direction-toggle button -- re-runs
     // the LAST resolved target in the OPPOSITE direction, no QuickPick.
     // Mirrors retraceLastTarget's H6a "always re-derive from a fresh scan"

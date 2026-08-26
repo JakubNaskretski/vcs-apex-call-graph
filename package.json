@@ -55,7 +55,7 @@
       },
       {
         "command": "apexTrace.toggleOrientation",
-        "title": "Toggle orientation: target-first / entry-first",
+        "title": "Toggle Orientation (Target-First / Entry-First)",
         "category": "Apex Call Graph",
         "icon": "$(list-tree)"
       },
@@ -75,6 +75,12 @@
         "command": "apexTrace.showEntryCatalog",
         "title": "Show Entry Points",
         "category": "Apex Call Graph",
+        "icon": "$(list-flat)"
+      },
+      {
+        "command": "apexTrace.refreshEntryCatalog",
+        "title": "Refresh Entry Points",
+        "category": "Apex Call Graph",
         "icon": "$(refresh)"
       },
       {
@@ -89,26 +95,36 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "apexTrace.toggleDirection",
+          "when": "apexTrace.hasResults"
+        },
+        {
+          "command": "apexTrace.refreshEntryCatalog",
+          "when": "false"
+        }
+      ],
       "editor/context": [
         {
           "command": "apexTrace.traceCallers",
           "group": "apextrace@1",
-          "when": "resourceExtname == .cls || resourceExtname == .trigger"
+          "when": "resourceExtname == .cls || resourceExtname == .trigger || resourceExtname == .apex"
         },
         {
           "command": "apexTrace.traceCallees",
           "group": "apextrace@2",
-          "when": "resourceExtname == .cls || resourceExtname == .trigger"
+          "when": "resourceExtname == .cls || resourceExtname == .trigger || resourceExtname == .apex"
         },
         {
           "command": "apexTrace.impactAnalysis",
           "group": "apextrace@3",
-          "when": "resourceExtname == .cls || resourceExtname == .trigger"
+          "when": "resourceExtname == .cls || resourceExtname == .trigger || resourceExtname == .apex"
         },
         {
           "command": "apexTrace.showPathMap",
           "group": "apextrace@4",
-          "when": "resourceExtname == .cls || resourceExtname == .trigger"
+          "when": "resourceExtname == .cls || resourceExtname == .trigger || resourceExtname == .apex"
         }
       ],
       "view/title": [
@@ -128,7 +144,7 @@
           "when": "view == apexTraceView && apexTrace.hasResults && apexTrace.mode != 'impact' && apexTrace.direction == 'callers'"
         },
         {
-          "command": "apexTrace.showEntryCatalog",
+          "command": "apexTrace.refreshEntryCatalog",
           "group": "navigation",
           "when": "view == apexTraceEntriesView"
         }
@@ -137,7 +153,7 @@
         {
           "command": "apexTrace.traceCallees",
           "group": "inline",
-          "when": "view == apexTraceEntriesView && viewItem == apexTraceEntryCatalogEntry"
+          "when": "view == apexTraceEntriesView && viewItem == apexTraceEntryCatalogEntryTraceable"
         }
       ]
     },
