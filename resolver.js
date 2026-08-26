@@ -42,6 +42,7 @@
 // =========================================================================
 
 const apexindex = require('./apexindex');
+const kinds = require('./kinds');
 
 const DEFAULT_MAX_DEPTH = 8;
 // Hard total-node cap for one buildCallerTree call (opts.maxNodes
@@ -192,6 +193,27 @@ const HTTP_ANNOTATIONS = new Set(['httpget', 'httppost', 'httpput', 'httpdelete'
 // from one call site, exactly the same "genuinely can't tell which one"
 // reasoning as 'interface'/'narrowed'.
 const APPROX_VIA = new Set(['interface', 'unique-name', 'lexical', 'override', 'dynamic', 'narrowed', 'ambiguous']);
+
+// v0.20/K1: the complete via vocabulary this file can stamp on an edge,
+// site, or TNode. Exported for test-kindparity.js's subset assertion
+// against scanflow.js's KNOWN_VIA_KINDS: a via minted here but missing
+// there is dropped, with no error anywhere, by buildDiagnosticsPayload's
+// vocabulary filter the moment any counter histograms it. 'access' (below)
+// was in exactly that state before v0.20 -- minted at :5162, unknown to
+// scanflow -- and stayed invisible only because refreshIndexDiagnostics
+// (:333-383) histograms index-site vias plus three hardcoded keys, and
+// never a rendered-tree via. Deliberately EXCLUDES the
+// unresolvedByReason reason strings buildCallerTree passes through as
+// mention-site vias (`via: s.reason || 'unresolved'`, :4461) -- those are
+// TNode-only annotations, never index edges, never histogram keys;
+// scanflow's KNOWN_UNRESOLVED_REASONS owns that vocabulary. Also excludes
+// 'rollup': scanflow's vocabulary carries it, but the rollup pseudo-node
+// this file builds (:6263-6270) stamps `via: null`, so this file cannot
+// emit it.
+const EMITTABLE_VIA = Object.freeze([...APPROX_VIA,
+  'typed', 'static', 'new', 'this', 'super', 'dml', 'dml-unresolved',
+  'publish', 'throws', 'async', 'metadata', 'access', 'subflow',
+  'external', 'unresolved']);
 
 // v0.13/H1: ATTACHMENT CAP for rule 7's unique-name fallback. A bare/dotted
 // call whose receiver could not be resolved to anything at all falls back to
@@ -5048,26 +5070,8 @@ function metaLevelPairs(index, classLower, methodLower) {
 }
 
 function metaEntryLabel(kind) {
-  switch (kind) {
-    case 'lwc':
-      return '@salesforce/apex import';
-    case 'aura':
-      return 'Aura controller';
-    case 'flow':
-      return 'Flow apex action';
-    case 'omniscript':
-      return 'OmniScript Remote Action';
-    case 'vf':
-      return 'VF controller';
-    case 'cmdt':
-      return 'Custom Metadata record';
-    case 'permissionset':
-      return 'Permission Set Apex access';
-    case 'profile':
-      return 'Profile Apex access';
-    default:
-      return 'metadata reference';
-  }
+  const nk = kinds.nodeKind(kind);
+  return nk ? nk.entryLabel : 'metadata reference';
 }
 
 // A6: groups MetaRefs into one TERMINAL(*) TNode per distinct (kind, label)
@@ -6617,25 +6621,15 @@ function suggestTargets(index) {
 // this fixed display order (even when a kind has zero entries -- a stable,
 // fully-enumerated key set is easier for a UI/test to consume than one whose
 // shape varies with workspace contents):
-const ENTRY_KIND_ORDER = ['trigger', 'aura', 'invocable', 'rest', 'soap', 'async', 'email', 'platform', 'flow', 'anonymous'];
+const ENTRY_KIND_ORDER = kinds.catalogGroupOrder();
 
-// v0.12/C2 note: matches uitree.js's own ENTRY_CATALOG_KIND_FALLBACK_LABEL
-// verbatim (that table only ever renders when a Group arrives with a falsy
-// label at all -- see its own header comment -- but since this file always
-// supplies one, keeping the two wordings identical avoids two subtly
-// different "what does this kind mean" labels existing in the product).
-const ENTRY_KIND_GROUP_LABEL = {
-  trigger: 'Triggers',
-  aura: 'Aura / LWC (@AuraEnabled)',
-  invocable: 'Invocable Actions',
-  rest: 'REST Endpoints',
-  soap: 'SOAP Web Services',
-  async: 'Async (Batch / Queueable / Schedulable / @future)',
-  email: 'Email Handlers',
-  platform: 'Platform Hooks',
-  flow: 'Flows',
-  anonymous: 'Anonymous Scripts',
-};
+// v0.20/K1 note: this wording and uitree.js's own
+// ENTRY_CATALOG_KIND_FALLBACK_LABEL used to be two hand-kept copies of the
+// same ten strings (a v0.12/C2 note here used to apologize for that
+// duplication); both now read the SAME kinds.js CATALOG_GROUPS[].label, so
+// there is only one place left to edit a group's display label.
+const ENTRY_KIND_GROUP_LABEL = {};
+for (const g of kinds.CATALOG_GROUPS) ENTRY_KIND_GROUP_LABEL[g.key] = g.label;
 
 // computeAnnotationEntries()/F5_ENTRY_RULES/BQS_LABEL above are this file's
 // ONLY producers of a method-level entries[] string (besides the trigger and
@@ -7413,4 +7407,8 @@ module.exports = {
   // clamp boundaries (NaN/-5/1e9/Infinity/'x' inputs) are exactly the kind
   // of thing best pinned directly rather than inferred from tree shape.
   clampInt,
+  // v0.20/K1: exported for test-kindparity.js's registry-parity pins
+  // (entryLabel round-trip; via vocabulary subset).
+  metaEntryLabel,
+  EMITTABLE_VIA,
 };

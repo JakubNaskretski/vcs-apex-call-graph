@@ -370,6 +370,26 @@
 //     -- the same honest-miss posture as every other tolerance in this
 //     file. Revisit only with evidence of a real corpus hit.
 //
+// v0.20/K1 (kind registry): this file now requires kinds.js -- the shared
+// kind registry at the repo root. kinds.js is PURE FROZEN DATA plus pure
+// string helpers with zero requires of its own (no vscode, no fs, no
+// parser.js, no resolver.js anywhere beneath it), so the dependency rule
+// at the top of this header is intact: metascan still depends on no
+// behavior, only on one shared vocabulary. Two mechanical consequences,
+// both output-identical for every file shape documented above:
+//
+//   - COMPOUND_EXT is no longer a hand-maintained literal: it is built at
+//     module load from kinds.allCompoundExts() (the union of every
+//     registered kind's compound extensions plus the cls-meta.xml /
+//     trigger-meta.xml sidecar pair). The extension SET is byte-for-byte
+//     the pre-v0.20 twelve; only the source of truth moved. A future
+//     kind's compound extension reaches stemOf by registering it in
+//     kinds.js -- this file needs no edit for that any more.
+//   - stemOf is now exported (test support: test-kindparity.js asserts
+//     every registered compound extension round-trips through it --
+//     stemOf('Vtx_Sample.' + ext) === 'Vtx_Sample'). Its behavior is
+//     untouched.
+//
 // Design notes:
 //
 // - `label` is the file's stem (its Salesforce API name) — see stemOf()
@@ -406,11 +426,17 @@
 //   `jest.mock()` it) but represent zero real Apex call edges — excluded by
 //   path, matching the corpus's acmeQuoteWizard.test.js fixture.
 
+const kinds = require('./kinds');
+
 // --- small path/text helpers ---------------------------------------------
 
 // Compound extensions that a plain "strip the last dot" would butcher (e.g.
-// 'Foo.flow-meta.xml'.replace(/\.[^.]+$/, '') would leave 'Foo.flow-meta').
-const COMPOUND_EXT = /\.(flow-meta\.xml|os-meta\.xml|cmp-meta\.xml|app-meta\.xml|js-meta\.xml|page-meta\.xml|component-meta\.xml|cls-meta\.xml|trigger-meta\.xml|md-meta\.xml|permissionset-meta\.xml|profile-meta\.xml)$/i;
+// 'Vtx_Sample.flow-meta.xml' -> 'Vtx_Sample.flow-meta'). Built from
+// the kind registry (v0.20/K1) -- see the header-contract note above; the
+// extension SET is byte-identical to the pre-v0.20 literal.
+const COMPOUND_EXT = new RegExp(
+  '\\.(' + kinds.allCompoundExts().map((e) => e.replace(/\./g, '\\.')).join('|') + ')$', 'i'
+);
 
 function baseNameOf(p) {
   const s = String(p || '');
@@ -1449,4 +1475,4 @@ function stripOwnNamespace(refs, ownNamespace) {
   });
 }
 
-module.exports = { parseMetaFile, scanBundle, stripOwnNamespace };
+module.exports = { parseMetaFile, scanBundle, stripOwnNamespace, stemOf };

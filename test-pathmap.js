@@ -746,7 +746,14 @@ check(countOccurrences(html2, 'SurchargeRule.apply') === 1, 'second fan-out impl
 check(countOccurrences(html2, '"via":"interface"') === 6, 'both fan-out nodes/sites/edges carry the interface via label');
 check(html2.includes('"approximate":true'), 'fan-out nodes/edges marked approximate');
 check(html2.includes('"badges":["@AuraEnabled"]'), '@AuraEnabled entry shortened on the fan-out node');
-check(!html2.includes('LWC/Aura'), 'un-shortened @AuraEnabled qualifier does not leak into output');
+// v0.20/K1: narrowed from a bare `!includes('LWC/Aura')` to the full
+// un-shortened entry string. Same intent and same strength for what this
+// case actually pins (the entry text is JSON-stringified verbatim into the
+// data blob, so an un-shortened badge still trips it) -- but the bare
+// substring now also occurs in the STATIC legend, whose registry-generated
+// 'screen' via row reads "flow screen field embedding a custom LWC/Aura
+// component". That row has nothing to do with shortenEntry.
+check(!html2.includes('@AuraEnabled (LWC/Aura)'), 'un-shortened @AuraEnabled qualifier does not leak into output');
 check(html2.includes('interface dispatch: showing every implementer'), 'treeResult.note is rendered');
 
 // =========================================================================
@@ -1703,7 +1710,7 @@ passCount += 5;
   const legendFixture = { root: baseNode({ label: 'Legend.Probe' }), targetLabel: 'Legend.Probe', note: null };
   const legendHtml = renderPathMapHtml(legendFixture, { legendOpen: true });
   check(legendHtml.includes('<span class="k">subflow</span>'), 'legend must document the new "subflow" via label');
-  check(/subflow.*&lt;subflows&gt;/.test(legendHtml) || legendHtml.includes('&lt;subflows&gt;'), 'legend text should name the actual <subflows> XML element for a user reading it');
+  check(legendHtml.includes('flow-to-subflow reference declared in Flow XML'), 'legend subflow row carries the registry glossary text');
 }
 
 // --- accentKind: a subflow-via node is still kind:'flow' -- same metadata

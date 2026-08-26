@@ -229,6 +229,13 @@
 // ahead of rerootEntryFirst() below for the full design, including the
 // edge-attachment choice.
 
+// v0.20/K1: the shared kind registry. kinds.js is PURE FROZEN DATA plus pure
+// string helpers with zero requires of its own (no vscode, no fs, no
+// resolver.js anywhere beneath it), so the "No vscode dependency" claim at
+// the top of this header still holds and `node test-uitree.js` keeps working
+// unchanged -- this file gains one shared vocabulary, no behavior.
+const kinds = require('./kinds');
+
 const ICON_TRIGGER = 'zap';
 const ICON_TEST = 'beaker';
 const ICON_ENTRIES = 'plug';
@@ -278,29 +285,15 @@ const ICON_ROLLUP = 'layers';
 // the SAME "unresolved/unconfirmed" family as the pre-existing aggregated
 // 'unresolved' leaf, just scoped to the caller direction instead of callee.
 
-// A7: metadata-caller node icons, one per MetaRef.kind (see resolver.js's
-// buildMetaChildren / metaEntryLabel — these TNode.kind values are
-// 'lwc'|'aura'|'flow'|'omniscript'|'vf'|'cmdt' (v0.4 F4b adds the last one),
-// disjoint from the pre-existing 'method'|'trigger'|'class' set).
-const ICON_FLOW = 'symbol-event';
-const ICON_LWC = 'symbol-interface';
-const ICON_AURA = 'browser';
-const ICON_OMNISCRIPT = 'json';
-const ICON_VF = 'file-code';
-const ICON_CMDT = 'gear';
-const ICON_PERMISSION_SET = 'shield';
-const ICON_PROFILE = 'account';
-
-const META_ICON_BY_KIND = {
-  flow: ICON_FLOW,
-  lwc: ICON_LWC,
-  aura: ICON_AURA,
-  omniscript: ICON_OMNISCRIPT,
-  vf: ICON_VF,
-  cmdt: ICON_CMDT,
-  permissionset: ICON_PERMISSION_SET,
-  profile: ICON_PROFILE,
-};
+// A7: metadata-caller node icons -- one per registry node kind, read from
+// kinds.js (single source; the per-kind ICON_* consts this table used to
+// name were deleted in v0.20/K1). These are the TNode.kind values
+// resolver.js's buildMetaChildren / metaEntryLabel produce for non-Apex
+// callers; the set itself is enumerated in kinds.js's NODE_KINDS and is
+// disjoint from the pre-existing 'method'|'trigger'|'class' set, so a new
+// kind registered there gets its icon here for free.
+const META_ICON_BY_KIND = {};
+for (const k of kinds.NODE_KINDS) META_ICON_BY_KIND[k.key] = k.treeIcon;
 
 // v0.7.1: the two orientation values. 'target-first' is today's default
 // rendering and MUST stay byte-identical (see the ORIENTATION section
@@ -319,8 +312,8 @@ const ORIENTATION_ENTRY_FIRST = 'entry-first';
 // A6/F4b contract, so they would otherwise fall through to the generic
 // ICON_ENTRIES 'plug' glyph and lose their distinct identity). A 'flow' node
 // with children (v0.4 F1b: a record-triggered flow's DML-site callers) still
-// gets ICON_FLOW here — icon selection is about what KIND of node this is,
-// not whether it happens to be a leaf.
+// gets the flow icon here — icon selection is about what KIND of node this
+// is, not whether it happens to be a leaf.
 function iconForNode(node) {
   if (node.kind === 'trigger') return ICON_TRIGGER;
   if (node.kind === 'anonymous') return ICON_ANONYMOUS;
@@ -603,7 +596,7 @@ function shapeSite(site) {
 // non-via marker (~, cycle, depth-cap, caughtHere, seenElsewhere, root).
 // Rendered into the NODE tooltip (see nodeTooltip below), not the badge text
 // itself, so the badges stay short while a hover still explains them.
-const VIA_GLOSSARY = {
+const VIA_GLOSSARY = Object.assign({
   typed: "resolved through the receiver's declared type, following the extends chain",
   static: 'Class.method() static call',
   new: 'constructor call',
@@ -613,7 +606,6 @@ const VIA_GLOSSARY = {
   'unique-name': 'no receiver type available; matched by a codebase-unique method name (approximate)',
   lexical: 'parse-error fallback, matched by text mention only (approximate)',
   metadata: 'caller is LWC, Aura, Flow, OmniScript, VF, or Custom Metadata, not Apex source',
-  access: 'Permission Set or Profile grants access to this Apex class; it does not invoke Apex and is not a runtime caller',
   dml: 'a DML statement whose target object has a trigger, or that matches a record-triggered flow',
   dynamic: "Type.forName('LiteralClassName') or a Custom Metadata field naming a class (approximate)",
   override: "fan-out edge to a subclass's override of a virtual/abstract method (approximate)",
@@ -652,15 +644,6 @@ const VIA_GLOSSARY = {
   // TNode.via field doc above), so this via never co-occurs with the '~'
   // marker glossary line.
   external: 'managed package code — source not analyzable',
-  // Flow-to-flow subflow chains -- a declared `<subflows>`
-  // reference between two Flow files metascan actually saw (never a
-  // fan-out guess, unlike interface/unique-name/dynamic/etc. above), so
-  // this via is deliberately absent from resolver.js's APPROX_VIA set and
-  // never co-occurs with the '~' marker line, same posture as 'publish'/
-  // 'throws'/'external' just above. In the callers direction it's the
-  // flow's own PARENT flow (the parent invokes it as a subflow); in the
-  // callees direction it's the flow's own SUBFLOW (it invokes the child).
-  subflow: 'a declared <subflows> reference between two Flow files — not an Apex call, a parent/child flow-orchestration edge',
   // Via values on a kind:
   // 'unresolved-mentions' node's individual mention-site children (see
   // resolver.js's buildCallerTree -- each mentionChildren entry carries
@@ -674,7 +657,17 @@ const VIA_GLOSSARY = {
   'non-literal-dynamic': 'a call site using this exact method name reached only through a non-literal dynamic dispatch (e.g. a computed Type.forName argument) — not literal-flow traceable',
   'parse-fallback': "a call site in a file that failed to parse — matched by text mention only, in a file this workspace couldn't fully analyze",
   'name-too-common': "a call site using this exact method name that COULD have attached via unique-name (its argument count matched), but the name attracted more unresolvable-receiver sites workspace-wide than UNIQUE_NAME_MAX allows — attaching all of them would make a framework-common name look like a confirmed caller",
-};
+},
+// v0.20/K1: registry-contributed vias (currently subflow, interview,
+// screen, composition, access, subscribe, surface) -- kinds.js is the single
+// source for those, so a via registered there gets its tooltip line here for
+// free, and the two literals this table used to carry for 'access' and
+// 'subflow' moved into the descriptors that mint them. `metadata:` above is
+// NOT registry-contributed (no descriptor registers a `metadata` via) and
+// stays literal. The registry map is deliberately the LAST Object.assign
+// argument: a registry via wins a key collision, which is what keeps
+// kinds.js the single source. There is no collision today.
+kinds.viaGlossary());
 
 const MARKER_GLOSSARY = {
   approximate: '~ — approximate resolution: this edge may be wrong or one of several candidates',
@@ -1373,76 +1366,78 @@ function shapeHeaderLines(treeResult, orientation) {
 //   of any group, workspace-wide).
 // =========================================================================
 
-// Group kinds that render pre-expanded (TreeItemCollapsible-
-// State.Expanded) the first time the catalog is shown -- triggers and flows
-// are the two kinds a Salesforce developer orienting on "how does the org
-// get entered" most wants to see without an extra click; every other kind
-// starts collapsed. `label`/`invocable`/etc. never appear here.
-const ENTRY_CATALOG_EXPANDED_KINDS = new Set(['trigger', 'flow']);
-
-// One icon per Group.kind, in the SAME display order the catalog
-// contract pins (trigger, aura, invocable, rest, soap, async, email,
-// platform, flow, anonymous) -- purely so a reader scanning this table can
-// check it against that order at a glance. 'trigger'/'flow'/'anonymous'
-// deliberately reuse ICON_TRIGGER/ICON_FLOW/ICON_ANONYMOUS (declared far
-// above) rather than picking new glyphs, so a trigger/flow/anonymous-script
-// node looks the SAME in this view as it does as a caller/callee-tree node
-// elsewhere in the extension -- one visual vocabulary, not two. The other
-// six kinds have no existing analog in the caller/callee tree (that tree
-// only ever shows a plain 'method' node for an @AuraEnabled/@InvocableMethod
-// /@HttpX/webservice/Batchable-Queueable-Schedulable-or-@future/
-// InboundEmailHandler/platform-hook method -- the entries[] BADGE is what
-// names the annotation there, not a distinct icon), so each gets its own
-// new, semantically-fitting codicon id.
-const ENTRY_CATALOG_ICON_BY_KIND = {
-  trigger: ICON_TRIGGER,
-  aura: 'radio-tower',
-  invocable: 'gear',
-  rest: 'globe',
-  soap: 'server-process',
-  async: 'watch',
-  email: 'mail',
-  platform: 'shield',
-  flow: ICON_FLOW,
-  anonymous: ICON_ANONYMOUS,
-};
-
-// One-line "what is this kind" explanation per Group.kind.
-// Group label wording comes verbatim from resolver.js's Group.label; this
-// is the additional explanatory line uitree.js adds on
-// top, exactly like VIA_GLOSSARY/MARKER_GLOSSARY do for the caller/callee
-// tree above). Rendered on both the group node's own tooltip and appended
-// to every entry leaf's tooltip within that group (see entryTooltip below).
-const ENTRY_CATALOG_KIND_GLOSSARY = {
-  trigger: 'Apex trigger — fires on DML against a specific object.',
-  aura: '@AuraEnabled method — callable from Aura components and Lightning Web Components.',
-  invocable: '@InvocableMethod method — callable as a Flow or Process Builder action.',
-  rest: '@HttpGet/@HttpPost/@HttpPut/@HttpPatch/@HttpDelete method on an @RestResource class — callable via the REST API.',
-  soap: 'webservice method — callable via the SOAP API.',
-  async: 'Batchable/Queueable/Schedulable execute method or @future method — runs asynchronously, not from a direct call site.',
-  email: 'Apex email service class (implements Messaging.InboundEmailHandler) — invoked when mail arrives at its service address.',
-  platform: 'platform-invoked hook (Install/Uninstall/RegistrationHandler/Comparable/Finalizer) — called by the platform itself, not application code.',
-  flow: 'Flow — screen, record-triggered, scheduled, autolaunched, or platform-event flow found in this workspace.',
-  anonymous: 'anonymous Apex script (.apex) — an ad hoc entry point, e.g. a one-off data-fix script.',
-};
-
-// Fallback display label, used ONLY when a Group arrives with a falsy
-// `label` (defensive -- the normal shape always supplies one; this just
-// keeps a malformed/partial fixture from rendering a blank tree row instead
-// of throwing, same defensive spirit as this file's other `|| fallback`
-// idioms, e.g. externalNamespace's label-derived fallback).
-const ENTRY_CATALOG_KIND_FALLBACK_LABEL = {
-  trigger: 'Triggers',
-  aura: 'Aura / LWC (@AuraEnabled)',
-  invocable: 'Invocable Actions',
-  rest: 'REST Endpoints',
-  soap: 'SOAP Web Services',
-  async: 'Async (Batch / Queueable / Schedulable / @future)',
-  email: 'Email Handlers',
-  platform: 'Platform Hooks',
-  flow: 'Flows',
-  anonymous: 'Anonymous Scripts',
-};
+// One icon, one glossary line, one fallback label, and one "starts
+// expanded" flag per Group.kind -- all four read from kinds.js's
+// CATALOG_GROUPS (single source; v0.20/K1), in the SAME display order the
+// catalog contract pins (trigger, aura, invocable, rest, soap, async, email,
+// platform, flow, anonymous). All four const names are kept, so every
+// consumer below reads exactly as it did before the tables were derived:
+//
+//   - ENTRY_CATALOG_EXPANDED_KINDS -- group kinds that render pre-expanded
+//     (TreeItemCollapsibleState.Expanded) the first time the catalog is
+//     shown, i.e. exactly the registry rows carrying `expanded: true`:
+//     triggers and flows are the two kinds a Salesforce developer orienting
+//     on "how does the org get entered" most wants to see without an extra
+//     click; every other kind starts collapsed.
+//   - ENTRY_CATALOG_ICON_BY_KIND -- 'trigger'/'flow'/'anonymous' deliberately
+//     reuse the glyph their caller/callee-tree node already carries (the
+//     registry says so with `iconFromKind`, resolved by catalogIconFor
+//     below), so a trigger/flow/anonymous-script row looks the SAME in this
+//     view as it does elsewhere in the extension -- one visual vocabulary,
+//     not two. The other six kinds have no existing analog in the
+//     caller/callee tree (that tree only ever shows a plain 'method' node
+//     for an @AuraEnabled/@InvocableMethod/@HttpX/webservice/
+//     Batchable-Queueable-Schedulable-or-@future/InboundEmailHandler/
+//     platform-hook method -- the entries[] BADGE is what names the
+//     annotation there, not a distinct icon), so each carries its own
+//     semantically-fitting literal `icon` in the registry.
+//     v0.20/K1 collision fixes, the two deliberate visual changes of that
+//     release (rule: one codicon id means one identity): the Invocable
+//     Actions GROUP moved off 'gear' to 'symbol-method', and the Platform
+//     Hooks GROUP off 'shield' to 'rocket', because the cmdt and
+//     permissionset NODE kinds own gear/shield in the trace tree and no
+//     reader should have to hold two meanings for one glyph. Sharing
+//     'symbol-method' with plain method nodes is deliberate and outside that
+//     rule's domain (test-kindparity.js's uniqueness assertion excludes it):
+//     an invocable action IS a method.
+//   - ENTRY_CATALOG_KIND_GLOSSARY -- the one-line "what is this kind"
+//     explanation uitree.js adds on top of resolver.js's Group.label,
+//     exactly like VIA_GLOSSARY/MARKER_GLOSSARY do for the caller/callee
+//     tree above. Rendered on both the group node's own tooltip and appended
+//     to every entry leaf's tooltip within that group (see entryTooltip
+//     below).
+//   - ENTRY_CATALOG_KIND_FALLBACK_LABEL -- display label used ONLY when a
+//     Group arrives with a falsy `label` (defensive -- the normal shape
+//     always supplies one; this just keeps a malformed/partial fixture from
+//     rendering a blank tree row instead of throwing, same defensive spirit
+//     as this file's other `|| fallback` idioms, e.g. externalNamespace's
+//     label-derived fallback). resolver.js's Group.label now reads the same
+//     CATALOG_GROUPS[].label, so the verbatim duplication these two tables
+//     used to maintain by hand is gone.
+//
+// catalogIconFor resolves `iconFromKind`: 'trigger'/'anonymous' name the two
+// Apex tree identities declared far above, any other value names a registry
+// node kind and yields that kind's treeIcon; a group without it uses its own
+// literal `icon`.
+function catalogIconFor(group) {
+  if (group.iconFromKind === 'trigger') return ICON_TRIGGER;
+  if (group.iconFromKind === 'anonymous') return ICON_ANONYMOUS;
+  if (group.iconFromKind) {
+    const nk = kinds.nodeKind(group.iconFromKind);
+    if (nk) return nk.treeIcon;
+  }
+  return group.icon;
+}
+const ENTRY_CATALOG_EXPANDED_KINDS = new Set();
+const ENTRY_CATALOG_ICON_BY_KIND = {};
+const ENTRY_CATALOG_KIND_GLOSSARY = {};
+const ENTRY_CATALOG_KIND_FALLBACK_LABEL = {};
+for (const g of kinds.CATALOG_GROUPS) {
+  ENTRY_CATALOG_ICON_BY_KIND[g.key] = catalogIconFor(g);
+  ENTRY_CATALOG_KIND_GLOSSARY[g.key] = g.glossary;
+  ENTRY_CATALOG_KIND_FALLBACK_LABEL[g.key] = g.label;
+  if (g.expanded) ENTRY_CATALOG_EXPANDED_KINDS.add(g.key);
+}
 
 // Derives the {classLower, methodLower} extension.js's inline
 // "What Does This Call?" action hands to resolver.buildCalleeTree, or null

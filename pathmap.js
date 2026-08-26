@@ -165,6 +165,13 @@
 // characters (U+2028/U+2029, which JSON allows but older JS string-literal
 // grammar does not).
 
+// v0.20/K1: the shared kind registry. kinds.js is PURE FROZEN DATA plus pure
+// string helpers with zero requires of its own (no vscode, no fs, no
+// resolver.js anywhere beneath it), so this file stays plain-node
+// requireable and `node test-pathmap.js` keeps working unchanged -- one
+// shared vocabulary, no behavior.
+const kinds = require('./kinds');
+
 // ---------------------------------------------------------------------
 // Layout constants (shared between the Node-side layout pass and the
 // client-side renderer, which trusts the x/y this file precomputes).
@@ -204,18 +211,21 @@ function shortenEntry(raw) {
 // badge, applied independently of accent — see buildNodeEl in the client
 // script) even when a different accent wins.
 //
-// The 'metadata' bucket covers LWC/Aura/Flow/OmniScript/VF
-// caller nodes resolver.js's attachMetaCallers/buildMetaChildren produce
-// (TNode.kind one of 'lwc'|'aura'|'flow'|'omniscript'|'vf'). v0.4 (F4b)
-// folds 'cmdt' (Custom Metadata record) into the same bucket — it is the
-// same "caller lives outside Apex source" family, just a different kind tag.
+// The 'metadata' bucket covers the non-Apex caller nodes resolver.js's
+// attachMetaCallers/buildMetaChildren produce -- every registry node kind
+// whose `mapAccent` is 'metadata' (v0.20/K1: kinds.js is the single source,
+// so a newly registered kind joins this bucket without an edit here; the
+// kinds themselves are no longer enumerated in this file). They are all the
+// same "caller lives outside Apex source" family, just different kind tags.
 // These nodes always carry a non-empty `entries` (their kind-specific
 // label, e.g. '@salesforce/apex import' / 'Custom Metadata record' — see
 // resolver.js's metaEntryLabel), so 'metadata' is
 // checked ahead of 'entry' — otherwise every metadata node would
 // collapse onto the same accent as an ordinary @AuraEnabled/@future/etc.
 // entry-point node and lose its distinct color in the map.
-const META_ACCENT_KINDS = new Set(['lwc', 'aura', 'flow', 'omniscript', 'vf', 'cmdt', 'permissionset', 'profile']);
+const META_ACCENT_KINDS = new Set(
+  kinds.NODE_KINDS.filter((k) => k.mapAccent === 'metadata').map((k) => k.key)
+);
 
 // The 'anonymous' bucket covers TNode.kind==='anonymous' --
 // an anonymous-Apex-script node. Deliberately NOT folded into 'metadata':
@@ -275,14 +285,16 @@ function nodeVisual(node) {
   const entries = Array.isArray(t.entries) ? t.entries.map((e) => String(e).toLowerCase()).join(' ') : '';
 
   if (kind === 'trigger') return { key: 'trigger', label: 'Trigger', tone: 'entry' };
-  if (kind === 'lwc') return { key: 'lwc', label: 'LWC', tone: 'interface' };
-  if (kind === 'aura') return { key: 'aura', label: 'Aura', tone: 'interface' };
-  if (kind === 'flow') return { key: 'flow', label: 'Flow', tone: 'automation' };
-  if (kind === 'omniscript') return { key: 'omniscript', label: 'OmniScript', tone: 'automation' };
-  if (kind === 'vf') return { key: 'visualforce', label: 'Visualforce', tone: 'interface' };
-  if (kind === 'cmdt') return { key: 'custom-metadata', label: 'Custom metadata', tone: 'data' };
-  if (kind === 'permissionset') return { key: 'permission-set', label: 'Permission set', tone: 'data' };
-  if (kind === 'profile') return { key: 'profile', label: 'Profile', tone: 'data' };
+  // v0.20/K1: one registry lookup replaces the per-kind metadata branches
+  // that used to sit here (lwc/aura/flow/omniscript/vf/cmdt/permissionset/
+  // profile, each spelling out the same three fields kinds.js's `mapVisual`
+  // now owns). Safe ahead of the Apex branches below: `kind` is already
+  // lowercased above, registry keys are lowercase, and no registry key
+  // collides with any Apex branch key ('trigger' just above,
+  // 'anonymous'/'exception'/'unresolved'/'external'/'rollup'/'constructor'/
+  // 'class' below), so this lookup can never shadow one.
+  const nk = kinds.nodeKind(kind);
+  if (nk) return { key: nk.mapVisual.cssKey, label: nk.mapVisual.chipLabel, tone: nk.mapVisual.tone };
   if (kind === 'anonymous') return { key: 'anonymous', label: 'Anonymous Apex', tone: 'entry' };
   if (kind === 'exception') return { key: 'exception', label: 'Exception', tone: 'danger' };
   if (kind === 'unresolved') return { key: 'unresolved', label: 'Unresolved', tone: 'neutral' };
@@ -1885,66 +1897,104 @@ const CLIENT_JS_TEXT = `
 })();
 `;
 
-const LEGEND_HTML = `
-    <summary>Legend</summary>
-    <h4>Node cards</h4>
-    <div class="legend-row"><span class="k">type chip</span>names the component directly (Apex, Trigger, Flow, LWC, Aura, Invocable, Visualforce, external, and others), so color is never the only cue</div>
-    <div class="legend-row"><span class="k">Target lane</span>the traced class or method; hop lanes show tree depth away from it</div>
-    <div class="legend-row"><span class="swatch trigger"></span><span><span class="k">trigger</span>trigger-file entry point</span></div>
-    <div class="legend-row"><span class="swatch entry"></span><span><span class="k">entry</span>has an entry-point annotation (@AuraEnabled, @InvocableMethod, @future, @HttpX, webservice, Batchable, Queueable, Schedulable)</span></div>
-    <div class="legend-row"><span class="swatch test"></span><span><span class="k">test</span>only reachable from test code</span></div>
-    <div class="legend-row"><span class="swatch normal"></span><span><span class="k">normal</span>regular method or class</span></div>
-    <div class="legend-row"><span class="swatch metadata"></span><span><span class="k">metadata</span>caller from LWC, Aura, Flow, OmniScript, VF, or Custom Metadata — not Apex source (a Flow node here may still have its own children, e.g. the DML sites on its object, or — v0.13 — its own subflow chain; a metadata node is not always a leaf). Permission Set/Profile access grants are authorization facts, not execution edges, and are shown only in the tree view.</span></div>
-    <div class="legend-row"><span class="swatch anonymous"></span><span><span class="k">anonymous</span>anonymous Apex script (.apex) — real Apex source, but with no declared class/trigger of its own; always a pure root (nothing calls it)</span></div>
-    <div class="legend-row"><span class="swatch exception"></span><span><span class="k">exception</span>(v0.7) a thrown exception's class, reached by tracing forward (What Does This Call?) through a "throw" statement — always terminal</span></div>
-    <div class="legend-row"><span class="swatch unresolved"></span><span><span class="k">unresolved</span>(v0.7) one aggregated leaf per method, summarizing every forward call site that couldn't be resolved to an indexed target (dynamic/platform calls, e.g. HttpRequest/System.debug) — always terminal, approximate. Also covers a DML statement whose target couldn't be narrowed to a concrete SObject type (e.g. a generic List&lt;SObject&gt;) — labeled "DML on unresolved SObject type", no trigger/flow linkage possible</span></div>
-    <div class="legend-row"><span class="swatch external"></span><span><span class="k">external</span>(v0.8) a reference into managed-package code this workspace has no source for — terminal when tracing What Does This Call?; a valid trace target with its own local-caller subtree when tracing Who Calls This</span></div>
-    <div class="legend-row"><span class="k">&#x25B8;/&#x25BE; N possible ... (unconfirmed)</span>(v0.13) a ROLLUP pill — groups every DIRECT approximate caller/callee of the node above it into one collapsed placeholder (dashed border, same color as the "~" approximate marker below), so a handful of confirmed edges aren't buried under a wall of guesses. Click the pill to expand it in place (&#x25BE;) or collapse it again (&#x25B8;) — everything it contains was already resolved, so expanding never re-scans or re-fetches anything. Controlled by the apexCallGraph.showUnconfirmed setting ('rollup' default / 'hide' drops these entirely / 'expand' restores the old flat rendering)</div>
-    <h4>Connection colors</h4>
-    <div class="legend-row"><span class="line-swatch apex"></span><span><span class="k">Apex</span>typed, static, constructor, this/super, and other confirmed code calls</span></div>
-    <div class="legend-row"><span class="line-swatch automation"></span><span><span class="k">Automation</span>Flow/metadata, subflow, and async transitions</span></div>
-    <div class="legend-row"><span class="line-swatch data"></span><span><span class="k">Data/event</span>DML and platform-event publish transitions</span></div>
-    <div class="legend-row"><span class="line-swatch external"></span><span><span class="k">External</span>managed-package boundary</span></div>
-    <div class="legend-row"><span class="line-swatch danger"></span><span><span class="k">Exception</span>throw transition</span></div>
-    <div class="legend-row"><span class="line-swatch approx"></span><span><span class="k">Possible</span>approximate match; always dashed</span></div>
-    <h4>Markers</h4>
-    <div class="legend-row"><span class="k">~ prefix</span>approximate resolution (dashed border too) — via interface/unique-name/lexical/override/narrowed/dynamic fallback, so this edge may be wrong or one of several candidates</div>
-    <div class="legend-row"><span class="k">&#x1F9EA;</span>test-only node (also dimmed)</div>
-    <div class="legend-row"><span class="k">&#x21BA;</span>cyclic — this call chain recurses back on itself here</div>
-    <div class="legend-row"><span class="k">&#x2026;</span>capped — trace depth cap OR the node-count (maxNodes) cap reached, more callers/callees may exist beyond this node</div>
-    <div class="legend-row"><span class="k">&#x1F6E1;</span>caughtHere — an ancestor catch clause here catches the exception being traced (exact type, a USER exception ancestor, or bare Exception); paired with a "catches &lt;Exc&gt;" badge. Traversal still continues past this node — rethrow is unknowable</div>
-    <div class="legend-row"><span class="k">&#x25C9;</span>root — no known caller in this trace: an entry point or unused/dead code. Never shown together with cyclic, truncated, or seenElsewhere (those all mean "there IS more above, it just isn't shown/expanded here")</div>
-    <div class="legend-row"><span class="k">&#x21E2;</span>seenElsewhere — this method's caller subtree was already expanded once elsewhere in this same trace (per-run dedup); its own call sites are still shown here, only the deeper callers above it are collapsed</div>
-    <div class="legend-row"><span class="k">+N pill</span>(v0.9) progressive-depth frontier — N direct callers/callees exist but haven't been loaded yet (see apexCallGraph.initialDepth). A distinct, CLICKABLE pill, separate from the plain read-only badges above and from the node body itself — click the pill (not the node) to expand this node in place; clicking the node body still jumps to its source, exactly as before. Pan/zoom and the legend's own open/closed state are preserved across the expand</div>
-    <div class="legend-row"><span class="k">(pkgLabel)</span>(v0.7 B3) package badge — shown on a node when its file lives in a DIFFERENT sfdx package directory than the traced target's; the label is the package name from sfdx-project.json's packageDirectories, or the path segment itself when that directory declares no package name. A single call site can fan out to two children with two DIFFERENT badges (see the "ambiguous" via below)</div>
-    <div class="legend-row"><span class="k">managed: ns</span>(v0.8 N4) managed-package badge — shown on an "external" node, naming the managed-package namespace it belongs to (e.g. "managed: zenq")</div>
-    <div class="legend-row"><span class="k">N dup. names</span>(v0.7 B3) header note — "&lt;N&gt; duplicate class names across packages" appears above the map whenever this workspace has classes sharing the same qualified name across two or more sfdx packages; resolution always prefers the referring file's own package first, then the default package, before falling back to the ambiguous fan-out below</div>
-    <h4>Direction</h4>
-    <div class="legend-row"><span class="k">Who Calls This</span>(default, unlabeled above) the traced target sits on the RIGHT; its callers fan out to the LEFT, one hop per column, converging into the target</div>
-    <div class="legend-row"><span class="k">What This Calls</span>(v0.7 A3, forward tracing — shown above as "What Does This Call?") the traced target sits on the LEFT instead; its callees fan out to the RIGHT, one hop per column — the column order and every tree connector mirror the default layout so both directions still read left-to-right</div>
-    <h4>Edge "via" labels</h4>
-    <div class="legend-row"><span class="k">typed</span>resolved through the receiver's declared type</div>
-    <div class="legend-row"><span class="k">static</span>Class.method() static call</div>
-    <div class="legend-row"><span class="k">new</span>constructor call</div>
-    <div class="legend-row"><span class="k">this</span>this.method() same-class call</div>
-    <div class="legend-row"><span class="k">super</span>super.method() parent-class call</div>
-    <div class="legend-row"><span class="k">interface</span>dispatched through an interface type (approximate — every implementer is included, including through an interface-extends-interface chain)</div>
-    <div class="legend-row"><span class="k">unique-name</span>no receiver type available; matched by a codebase-unique method name (approximate)</div>
-    <div class="legend-row"><span class="k">lexical</span>parse-error fallback, matched by text mention only (approximate)</div>
-    <div class="legend-row"><span class="k">metadata</span>caller is LWC, Aura, Flow, OmniScript, VF, or Custom Metadata, not Apex source (see the metadata accent above)</div>
-    <div class="legend-row"><span class="k">dml</span>a DML statement (or Database.xxx() method call) whose target object has a trigger, or that matches a record-triggered flow's operation — not a direct method call</div>
-    <div class="legend-row"><span class="k">dynamic</span>Type.forName('LiteralClassName') or a Custom Metadata field value naming a class (approximate — resolved by name only, not by real dispatch)</div>
-    <div class="legend-row"><span class="k">override</span>fan-out edge to a subclass's override of a virtual/abstract method reached via a base-type receiver (approximate — the runtime type may differ)</div>
-    <div class="legend-row"><span class="k">publish</span>EventBus.publish(...) of a platform-event (__e) record — resolves to every trigger registered on that event, and to the publish sites shown as children of a platform-event-triggered flow (not approximate)</div>
-    <div class="legend-row"><span class="k">throws</span>a throw statement (creator-type "throw new X(...)" or a resolved "throw e" rethrow) — shown as a root-level child when tracing the thrown exception type itself (not approximate)</div>
-    <div class="legend-row"><span class="k">narrowed</span>instanceof-narrowing fallback — the receiver's declared type doesn't have the method, but an "x instanceof T" narrowing found in the same method does (approximate — branch polarity is not tracked, only that the narrowing exists in the method)</div>
-    <div class="legend-row"><span class="k">async</span>System.enqueueJob / Database.executeBatch / System.schedule call whose argument is an inline "new KnownClass(...)" — edge added to that class's execute method, in addition to the ordinary "new" constructor edge (not approximate)</div>
-    <div class="legend-row"><span class="k">ambiguous</span>(v0.7 B2) a class name duplicated across sfdx packages that neither same-package nor default-package preference could resolve — every remaining candidate gets its own edge, each typically carrying a DIFFERENT package badge (approximate)</div>
-    <div class="legend-row"><span class="k">unresolved</span>(v0.7.1) marks the aggregated "N unresolved sites" leaf itself — one or more forward call sites in this method couldn't be resolved to an indexed target (approximate)</div>
-    <div class="legend-row"><span class="k">dml-unresolved</span>(v0.7.1) a DML statement whose target couldn't be narrowed to a concrete SObject (e.g. a generic List&lt;SObject&gt;/SObject-typed variable) — no trigger or flow linkage could be traced (approximate)</div>
-    <div class="legend-row"><span class="k">external</span>(v0.8 N1/N2/N4) a reference into managed-package code (a namespaced method/class call, or a DML target naming a managed object) — NOT approximate, a genuine namespace match (see the "external" accent above)</div>
-    <div class="legend-row"><span class="k">subflow</span>(v0.13) a declared &lt;subflows&gt; reference between two Flow files, never an Apex call — NOT approximate, a declared reference. Who Calls This: the flow's own PARENT flow (the parent invokes it as a subflow), recursing up. What This Calls: the flow's own SUBFLOW (it invokes the child), recursing down into that subflow's own apex actions/further subflows. Cycle-guarded (&#x21BA; on repeat, never hangs)</div>
-`;
+// v0.20/K1: the legend is BUILT rather than written as one literal, so two
+// of its rows can come from kinds.js instead of being hand-maintained here:
+// the type-chip enumeration (one chip label per registry node kind) and the
+// per-via rows at the end (one row per registry-contributed via, carrying
+// that via's registry glossary text -- the hand-written 'subflow' row this
+// replaces said the same thing in the registry's words). Every other row is
+// a literal push, byte-identical to the pre-v0.20 template literal, and the
+// assembled string reproduces it exactly: the template opened with a newline
+// straight after its backtick and closed with one before it, and every row
+// already carries its own 4-space indent, so '\n' + rows.join('\n') + '\n'
+// is the same string. Literal rows are pushed as BACKTICK templates because
+// most carry apostrophes and all carry double quotes; none contains a
+// backtick, a backslash, or a ${ sequence, so no escaping is involved.
+// The static Apex via rows (typed ... external) stay literal: resolver.js's
+// own pass-B vocabulary is not registry-owned.
+function buildLegendHtml() {
+  const rows = [];
+  rows.push(`    <summary>Legend</summary>`);
+  rows.push(`    <h4>Node cards</h4>`);
+  // Generated from the registry: one chip label per node kind, wrapped by
+  // the two Apex-side chips ('Apex'/'Trigger') and the two entry-annotation
+  // chips ('Invocable'/'external') nodeVisual can also produce. Every other
+  // character of this row -- including the pinned "type chip" key text and
+  // the trailing "so color is never the only cue" -- is verbatim.
+  const chipEnum = ['Apex', 'Trigger']
+    .concat(kinds.NODE_KINDS.map((k) => k.mapVisual.chipLabel))
+    .concat(['Invocable', 'external']);
+  rows.push('    <div class="legend-row"><span class="k">type chip</span>names the component directly ('
+    + chipEnum.join(', ')
+    + ', and others), so color is never the only cue</div>');
+  rows.push(`    <div class="legend-row"><span class="k">Target lane</span>the traced class or method; hop lanes show tree depth away from it</div>`);
+  rows.push(`    <div class="legend-row"><span class="swatch trigger"></span><span><span class="k">trigger</span>trigger-file entry point</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="swatch entry"></span><span><span class="k">entry</span>has an entry-point annotation (@AuraEnabled, @InvocableMethod, @future, @HttpX, webservice, Batchable, Queueable, Schedulable)</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="swatch test"></span><span><span class="k">test</span>only reachable from test code</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="swatch normal"></span><span><span class="k">normal</span>regular method or class</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="swatch metadata"></span><span><span class="k">metadata</span>caller from LWC, Aura, Flow, OmniScript, VF, or Custom Metadata — not Apex source (a Flow node here may still have its own children, e.g. the DML sites on its object, or — v0.13 — its own subflow chain; a metadata node is not always a leaf). Permission Set/Profile access grants are authorization facts, not execution edges, and are shown only in the tree view.</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="swatch anonymous"></span><span><span class="k">anonymous</span>anonymous Apex script (.apex) — real Apex source, but with no declared class/trigger of its own; always a pure root (nothing calls it)</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="swatch exception"></span><span><span class="k">exception</span>(v0.7) a thrown exception's class, reached by tracing forward (What Does This Call?) through a "throw" statement — always terminal</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="swatch unresolved"></span><span><span class="k">unresolved</span>(v0.7) one aggregated leaf per method, summarizing every forward call site that couldn't be resolved to an indexed target (dynamic/platform calls, e.g. HttpRequest/System.debug) — always terminal, approximate. Also covers a DML statement whose target couldn't be narrowed to a concrete SObject type (e.g. a generic List&lt;SObject&gt;) — labeled "DML on unresolved SObject type", no trigger/flow linkage possible</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="swatch external"></span><span><span class="k">external</span>(v0.8) a reference into managed-package code this workspace has no source for — terminal when tracing What Does This Call?; a valid trace target with its own local-caller subtree when tracing Who Calls This</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="k">&#x25B8;/&#x25BE; N possible ... (unconfirmed)</span>(v0.13) a ROLLUP pill — groups every DIRECT approximate caller/callee of the node above it into one collapsed placeholder (dashed border, same color as the "~" approximate marker below), so a handful of confirmed edges aren't buried under a wall of guesses. Click the pill to expand it in place (&#x25BE;) or collapse it again (&#x25B8;) — everything it contains was already resolved, so expanding never re-scans or re-fetches anything. Controlled by the apexCallGraph.showUnconfirmed setting ('rollup' default / 'hide' drops these entirely / 'expand' restores the old flat rendering)</div>`);
+  rows.push(`    <h4>Connection colors</h4>`);
+  rows.push(`    <div class="legend-row"><span class="line-swatch apex"></span><span><span class="k">Apex</span>typed, static, constructor, this/super, and other confirmed code calls</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="line-swatch automation"></span><span><span class="k">Automation</span>Flow/metadata, subflow, and async transitions</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="line-swatch data"></span><span><span class="k">Data/event</span>DML and platform-event publish transitions</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="line-swatch external"></span><span><span class="k">External</span>managed-package boundary</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="line-swatch danger"></span><span><span class="k">Exception</span>throw transition</span></div>`);
+  rows.push(`    <div class="legend-row"><span class="line-swatch approx"></span><span><span class="k">Possible</span>approximate match; always dashed</span></div>`);
+  rows.push(`    <h4>Markers</h4>`);
+  rows.push(`    <div class="legend-row"><span class="k">~ prefix</span>approximate resolution (dashed border too) — via interface/unique-name/lexical/override/narrowed/dynamic fallback, so this edge may be wrong or one of several candidates</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">&#x1F9EA;</span>test-only node (also dimmed)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">&#x21BA;</span>cyclic — this call chain recurses back on itself here</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">&#x2026;</span>capped — trace depth cap OR the node-count (maxNodes) cap reached, more callers/callees may exist beyond this node</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">&#x1F6E1;</span>caughtHere — an ancestor catch clause here catches the exception being traced (exact type, a USER exception ancestor, or bare Exception); paired with a "catches &lt;Exc&gt;" badge. Traversal still continues past this node — rethrow is unknowable</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">&#x25C9;</span>root — no known caller in this trace: an entry point or unused/dead code. Never shown together with cyclic, truncated, or seenElsewhere (those all mean "there IS more above, it just isn't shown/expanded here")</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">&#x21E2;</span>seenElsewhere — this method's caller subtree was already expanded once elsewhere in this same trace (per-run dedup); its own call sites are still shown here, only the deeper callers above it are collapsed</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">+N pill</span>(v0.9) progressive-depth frontier — N direct callers/callees exist but haven't been loaded yet (see apexCallGraph.initialDepth). A distinct, CLICKABLE pill, separate from the plain read-only badges above and from the node body itself — click the pill (not the node) to expand this node in place; clicking the node body still jumps to its source, exactly as before. Pan/zoom and the legend's own open/closed state are preserved across the expand</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">(pkgLabel)</span>(v0.7 B3) package badge — shown on a node when its file lives in a DIFFERENT sfdx package directory than the traced target's; the label is the package name from sfdx-project.json's packageDirectories, or the path segment itself when that directory declares no package name. A single call site can fan out to two children with two DIFFERENT badges (see the "ambiguous" via below)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">managed: ns</span>(v0.8 N4) managed-package badge — shown on an "external" node, naming the managed-package namespace it belongs to (e.g. "managed: zenq")</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">N dup. names</span>(v0.7 B3) header note — "&lt;N&gt; duplicate class names across packages" appears above the map whenever this workspace has classes sharing the same qualified name across two or more sfdx packages; resolution always prefers the referring file's own package first, then the default package, before falling back to the ambiguous fan-out below</div>`);
+  rows.push(`    <h4>Direction</h4>`);
+  rows.push(`    <div class="legend-row"><span class="k">Who Calls This</span>(default, unlabeled above) the traced target sits on the RIGHT; its callers fan out to the LEFT, one hop per column, converging into the target</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">What This Calls</span>(v0.7 A3, forward tracing — shown above as "What Does This Call?") the traced target sits on the LEFT instead; its callees fan out to the RIGHT, one hop per column — the column order and every tree connector mirror the default layout so both directions still read left-to-right</div>`);
+  rows.push(`    <h4>Edge "via" labels</h4>`);
+  rows.push(`    <div class="legend-row"><span class="k">typed</span>resolved through the receiver's declared type</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">static</span>Class.method() static call</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">new</span>constructor call</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">this</span>this.method() same-class call</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">super</span>super.method() parent-class call</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">interface</span>dispatched through an interface type (approximate — every implementer is included, including through an interface-extends-interface chain)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">unique-name</span>no receiver type available; matched by a codebase-unique method name (approximate)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">lexical</span>parse-error fallback, matched by text mention only (approximate)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">metadata</span>caller is LWC, Aura, Flow, OmniScript, VF, or Custom Metadata, not Apex source (see the metadata accent above)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">dml</span>a DML statement (or Database.xxx() method call) whose target object has a trigger, or that matches a record-triggered flow's operation — not a direct method call</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">dynamic</span>Type.forName('LiteralClassName') or a Custom Metadata field value naming a class (approximate — resolved by name only, not by real dispatch)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">override</span>fan-out edge to a subclass's override of a virtual/abstract method reached via a base-type receiver (approximate — the runtime type may differ)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">publish</span>EventBus.publish(...) of a platform-event (__e) record — resolves to every trigger registered on that event, and to the publish sites shown as children of a platform-event-triggered flow (not approximate)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">throws</span>a throw statement (creator-type "throw new X(...)" or a resolved "throw e" rethrow) — shown as a root-level child when tracing the thrown exception type itself (not approximate)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">narrowed</span>instanceof-narrowing fallback — the receiver's declared type doesn't have the method, but an "x instanceof T" narrowing found in the same method does (approximate — branch polarity is not tracked, only that the narrowing exists in the method)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">async</span>System.enqueueJob / Database.executeBatch / System.schedule call whose argument is an inline "new KnownClass(...)" — edge added to that class's execute method, in addition to the ordinary "new" constructor edge (not approximate)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">ambiguous</span>(v0.7 B2) a class name duplicated across sfdx packages that neither same-package nor default-package preference could resolve — every remaining candidate gets its own edge, each typically carrying a DIFFERENT package badge (approximate)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">unresolved</span>(v0.7.1) marks the aggregated "N unresolved sites" leaf itself — one or more forward call sites in this method couldn't be resolved to an indexed target (approximate)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">dml-unresolved</span>(v0.7.1) a DML statement whose target couldn't be narrowed to a concrete SObject (e.g. a generic List&lt;SObject&gt;/SObject-typed variable) — no trigger or flow linkage could be traced (approximate)</div>`);
+  rows.push(`    <div class="legend-row"><span class="k">external</span>(v0.8 N1/N2/N4) a reference into managed-package code (a namespaced method/class call, or a DML target naming a managed object) — NOT approximate, a genuine namespace match (see the "external" accent above)</div>`);
+  // One row per registry-contributed via, in registry order (currently
+  // subflow, interview, screen, composition, access, subscribe, surface),
+  // in the exact markup shape every literal row above uses. The escaper is
+  // belt-and-braces: no registry glossary carries markup characters today,
+  // and a future one that does must not be able to inject markup here.
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const glossary = kinds.viaGlossary();
+  for (const via of kinds.allViaKinds()) {
+    rows.push(`    <div class="legend-row"><span class="k">${esc(via)}</span>${esc(glossary[via])}</div>`);
+  }
+  return '\n' + rows.join('\n') + '\n';
+}
+
+const LEGEND_HTML = buildLegendHtml();
 
 // Mirrors uitree.js's directionHeaderLine exactly -- see that
 // file's INTERPRETIVE DECISION comment for the full byte-identical-bar

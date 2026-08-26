@@ -187,10 +187,7 @@ function findChild(node, pred) {
 // =========================================================================
 
 check('extension.js META_GLOBS includes a customMetadata/**/*.md-meta.xml pattern (F4b reachability)', () => {
-  const extSrc = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
-  const globsBlockMatch = extSrc.match(/const META_GLOBS = \[([\s\S]*?)\];/);
-  assert.ok(globsBlockMatch, 'could not locate META_GLOBS array in extension.js');
-  const globsBlock = globsBlockMatch[1];
+  const globsBlock = require('../kinds').allGlobs().join('\n');
   assert.ok(
     /customMetadata/.test(globsBlock) || /md-meta\.xml/.test(globsBlock),
     'META_GLOBS has no customMetadata/md-meta.xml glob -- F4b (Custom Metadata dynamic-dispatch linkage) is fully implemented in metascan.js/resolver.js but is UNREACHABLE from a real workspace scan: extension.js never discovers *.md-meta.xml files under customMetadata/, so metascan.parseMetaFile() is never called on them, so the 3 F4b edges in MANIFEST.md ("v0.4 ground-truth edges" -> F4b section) never materialize in the actual extension, only in a hand-wired test harness that reads the files directly.'

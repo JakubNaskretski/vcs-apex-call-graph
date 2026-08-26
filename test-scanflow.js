@@ -505,6 +505,18 @@ async function run() {
     assert.doesNotThrow(() => assertCountsOnly(payload));
   }
 
+  // --- v0.20/K1: registry-contributed via kinds pass the counts-only ------
+  // filter unmodified -- 'access' is the proof case (minted by resolver.js
+  // since v0.14 but, before this package, unknown to KNOWN_VIA_KINDS; the
+  // pre-v0.20 vocabulary would have dropped all three keys below).
+  {
+    const payload = buildDiagnosticsPayload({ viaHistogram: { access: 2, composition: 1, surface: 3 } });
+    assert.strictEqual(payload.viaHistogram.access, 2);
+    assert.strictEqual(payload.viaHistogram.composition, 1);
+    assert.strictEqual(payload.viaHistogram.surface, 3);
+    assert.doesNotThrow(() => assertCountsOnly(payload));
+  }
+
   // --- garbage/name-shaped input is coerced away, never passed through ----
   {
     const raw = {

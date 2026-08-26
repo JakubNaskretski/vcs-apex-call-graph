@@ -120,7 +120,7 @@ assert.strictEqual(iconForNode({ kind: 'profile', entries: ['Profile Apex access
     cyclic: false, truncated: false, approximate: false, seenElsewhere: false,
   });
   assert.ok(permissionUi.tooltip.includes('access:'), 'access metadata receives a dedicated non-caller explanation');
-  assert.ok(permissionUi.tooltip.includes('does not invoke Apex'));
+  assert.ok(permissionUi.tooltip.includes('not a runtime caller'));
 }
 
 // --- iconForNode: v0.5 G4 'anonymous' kind gets its own distinct icon
@@ -2173,7 +2173,7 @@ function subflowFlowNode(label, opts = {}) {
   assert(!shaped.description.includes('~'), "'subflow' is NEVER approximate -- no '~' prefix/badge");
   assert.strictEqual(labelForNode(node), 'S13ParentFlow', 'no approximate prefix on the label either');
   assert(shaped.tooltip.includes('subflow:'), "the tooltip must carry a 'subflow: ...' glossary line, same convention as every other via value (VIA_GLOSSARY)");
-  assert(shaped.tooltip.toLowerCase().includes('<subflows>'), 'the glossary line should name the actual XML element this edge comes from, for a user reading the tooltip');
+  assert(shaped.tooltip.toLowerCase().includes('flow-to-subflow'), 'the glossary line should name the flow-to-subflow relationship this edge comes from, for a user reading the tooltip');
 }
 
 // --- cyclic subflow node: marker + glossary, zero children ----------------

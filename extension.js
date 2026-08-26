@@ -100,6 +100,7 @@ const cachecoordinator = require('./cachecoordinator');
 const editoroverlay = require('./editoroverlay');
 const workspacepaths = require('./workspacepaths');
 const targets = require('./targets');
+const kinds = require('./kinds');
 // Pure, vscode-free helpers for single-flight/coalescing,
 // the watcher dirty-set tracker, and the counts-only diagnostics payload
 // shape) -- see scanflow.js's own header for the full contract each export
@@ -917,21 +918,11 @@ async function scanAndParse(progress, excludeGlobs, opts) {
 // '@salesforce/apex/Cls.method' specifier to jest.mock() it, but represent
 // zero real Apex call edges — metascan.js already excludes these by path
 // too; excluding at the glob level here just avoids reading them at all).
+// v0.20/K1: the glob LIST itself now comes from kinds.js (kinds.allGlobs(),
+// the dedup union of every registered kind's globs) -- the exclusion
+// pattern above stays local, it is not a per-kind concern.
 const META_GLOB_EXCLUDE = '{**/node_modules/**,**/.sfdx/**,**/.sf/**,**/.git/**,**/__tests__/**}';
-const META_GLOBS = [
-  '**/lwc/**/*.js',
-  '**/aura/**/*.cmp',
-  '**/aura/**/*.app',
-  '**/aura/**/*.js',
-  '**/flows/**/*.flow-meta.xml',
-  '**/omniscripts/**/*.os-meta.xml',
-  '**/omniscripts/**/*.json',
-  '**/pages/**/*.page',
-  '**/components/**/*.component',
-  '**/customMetadata/**/*.md-meta.xml',
-  '**/permissionsets/**/*.permissionset-meta.xml',
-  '**/profiles/**/*.profile-meta.xml',
-];
+const META_GLOBS = kinds.allGlobs();
 
 // Apply the same apexCallGraph.excludeGlobs post-filter as the
 // Apex scan above, so one setting covers both scans and full/incremental

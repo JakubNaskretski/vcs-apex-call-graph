@@ -32,6 +32,7 @@ const checks = [
   ['path map refresh freshness', process.execPath, ['dev/verify-h6-freshness-tiebreak.js']],
   ['scan coordination', process.execPath, ['test-scanflow.js']],
   ['glob parity', process.execPath, ['test-globparity.js']],
+  ['kind parity', process.execPath, ['test-kindparity.js']],
   ['workspace path schemes', process.execPath, ['test-workspacepaths.js']],
   ['worker pool', process.execPath, ['test-workerpool.js']],
   ['end-to-end', process.execPath, ['test.js']],

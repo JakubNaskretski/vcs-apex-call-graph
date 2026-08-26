@@ -20,16 +20,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const EXT_PATH = path.join(__dirname, '..', 'extension.js');
-const extSource = fs.readFileSync(EXT_PATH, 'utf8');
-
-const m = extSource.match(/const META_GLOBS = \[([\s\S]*?)\];/);
-if (!m) {
-  console.log('FAIL: could not locate META_GLOBS array in extension.js -- has the variable been renamed?');
-  process.exit(1);
-}
-const globLines = m[1].match(/'[^']*'/g) || [];
-const globs = globLines.map((s) => s.slice(1, -1));
+const globs = require('../kinds').allGlobs();
 console.log('extension.js META_GLOBS (as actually shipped):');
 for (const g of globs) console.log('  ' + g);
 

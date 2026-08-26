@@ -5,11 +5,14 @@
 // counts-only diagnostics payload builder, since it is pure data shaping
 // with no vscode dependency either.
 //
-// Nothing in this file touches `vscode`, the filesystem, or worker_threads --
+// Nothing in this file touches `vscode`, the filesystem, or worker_threads
+// (save for one pure-data require, kinds.js, which itself requires nothing) --
 // it is plain, synchronous-except-for-Promises JS, runnable (and unit-tested,
 // see test-scanflow.js) under plain `node`. extension.js is the only caller
 // that wires real vscode.FileSystemWatcher events / vscode.window.withProgress
 // tokens into the shapes this module defines.
+
+const kinds = require('./kinds');
 
 // =========================================================================
 // H5: single-flight + same-key coalescing + one-pending-queue ("latest wins")
@@ -666,33 +669,26 @@ const KNOWN_UNRESOLVED_REASONS = new Set([
   'parse-fallback',
   'name-too-common',
 ]);
-// via-kind histogram: resolver.js's own existing `via` value vocabulary
-// (static/ambiguous/external/override/dml/interface/typed/unique-name/
-// dynamic/publish/throws/lexical/new) plus narrowed and rollup edges.
-const KNOWN_VIA_KINDS = new Set([
-  'static',
-  'this',
-  'super',
-  'ambiguous',
-  'external',
-  'override',
-  'dml',
-  'dml-unresolved',
-  'interface',
-  'typed',
-  'unique-name',
-  'dynamic',
-  'publish',
-  'throws',
-  'async',
-  'lexical',
-  'new',
-  'narrowed',
-  'metadata',
-  'subflow',
-  'unresolved',
-  'rollup',
-]);
+// via-kind histogram vocabulary = the Apex-resolution core below (owned
+// by resolver.js's own pass-B machinery, stays literal here) UNIONED with
+// every via the kind registry contributes (kinds.allViaKinds() --
+// currently subflow/interview/screen/composition/access/subscribe/
+// surface). v0.20/K1: 'access' -- minted by resolver.js's permission-set
+// attach since v0.14, never listed here -- arrives via the registry. It
+// never actually reached this filter before (today's histogram counts
+// index-site vias, and 'access' lives only on rendered tree nodes), so
+// nothing was being dropped in the shipped product; the point of the union
+// is that the FIRST counter to histogram a tree/store via can no longer
+// lose it here without anyone noticing. Still a fixed, engine-internal
+// vocabulary: nothing workspace-derived can enter it, so the counts-only
+// privacy posture is unchanged.
+const CORE_VIA_KINDS = [
+  'static', 'this', 'super', 'ambiguous', 'external', 'override', 'dml',
+  'dml-unresolved', 'interface', 'typed', 'unique-name', 'dynamic',
+  'publish', 'throws', 'async', 'lexical', 'new', 'narrowed', 'metadata',
+  'unresolved', 'rollup',
+];
+const KNOWN_VIA_KINDS = new Set(CORE_VIA_KINDS.concat(kinds.allViaKinds()));
 
 function buildDiagnosticsPayload(raw) {
   raw = raw || {};
@@ -843,4 +839,6 @@ module.exports = {
   createExcludeTracker,
   buildDiagnosticsPayload,
   assertCountsOnly,
+  // v0.20/K1: exported for test-kindparity.js's vocabulary-subset assertions.
+  KNOWN_VIA_KINDS,
 };

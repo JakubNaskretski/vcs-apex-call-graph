@@ -1381,12 +1381,17 @@ function findChild(tree, label) {
 // gets exercised by a real workspace scan (extension.js requires the
 // 'vscode' module, so it can't be require()'d directly outside the
 // extension host -- read its source and check the glob list instead).
+// v0.20/K1: the glob list itself now comes from kinds.js
+// (kinds.allGlobs()), so this checks the WIRING (extension.js actually
+// reads from the registry) plus the registry content directly.
 // =========================================================================
 {
   const extSrc = fs.readFileSync(path.join(__dirname, 'extension.js'), 'utf8');
-  const globsBlockMatch = extSrc.match(/const META_GLOBS = \[([\s\S]*?)\];/);
-  assert(globsBlockMatch, 'could not locate META_GLOBS array in extension.js');
-  const globsBlock = globsBlockMatch[1];
+  assert(
+    /const META_GLOBS = kinds\.allGlobs\(\);/.test(extSrc),
+    'extension.js must take its metadata scan globs from the kind registry (kinds.allGlobs())'
+  );
+  const globsBlock = require('./kinds').allGlobs().join('\n');
   assert(
     /customMetadata/.test(globsBlock) && /md-meta\.xml/.test(globsBlock),
     'META_GLOBS must include a customMetadata/**/*.md-meta.xml pattern -- otherwise F4b (Custom Metadata linkage) is unreachable from a real workspace scan even though metascan.js/resolver.js implement it correctly'

@@ -37,7 +37,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { parseMetaFile, scanBundle, stripOwnNamespace } = require('./metascan');
+const { parseMetaFile, scanBundle, stripOwnNamespace, stemOf } = require('./metascan');
 
 const src = (lines) => lines.join('\n');
 
@@ -129,11 +129,27 @@ function refsOf(kind, refs) {
 
 // The pure extractor is not enough: pin the extension's real workspace
 // inventory so both metadata types are reachable in full and watcher-fed
-// incremental scans.
+// incremental scans. v0.20/K1: the glob list itself now comes from
+// kinds.js, so this pins the WIRING plus the registry content directly.
 {
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.js'), 'utf8');
-  assert.ok(extensionSource.includes("'**/permissionsets/**/*.permissionset-meta.xml'"));
-  assert.ok(extensionSource.includes("'**/profiles/**/*.profile-meta.xml'"));
+  assert.ok(
+    extensionSource.includes('const META_GLOBS = kinds.allGlobs();'),
+    "extension.js's metadata inventory comes from the kind registry"
+  );
+  const globs = require('./kinds').allGlobs();
+  assert.ok(globs.includes('**/permissionsets/**/*.permissionset-meta.xml'));
+  assert.ok(globs.includes('**/profiles/**/*.profile-meta.xml'));
+}
+
+// v0.20/K1: stemOf is now exported directly (the compound-extension matrix
+// itself is pinned exhaustively in test-kindparity.js assertion 7).
+{
+  assert.strictEqual(
+    stemOf('force-app/main/default/flows/Vtx_Order_Screen.flow-meta.xml'),
+    'Vtx_Order_Screen'
+  );
+  assert.strictEqual(stemOf('Vtx_Panel.js-meta.xml'), 'Vtx_Panel');
 }
 
 // ===========================================================================
