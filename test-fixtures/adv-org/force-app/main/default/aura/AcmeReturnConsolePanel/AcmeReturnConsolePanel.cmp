@@ -1,0 +1,18 @@
+<aura:component controller="AcmeReturnConsoleController"
+                 implements="flexipage:availableForAllPageTypes"
+                 access="global">
+
+    <aura:attribute name="summary" type="String" />
+    <aura:attribute name="isLoading" type="Boolean" default="true" />
+
+    <aura:handler name="init" value="{!this}" action="{!c.doInit}" />
+
+    <lightning:card title="Return Console" iconName="standard:return_order">
+        <div class="slds-p-around_medium">
+            <aura:if isTrue="{!v.isLoading}">
+                <lightning:spinner alternativeText="Loading" size="small" />
+            </aura:if>
+            {!v.summary}
+        </div>
+    </lightning:card>
+</aura:component>

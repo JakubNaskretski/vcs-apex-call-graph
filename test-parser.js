@@ -870,7 +870,9 @@ assert.strictEqual(baseName('OppService.cls-meta.xml'), 'OppService');
   // cross-check). This literal is corpus-state, not parser-behavior; update
   // it here whenever the corpus grows rather than treating a drift as a
   // parser.js regression.
-  assert.strictEqual(allFiles.length, 77, 'corpus has exactly 77 .cls/.trigger files (post-v0.5 + G6-diamond fix + H2 corpus fixtures)');
+  // -> 78 after the v0.20 M1 defect round added AcmeReturnConsoleController.cls
+  //    (D2's cmp.get receiver fixture).
+  assert.strictEqual(allFiles.length, 78, 'corpus has exactly 78 .cls/.trigger files (post-v0.5 + G6-diamond fix + H2 corpus fixtures)');
   let parseErrorCount = 0;
   let parseErrorPaths = [];
   let dmlFactTotal = 0;
@@ -1346,7 +1348,7 @@ assert.strictEqual(baseName('OppService.cls-meta.xml'), 'OppService');
     return out;
   }
   const allFiles = walkClsAndTriggerFiles(forceAppRoot, []);
-  assert.strictEqual(allFiles.length, 77, 'corpus has exactly 77 .cls/.trigger files (v0.5 round + G6-diamond regression fixture + H2 corpus fixtures)');
+  assert.strictEqual(allFiles.length, 78, 'corpus has exactly 78 .cls/.trigger files (v0.5 round + G6-diamond regression fixture + H2 corpus fixtures)');
   let parseErrorCount = 0;
   let parseErrorPaths = [];
   let throwsSitesTotal = 0;

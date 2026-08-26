@@ -5453,7 +5453,8 @@ function buildFlowCalleeChildren(index, flowLower, ancestorPath, ctx, ownerNode,
 // v0.8/N1(c): given a metascan MetaRef and the (lowercased) own-namespace
 // token, detects whether this ref names a namespace -- normally via the
 // EXPLICIT `namespace` field metascan.js now populates for ALL ref kinds
-// (LWC, Flow, CMDT, os-meta; metascan superseded the
+// (LWC, Flow, CMDT, os-meta, and -- as of v0.20/D4 -- Aura;
+// metascan superseded the
 // older LWC-only split), with the shape-inference branches below kept as a
 // defensive fallback for refs from any older/partial extraction -- and,
 // if so, whether that namespace IS the workspace's own (isOwn:true, per N3:
@@ -6820,40 +6821,33 @@ function collectFlowEntries(index, addEntry) {
     seenLabels.add(label);
   }
 
-  const flowFilePaths = Array.isArray(index && index.flowFilePaths) ? index.flowFilePaths : [];
-  for (const p of flowFilePaths) {
-    if (typeof p !== 'string' || !p) continue;
-    const label = flowStemOf(p);
-    if (!label || seenLabels.has(label)) continue;
-    seenLabels.add(label);
-    // v0.13/S2: this loop's flows never carry <start> info at all (no ref
-    // survived to tell us -- see this loop's own header note on WHY a flow
-    // lands here), so hasStartInfo is unconditionally false -- the same
-    // additive suffix rule applies.
-    addEntry('flow', `flow:${label}`, {
-      label,
-      className: null,
-      methodLower: null,
-      path: p,
-      line: 0,
-      detail: 'screen or autolaunched' + subflowSuffixFor(index, label, false),
-      package: null,
-    });
-  }
-
-  // v0.13/S2: index.flowInfo (built by attachMetaCallers, see its own header
-  // note) is a THIRD, independent fallback -- it registers a flow's label
+  // v0.20/D1: this loop MUST run BEFORE the flowFilePaths loop below --
+  // swapped from their pre-v0.20 order. Reason: index.flowFilePaths (real
+  // production usage) unconditionally lists EVERY '.flow-meta.xml' path the
+  // scan saw, so if it ran first it would claim every flowInfo-known label
+  // first with the bare 'screen or autolaunched' fallback, permanently
+  // shadowing the richer computation below via the `seenLabels.has(...)`
+  // guard -- exactly the catalog-mislabeling defect D1 exists to fix.
+  // (Pre-v0.20 the only shape that could reach BOTH fallbacks was the
+  // subflow-only synthetic ref, and no flow in either fixture corpus
+  // combined that with a recognized <start><triggerType>, so the shadowing
+  // was never observed -- it was latent, not impossible: that shape DOES
+  // stamp flowObject when the <start> carries one.)
+  // index.flowInfo (built by attachMetaCallers, see its own
+  // header note) is an independent fallback -- it registers a flow's label
   // from ANY flow-kind ref it ever saw, including the bare/synthetic
   // (className:null) ref metascan.js emits for a flow that
   // has >=1 <subflows> element but ZERO apex actionCalls of its own (a
-  // subflow-only orchestration node. That shape never reaches
-  // metaCallers/externalMetaRefs at all
-  // (attachMetaCallers' own local-attach loop skips any ref with no
-  // className), so without this fallback such a flow would be invisible
-  // here unless the CALLER separately populated index.flowFilePaths (the
-  // pre-existing v0.12 mechanism, which solves the identical problem but
-  // depends on extension.js remembering to set it before calling this
-  // function). flowInfo also carries real flowObject/flowTriggerType/
+  // subflow-only orchestration node) and -- as of v0.20/D1 -- also for a
+  // record-triggered/platform-event flow doing purely declarative work
+  // (zero apex actions, zero subflows). That shape never reaches
+  // metaCallers/externalMetaRefs at all (attachMetaCallers' own
+  // local-attach loop skips any ref with no className), so without this
+  // fallback such a flow would be invisible here unless the CALLER
+  // separately populated index.flowFilePaths (the pre-existing v0.12
+  // mechanism, which solves the identical problem but depends on
+  // extension.js remembering to set it before calling this function).
+  // flowInfo also carries real flowObject/flowTriggerType/
   // flowRecordTriggerType for this shape (S1 stamps those onto the
   // synthetic ref too), so the SAME rich detail computation the byLabel
   // loop above uses applies here, not just the bare fallback string.
@@ -6875,6 +6869,34 @@ function collectFlowEntries(index, addEntry) {
       path: info.path || '',
       line: info.line || 0,
       detail: baseDetail + subflowSuffixFor(index, info.label, !!info.flowObject),
+      package: null,
+    });
+  }
+
+  // v0.12/C1: additive over metaCallers/externalMetaRefs above -- every
+  // distinct '.flow-meta.xml' path the metadata scan saw, regardless of
+  // content. v0.20/D1: now runs AFTER the flowInfo loop above (see that
+  // loop's header note for why the order is load-bearing) -- so this loop
+  // only ever picks up a flow that produced literally ZERO metascan refs of
+  // any kind (a real Screen/Decision-only flow with no apex, no subflows,
+  // no recognized <start> trigger info).
+  const flowFilePaths = Array.isArray(index && index.flowFilePaths) ? index.flowFilePaths : [];
+  for (const p of flowFilePaths) {
+    if (typeof p !== 'string' || !p) continue;
+    const label = flowStemOf(p);
+    if (!label || seenLabels.has(label)) continue;
+    seenLabels.add(label);
+    // v0.13/S2: this loop's flows never carry <start> info at all (no ref
+    // survived to tell us -- see this loop's own header note on WHY a flow
+    // lands here), so hasStartInfo is unconditionally false -- the same
+    // additive suffix rule applies.
+    addEntry('flow', `flow:${label}`, {
+      label,
+      className: null,
+      methodLower: null,
+      path: p,
+      line: 0,
+      detail: 'screen or autolaunched' + subflowSuffixFor(index, label, false),
       package: null,
     });
   }

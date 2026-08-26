@@ -3283,6 +3283,76 @@ attachMetaCallers(indexW7, metaRefsW7);
   }
 }
 
+// ---- v0.20/D1: declarative-only record-triggered flow (synthetic ref) ----
+{
+  const AcmeEscalationWriter = ty('AcmeEscalationWriter', 'AcmeEscalationWriter', {
+    methods: [
+      mth('close', {
+        line: 1,
+        locals: [{ name: 'esc', type: 'Acme_Escalation__c', line: 2 }],
+        dml: [dmlFact('update', 'esc', { line: 3, lineText: 'update esc;' })],
+      }),
+    ],
+  });
+  const index = buildSemanticIndex([mkFile(AcmeEscalationWriter)]);
+  const syntheticRef = {
+    kind: 'flow',
+    label: 'AcmeEscalationCleanupFlow',
+    className: null,
+    methodName: null,
+    namespace: null,
+    flowObject: 'Acme_Escalation__c',
+    flowRecordTriggerType: 'Update',
+    flowTriggerType: 'RecordAfterSave',
+    subflows: [],
+    path: 'flows/AcmeEscalationCleanupFlow.flow-meta.xml',
+    line: 17,
+    lineText: '<triggerType>RecordAfterSave</triggerType>',
+  };
+  attachMetaCallers(index, [syntheticRef]);
+  index.flowFilePaths = [syntheticRef.path];
+
+  assert.strictEqual(index.metaCallers.size, 0, 'a className-null ref creates no metaCallers bucket at all');
+  assert.strictEqual(index.flowInfo.has('acmeescalationcleanupflow'), true);
+  assert.strictEqual(index.flowRefsByObject.has('acme_escalation__c'), true);
+
+  const tree = buildCalleeTree(index, { classLower: 'acmeescalationwriter', methodLower: 'close' });
+  const flow = findChild(tree.root.children, 'AcmeEscalationCleanupFlow');
+  assert.ok(flow, 'D1: the declarative-only record-triggered flow must appear as a dml fan-out child');
+  assert.strictEqual(flow.via, 'dml');
+  assert.strictEqual(flow.kind, 'flow');
+  assert.strictEqual(flow.approximate, false);
+  assert.strictEqual(flow.truncated, true);
+  assert.deepStrictEqual(flow.children, []);
+
+  const cat = buildEntryCatalog(index);
+  const g = cat.groups.find((x) => x.kind === 'flow');
+  const e = g && g.entries.find((x) => x.label === 'AcmeEscalationCleanupFlow');
+  assert.ok(e, 'D1: the flow must appear in the entry catalog');
+  assert.strictEqual(e.detail, 'RecordAfterSave on Acme_Escalation__c');
+}
+
+// ---- v0.20/D1: collectFlowEntries fallback ORDER regression -------------
+{
+  const index = buildSemanticIndex([]);
+  index.flowInfo = new Map([['acmeorderingestflow', {
+    label: 'AcmeOrderIngestFlow',
+    path: 'flows/AcmeOrderIngestFlow.flow-meta.xml',
+    line: 4,
+    flowObject: 'Acme_Order__c',
+    flowTriggerType: 'RecordBeforeSave',
+    flowRecordTriggerType: 'Create',
+  }]]);
+  index.flowFilePaths = ['flows/AcmeOrderIngestFlow.flow-meta.xml'];
+  const cat = buildEntryCatalog(index);
+  const g = cat.groups.find((x) => x.kind === 'flow');
+  assert.strictEqual(g.entries.length, 1, 'the same label must be deduped across both fallback sources');
+  assert.strictEqual(g.entries[0].label, 'AcmeOrderIngestFlow');
+  assert.strictEqual(g.entries[0].detail, 'RecordBeforeSave on Acme_Order__c');
+  assert.strictEqual(g.entries[0].line, 4);
+  assert.strictEqual(g.entries[0].path, 'flows/AcmeOrderIngestFlow.flow-meta.xml');
+}
+
 // ---- direction field --------------------------------------------------
 {
   const calleeTree = buildCalleeTree(indexW7, { classLower: 'w7caller', methodLower: 'entry' });
@@ -4702,6 +4772,60 @@ const W7_DEFAULT_PACKAGE = 'pkgA';
   const tree = buildCallerTree(index, { classLower: 'v8ownmetatarget', methodLower: 'dowork' });
   const lwcChild = tree.root.children.find((c) => c.kind === 'lwc');
   assert.ok(lwcChild, 'v0.8/N3: the own-namespace-stripped LWC ref attaches to the LOCAL class/method exactly like a bare (no-namespace) ref would');
+}
+
+// ---- v0.20/D4: namespaced aura ref, FOREIGN namespace -> external node --
+{
+  const index = buildSemanticIndex([]);
+  const classLevelAuraRef = {
+    kind: 'aura',
+    label: 'AcmeKappaGatewayPanel',
+    className: 'KappaGateway',
+    methodName: null,
+    namespace: 'zenq',
+    path: 'aura/AcmeKappaGatewayPanel/AcmeKappaGatewayPanel.cmp',
+    line: 1,
+    lineText: '<aura:component controller="zenq.KappaGateway">',
+  };
+  const methodLevelAuraRef = {
+    kind: 'aura',
+    label: 'AcmeKappaGatewayPanel',
+    className: 'KappaGateway',
+    methodName: 'refreshGateway',
+    namespace: 'zenq',
+    path: 'aura/AcmeKappaGatewayPanel/AcmeKappaGatewayPanelController.js',
+    line: 5,
+    lineText: "var action = cmp.get('c.refreshGateway');",
+  };
+  attachMetaCallers(index, [classLevelAuraRef, methodLevelAuraRef]);
+  const key = 'zenq.kappagateway';
+  const ext = index.externals.get(key);
+  assert.ok(ext, 'v0.20/D4: a namespaced aura controller= value attaches to an external node, not the inert dotted metaCallers bucket');
+  assert.deepStrictEqual([...ext.methods], ['refreshgateway']);
+  assert.strictEqual(ext.refCount, 2, 'both the class-level and method-level aura refs attach to the SAME external node');
+  assert.strictEqual(index.externalMetaRefs.get(key).length, 2);
+  assert.strictEqual(index.metaCallers.has(key), false, 'the pre-v0.20 inert dotted bucket must no longer be created');
+}
+
+// ---- v0.20/D4: namespaced aura ref, OWN namespace -> resolves LOCALLY ---
+{
+  const V8OwnKappaGateway = ty('KappaGateway', 'KappaGateway', { methods: [mth('refreshGateway', { line: 1 })] });
+  const index = buildSemanticIndex([mkFile(V8OwnKappaGateway)], { ownNamespace: 'vtx' });
+  const ownAuraRef = {
+    kind: 'aura',
+    label: 'AcmeKappaGatewayPanel',
+    className: 'KappaGateway',
+    methodName: 'refreshGateway',
+    namespace: 'vtx',
+    path: 'aura/AcmeKappaGatewayPanel/AcmeKappaGatewayPanelController.js',
+    line: 5,
+    lineText: "var action = cmp.get('c.refreshGateway');",
+  };
+  attachMetaCallers(index, [ownAuraRef]);
+  assert.strictEqual(index.externals.size, 0, "v0.20/D4: an aura ref whose namespace IS the workspace's own must resolve locally, not externally");
+  const tree = buildCallerTree(index, { classLower: 'kappagateway', methodLower: 'refreshgateway' });
+  const auraChild = tree.root.children.find((c) => c.kind === 'aura');
+  assert.ok(auraChild, 'v0.20/D4: the own-namespace-stripped aura ref attaches to the LOCAL class/method exactly like a bare (no-namespace) ref would');
 }
 
 // =========================================================================

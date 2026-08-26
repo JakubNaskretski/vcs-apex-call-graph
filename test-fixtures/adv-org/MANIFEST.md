@@ -106,19 +106,22 @@ call-graph shapes at once:
 | `classes/AcmeQuoteAuraService.cls` | `@AuraEnabled` quote service backing 3 LWC bundles and the quote OmniScript. |
 | `classes/AcmeShipmentAuraService.cls` | `@AuraEnabled` shipment service backing the shipment-tracker LWC, the Aura status board, and the shipment OmniScript. |
 | `classes/AcmeOrderApprovalController.cls` | `@AuraEnabled` controller backing the `AcmeOrderApprovalPanel` Aura component. |
+| `classes/AcmeReturnConsoleController.cls` | Two `@AuraEnabled` statics (`getReturnSummary`, `summarizeReturns`) backing the `AcmeReturnConsolePanel` Aura bundle and `acmeOrderDashboard`'s secondary LWC module. |
 | `classes/AcmeOrderRestResource.cls` | `@RestResource('/acmeOrders/*')`: GET recalculates pricing, POST processes an order batch. |
 | `classes/AcmeLegacyOrderSoapService.cls` | Global legacy SOAP surface predating the REST resource; calls `AcmeOrderUtil.markApproved` directly. |
 | `classes/AcmeOrderServiceTest.cls` | `@isTest`; exercises the service layer, batch processor, bulk invocable, quote construction, dispatcher, and scheduler end-to-end. |
-| `lwc/acmeOrderDashboard/*` | Wire adapter → `AcmeQuoteAuraService.getRecentQuotes`. |
+| `lwc/acmeOrderDashboard/*` | Wire adapter → `AcmeQuoteAuraService.getRecentQuotes`. Also carries the secondary module `orderChartUtils.js` → `AcmeReturnConsoleController.summarizeReturns` (v0.20/D3 bundle-identity fixture). |
 | `lwc/acmeQuoteWizard/*` | Imperative call → `AcmeQuoteAuraService.createQuote`; has a Jest unit test with no Apex edges. |
 | `lwc/acmeInvoiceViewer/*` | Wire (`getInvoiceSummary`) + imperative (`recalculateInvoice`), both on `AcmeQuoteAuraService`. |
 | `lwc/acmeShipmentTracker/*` | Wire (`getShipmentStatuses`) + imperative (`refreshTracking`), both on `AcmeShipmentAuraService`. |
 | `aura/AcmeOrderApprovalPanel/*` | `controller="AcmeOrderApprovalController"`; button action calls `c.approveOrder`. |
 | `aura/AcmeShipmentStatusBoard/*` | `controller="AcmeShipmentAuraService"`; init handler calls `c.getShipmentStatuses`. |
+| `aura/AcmeReturnConsolePanel/*` | `controller="AcmeReturnConsoleController"`; init handler calls `c.getReturnSummary` via the `cmp` receiver style (v0.20/D2). |
 | `flows/AcmeQuoteApprovalScreenFlow.flow-meta.xml` | Screen Flow; apex action calls `AcmeDiscountApprovalInvocable`. |
 | `flows/AcmeOrderStatusRecordTriggeredFlow.flow-meta.xml` | Record-triggered Flow; apex action calls `AcmeOrderService.recalculatePricing`. |
 | `flows/AcmeBackorderResolutionFlow.flow-meta.xml` | Autolaunched Flow; apex action calls `AcmeOrderInvocable`, then a subflow. |
 | `flows/AcmeNotifyCustomerSubflow.flow-meta.xml` | Subflow target of the above; no further Apex calls. |
+| `flows/AcmeEscalationCleanupFlow.flow-meta.xml` | Record-triggered (RecordAfterSave/Update) Flow on `Acme_Escalation__c` doing purely declarative work — zero apex actions, zero subflows (v0.20/D1). |
 | `omniscripts/AcmeQuoteOmniScript/*` | DataPack; remote actions call `AcmeQuoteAuraService.createQuote`/`getInvoiceSummary`. |
 | `omniscripts/AcmeOrderIntegrationProcedure/*` | DataPack; remote actions call `AcmeOrderService.recalculatePricing` and `AcmeShipmentService.scheduleDelivery`. |
 | `omniscripts/AcmeShipmentOmniScript.os-meta.xml` | Remote action calls `AcmeShipmentAuraService.refreshTracking`. |
@@ -247,6 +250,10 @@ distinct data shape/upgrade: JSON `remoteClass`/`remoteMethod` pairs and
 - `flows/AcmeOrderStatusRecordTriggeredFlow.flow-meta.xml → AcmeOrderService.recalculatePricing` [needs: metadata-callers] — this Flow calls a plain `@AuraEnabled`-style Apex action, not an `@InvocableMethod`; same class-only reference shape.
 - `flows/AcmeBackorderResolutionFlow.flow-meta.xml → AcmeOrderInvocable.execute` [needs: metadata-callers]
 - `flows/AcmeBackorderResolutionFlow.flow-meta.xml → AcmeNotifyCustomerSubflow (subflow)` [MUST — promoted 2026-07-18, v0.13 S1/S2] (`<subflows><flowName>AcmeNotifyCustomerSubflow</flowName>`) — flow-to-flow, never an Apex edge, but no longer un-ingested: v0.13 gives `resolver.js` a `flowGraph` keyed off exactly this kind of `<subflows>` reference. See "## v0.13 subflow chains (adv-org)" below for the full node-by-node expectation; this line's original `[needs: metadata-callers]` tag is now historical (kept struck nowhere else in this list — every OTHER bullet in this section still reflects the engine's actual state as of when each was written, this one line alone is superseded).
+- `lwc/acmeOrderDashboard/orderChartUtils.js → AcmeReturnConsoleController.summarizeReturns` — v0.20/D3: secondary bundle module; ref label MUST be `acmeOrderDashboard` (the bundle), never `orderChartUtils` (the file stem).
+- `aura/AcmeReturnConsolePanel/AcmeReturnConsolePanel.cmp → AcmeReturnConsoleController` (`controller="..."` attribute)
+- `aura/AcmeReturnConsolePanel/AcmeReturnConsolePanelController.js → AcmeReturnConsoleController.getReturnSummary` — v0.20/D2: `cmp.get('c.getReturnSummary')` receiver style (NOT the literal `component`); the sibling `$A.get('e.force:showToast')` line MUST yield nothing.
+- `flows/AcmeEscalationCleanupFlow.flow-meta.xml` — v0.20/D1: declarative-only RecordAfterSave/Update flow on `Acme_Escalation__c`; zero apex actions, zero subflows → exactly ONE synthetic ref (className null) carrying `flowObject='Acme_Escalation__c'`, `flowRecordTriggerType='Update'`, `flowTriggerType='RecordAfterSave'`, `subflows: []`, anchored at the `<triggerType>` line.
 - `omniscripts/AcmeQuoteOmniScript/AcmeQuoteOmniScript_DataPack.json → AcmeQuoteAuraService.createQuote` [needs: omniscript] (`"remoteClass":"AcmeQuoteAuraService","remoteMethod":"createQuote"`)
 - `omniscripts/AcmeQuoteOmniScript/AcmeQuoteOmniScript_DataPack.json → AcmeQuoteAuraService.getInvoiceSummary` [needs: omniscript]
 - `omniscripts/AcmeOrderIntegrationProcedure/AcmeOrderIntegrationProcedure_DataPack.json → AcmeOrderService.recalculatePricing` [needs: omniscript]
@@ -1403,3 +1410,33 @@ parents (nothing subflows either of them in this corpus), so both stay
 exactly `'screen or autolaunched'`, unchanged. `[MUST]`. `stats.flow` count
 (6) is unchanged -- this is a detail-string-only delta, no entries added or
 removed, matching the v0.13 REGRESSION POLICY's "counts unchanged" clause.
+
+## v0.20 defect-round additions (M1)
+
+Four new fixture files, each pinning one of the four M1 wrong-answer
+defects fixed this round (D1-D4; see the plan's own defect writeups for the
+full rationale). Per this file's own non-enumeration convention, the two
+`-meta.xml` sidecars (`AcmeReturnConsoleController.cls-meta.xml`,
+`AcmeReturnConsolePanel.cmp-meta.xml`) are not itemized separately.
+
+- `flows/AcmeEscalationCleanupFlow.flow-meta.xml` -- pins D1 (declarative-only
+  record-triggered flow now emits a synthetic ref and fans out from DML).
+- `classes/AcmeReturnConsoleController.cls` -- pins D2 (backs the `cmp.get`
+  receiver-style Aura fixture below).
+- `aura/AcmeReturnConsolePanel/*` -- pins D2 (`cmp.get('c.getReturnSummary')`
+  now matches; the literal receiver `component` is no longer required).
+- `lwc/acmeOrderDashboard/orderChartUtils.js` -- pins D3 (secondary bundle
+  module labels as the bundle, not its own file stem).
+
+### Entry catalog delta (v0.20)
+
+`flow 6 -> 7` (the new `AcmeEscalationCleanupFlow` entry, D1); `aura 8 -> 10`
+(the new `AcmeReturnConsoleController.getReturnSummary`/`.summarizeReturns`
+entries, D2); `total 34 -> 37`. `[MUST]` -- pinned in
+`dev/gauntlet-run.js`'s `advExpectedByKind`/`advCatalog.stats.total` checks.
+
+Final counts: trigger 4, aura 10, invocable 2, rest 2, soap 1, async 6,
+email 1, platform 3, flow 7, anonymous 1, total 37; excludedTestEntries 0 --
+these supersede the `## Entry catalog` "Counts per kind" table above (and its
+file-count prose: now 81 `.cls`, 7 `.flow-meta.xml`), which records the
+pre-v0.20 state.

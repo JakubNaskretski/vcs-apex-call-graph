@@ -146,7 +146,8 @@
 //     text for every kind that carries a `namespace` field, so once
 //     `namespace` is nulled the ref reads exactly like an ordinary local
 //     reference always would have. Refs with no `namespace` field at all
-//     (aura/vf, or another unaffected ref) pass through
+//     (vf, or another unaffected ref -- aura refs carry the field as of
+//     v0.20/D4 and participate normally) pass through
 //     unchanged (same object, not even copied). This function does NOT run
 //     automatically inside parseMetaFile()/scanBundle() -- like `packageOf`,
 //     it is opts-time plumbing the extension is expected to call explicitly
@@ -259,11 +260,77 @@
 //     file paths), so it is captured
 //     here rather than requiring a second, index-level mechanism.
 //
+// v0.20 (M1 defect round, D1-D4): four extraction-correctness fixes,
+// documented in one block. Every field documented above keeps its exact
+// pre-existing meaning; each behavior delta below is a fix for a verified
+// wrong answer (the pre-v0.20 output was a defect, not a contract), and
+// each is pinned by its own regression tests:
+//
+//   - D1 (flow): the zero-actionCalls synthetic 'flow' ref (the
+//     LOAD-BEARING EXCEPTION above) now ALSO fires for a flow whose
+//     <start> carries a RECOGNIZED <triggerType> (the three
+//     RecordBefore*/RecordAfterSave values, or PlatformEvent) even when
+//     the file has ZERO <subflows> elements. A record-triggered or
+//     platform-event flow doing purely declarative work (assignments/
+//     recordUpdates -- no apex actionCalls, no subflows) previously
+//     emitted NO refs at all, so its flowObject/flowTriggerType facts
+//     vanished from this file's output entirely and a downstream
+//     consumer (resolver.js's DML/publish fan-out and entry catalog, out
+//     of scope here) could neither fan out to it nor label it. Exact
+//     gate: `(subflows.length || flowTriggerType != null) && zero apex
+//     refs emitted` -- a Screen/Autolaunched flow with no recognized
+//     <start><triggerType> and no <subflows> still yields nothing,
+//     byte-identical to pre-v0.20. The shape is the SAME synthetic ref
+//     documented above (className/methodName both null -- still the
+//     ONLY 'flow' shape with a null className); `subflows` may now be
+//     [] on this shape (previously non-empty by construction).
+//     `line`/`lineText` anchor at the file's first <subflows><flowName>
+//     when one exists (unchanged), else at the <start> block's
+//     <triggerType> element -- the concrete fact that justified the ref.
+//   - D2 (aura): AURA_GET_RE's receiver is now ANY identifier, not the
+//     literal text 'component' -- `cmp.get('c.save')` and every other
+//     parameter naming style now yield method-level refs. The receiver
+//     must not be preceded by '$', '.', or a word character (so
+//     `$A.get(...)` and dotted chains stay excluded) and the quoted
+//     argument must still start with the literal 'c.' (so 'v.'/'e.'
+//     lookups stay excluded). The pre-v0.20 design-note claim that
+//     controller/helper JS "only ever says component.get(...)" was
+//     factually wrong and has been corrected below.
+//   - D3 (lwc): kind:'lwc' `label` is now the BUNDLE-DIRECTORY name (the
+//     path segment after 'lwc/'), no longer the individual file's stem:
+//     a secondary bundle module (lwc/acmePanel/dataService.js) previously
+//     produced label 'dataService', splitting one deployable component
+//     into differently-named downstream nodes. For the dominant
+//     lwc/<bundle>/<bundle>.js layout the two values are identical, so
+//     output there is byte-identical. A .js path with no
+//     'lwc/<bundle>/<file>' shape falls back to the file stem (tolerant
+//     posture, never throws, never an empty label).
+//   - D4 (aura): kind:'aura' refs gain the same always-present
+//     `namespace: string|null` field every other namespace-carrying kind
+//     already has (null for every undotted controller= value -- the only
+//     shape emitted pre-v0.20 -- so pre-existing refs change by exactly
+//     this one added field and nothing else). A dotted
+//     controller="ns.Class" value splits via the SAME dotted
+//     single-class-tail treatment the os-meta <remoteClass> surface uses
+//     (splitDottedNamespace, tailCount 1 -- a controller= value never
+//     embeds a method segment): `className` becomes the bare class,
+//     `namespace` the verbatim prefix; scanBundle() stamps the SAME
+//     namespace onto every method-level ref it derives from that
+//     bundle's markup. The bare 'ns__Class' double-underscore form is
+//     deliberately NOT split for this surface (Aura markup references
+//     managed controllers dotted; an Apex class name can never itself
+//     contain '__', so such a value was already garbage and keeps its
+//     pre-existing inert fate). stripOwnNamespace() now naturally covers
+//     aura refs too -- it always keyed off the `namespace` field; aura
+//     simply never carried one before.
+//
 // Design notes:
 //
-// - `label` is always the file's stem (its Salesforce API name) — see
-//   stemOf() below for the compound-extension list (.flow-meta.xml,
-//   .os-meta.xml, etc.) that a naive "strip the last dot" would mangle.
+// - `label` is the file's stem (its Salesforce API name) — see stemOf()
+//   below for the compound-extension list (.flow-meta.xml, .os-meta.xml,
+//   etc.) that a naive "strip the last dot" would mangle — for every kind
+//   EXCEPT 'lwc', whose label is the bundle-directory name (v0.20/D3, see
+//   the note above extractLwc and the D3 paragraph above).
 // - `line`/`lineText` are BEST-EFFORT: the line of the matched element
 //   (import specifier, controller= attribute, actionName, remoteMethod key,
 //   ...), 1-based, with lineText trimmed the same way parser.js trims
@@ -272,7 +339,11 @@
 //   deliberately tolerant: a file
 //   that doesn't match the expected shape yields zero refs, never throws.
 // - Aura is the one source that needs CROSS-FILE context: a bundle's
-//   Controller/Helper .js only ever says `component.get('c.methodName')` —
+//   Controller/Helper .js refers to server actions as
+//   `<receiver>.get('c.methodName')`, where <receiver> is whatever the
+//   callback parameter is named (`component`, `cmp`, ... -- see
+//   AURA_GET_RE's own note; the pre-v0.20 claim that it is "only ever"
+//   the literal `component` was wrong, and was defect D2) —
 //   the class it belongs to is declared on a SIBLING .cmp/.app's
 //   `controller="..."` attribute, not in the .js file itself. Design
 //   decision: parseMetaFile() run on a single .cmp/.app still yields the
@@ -417,8 +488,22 @@ function splitBareNamespace(token) {
 // deliberately does not match — there's no method to attribute it to.
 const LWC_IMPORT_RE = /from\s+['"]@salesforce\/apex\/([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)['"]/g;
 
+// D3: an LWC ref's identity is its BUNDLE (the deployable component --
+// the directory segment after 'lwc/'), never the individual file's stem:
+// lwc/acmePanel/dataService.js belongs to component 'acmePanel'. Mirrors
+// scanBundle's own aura-segment test below; same (^|separator) tolerance
+// for absolute corpus paths and bundle-relative fixture paths. A .js path
+// with no 'lwc/<bundle>/<file>' shape falls back to the file stem
+// (tolerant posture -- never throws, never yields an empty label).
+const LWC_BUNDLE_DIR_RE = /(^|[\\/])lwc[\\/]([^\\/]+)[\\/]/i;
+
+function lwcBundleNameOf(p) {
+  const m = LWC_BUNDLE_DIR_RE.exec(String(p || ''));
+  return m ? m[2] : null;
+}
+
 function extractLwc(path, text, lineStarts, out) {
-  const label = stemOf(path);
+  const label = lwcBundleNameOf(path) || stemOf(path);
   LWC_IMPORT_RE.lastIndex = 0;
   let m;
   while ((m = LWC_IMPORT_RE.exec(text))) {
@@ -438,7 +523,17 @@ function extractLwc(path, text, lineStarts, out) {
 // --- Aura --------------------------------------------------------------
 const AURA_ROOT_RE = /<aura:(?:component|application)\b[\s\S]*?>/;
 const CONTROLLER_ATTR_RE = /\bcontroller\s*=\s*["']([\w.]+)["']/;
-const AURA_GET_RE = /component\s*\.\s*get\(\s*['"]c\.([A-Za-z_]\w*)['"]\s*\)/g;
+// D2: the receiver is ANY identifier (component/cmp/whatever the callback
+// parameter is named), not the literal 'component'. Guards, in order:
+//   - `(?<![$.\w])` -- receiver must not be preceded by '$', '.', or a
+//     word char: excludes `$A.get(...)` (global value provider / event
+//     lookups -- NOTE the char class alone would NOT exclude it, since
+//     the regex would happily match the bare 'A' inside '$A'), excludes
+//     dotted chains (`x.cmp.get(...)` -- not an idiomatic Aura receiver
+//     shape), and prevents mid-identifier matches.
+//   - the quoted argument must start with the literal 'c.' -- 'v.'/'e.'
+//     value/event lookups stay excluded exactly as before.
+const AURA_GET_RE = /(?<![$.\w])([A-Za-z_]\w*)\s*\.\s*get\(\s*['"]c\.([A-Za-z_]\w*)['"]\s*\)/g;
 
 // Class-level only: `<aura:component controller="Cls" ...>` on a single
 // .cmp/.app file. No bundle context needed or used.
@@ -450,7 +545,26 @@ function extractAuraClassLevel(path, text, lineStarts, out) {
   if (!ctrlMatch) return;
   const idx = rootMatch.index + ctrlMatch.index;
   const label = stemOf(path);
-  out.push(makeRef('aura', label, ctrlMatch[1], null, text, lineStarts, idx));
+  const raw = ctrlMatch[1];
+  // D4: controller="ns.Class" carries its namespace dotted -- the same
+  // dotted single-class-tail treatment the os-meta <remoteClass> surface
+  // gets (splitDottedNamespace with tailCount 1; a controller= value
+  // never embeds a method segment). The bare 'ns__Class' double-
+  // underscore form is deliberately NOT tried here -- Aura markup
+  // references managed controllers dotted, and an Apex class name can
+  // never itself contain '__', so an undotted '__' value keeps its
+  // pre-existing inert fate. An undotted value is byte-identical to
+  // pre-v0.20 output except for the new namespace:null field.
+  let split;
+  if (raw.indexOf('.') !== -1) {
+    const dotted = splitDottedNamespace(raw, 1);
+    split = { namespace: dotted.namespace, className: dotted.tail[0] };
+  } else {
+    split = { namespace: null, className: raw };
+  }
+  const ref = makeRef('aura', label, split.className, null, text, lineStarts, idx);
+  ref.namespace = split.namespace;
+  out.push(ref);
 }
 
 // --- Flow ------------------------------------------------------------------
@@ -476,6 +590,7 @@ const ACTION_CALLS_OPEN_TAG = '<actionCalls>';
 // Autolaunched Flows leave <object>/<recordTriggerType> absent from <start>
 // entirely, so this correctly yields {null, null} for those.
 const FLOW_START_RE = /<start>([\s\S]*?)<\/start>/;
+const FLOW_START_OPEN_TAG = '<start>';
 const FLOW_START_OBJECT_RE = /<object>([^<]+)<\/object>/;
 const FLOW_START_TRIGGER_TYPE_RE = /<triggerType>([^<]+)<\/triggerType>/;
 const FLOW_START_RECORD_TRIGGER_TYPE_RE = /<recordTriggerType>([^<]+)<\/recordTriggerType>/;
@@ -543,10 +658,16 @@ function extractFlowSubflows(text) {
 
 function extractFlowStart(text) {
   const startMatch = FLOW_START_RE.exec(text);
-  if (!startMatch) return { flowObject: null, flowRecordTriggerType: null, flowTriggerType: null };
+  if (!startMatch) return { flowObject: null, flowRecordTriggerType: null, flowTriggerType: null, anchorIdx: -1 };
   const block = startMatch[1];
   const triggerTypeMatch = FLOW_START_TRIGGER_TYPE_RE.exec(block);
   const triggerType = triggerTypeMatch ? triggerTypeMatch[1].trim() : null;
+  // Best-effort position of the <triggerType> element itself -- the
+  // concrete fact that justifies D1's zero-actionCalls synthetic ref when
+  // there is no <subflows> element to anchor at (see extractFlow below).
+  const anchorIdx = triggerTypeMatch
+    ? startMatch.index + FLOW_START_OPEN_TAG.length + triggerTypeMatch.index
+    : -1;
 
   if (triggerType === PLATFORM_EVENT_TRIGGER_TYPE) {
     const objectMatch = FLOW_START_OBJECT_RE.exec(block);
@@ -554,11 +675,12 @@ function extractFlowStart(text) {
       flowObject: objectMatch ? objectMatch[1].trim() : null,
       flowRecordTriggerType: null,
       flowTriggerType: PLATFORM_EVENT_TRIGGER_TYPE,
+      anchorIdx,
     };
   }
 
   if (!triggerType || !RECORD_TRIGGERED_TYPES.has(triggerType)) {
-    return { flowObject: null, flowRecordTriggerType: null, flowTriggerType: null };
+    return { flowObject: null, flowRecordTriggerType: null, flowTriggerType: null, anchorIdx: -1 };
   }
   const objectMatch = FLOW_START_OBJECT_RE.exec(block);
   const recordTriggerTypeMatch = FLOW_START_RECORD_TRIGGER_TYPE_RE.exec(block);
@@ -566,6 +688,7 @@ function extractFlowStart(text) {
     flowObject: objectMatch ? objectMatch[1].trim() : null,
     flowRecordTriggerType: recordTriggerTypeMatch ? recordTriggerTypeMatch[1].trim() : null,
     flowTriggerType: triggerType,
+    anchorIdx,
   };
 }
 
@@ -634,8 +757,18 @@ function extractFlow(path, text, lineStarts, out) {
   // *.flow-meta.xml" -- not "every subflows element attached to an EXISTING
   // apex ref"), emit ONE synthetic 'flow' MetaRef in exactly this case --
   // see the top-of-file flow-reference note for the full shape rationale.
-  if (subflows.length && out.length === refCountBefore) {
-    const ref = makeRef('flow', label, null, null, text, lineStarts, firstIdx);
+  // v0.20/D1: this branch now has a SECOND firing condition -- a flow whose
+  // <start> carries a RECOGNIZED <triggerType> (one of
+  // RECORD_TRIGGERED_TYPES, or PLATFORM_EVENT_TRIGGER_TYPE) and ZERO apex
+  // actionCalls, even with no <subflows> element at all. Such a flow (purely
+  // declarative record-triggered work: assignments/recordUpdates only)
+  // previously emitted NOTHING, so its flowObject/flowTriggerType facts
+  // vanished from this file's output entirely. `subflows` may therefore now
+  // be [] on this shape. See the v0.20/D1 bullet in the top-of-file contract
+  // for the full rationale and for the line/lineText anchoring rule.
+  if ((subflows.length || start.flowTriggerType) && out.length === refCountBefore) {
+    const anchorIdx = firstIdx !== -1 ? firstIdx : (start.anchorIdx !== -1 ? start.anchorIdx : 0);
+    const ref = makeRef('flow', label, null, null, text, lineStarts, anchorIdx);
     ref.namespace = null;
     ref.flowObject = start.flowObject;
     ref.flowRecordTriggerType = start.flowRecordTriggerType;
@@ -1074,8 +1207,10 @@ function parseMetaFile(file) {
  * directory, then per group: finds the .cmp/.app root's `controller="..."`
  * attribute (the class-level ref, re-derived here -- do not ALSO call
  * parseMetaFile() on the same .cmp/.app or the class-level ref double-counts)
- * and pairs every `component.get('c.methodName')` found in that group's
- * .js files with that class, producing the method-level refs. A group with
+ * and pairs every `<receiver>.get('c.methodName')` found in that group's
+ * .js files with that class -- <receiver> being any identifier, not the
+ * literal `component` (v0.20/D2; see AURA_GET_RE's own note) -- producing
+ * the method-level refs. A group with
  * no markup (no resolvable controller class) yields nothing for its .js
  * files -- there is no class to attribute them to.
  */
@@ -1115,6 +1250,7 @@ function scanBundle(files) {
     if (classRefs.length === 0) continue; // no controller declared -> nothing to attribute method-level refs to
 
     const controllerClass = classRefs[0].className;
+    const controllerNamespace = classRefs[0].namespace != null ? classRefs[0].namespace : null;
     const label = classRefs[0].label;
 
     for (const jsFile of g.jsFiles) {
@@ -1122,7 +1258,9 @@ function scanBundle(files) {
       AURA_GET_RE.lastIndex = 0;
       let m;
       while ((m = AURA_GET_RE.exec(jsFile.text))) {
-        out.push(makeRef('aura', label, controllerClass, m[1], jsFile.text, lineStarts, m.index));
+        const ref = makeRef('aura', label, controllerClass, m[2], jsFile.text, lineStarts, m.index);
+        ref.namespace = controllerNamespace;
+        out.push(ref);
       }
     }
   }
@@ -1152,8 +1290,9 @@ function scanBundle(files) {
  * the namespace prefix out of `className`/`methodName` for every kind that
  * carries a `namespace` field, so nulling it is the entire fix: the ref now
  * reads exactly like an always-local reference would have. Every other ref
- * (non-matching namespace, or no `namespace` field at all -- aura/vf, or any
- * unaffected kind) passes through as the SAME object
+ * (non-matching namespace, or no `namespace` field at all -- vf, or any
+ * unaffected kind, aura refs carry the field as of v0.20/D4 and participate
+ * normally) passes through as the SAME object
  * (never copied), so callers that rely on reference identity for refs this
  * function doesn't touch are unaffected.
  *

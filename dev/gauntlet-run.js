@@ -1762,14 +1762,15 @@ if (typeof resolver.buildEntryCatalog !== 'function') {
     bug('EC-determinism-advorg', 'v0.12.0 [MUST]: buildEntryCatalog(index) is not deterministic across two calls on the SAME adv-org index.');
   }
 
-  const advExpectedByKind = { trigger: 4, aura: 8, invocable: 2, rest: 2, soap: 1, async: 6, email: 1, platform: 3, flow: 6, anonymous: 1 };
+  // v0.20.0: total 34 -> 37 (+1 Flow, +2 Aura fixtures -- M1 defect round; see MANIFEST.md's own v0.20 section).
+  const advExpectedByKind = { trigger: 4, aura: 10, invocable: 2, rest: 2, soap: 1, async: 6, email: 1, platform: 3, flow: 7, anonymous: 1 };
   for (const [kind, expected] of Object.entries(advExpectedByKind)) {
     const actual = (advCatalog.stats.byKind && advCatalog.stats.byKind[kind]) || 0;
     if (actual !== expected) {
       bug('EC-count-advorg-' + kind, `MANIFEST.md '## Entry catalog' [MUST]: kind='${kind}' expected count ${expected}, got ${actual}.`);
     }
   }
-  if (advCatalog.stats.total !== 34) bug('EC-total-advorg', `MANIFEST.md [MUST]: expected total=34, got ${advCatalog.stats.total}.`);
+  if (advCatalog.stats.total !== 37) bug('EC-total-advorg', `MANIFEST.md [MUST]: expected total=37, got ${advCatalog.stats.total}.`);
   if (advCatalog.stats.excludedTestEntries !== 0) bug('EC-excluded-advorg', `MANIFEST.md [MUST]: expected excludedTestEntries=0, got ${advCatalog.stats.excludedTestEntries}.`);
   if (!Array.isArray(advCatalog.stats.packages) || advCatalog.stats.packages.length !== 0) bug('EC-packages-advorg', `MANIFEST.md [MUST]: every annotated class lives in the default package -- expected packages=[], got ${JSON.stringify(advCatalog.stats.packages)}.`);
 
@@ -1802,8 +1803,8 @@ if (typeof resolver.buildEntryCatalog !== 'function') {
   advCheckEntry('spot14', 'platform', 'AcmeReconciliationFinalizer.execute', 'Finalizer (async)');
   advCheckEntry('spot15', 'flow', 'AcmeOrderCreatedWelcomeFlow', 'RecordAfterSave on Acme_Order__c');
 
-  // MANIFEST.md's "Additional flow details" paragraph -- the other 5 of
-  // the corpus's 6 flow files, exercising all 3 flow detail shapes
+  // MANIFEST.md's "Additional flow details" paragraph -- the other 6 of
+  // the corpus's 7 flow files, exercising all 3 flow detail shapes
   // (record-triggered, platform-event [the ruling-1 lowercase-string
   // case], and the 'screen or autolaunched' fallback).
   advCheckEntry('flow-note', 'flow', 'AcmeNoteEventFlow', 'platform event on Acme_Note__e');
@@ -1817,8 +1818,11 @@ if (typeof resolver.buildEntryCatalog !== 'function') {
   // AcmeQuoteApprovalScreenFlow have zero parents each -- unchanged.
   advCheckEntry('flow-notifysub', 'flow', 'AcmeNotifyCustomerSubflow', 'screen or autolaunched (subflow of AcmeBackorderResolutionFlow)');
   advCheckEntry('flow-quoteapproval', 'flow', 'AcmeQuoteApprovalScreenFlow', 'screen or autolaunched');
+  advCheckEntry('flow-escalation', 'flow', 'AcmeEscalationCleanupFlow', 'RecordAfterSave on Acme_Escalation__c');
+  advCheckEntry('aura-return-summary', 'aura', 'AcmeReturnConsoleController.getReturnSummary', '@AuraEnabled (LWC/Aura)');
+  advCheckEntry('aura-return-summarize', 'aura', 'AcmeReturnConsoleController.summarizeReturns', '@AuraEnabled (LWC/Aura)');
 
-  console.log('adv-org: counts-per-kind + all 15 representative spot entries + the 5 remaining flow details checked.');
+  console.log('adv-org: counts-per-kind + all 15 representative spot entries + the 6 remaining flow details checked.');
 
   // v0.13.0: MANIFEST.md "## v0.13 subflow chains (adv-org)" -> "The
   // promoted edge" table -- the famous historically-invisible

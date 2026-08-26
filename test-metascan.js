@@ -338,6 +338,50 @@ function refsOf(kind, refs) {
   assert.deepStrictEqual(refs, [], '__tests__ path must yield zero refs even for a namespaced specifier');
 }
 
+// 5b. v0.20/D3: a secondary bundle module (not the main bundle file) must
+//     still label its ref with the BUNDLE name, never its own file stem.
+{
+  const refs = parseMetaFile({
+    path: 'lwc/acmeOrderDashboard/orderChartUtils.js',
+    text: "import x from '@salesforce/apex/AcmeReturnConsoleController.summarizeReturns';",
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].label, 'acmeOrderDashboard', 'label must be the bundle, not the file stem orderChartUtils');
+}
+
+// 5c. v0.20/D3: absolute corpus-style path shape -- the bundle segment is
+//     still found regardless of how many directories precede 'lwc/'.
+{
+  const refs = parseMetaFile({
+    path: 'force-app/main/default/lwc/acmeQuoteWizard/wizardHelpers.js',
+    text: "import x from '@salesforce/apex/AcmeQuoteAuraService.createQuote';",
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].label, 'acmeQuoteWizard');
+}
+
+// 5d. v0.20/D3: fallback -- a .js path with no 'lwc/<bundle>/' segment at
+//     all falls back to the file stem, unchanged pre-v0.20 behavior.
+{
+  const refs = parseMetaFile({
+    path: 'scripts/standaloneImport.js',
+    text: "import x from '@salesforce/apex/AcmeQuoteAuraService.createQuote';",
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].label, 'standaloneImport');
+}
+
+// 5e. v0.20/D3: a nested subdirectory inside the bundle still resolves to
+//     the FIRST segment after 'lwc/' -- the bundle, not the nested folder.
+{
+  const refs = parseMetaFile({
+    path: 'lwc/acmePanel/utils/helper.js',
+    text: "import x from '@salesforce/apex/AcmeQuoteAuraService.createQuote';",
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].label, 'acmePanel');
+}
+
 // ===========================================================================
 // Aura — class-level controller= attribute (single-file) + bundle pairing
 // ===========================================================================
@@ -414,6 +458,11 @@ function refsOf(kind, refs) {
   assert.strictEqual(methodRef.className, 'AcmeShipmentAuraService');
   assert.strictEqual(methodRef.methodName, 'getShipmentStatuses');
   assert.strictEqual(methodRef.label, 'AcmeShipmentStatusBoard');
+  // v0.20/D4: an undotted controller= value always carries namespace: null --
+  // the always-present-null shape, additive over the pre-existing assertions
+  // above.
+  assert.strictEqual(classRef.namespace, null);
+  assert.strictEqual(methodRef.namespace, null);
 }
 
 // 9. scanBundle: a .js file with NO sibling .cmp/.app in its directory
@@ -437,10 +486,14 @@ function refsOf(kind, refs) {
     { path: 'aura/AcmeMultiActionBundle/AcmeMultiActionBundleController.js', text: controllerJs },
     { path: 'aura/AcmeMultiActionBundle/AcmeMultiActionBundleHelper.js', text: helperJs },
   ]);
-  // controllerJs uses `cmp.get(...)` (not `component.get(...)`) so it must NOT match --
-  // only helperJs's `component.get('c.actionTwo')` plus the class-level ref.
-  assert.strictEqual(refs.length, 2);
+  // v0.20/D2 inversion: `cmp.get(...)` IS a server-action lookup and MUST
+  // match -- the receiver is ANY identifier, not the literal 'component'.
+  // The pre-v0.20 pin of the opposite (controllerJs's `cmp.get(...)` must
+  // NOT match) was defect D2. Both controllerJs's actionOne and helperJs's
+  // actionTwo now pair to the one controller class, plus the class-level ref.
+  assert.strictEqual(refs.length, 3);
   assert.ok(refs.some((r) => r.methodName === null && r.className === 'AcmeMultiActionController'));
+  assert.ok(refs.some((r) => r.methodName === 'actionOne' && r.className === 'AcmeMultiActionController'));
   assert.ok(refs.some((r) => r.methodName === 'actionTwo' && r.className === 'AcmeMultiActionController'));
 }
 
@@ -485,6 +538,136 @@ function refsOf(kind, refs) {
     { path: 'aura/AcmeNoController/AcmeNoControllerController.js', text: jsText },
   ]);
   assert.deepStrictEqual(refsBundle, []);
+}
+
+// 13a. v0.20/D2: receiver variety -- `component.get`, `cmp.get`, and
+//      `c.get` (three distinct receiver identifiers, one line each) all
+//      match and pair to the one controller class.
+{
+  const cmpText = '<aura:component controller="AcmeReceiverVarietyController"></aura:component>';
+  const jsText = [
+    "component.get('c.actionA');",
+    "cmp.get('c.actionB');",
+    "c.get('c.actionC');",
+  ].join('\n');
+  const refs = scanBundle([
+    { path: 'aura/AcmeReceiverVarietyBundle/AcmeReceiverVarietyBundle.cmp', text: cmpText },
+    { path: 'aura/AcmeReceiverVarietyBundle/AcmeReceiverVarietyBundleController.js', text: jsText },
+  ]);
+  assert.strictEqual(refs.length, 4, '1 class-level + 3 method-level (one per receiver style)');
+  assert.ok(refs.some((r) => r.methodName === 'actionA' && r.line === 1));
+  assert.ok(refs.some((r) => r.methodName === 'actionB' && r.line === 2));
+  assert.ok(refs.some((r) => r.methodName === 'actionC' && r.line === 3));
+}
+
+// 13b. Negative -- `$A.get('c.phantom')` must NOT match: the receiver `A`
+//      inside `$A` is excluded by the lookbehind (a global value provider
+//      lookup, not a server-action call).
+{
+  const cmpText = '<aura:component controller="AcmeGlobalValueProviderController"></aura:component>';
+  const jsText = "$A.get('c.phantom');";
+  const refs = scanBundle([
+    { path: 'aura/AcmeGvpBundle/AcmeGvpBundle.cmp', text: cmpText },
+    { path: 'aura/AcmeGvpBundle/AcmeGvpBundleController.js', text: jsText },
+  ]);
+  assert.strictEqual(refs.length, 1, 'only the class-level ref -- $A.get(...) yields no method-level ref');
+  assert.ok(refs.every((r) => r.methodName === null));
+}
+
+// 13c. Negative -- a dotted receiver chain (`helperState.cmp.get(...)`)
+//      must NOT match: not an idiomatic Aura receiver shape.
+{
+  const cmpText = '<aura:component controller="AcmeDottedChainController"></aura:component>';
+  const jsText = "helperState.cmp.get('c.chained');";
+  const refs = scanBundle([
+    { path: 'aura/AcmeDottedChainBundle/AcmeDottedChainBundle.cmp', text: cmpText },
+    { path: 'aura/AcmeDottedChainBundle/AcmeDottedChainBundleController.js', text: jsText },
+  ]);
+  assert.strictEqual(refs.length, 1, 'only the class-level ref -- dotted chains stay excluded');
+  assert.ok(refs.every((r) => r.methodName === null));
+}
+
+// 13d. Negative -- non-'c.' args (`v.`/`e.` value/event lookups) stay
+//      excluded, unchanged from pre-v0.20, regardless of receiver identity.
+{
+  const cmpText = '<aura:component controller="AcmeValueEventLookupController"></aura:component>';
+  const jsText = "cmp.get('v.recordId'); cmp.get('e.notify');";
+  const refs = scanBundle([
+    { path: 'aura/AcmeValueEventLookupBundle/AcmeValueEventLookupBundle.cmp', text: cmpText },
+    { path: 'aura/AcmeValueEventLookupBundle/AcmeValueEventLookupBundleController.js', text: jsText },
+  ]);
+  assert.strictEqual(refs.length, 1, 'only the class-level ref -- v./e. lookups never matched and still do not');
+  assert.ok(refs.every((r) => r.methodName === null));
+}
+
+// 13e. v0.20/D4: class-level dotted split -- controller="zenq.KappaGateway"
+//      splits into namespace 'zenq' + className 'KappaGateway', the same
+//      dotted single-class-tail treatment the os-meta <remoteClass> surface
+//      uses.
+{
+  const refs = parseMetaFile({
+    path: 'aura/AcmeKappaGatewayPanel/AcmeKappaGatewayPanel.cmp',
+    text: '<aura:component controller="zenq.KappaGateway"></aura:component>',
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'KappaGateway');
+  assert.strictEqual(refs[0].namespace, 'zenq');
+  assert.strictEqual(refs[0].methodName, null);
+}
+
+// 13f. v0.20/D4: scanBundle propagation -- the class-level namespace is
+//      stamped onto every method-level ref scanBundle derives from that
+//      bundle's markup too.
+{
+  const cmpText = '<aura:component controller="zenq.KappaGateway"></aura:component>';
+  const jsText = "cmp.get('c.refreshGateway');";
+  const refs = scanBundle([
+    { path: 'aura/AcmeKappaGatewayPanel/AcmeKappaGatewayPanel.cmp', text: cmpText },
+    { path: 'aura/AcmeKappaGatewayPanel/AcmeKappaGatewayPanelController.js', text: jsText },
+  ]);
+  assert.strictEqual(refs.length, 2);
+  assert.ok(refs.every((r) => r.namespace === 'zenq'), 'both class-level and method-level refs carry the same namespace');
+  const methodRef = refs.find((r) => r.methodName !== null);
+  assert.ok(methodRef);
+  assert.strictEqual(methodRef.className, 'KappaGateway');
+  assert.strictEqual(methodRef.methodName, 'refreshGateway');
+}
+
+// 13g. Negative -- the bare 'ns__Class' double-underscore form is
+//      deliberately NOT split for the controller= surface: an Apex class
+//      name can never itself contain '__', so this value keeps its
+//      pre-existing inert fate verbatim.
+{
+  const refs = parseMetaFile({
+    path: 'aura/AcmeLegacyGatewayPanel/AcmeLegacyGatewayPanel.cmp',
+    text: '<aura:component controller="vtx__LegacyGateway"></aura:component>',
+  });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, 'vtx__LegacyGateway', 'no __ split attempted on this surface');
+  assert.strictEqual(refs[0].namespace, null);
+}
+
+// 13h. v0.20/D4: stripOwnNamespace now naturally covers aura refs -- it
+//      always keyed off the `namespace` field; aura simply never carried
+//      one before.
+{
+  const cmpText = '<aura:component controller="zenq.KappaGateway"></aura:component>';
+  const jsText = "cmp.get('c.refreshGateway');";
+  const refs = scanBundle([
+    { path: 'aura/AcmeKappaGatewayPanel/AcmeKappaGatewayPanel.cmp', text: cmpText },
+    { path: 'aura/AcmeKappaGatewayPanel/AcmeKappaGatewayPanelController.js', text: jsText },
+  ]);
+  const strippedOwn = stripOwnNamespace(refs, 'zenq');
+  assert.strictEqual(strippedOwn.length, 2);
+  for (let i = 0; i < refs.length; i++) {
+    assert.strictEqual(strippedOwn[i].namespace, null, 'own-namespace strip resets namespace to null');
+    assert.strictEqual(strippedOwn[i].className, refs[i].className);
+    assert.strictEqual(strippedOwn[i].methodName, refs[i].methodName);
+  }
+  const strippedForeign = stripOwnNamespace(refs, 'kwx');
+  for (let i = 0; i < refs.length; i++) {
+    assert.strictEqual(strippedForeign[i], refs[i], 'a foreign namespace leaves the ref as the same object');
+  }
 }
 
 // ===========================================================================
@@ -1651,7 +1834,7 @@ function refsOf(kind, refs) {
   );
 }
 
-// 40. Refs with no `namespace` field at all (aura/vf, or any kind this
+// 40. Refs whose `namespace` is null or absent (vf, aura's undotted shape, or any kind this
 //     amendment doesn't touch) pass through as the exact SAME object
 //     reference, never copied -- stripOwnNamespace must be a true no-op for
 //     kinds it has nothing to do.
@@ -1666,7 +1849,7 @@ function refsOf(kind, refs) {
   });
   const strippedAura = stripOwnNamespace(auraRefs, 'anyns');
   const strippedVf = stripOwnNamespace(vfRefs, 'anyns');
-  assert.strictEqual(strippedAura[0], auraRefs[0], 'aura ref (no namespace field) must pass through as the same object');
+  assert.strictEqual(strippedAura[0], auraRefs[0], 'aura ref (namespace null as of v0.20/D4) must pass through as the same object');
   assert.strictEqual(strippedVf[0], vfRefs[0], 'vf ref (no namespace field) must pass through as the same object');
 }
 
@@ -2320,6 +2503,117 @@ console.log('metascan.js inline-fixture self-check: all assertions passed');
   assert.deepStrictEqual(refs[0].subflows, ['AcmeWidgetNotifySubflow']);
 }
 
+// 60l. v0.20/D1: a declarative-only record-triggered flow (RecordAfterSave,
+//      zero apex actionCalls, zero <subflows>) now emits exactly ONE
+//      synthetic ref carrying the file's <start> record-trigger facts,
+//      anchored at the <triggerType> element itself (no <subflows> element
+//      exists to anchor at).
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <connector><targetReference>Set_Flag</targetReference></connector>',
+    '        <object>Acme_Widget__c</object>',
+    '        <recordTriggerType>Update</recordTriggerType>',
+    '        <triggerType>RecordAfterSave</triggerType>',
+    '    </start>',
+    '    <assignments>',
+    '        <name>Set_Flag</name>',
+    '        <assignmentItems>',
+    '            <assignToReference>$Record.Acme_Processed__c</assignToReference>',
+    '            <operator>Assign</operator>',
+    '            <value><booleanValue>true</booleanValue></value>',
+    '        </assignmentItems>',
+    '    </assignments>',
+    '    <recordUpdates>',
+    '        <name>Update_Widget</name>',
+    '        <inputReference>$Record</inputReference>',
+    '    </recordUpdates>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeWidgetCleanupFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1, 'v0.20/D1: declarative-only record-triggered flow must emit exactly one synthetic ref');
+  assert.strictEqual(refs[0].kind, 'flow');
+  assert.strictEqual(refs[0].className, null);
+  assert.strictEqual(refs[0].methodName, null);
+  assert.strictEqual(refs[0].namespace, null);
+  assert.strictEqual(refs[0].flowObject, 'Acme_Widget__c');
+  assert.strictEqual(refs[0].flowRecordTriggerType, 'Update');
+  assert.strictEqual(refs[0].flowTriggerType, 'RecordAfterSave');
+  assert.deepStrictEqual(refs[0].subflows, []);
+  assert.strictEqual(refs[0].line, 6, 'anchors at the <triggerType> element -- no <subflows> element exists to anchor at instead');
+  assert.strictEqual(refs[0].lineText, '<triggerType>RecordAfterSave</triggerType>');
+}
+
+// 60m. v0.20/D1: a declarative-only PLATFORM-EVENT flow (triggerType
+//      PlatformEvent, zero apex actionCalls, zero <subflows>) also gets the
+//      synthetic ref; flowRecordTriggerType stays null (platform-event start
+//      blocks never carry it).
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <connector><targetReference>Notify</targetReference></connector>',
+    '        <object>Acme_Note__e</object>',
+    '        <triggerType>PlatformEvent</triggerType>',
+    '    </start>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeNoteRelayFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].className, null);
+  assert.strictEqual(refs[0].flowTriggerType, 'PlatformEvent');
+  assert.strictEqual(refs[0].flowObject, 'Acme_Note__e');
+  assert.strictEqual(refs[0].flowRecordTriggerType, null);
+  assert.deepStrictEqual(refs[0].subflows, []);
+}
+
+// 60n. Negative -- an UNRECOGNIZED <triggerType> (Scheduled) with zero apex
+//      actionCalls and zero <subflows> still yields nothing at all:
+//      'Scheduled' stays deliberately unrecognized in this package (see the
+//      plan's Non-goals).
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <connector><targetReference>Foo</targetReference></connector>',
+    '        <triggerType>Scheduled</triggerType>',
+    '    </start>',
+    '</Flow>',
+  ]);
+  assert.deepStrictEqual(parseMetaFile({ path: 'flows/AcmeScheduledSweepFlow.flow-meta.xml', text }), []);
+}
+
+// 60o. Precedence -- when a record-triggered flow has BOTH a recognized
+//      <triggerType> AND a <subflows> element (with zero apex actionCalls),
+//      the synthetic ref still anchors at the <flowName> element, exactly as
+//      before v0.20 -- the <start>-anchor fallback only applies when there
+//      is no <subflows> element at all (test 60h/60k behavior unchanged).
+{
+  const text = src([
+    '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+    '    <start>',
+    '        <connector><targetReference>Call_Child</targetReference></connector>',
+    '        <object>Acme_Widget__c</object>',
+    '        <recordTriggerType>Create</recordTriggerType>',
+    '        <triggerType>RecordBeforeSave</triggerType>',
+    '    </start>',
+    '    <subflows>',
+    '        <name>Call_Child</name>',
+    '        <flowName>AcmeWidgetChildFlow</flowName>',
+    '    </subflows>',
+    '</Flow>',
+  ]);
+  const refs = parseMetaFile({ path: 'flows/AcmeWidgetOrchestratorFlow.flow-meta.xml', text });
+  assert.strictEqual(refs.length, 1);
+  assert.strictEqual(refs[0].flowObject, 'Acme_Widget__c');
+  assert.strictEqual(refs[0].flowRecordTriggerType, 'Create');
+  assert.strictEqual(refs[0].flowTriggerType, 'RecordBeforeSave');
+  assert.deepStrictEqual(refs[0].subflows, ['AcmeWidgetChildFlow']);
+  assert.strictEqual(refs[0].line, 10, 'anchors at <flowName>, not <triggerType>, when a <subflows> element exists');
+  assert.strictEqual(refs[0].lineText, '<flowName>AcmeWidgetChildFlow</flowName>');
+}
+
 console.log('metascan.js v0.13 subflow-extraction inline self-check: all assertions passed');
 
 // ===========================================================================
@@ -2372,6 +2666,17 @@ const t0 = Date.now();
   assert.deepStrictEqual(jestSpec, [], 'the __tests__ jest mock must yield NO refs');
 }
 
+// v0.20/D3: the real adv-org acmeOrderDashboard bundle's secondary module
+// orderChartUtils.js -- its ref MUST label as the bundle 'acmeOrderDashboard',
+// never the file stem 'orderChartUtils'.
+{
+  const chartUtils = parseMetaFile(readCorpus('lwc/acmeOrderDashboard/orderChartUtils.js'));
+  assert.strictEqual(chartUtils.length, 1);
+  assert.strictEqual(chartUtils[0].label, 'acmeOrderDashboard', 'D3: secondary module labels as the bundle, not its own file stem');
+  assert.strictEqual(chartUtils[0].className, 'AcmeReturnConsoleController');
+  assert.strictEqual(chartUtils[0].methodName, 'summarizeReturns');
+}
+
 // --- Aura (scanBundle, both bundles together) ---------------------------
 {
   const auraFiles = [
@@ -2398,6 +2703,29 @@ const t0 = Date.now();
   assert.ok(
     findRef(refs, 'AcmeShipmentAuraService', 'getShipmentStatuses'),
     "AcmeShipmentStatusBoardController.js -> AcmeShipmentAuraService.getShipmentStatuses (component.get('c.getShipmentStatuses'))"
+  );
+}
+
+// v0.20/D2: the real adv-org AcmeReturnConsolePanel bundle -- its controller
+// JS uses the `cmp` receiver style (`cmp.get('c.getReturnSummary')`), not
+// the literal `component`, plus a sibling `$A.get('e.force:showToast')`
+// line that must contribute nothing. This bundle is its OWN block, NOT
+// added to the two-bundle `auraFiles` array above (which would force that
+// block's pinned `4` to become `6`).
+{
+  const returnConsoleFiles = [
+    readCorpus('aura/AcmeReturnConsolePanel/AcmeReturnConsolePanel.cmp'),
+    readCorpus('aura/AcmeReturnConsolePanel/AcmeReturnConsolePanelController.js'),
+  ];
+  const refs = scanBundle(returnConsoleFiles);
+  assert.strictEqual(refs.length, 2, '1 class-level + 1 method-level (cmp.get receiver style)');
+  assert.ok(
+    findRef(refs, 'AcmeReturnConsoleController', null),
+    'AcmeReturnConsolePanel.cmp -> AcmeReturnConsoleController (controller= attribute)'
+  );
+  assert.ok(
+    findRef(refs, 'AcmeReturnConsoleController', 'getReturnSummary'),
+    "AcmeReturnConsolePanelController.js -> AcmeReturnConsoleController.getReturnSummary (cmp.get('c.getReturnSummary'))"
   );
 }
 
@@ -2493,6 +2821,25 @@ const t0 = Date.now();
   // subflows.length is also 0 for this file).
   const notifySubflow = parseMetaFile(readCorpus('flows/AcmeNotifyCustomerSubflow.flow-meta.xml'));
   assert.deepStrictEqual(notifySubflow, [], 'v0.13 regression: no <subflows> element in this file -- must stay []');
+}
+
+// v0.20/D1: the real adv-org AcmeEscalationCleanupFlow -- a declarative-only
+// RecordAfterSave/Update flow on Acme_Escalation__c (zero apex actionCalls,
+// zero <subflows>) that previously vanished from this file's output
+// entirely. See MANIFEST.md's own v0.20/D1 bullet for the promised shape.
+{
+  const escalation = parseMetaFile(readCorpus('flows/AcmeEscalationCleanupFlow.flow-meta.xml'));
+  assert.strictEqual(escalation.length, 1, 'v0.20/D1: exactly one synthetic ref for the declarative-only flow');
+  assert.strictEqual(escalation[0].kind, 'flow');
+  assert.strictEqual(escalation[0].className, null);
+  assert.strictEqual(escalation[0].methodName, null);
+  assert.strictEqual(escalation[0].namespace, null);
+  assert.strictEqual(escalation[0].flowObject, 'Acme_Escalation__c');
+  assert.strictEqual(escalation[0].flowRecordTriggerType, 'Update');
+  assert.strictEqual(escalation[0].flowTriggerType, 'RecordAfterSave');
+  assert.deepStrictEqual(escalation[0].subflows, []);
+  assert.strictEqual(escalation[0].line, 17, 'anchors at the <triggerType> element');
+  assert.strictEqual(escalation[0].lineText, '<triggerType>RecordAfterSave</triggerType>');
 }
 
 // --- Custom Metadata (F4b) ------------------------------------------------
