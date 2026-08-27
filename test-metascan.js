@@ -142,6 +142,20 @@ function refsOf(kind, refs) {
   assert.ok(globs.includes('**/profiles/**/*.profile-meta.xml'));
 }
 
+// v0.2x/K2: the bundle-name rosters are stamped in extension.js with no
+// integration harness around that seam, so pin the wiring source-text the
+// same way the META_GLOBS pin above does -- a lwc/aura transposition or a
+// divergent path list must fail here, not in the field.
+{
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.js'), 'utf8');
+  assert.ok(extensionSource.includes("const metaScanPaths = metaScan.files.map((f) => (f && f.path) || '');"),
+    'K2 rosters derive from metaScan.files -- the same list flowFilePaths comes from');
+  assert.ok(extensionSource.includes("index.lwcBundleNames = resolver.collectBundleNames(metaScanPaths, 'lwc');"),
+    "extension.js stamps index.lwcBundleNames from the 'lwc' roster (no transposition)");
+  assert.ok(extensionSource.includes("index.auraBundleNames = resolver.collectBundleNames(metaScanPaths, 'aura');"),
+    "extension.js stamps index.auraBundleNames from the 'aura' roster (no transposition)");
+}
+
 // v0.20/K1: stemOf is now exported directly (the compound-extension matrix
 // itself is pinned exhaustively in test-kindparity.js assertion 7).
 {
@@ -3884,3 +3898,49 @@ console.log('metascan.js v0.10-B gauntlet-org VF regression self-check: all asse
 }
 
 console.log('metascan.js v0.13 gauntlet-org subflow-chains regression self-check: all assertions passed');
+
+// ---- K2: no shipped extractor emits targetKind/targetName/targetVia -----
+{
+  const sweepFiles = [
+    { path: 'force-app/main/default/lwc/acmeK2Sweep/acmeK2Sweep.js',
+      text: "import fetchRows from '@salesforce/apex/AcmeK2SweepSvc.fetchRows';\nexport default class AcmeK2Sweep {}" },
+    { path: 'force-app/main/default/flows/Acme_K2_Sweep_Flow.flow-meta.xml',
+      text: ['<?xml version="1.0" encoding="UTF-8"?>',
+        '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">',
+        '  <actionCalls>',
+        '    <name>Invoke_Sweep</name>',
+        '    <actionName>AcmeK2SweepInvocable</actionName>',
+        '    <actionType>apex</actionType>',
+        '  </actionCalls>',
+        '  <start><triggerType>RecordAfterSave</triggerType><object>Account</object><recordTriggerType>Update</recordTriggerType></start>',
+        '  <subflows><name>Call_Child</name><flowName>Acme_K2_Sweep_Child</flowName></subflows>',
+        '</Flow>'].join('\n') },
+    { path: 'force-app/main/default/pages/AcmeK2Sweep.page',
+      text: '<apex:page controller="AcmeK2SweepCtrl" action="{!bootstrap}"><apex:commandButton action="{!save}" value="Save"/></apex:page>' },
+    { path: 'force-app/main/default/customMetadata/Acme_Cfg.K2_Sweep.md-meta.xml',
+      text: '<CustomMetadata><values><field>Handler_Class_Name__c</field><value xsi:type="xsd:string">AcmeK2SweepHandler</value></values></CustomMetadata>' },
+    { path: 'force-app/main/default/permissionsets/Acme_K2_Sweep.permissionset-meta.xml',
+      text: '<PermissionSet><classAccesses><apexClass>AcmeK2SweepSvc</apexClass><enabled>true</enabled></classAccesses></PermissionSet>' },
+    { path: 'force-app/main/default/profiles/Acme_K2_Sweep.profile-meta.xml',
+      text: '<Profile><classAccesses><apexClass>AcmeK2SweepSvc</apexClass><enabled>true</enabled></classAccesses></Profile>' },
+    { path: 'force-app/main/default/omniscripts/Acme_K2_Sweep.os-meta.xml',
+      text: '<OmniScript><remoteClass>AcmeK2SweepRemote</remoteClass><remoteMethod>invoke</remoteMethod></OmniScript>' },
+    { path: 'force-app/main/default/omniscripts/Acme_K2_Sweep_DataPack.json',
+      text: '{"propertySetConfig":{"remoteClass":"AcmeK2SweepRemote","remoteMethod":"invoke"}}' },
+  ];
+  const allRefs = [];
+  for (const f of sweepFiles) allRefs.push(...parseMetaFile(f));
+  allRefs.push(...scanBundle([
+    { path: 'force-app/main/default/aura/acmeK2SweepPanel/acmeK2SweepPanel.cmp',
+      text: '<aura:component controller="AcmeK2SweepCtrl"></aura:component>' },
+    { path: 'force-app/main/default/aura/acmeK2SweepPanel/acmeK2SweepPanelController.js',
+      text: "({ load: function(component) { var a = component.get('c.fetchRows'); } })" },
+  ]));
+  assert.strictEqual(allRefs.length, 12,
+    'K2 sweep: 1 lwc + 1 flow apex action + 3 vf (class-level + 2 action bindings) + 1 cmdt + 1 permissionset + 1 profile + 1 omniscript xml + 1 omniscript json + 2 aura (class-level + method-level) = 12');
+  for (const ref of allRefs) {
+    assert.ok(!('targetKind' in ref) && !('targetName' in ref) && !('targetVia' in ref),
+      `K2 invariant 1: no shipped extractor stamps targetKind/targetName/targetVia (violated by ${ref.kind}:${ref.label})`);
+  }
+}
+console.log('metascan.js K2 default-absence self-check: all assertions passed');

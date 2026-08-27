@@ -452,6 +452,44 @@
 //     PlatformEvent shape; flowRecordTriggerType stays null always (a
 //     scheduled flow never carries <recordTriggerType>).
 //
+// v0.2x/K2: metadata-to-metadata target fields, purely additive -- every
+// field documented above keeps its exact pre-existing meaning, and every
+// ref this file emitted before this note is byte-identical (none of the
+// pre-existing extractors stamp any of the three new fields):
+//
+//   - THREE new OPTIONAL fields, always present together or absent
+//     together: { targetKind, targetName, targetVia }. ABSENT on every ref
+//     whose target is an Apex class/method (all pre-K2 shapes) -- absence
+//     and the value 'apex' mean the same thing to a downstream consumer,
+//     and metascan itself never stamps 'apex' explicitly (absence IS the
+//     default). When present, the ref names a NON-Apex target:
+//     `targetKind` is one of kinds.js's TARGET_KINDS, `targetName` is the
+//     referenced component's API name verbatim (case preserved; when the
+//     source syntax carries a namespace prefix it is split into the
+//     existing `namespace` field first, same as every Apex-target shape
+//     above), and `targetVia` is the edge label the downstream consumer
+//     (resolver.js's attachMetaCallers, out of scope here) must stamp on
+//     the resulting edge -- always a member of the fixed via vocabulary,
+//     so the diagnostics histogram never silently drops it.
+//   - On any ref carrying targetKind, `className` and `methodName` are
+//     BOTH null, always: the Apex-target fields and the metadata-target
+//     fields are mutually exclusive by construction, which is what keeps
+//     the pre-existing "no className -> skip" consumer path from ever
+//     double-routing one ref.
+//   - targetKind:'component' is the DELIBERATELY AMBIGUOUS value: a
+//     FlexiPage componentName, a Flow screen field's extensionName, an
+//     Aura c: markup tag, and a legacy CustomTab lightningComponent all
+//     name an LWC bundle and an Aura bundle identically, and this file
+//     has no file index (per the header contract) so it CANNOT know which
+//     exists. Resolution is resolver.js's job (out of scope here), against
+//     caller-supplied bundle rosters in kinds.js's
+//     BARE_COMPONENT_RESOLUTION_ORDER (lwc first, then aura); a name in
+//     neither roster stays an honest unresolved reference -- counted,
+//     rendered approximate, never guessed. Extractors whose syntax IS
+//     unambiguous (an LWC 'c/x' import or <c-kebab> template tag, a
+//     QuickAction <lightningWebComponent>, a CustomTab <lwcComponent>/
+//     <auraComponent>) emit the exact kind and never 'component'.
+//
 // Design notes:
 //
 // - `label` is the file's stem (its Salesforce API name) — see stemOf()

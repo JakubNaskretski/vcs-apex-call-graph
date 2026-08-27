@@ -2355,6 +2355,18 @@ async function activate(context) {
         }
         resolver.attachMetaCallers(index, strippedMetaRefs);
         index.flowFilePaths = flowFilePaths;
+        // K2 rosters: lowercased lwc/aura bundle-directory stems, derived
+        // from the SAME metaScan.files list flowFilePaths is derived from
+        // above -- stamped here, after attachMetaCallers, for exactly the
+        // ordering reason index.flowFilePaths' own note gives (resolver.js's
+        // v0.13/S2 ORDERING NOTE): their only consumer
+        // (resolver.finalizeMetaTargets, a no-op until the node/edge store
+        // lands) runs lazily, always after this assignment. Same best-effort
+        // posture as flowFilePaths: metaScan.files defaults to [] on any
+        // scan failure, so these degrade to empty Sets, never block a trace.
+        const metaScanPaths = metaScan.files.map((f) => (f && f.path) || '');
+        index.lwcBundleNames = resolver.collectBundleNames(metaScanPaths, 'lwc');
+        index.auraBundleNames = resolver.collectBundleNames(metaScanPaths, 'aura');
         phaseMs.index = Date.now() - tIndex0;
 
         // v0.2x/M2W: store this build so a later no-op scan can reuse it

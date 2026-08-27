@@ -7,7 +7,7 @@
 // must-cover behaviors from the task brief (see the section markers below).
 
 const assert = require('assert');
-const { buildSemanticIndex, buildCallerTree, buildCalleeTree, suggestTargets, attachMetaCallers, buildEntryCatalog, buildImpactReport, impactMethodSignature, clampInt } = require('./resolver');
+const { buildSemanticIndex, buildCallerTree, buildCalleeTree, suggestTargets, attachMetaCallers, buildEntryCatalog, buildImpactReport, impactMethodSignature, clampInt, finalizeMetaTargets, resolveBareComponentTarget, collectBundleNames } = require('./resolver');
 
 // ---- fixture builders (mirror the frozen contract's field names exactly) --
 
@@ -7692,6 +7692,121 @@ function v13FlattenRollup(nodes) {
   assert.strictEqual(sub.via, 'subflow');
   assert.strictEqual(sub.flowStatus, 'Obsolete', 'v0.2x/M2W: D5 -- buildOneFlowNode must carry flowStatus onto the subflow-chain TNode');
   assert.strictEqual(sub.flowHasScheduledPaths, false);
+}
+
+// ---- K2: MetaRef targetKind/targetName/targetVia schema seam ------------
+{
+  const AcmeK2Target = ty('AcmeK2Target', 'AcmeK2Target', { methods: [mth('run', { line: 2 })] });
+  const mkRefs = (extra) => ([
+    Object.assign({ kind: 'lwc', label: 'acmeQuotePanel', className: 'AcmeK2Target',
+      methodName: 'run', namespace: null,
+      path: 'force-app/main/default/lwc/acmeQuotePanel/acmeQuotePanel.js', line: 3,
+      lineText: "import run from '@salesforce/apex/AcmeK2Target.run';" }, extra),
+    Object.assign({ kind: 'flow', label: 'Acme_K2_Probe_Flow', className: 'AcmeK2Target',
+      methodName: null, namespace: null, flowObject: null, flowRecordTriggerType: null,
+      flowTriggerType: null, subflows: [],
+      path: 'force-app/main/default/flows/Acme_K2_Probe_Flow.flow-meta.xml', line: 9,
+      lineText: '<actionName>AcmeK2Target</actionName>' }, extra),
+  ]);
+  const a = buildSemanticIndex([mkFile(AcmeK2Target)], {});
+  const b = buildSemanticIndex([mkFile(AcmeK2Target)], {});
+  attachMetaCallers(a, mkRefs({}));
+  attachMetaCallers(b, mkRefs({ targetKind: 'apex' }));
+  const treeA = buildCallerTree(a, { classLower: 'acmek2target', methodLower: 'run' });
+  const treeB = buildCallerTree(b, { classLower: 'acmek2target', methodLower: 'run' });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(treeB)), JSON.parse(JSON.stringify(treeA)),
+    "K2: an explicit targetKind:'apex' takes the legacy attach path byte-identically (absence and 'apex' mean the same thing)");
+  assert.strictEqual((b._pendingTargetRefs || []).length, 0,
+    "K2: targetKind:'apex' is never queued -- it falls through to the pre-existing path");
+  assert.strictEqual(a.metaCallers.get('acmek2target').length, b.metaCallers.get('acmek2target').length);
+  assert.strictEqual(a.stats.metaUnresolved, 0);
+  assert.strictEqual(b.stats.metaUnresolved, 0);
+}
+
+{
+  const AcmeK2Bystander = ty('AcmeK2Bystander', 'AcmeK2Bystander', { methods: [mth('noop', { line: 2 })] });
+  const idx = buildSemanticIndex([mkFile(AcmeK2Bystander)], {});
+  const ref = { kind: 'lwc', label: 'acmeOrderDashboard', className: null, methodName: null,
+    namespace: null, targetKind: 'lwc', targetName: 'acmeQuotePanel', targetVia: 'composition',
+    path: 'force-app/main/default/lwc/acmeOrderDashboard/acmeOrderDashboard.html', line: 12,
+    lineText: '<c-acme-quote-panel record-id={recordId}>' };
+  attachMetaCallers(idx, [ref]);
+  assert.ok(Array.isArray(idx._pendingTargetRefs) && idx._pendingTargetRefs.length === 1,
+    'K2: a non-apex targetKind ref is queued for deferred resolution');
+  assert.strictEqual(idx._pendingTargetRefs[0], ref,
+    'K2: buffered VERBATIM -- same object, no copy, no normalization at queue time');
+  assert.strictEqual(idx.metaCallers.size, 0, 'K2: never reaches metaCallers');
+  assert.strictEqual(idx.metaMethodCallers.size, 0, 'K2: never reaches metaMethodCallers');
+  assert.strictEqual(idx.externals.size, 0, 'K2: never minted as an external');
+  assert.strictEqual(idx.stats.metaUnresolved, 0,
+    'K2: the reserved counter stays 0 -- counting is finalize-time work, and finalize is a no-op until the store lands');
+  finalizeMetaTargets(idx);
+  finalizeMetaTargets(idx);
+  assert.strictEqual(idx._pendingTargetRefs.length, 1,
+    'K2: finalizeMetaTargets is an idempotent no-op stub -- pending refs stay buffered, nothing throws');
+  attachMetaCallers(idx, [Object.assign({}, ref, { line: 20 })]);
+  assert.strictEqual(idx._pendingTargetRefs.length, 2,
+    'K2: later attachMetaCallers calls APPEND (same multi-call contract as _pendingSubflowRefs)');
+  assert.ok(!idx._pendingSubflowRefs || idx._pendingSubflowRefs.length === 0,
+    'K2 invariant 4: the K2 queue never leaks into _pendingSubflowRefs -- the two pending lists are independent fields');
+  assert.strictEqual(idx.flowGraph instanceof Map ? idx.flowGraph.size : 0, 0,
+    'K2 invariant 4: a non-flow K2 ref creates no flowGraph node');
+}
+
+{
+  const AcmeK2Decoy = ty('AcmeK2Decoy', 'AcmeK2Decoy', { methods: [mth('run', { line: 2 })] });
+  const idx = buildSemanticIndex([mkFile(AcmeK2Decoy)], {});
+  attachMetaCallers(idx, [{ kind: 'lwc', label: 'vtxRatePicker', className: 'AcmeK2Decoy',
+    methodName: 'run', namespace: null, targetKind: 'lwc', targetName: 'acmeQuotePanel',
+    targetVia: 'composition', path: 'force-app/main/default/lwc/vtxRatePicker/vtxRatePicker.js',
+    line: 4, lineText: 'malformed-by-construction fixture' }]);
+  assert.strictEqual(idx.metaCallers.has('acmek2decoy'), false,
+    'K2 invariant guard: a malformed ref carrying BOTH targetKind and className is routed once, to the queue -- its Apex fields are ignored entirely (single-routing is structural)');
+  assert.strictEqual(idx._pendingTargetRefs.length, 1);
+}
+
+{
+  const idx = buildSemanticIndex([mkFile(ty('AcmeK2FlowSide', 'AcmeK2FlowSide', { methods: [mth('x', { line: 1 })] }))], {});
+  attachMetaCallers(idx, [{ kind: 'flow', label: 'Acme_Order_Screen', className: null,
+    methodName: null, namespace: null, flowObject: null, flowRecordTriggerType: null,
+    flowTriggerType: null, subflows: [], targetKind: 'component',
+    targetName: 'acmeOrderDashboard', targetVia: 'screen',
+    path: 'force-app/main/default/flows/Acme_Order_Screen.flow-meta.xml', line: 21,
+    lineText: '<extensionName>acmeOrderDashboard</extensionName>' }]);
+  assert.strictEqual(idx._pendingTargetRefs.length, 1);
+  assert.ok(idx.flowInfo.has('acme_order_screen'),
+    "K2: a flow ref carrying targetKind is queued AND still registers flowInfo -- file-level flow facts stay file-level facts, same as today's className-less flow refs");
+  assert.strictEqual(idx.flowApexTargets.has('acme_order_screen'), false,
+    'K2: className is null by mutual exclusion, so no flow->apex target is registered');
+}
+
+{
+  const idx = { lwcBundleNames: new Set(['acmequotepanel']),
+    auraBundleNames: new Set(['acmequotepanel', 'vtxlegacypanel']) };
+  assert.strictEqual(resolveBareComponentTarget(idx, 'acmequotepanel'), 'lwc',
+    'K2: lwc wins a both-rosters collision (BARE_COMPONENT_RESOLUTION_ORDER is registry data)');
+  assert.strictEqual(resolveBareComponentTarget(idx, 'vtxlegacypanel'), 'aura');
+  assert.strictEqual(resolveBareComponentTarget(idx, 'vtxghostpanel'), null,
+    'K2: a name in neither roster is an honest null -- counted by finalize (later), never guessed');
+  assert.strictEqual(resolveBareComponentTarget({}, 'acmequotepanel'), null, 'missing rosters -> null, never throws');
+  assert.strictEqual(resolveBareComponentTarget(null, 'acmequotepanel'), null);
+  assert.strictEqual(resolveBareComponentTarget(idx, ''), null);
+}
+
+{
+  const names = collectBundleNames([
+    'force-app/main/default/lwc/acmeQuotePanel/acmeQuotePanel.js',
+    'force-app/main/default/lwc/acmeQuotePanel/utils/mathHelpers.js',   // nested module -> BUNDLE dir
+    'force-app\\main\\default\\lwc\\vtxRatePicker\\vtxRatePicker.html', // windows separators
+    'force-app/main/default/lwc/.eslintrc.js',                          // directly under lwc/ -> no bundle
+    'force-app/main/default/aura/vtxLegacyPanel/vtxLegacyPanel.cmp',    // wrong root dir
+    null,                                                               // tolerant of junk
+  ], 'lwc');
+  assert.deepStrictEqual([...names].sort(), ['acmequotepanel', 'vtxratepicker'],
+    'K2 rosters: lowercased bundle-directory stems only -- nested files fold to their bundle, rootless files and other dirs contribute nothing');
+  const aura = collectBundleNames(['force-app/main/default/aura/vtxLegacyPanel/vtxLegacyPanelController.js'], 'aura');
+  assert.deepStrictEqual([...aura], ['vtxlegacypanel']);
+  assert.strictEqual(collectBundleNames(null, 'lwc').size, 0, 'null paths -> empty Set, never throws');
 }
 
 console.log('test-resolver.js: all assertions passed.');

@@ -5789,6 +5789,23 @@ function attachAnnotatedTriggerActionMethods(index, cmdtRefs, metaCallers, metaM
   }
 }
 
+// K2 (see metascan.js's "v0.2x/K2" header paragraph for the ref shape):
+// buffers a metadata->metadata target ref for deferred resolution. Same
+// accumulate-across-calls posture index._pendingSubflowRefs uses later in
+// attachMetaCallers (see its v0.13/S2 ORDERING NOTE); the ref is buffered
+// VERBATIM (its `path` was already stamped onto the ref by the caller --
+// extension.js's computeMetaRefs does `ref.path = f.path`, metascan itself
+// never sets the field) -- validation and the edge-or-counted decision are
+// finalizeMetaTargets' job, exactly once per entry, once the generic
+// node/edge store exists (out of scope here).
+// Until then nothing drains this list, which is safe: no shipped extractor
+// emits targetKind yet, so the list is empty in every real pipeline.
+function queueMetaTargetRef(index, ref) {
+  const pending = Array.isArray(index._pendingTargetRefs) ? index._pendingTargetRefs : [];
+  pending.push(ref);
+  index._pendingTargetRefs = pending;
+}
+
 // A6: attaches metascan.js's MetaRef[] output onto an existing index,
 // mutating it with metaCallers (by class) and metaMethodCallers (by
 // 'classLower#methodLower'). Pure and order-independent: safe to call
@@ -5831,6 +5848,20 @@ function attachMetaCallers(index, metaRefs) {
     // controllers are not resolved by this path.
     if (ref.kind === 'vf' && ref.className == null && ref.methodName) {
       attachVfActionRef(index, ref, metaCallers, metaMethodCallers);
+      continue;
+    }
+    // K2: metadata->metadata target ref -- targetKind names a NON-Apex
+    // target (see metascan.js's "v0.2x/K2" header paragraph; className/
+    // methodName are both null by construction on this shape, and this
+    // router deliberately never reads them -- single-routing is
+    // structural, same precedent as the VF branch just above). Queued for
+    // deferred resolution by finalizeMetaTargets (a no-op until the
+    // node/edge store lands). Everything else -- absent targetKind, or an
+    // explicit 'apex' (which no metascan extractor ever stamps; absence IS
+    // the default) -- falls through to the exact pre-existing local/
+    // external attach path below, byte-identically.
+    if (ref.targetKind != null && ref.targetKind !== 'apex') {
+      queueMetaTargetRef(index, ref);
       continue;
     }
     if (!ref.className) continue;
@@ -6176,6 +6207,62 @@ function finalizeFlowSubflowRefs(index) {
   index.stats = index.stats || {};
   index.stats.unknownSubflowRefs = (index.stats.unknownSubflowRefs || 0) + unknownDelta;
   refreshIndexDiagnostics(index);
+}
+
+// K2/K4 seam -- deferred metadata->metadata target resolution. CONTRACT
+// (implemented by the generic node/edge store work package, out of scope
+// here; until that lands this function is DELIBERATELY an idempotent no-op
+// that leaves index._pendingTargetRefs buffered and untouched): each
+// pending ref queued by queueMetaTargetRef is decided exactly once --
+// edge-or-counted, never both, never neither, never twice (the same
+// contract finalizeFlowSubflowRefs pins just above for
+// _pendingSubflowRefs) -- with targetKind:'component' resolved via
+// resolveBareComponentTarget() below; a name in neither roster keeps its
+// raw 'component:' target identity, creates NO node, and increments
+// stats.metaUnresolved once per distinct unresolved id (the counter
+// attachMetaCallers' own v0.7.1/M2 note reserves for exactly this case).
+// The tree builders / entry catalog will call this beside
+// finalizeFlowSubflowRefs once the store lands; nothing calls it today.
+function finalizeMetaTargets(index) {
+  if (!index) return;
+  // No-op until index.nodes/edgesIn/edgesOut (the generic store) exist.
+}
+
+// K2 bare-name ambiguity rule, DATA-driven: resolves a targetKind:
+// 'component' name against the bundle rosters named by kinds.js's
+// BARE_COMPONENT_RESOLUTION_ORDER (lwc first, then aura -- the order is
+// registry data, not code here). Roster key = `${kind}BundleNames` (the K2
+// naming rule; stamped by extension.js beside index.flowFilePaths).
+// Returns the winning kind string, or null -- an honest unresolved, which
+// the caller (finalizeMetaTargets, once the store lands) counts and
+// renders approximate, never guesses. Pure, tolerant, never throws.
+function resolveBareComponentTarget(index, nameLower) {
+  if (!index || typeof nameLower !== 'string' || !nameLower) return null;
+  for (const k of kinds.BARE_COMPONENT_RESOLUTION_ORDER) {
+    const roster = index[k + 'BundleNames'];
+    if (roster instanceof Set && roster.has(nameLower)) return k;
+  }
+  return null;
+}
+
+// K2 rosters: the lowercased bundle-DIRECTORY stems under a bundle-rooted
+// source dir ('lwc' / 'aura'), derived from scanned file paths. A file
+// sitting DIRECTLY under the dir (no bundle folder -- e.g. lwc/.eslintrc.js,
+// which '**/lwc/**/*.js' does match) has no bundle identity and contributes
+// nothing: the trailing separator in the pattern requires the captured
+// segment to be a directory. Nested module files (lwc/acmeQuotePanel/utils/
+// mathHelpers.js) contribute their BUNDLE dir (the first segment after the
+// root dir), matching how template tags / componentName values reference a
+// component. Pure, tolerant of non-string entries, never throws.
+function collectBundleNames(paths, dirName) {
+  const out = new Set();
+  const re = new RegExp('(^|[\\\\/])' + dirName + '[\\\\/]([^\\\\/]+)[\\\\/]', 'i');
+  for (const p of paths || []) {
+    if (typeof p !== 'string') continue;
+    const m = re.exec(p);
+    if (m && m[2]) out.add(m[2].toLowerCase());
+  }
+  return out;
 }
 
 // Returns the method name of the sole @InvocableMethod-annotated method on
@@ -7469,6 +7556,15 @@ module.exports = {
   // clamp boundaries (NaN/-5/1e9/Infinity/'x' inputs) are exactly the kind
   // of thing best pinned directly rather than inferred from tree shape.
   clampInt,
+  // K2: the deferred metadata->metadata target seam (no-op until the
+  // node/edge store lands) plus the bare-name ambiguity rule's two pure
+  // pieces. collectBundleNames is a REAL consumer export -- extension.js
+  // calls it to stamp index.lwcBundleNames/auraBundleNames; the other two
+  // are exported for direct unit-level pinning in test-resolver.js, same
+  // rationale as clampInt just above.
+  finalizeMetaTargets,
+  resolveBareComponentTarget,
+  collectBundleNames,
   // v0.20/K1: exported for test-kindparity.js's registry-parity pins
   // (entryLabel round-trip; via vocabulary subset).
   metaEntryLabel,
