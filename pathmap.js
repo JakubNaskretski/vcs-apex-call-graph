@@ -375,14 +375,14 @@ function frontierMethodKey(node) {
 
 // =========================================================================
 // Approximate-edge rollup on the map.
-// Mirrors uitree.js's identical section (same rationale for why this is a
-// pure rendering-layer regroup, not a resolver.js change) as an independent
-// implementation, same "standalone, dev-tool-friendly module" posture as
-// every other small helper this file re-implements rather than requiring
-// uitree.js for (see isRootNode/packageBadge/frontierMethodKey above).
+// An independent implementation of resolver.js's normalizeShowUnconfirmed/
+// applyShowUnconfirmed -- a pure rendering-layer regroup, not a resolver.js
+// change -- same "standalone, dev-tool-friendly module" posture as every
+// other small helper this file re-implements rather than requiring uitree.js
+// for (see isRootNode/packageBadge/frontierMethodKey above).
 //
-// UNLIKE uitree.js's shapeNode (which regroups already-shaped UiNode
-// children), this operates on the RAW TNode tree, BEFORE layoutTree ever
+// UNLIKE resolver.js's applyShowUnconfirmed (which regroups the built
+// children array), this operates on the RAW TNode tree, BEFORE layoutTree ever
 // sees it -- groupApproximateChildren returns a brand-new TNode tree (never
 // mutates its input) with a synthetic `kind:'rollup'` pseudo-node spliced in
 // wherever a node had approximate children to group. layoutTree/
@@ -394,9 +394,10 @@ function frontierMethodKey(node) {
 // rendering (CLIENT_JS_TEXT, see the ROLLUP PILL section there) need to know
 // kind:'rollup' exists at all.
 //
-// Same three modes as uitree.js (SHOW_UNCONFIRMED_ROLLUP/_HIDE/_EXPAND
-// below), same 'expand' default-when-omitted/unrecognized for identical
-// regression-safety reasons -- see normalizeShowUnconfirmed's doc.
+// Same three modes as the apexCallGraph.showUnconfirmed setting
+// (SHOW_UNCONFIRMED_ROLLUP/_HIDE/_EXPAND below), but omitted/unrecognized
+// normalizes to 'expand' here -- NOT resolver.js's 'rollup' default --
+// preserving the legacy flat shape for existing callers (buildPathMapData).
 const SHOW_UNCONFIRMED_ROLLUP = 'rollup';
 const SHOW_UNCONFIRMED_HIDE = 'hide';
 const SHOW_UNCONFIRMED_EXPAND = 'expand';
@@ -405,8 +406,8 @@ function normalizeShowUnconfirmed(value) {
   return SHOW_UNCONFIRMED_VALUES.has(value) ? value : SHOW_UNCONFIRMED_EXPAND;
 }
 
-// Mirrors uitree.js's rollupNoun/rollupLabel exactly -- see that file's
-// comments for the singular/plural rationale.
+// Produces the exact same label string as resolver.js's applyShowUnconfirmed
+// builds inline (see its noun ternary for the singular/plural rationale).
 function rollupNoun(direction, count) {
   const plural = direction === 'callees' ? 'callees' : 'callers';
   return count === 1 ? plural.slice(0, -1) : plural;
@@ -2047,22 +2048,19 @@ function directionHeaderLine(direction) {
 // to the ONE method being traced; `stats` itself is unchanged, those fields
 // simply move to being an H8 "Scan Stats" output-channel concern only).
 // unresolvedMentionsHeaderLine below is the one new, genuinely SCOPED
-// replacement, matching uitree.js's identical function.
-function unresolvedMentionsTargetMethodName(treeResult) {
-  const um = treeResult && treeResult.unresolvedMentions;
-  if (um && typeof um.method === 'string' && um.method) return um.method;
-  const label = (treeResult && treeResult.root && treeResult.root.label) || '';
-  const dotIdx = label.lastIndexOf('.');
-  return dotIdx >= 0 ? label.slice(dotIdx + 1) : label;
-}
+// replacement, matching uitree.js's identical function -- which means
+// reading resolver.js's kind:'unresolved-mentions' child of the traced
+// target and reusing its already-complete `.label` VERBATIM (see
+// uitree.js's findUnresolvedMentionsNode doc for every "absent" case).
+// It must NOT reconstruct the wording from a `treeResult.unresolvedMentions`
+// {count, method} field: resolver.js has never emitted such a field, so
+// that shape silently dropped the line from every real trace.
 function unresolvedMentionsHeaderLine(treeResult) {
   if ((treeResult && treeResult.direction) === 'callees') return null;
-  const um = treeResult && treeResult.unresolvedMentions;
-  const count = um && typeof um.count === 'number' ? um.count : 0;
-  if (count <= 0) return null;
-  const method = unresolvedMentionsTargetMethodName(treeResult);
-  const siteWord = count === 1 ? 'site' : 'sites';
-  return `${count} unresolved ${siteWord} elsewhere mention ${method}( — potential unconfirmed callers`;
+  const children =
+    treeResult && treeResult.root && Array.isArray(treeResult.root.children) ? treeResult.root.children : [];
+  const node = children.find((c) => c && c.kind === 'unresolved-mentions');
+  return node ? node.label : null;
 }
 function headerExtraLinesForResult(treeResult) {
   const lines = [];
@@ -2296,6 +2294,5 @@ module.exports = {
   groupApproximateChildren,
   // Scoped-header surface, same
   // export rationale.
-  unresolvedMentionsTargetMethodName,
   unresolvedMentionsHeaderLine,
 };

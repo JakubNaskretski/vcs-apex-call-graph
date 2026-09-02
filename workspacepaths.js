@@ -91,7 +91,6 @@ module.exports = {
   sourcePathForUri,
   workspaceSetIdentity,
   isSerializedResourcePath,
-  sameOrigin,
   findContainingWorkspaceFolder,
   findContainingWorkspaceFolderForUri,
 };

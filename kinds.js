@@ -18,7 +18,7 @@
 // ships the behavior (m2-roots: flow traceable; m3-lwc-core: lwc traceable;
 // m2-store consumes store). Globs/compound extensions likewise land in the
 // package that adds the extractor -- the commented values are BINDING
-// (plans/CONTRACTS.local.md) and must be used verbatim when flipped on.
+// (fixed by the kind-registry contract) and must be used verbatim when flipped on.
 
 const NODE_KINDS = [
   {
@@ -141,7 +141,7 @@ const NODE_KINDS = [
   //      vias are live so one registry read covers them the day they render)
   //      with store:false and empty globs/compoundExts/overlayExts; their
   //      own packages flip store and fill the BINDING glob values recorded
-  //      in plans/CONTRACTS.local.md.
+  //      in the kind-registry contract.
   {
     key: 'messagechannel',             // m3-lwc-edges flips store:true; globs stay [] (synthesized from refs, like externals -- final)
     labelSingular: 'Message channel', labelPlural: 'Message channels',

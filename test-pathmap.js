@@ -36,7 +36,6 @@ const {
   normalizeShowUnconfirmed,
   rollupLabel,
   groupApproximateChildren,
-  unresolvedMentionsTargetMethodName,
   unresolvedMentionsHeaderLine,
 } = require('./pathmap');
 
@@ -908,9 +907,9 @@ check(html7.toLowerCase().includes('seenelsewhere'), 'legend mentions seenElsewh
 // v0.13 (Round 2.5, H3 -- header half) REGRESSION: the OLD combined
 // headerExtra array used to include a trailing unresolvedSites line here --
 // H3 removes it unconditionally (workspace-global counters are out of
-// scope for a per-trace header); fixture7 sets no `unresolvedMentions`
-// field, so the NEW scoped line doesn't fire either -- only the capped line
-// survives.
+// scope for a per-trace header); fixture7's root has no
+// kind:'unresolved-mentions' child, so the NEW scoped line doesn't fire
+// either -- only the capped line survives.
 check(html7.includes('"capped":true') || html7.includes('capped'), 'H1 forward-compat: capped info reaches the rendered document');
 check(html7.includes('"headerExtra":["Result capped -- not every caller could be expanded."]'), 'H3 (Round 2.5): headerExtra now has ONLY the capped line -- the old unresolvedSites line is gone');
 check(html7.includes("DATA.meta.headerExtra"), 'client script reads and renders meta.headerExtra');
@@ -1912,34 +1911,40 @@ check(rollupLabel(2, 'callees') === '2 possible callees (unconfirmed)');
 // v0.13 (Round 2.5, H3 -- header half): SCOPED HEADERS, map side.
 // =========================================================================
 
-check(unresolvedMentionsTargetMethodName({ unresolvedMentions: { method: 'Reprice' }, root: { label: 'Ignored.other' } }) === 'Reprice', 'explicit unresolvedMentions.method wins verbatim');
-check(unresolvedMentionsTargetMethodName({ root: { label: 'VertexPricingService.reprice' } }) === 'reprice', 'derived from root.label after the last dot');
-check(unresolvedMentionsTargetMethodName({ root: { label: 'AccountTrigger' } }) === 'AccountTrigger', 'no dot at all -> the whole label');
-check(unresolvedMentionsTargetMethodName(null) === '', 'defensive: null treeResult -> empty string');
+// The line is resolver.js's kind:'unresolved-mentions' child node's `.label`
+// reused VERBATIM -- the same node shape test-uitree.js's matching block
+// pins, and the ONLY shape resolver.js has ever emitted (it sets no
+// `treeResult.unresolvedMentions` field, so reconstructing the wording from
+// one silently dropped this line from every real trace).
+const mentionsNode = baseNode({
+  label: '5 unresolved sites elsewhere mention reprice( — potential unconfirmed callers',
+  kind: 'unresolved-mentions', path: '', line: 0, via: 'unresolved', approximate: true,
+});
+const mentionsConfirmed = baseNode({ label: 'ConfirmedCaller.run', className: 'ConfirmedCaller', methodLower: 'run', via: 'typed' });
+const mentionsRoot = baseNode({ label: 'X.reprice', className: 'X', methodLower: 'reprice', path: '/ws/X.cls', children: [mentionsConfirmed, mentionsNode] });
+const mentionsTree = { root: mentionsRoot, targetLabel: mentionsRoot.label, note: null, direction: 'callers', stats: { capped: true } };
 
 check(
-  unresolvedMentionsHeaderLine({ root: { label: 'X.reprice' }, direction: 'callers', unresolvedMentions: { count: 5 } }) ===
-    '5 unresolved sites elsewhere mention reprice( — potential unconfirmed callers',
-  'exact H3-spec wording, mirrors uitree.js exactly'
+  unresolvedMentionsHeaderLine(mentionsTree) === '5 unresolved sites elsewhere mention reprice( — potential unconfirmed callers',
+  "resolver.js's mentions-node label reused verbatim, mirrors uitree.js exactly"
 );
+check(unresolvedMentionsHeaderLine({ ...mentionsTree, direction: 'callees' }) === null, 'callees direction -> null even with the node present');
 check(
-  unresolvedMentionsHeaderLine({ root: { label: 'X.reprice' }, direction: 'callers', unresolvedMentions: { count: 1 } }) ===
-    '1 unresolved site elsewhere mention reprice( — potential unconfirmed callers',
-  'singular "site" for K === 1'
+  unresolvedMentionsHeaderLine({ ...mentionsTree, root: { ...mentionsRoot, children: [mentionsConfirmed] } }) === null,
+  'no unresolved-mentions child (K === 0) -> null'
 );
-check(unresolvedMentionsHeaderLine({ root: { label: 'X.reprice' }, direction: 'callers', unresolvedMentions: { count: 0 } }) === null, 'K === 0 -> null');
-check(unresolvedMentionsHeaderLine({ root: { label: 'X.reprice' }, direction: 'callees', unresolvedMentions: { count: 5 } }) === null, 'callees direction -> null even with K > 0');
+check(unresolvedMentionsHeaderLine({ root: { label: 'X.reprice' }, direction: 'callers' }) === null, 'legacy root with no children array -> null');
 check(unresolvedMentionsHeaderLine(null) === null, 'defensive: null treeResult never throws');
 
 // headerExtraLinesForResult integration: the new scoped line slots in after
 // capped, caller direction only.
 assert.deepStrictEqual(
-  headerExtraLinesForResult({ root: { label: 'X.reprice' }, direction: 'callers', stats: { capped: true }, unresolvedMentions: { count: 3 } }),
-  ['Result capped -- not every caller could be expanded.', '3 unresolved sites elsewhere mention reprice( — potential unconfirmed callers'],
+  headerExtraLinesForResult(mentionsTree),
+  ['Result capped -- not every caller could be expanded.', '5 unresolved sites elsewhere mention reprice( — potential unconfirmed callers'],
   'H3: the new scoped line slots in after capped, mirrors test-uitree.js exactly'
 );
 assert.deepStrictEqual(
-  headerExtraLinesForResult({ root: { label: 'X.reprice' }, direction: 'callees', unresolvedMentions: { count: 3 } }),
+  headerExtraLinesForResult({ ...mentionsTree, direction: 'callees', stats: {} }),
   [],
   'H3: callees direction never gets the new scoped line'
 );
@@ -1963,11 +1968,9 @@ assert.deepStrictEqual(
 
 // full render: the new header line reaches meta.headerExtra end to end.
 {
-  const root = baseNode({ label: 'X.reprice', className: 'X', methodLower: 'reprice', path: '/ws/X.cls' });
-  const tree = { root, targetLabel: 'X.reprice', note: null, direction: 'callers', stats: { capped: true }, unresolvedMentions: { count: 3 } };
-  const html = renderPathMapHtml(tree);
+  const html = renderPathMapHtml(mentionsTree);
   check(
-    html.includes('"headerExtra":["Result capped -- not every caller could be expanded.","3 unresolved sites elsewhere mention reprice( — potential unconfirmed callers"]'),
+    html.includes('"headerExtra":["Result capped -- not every caller could be expanded.","5 unresolved sites elsewhere mention reprice( — potential unconfirmed callers"]'),
     'H3: the new scoped line reaches the rendered headerExtra array end to end, after the capped line'
   );
 }

@@ -14,8 +14,7 @@ hand-illustrated mockup:
 
 ```
 === VertexRepriceBatch.execute ===
-36 unresolved · 17 managed-package refs (kwx, zenq).
-stats: nodes=2 unique=1 unresolved=36 capped=false
+stats: nodes=2 unique=1 unresolved=79 capped=false
 VertexRepriceBatch.execute  [Batchable]
   VertexNightlyAdjustmentJob.execute  [Schedulable · async · ◉ root]
       L3: Database.executeBatch(new VertexRepriceBatch());
@@ -24,9 +23,10 @@ VertexRepriceBatch.execute  [Batchable]
 
 Every call site shows its source line **and** (when present) the overload signature
 and the arguments bound to your parameter names. `◉ root` marks a node with no known
-caller of its own — an entry point or dead code. The header line above the tree is
-honest about what couldn't be resolved workspace-wide (dynamic dispatch, platform
-calls, chains deeper than 12 segments), instead of staying silent about it.
+caller of its own — an entry point or dead code. Workspace-wide totals for what
+couldn't be resolved (dynamic dispatch, platform calls, chains deeper than 12
+segments) show in the **Entry Points** view header, with a per-reason breakdown in
+the **Apex Call Graph: Scan Stats** output channel — not on the tree itself.
 
 ## Quickstart
 
@@ -84,17 +84,15 @@ exception-class node. The transcript below is pasted **verbatim** from
 ```
 === AcmeNoteEventPublisher.publishNote -- A4 publish-forward: EventBus.publish -> trigger + PE flow ===
 What Does This Call?
-75 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).
-stats: nodes=5 unique=2 unresolved=75 capped=false direction=callees
+stats: nodes=4 unique=2 unresolved=33 capped=false direction=callees
 AcmeNoteEventPublisher.publishNote
   AcmeNoteEventTrigger  [trigger on Acme_Note__e (after insert) · publish]
-      L6: EventBus.publish(new Acme_Note__e(Message__c = message));
+      L10: EventBus.publish(new Acme_Note__e(Message__c = message));
       -> new Acme_Note__e(Message__c = message)
-    AcmeNoteEventHandler.handle  [static]
-        L9: AcmeNoteEventHandler.handle(Trigger.new);
+    AcmeNoteEventHandler.handle  [static · ◉ root]
+        L7: AcmeNoteEventHandler.handle(Trigger.new);
         -> events: Trigger.new
-      ~1 unresolved site  [unresolved · ~ · … depth cap]
-  AcmeNoteEventFlow  [Flow apex action · publish · … depth cap]
+  AcmeNoteEventFlow  [Flow apex action · publish · … capped]
       L10: EventBus.publish(new Acme_Note__e(Message__c = message));
       -> new Acme_Note__e(Message__c = message)
 ```
@@ -119,14 +117,17 @@ RIGHT.
   subtree was already shown once above, in a diamond-shaped call graph — only its own
   call sites repeat, not its callers again), `◉ root` (no known caller — entry point
   or dead code), `🛡` an ancestor catches the exception being traced, `managed: ns` (a
-  [managed-package reference](#managed-packages), package-icon glyph). Hover any node
-  or badge for a one-line explanation.
+  [managed-package reference](#managed-packages), package-icon glyph). A Flow node
+  also carries its own status whenever the Flow is not Active (`Draft`, `Obsolete`,
+  `InvalidDraft` — badged, never hidden, so a deactivated Flow never reads like a live
+  one), and `async path` when a record-triggered Flow has Scheduled Paths. Hover any
+  node or badge for a one-line explanation.
 - **Site rows** (indented under a node): the source line, plus a second line showing
   the overload signature and/or the arguments, when either is available.
 - A **note** above the tree calls out an honest zero-caller result instead of
-  rendering a silent empty tree, and (when non-zero) a workspace-wide count of call
-  sites that couldn't be resolved — split into a plain unresolved count and a
-  [managed-package](#managed-packages) ref count once any namespace references exist.
+  rendering a silent empty tree. Workspace-wide counts of unresolved call sites and
+  [managed-package](#managed-packages) references live in the **Entry Points** view
+  header, not on the tree itself.
 
 ### Confirmed vs possible edges
 
@@ -161,12 +162,11 @@ place, no re-scan, no losing your Path Map pan/zoom position. This keeps a first
 look at a heavily-called method (or a busy hub class) fast and readable instead of
 dumping hundreds of nodes at once; expand only the branches you actually care about.
 
-The transcript below is pasted **verbatim** from `node dev/smoke.js`:
+The transcript below is from `node dev/smoke.js` (section titles shortened):
 
 ```
 === AcmeOrderTriggerHandler.handle -- STEP 1: initialDepth=2 (collapsed) ===
-72 call sites workspace-wide could not be resolved (dynamic/platform/deep-chain).
-stats: nodes=10 unique=9 unresolved=72 capped=false frontierNodes=2
+stats: nodes=10 unique=9 unresolved=33 capped=false frontierNodes=2
 AcmeOrderTriggerHandler.handle
   AcmeOrderTrigger  [trigger on Acme_Order__c (before insert, before update, after insert, after update) · typed]
       L9: handler.handle(
@@ -201,7 +201,7 @@ AcmeOrderTriggerHandler.handle
 -- after clicking the first +2 --
 
 === AcmeOrderTriggerHandler.handle -- STEP 2: after expanding ONE frontier click ===
-stats: nodes=12 unique=10 unresolved=72 capped=false frontierNodes=1
+stats: nodes=12 unique=10 unresolved=33 capped=false frontierNodes=1
 AcmeOrderTriggerHandler.handle
   AcmeOrderTrigger  [trigger on Acme_Order__c (before insert, before update, after insert, after update) · typed]
       L9: handler.handle(
@@ -271,6 +271,13 @@ Procedure** Remote Actions (Vlocity DataPack JSON and `.os-meta.xml`), and
 `apex:page`/`commandButton`/`commandLink`/`actionFunction`/`actionSupport`/
 `actionPoller` — attached to whichever of the page's controller/extensions classes
 actually declares that method; see Limits below).
+
+JavaScript Remoting is recognized too: a `{!$RemoteAction.Class.method}` merge field
+anywhere in the page makes it a caller of that exact method, the namespace-qualified
+`{!$RemoteAction.ns.Class.method}` form included. The merge field spells out its own
+class and method, so no controller/extensions lookup is needed; it is also the anchor
+rather than the surrounding `invokeAction(...)` call, so the common style of assigning
+it to a variable first still resolves.
 
 A class-level **Who Calls This?** trace rolls up the method-specific metadata above,
 so two `@salesforce/apex/Class.method` imports in one LWC appear as one component node
@@ -342,6 +349,12 @@ group starts collapsed. `@isTest` classes are excluded from the catalog entirely
 separate count in the header says how many). The same header also reports unresolved
 call sites and managed-package references, so incomplete analysis is visible instead
 of silently looking exhaustive.
+
+A Flow row's detail says how that Flow starts — `Scheduled`, the record or platform
+event trigger and its object, or `screen or autolaunched` when no start trigger was
+found — followed by the Flow's own status whenever it is not Active (`(Draft)`,
+`(Obsolete)`, `(InvalidDraft)`) and `(async path)` when a record-triggered Flow has
+Scheduled Paths. Inactive Flows stay listed rather than disappearing from the catalog.
 
 Click any entry to jump to its source. Every entry also carries an inline **What Does
 This Call?** action — the same forward-trace command the main view uses — so you can go
@@ -456,8 +469,8 @@ What it can never show:
   external node, even when `Foo` looks like it could be a namespace — that
   shape is indistinguishable from an ordinary reference to a class this
   workspace simply never declared, and stays in the plain unresolved count
-  instead (see the header's `N unresolved · M managed-package refs (ns, …)`
-  line for that split).
+  instead (see the **Entry Points** header's `N unresolved sites · M managed
+  references` clause for that split).
 - If your own workspace declares a namespace (`sfdx-project.json`'s
   `"namespace"` property), references prefixed with *your own* namespace
   resolve locally instead — they're not managed-package code at all, so they
@@ -545,6 +558,12 @@ deleted ones; if watching is unavailable or uncertain, the extension falls back 
 safe full sweep. Large cold parses are split across worker threads, while smaller and
 warm scans stay inline to avoid unnecessary startup overhead.
 
+When nothing at all has changed since the last successful scan — no watched file
+changed, the same exclusion globs, unsaved editor buffers identical — the whole
+semantic index is reused instead of rebuilt, so **Switch Trace Direction** and a
+repeated trace on an unchanged workspace skip indexing entirely. **Clear Cache**
+invalidates that reuse along with everything else.
+
 Indexing is cancellable from the progress notification. Cancelling terminates active
 parse workers, preserves already-valid cached facts, discards the partial index, and
 leaves the last good tree untouched. Repeated requests are single-flighted: an
@@ -582,6 +601,7 @@ symbols, or call arguments.
 | `Apex Call Graph: What Does This Call?` | Editor context menu (`.cls`/`.trigger`/`.apex`), command palette |
 | `Apex Call Graph: Impact of Changing This Method` | Editor context menu (`.cls`/`.trigger`/`.apex`), command palette |
 | `Apex Call Graph: Switch Trace Direction` | View title button, command palette (after a first trace) — re-runs the last target the other way |
+| `Apex Call Graph: Toggle Orientation (Target-First / Entry-First)` | View title button (callers direction only), command palette |
 | `Apex Call Graph: Show Path Map` | Editor context menu, command palette — resolves the current target |
 | `Apex Call Graph: Refresh Path Map` | Trace view title button, command palette — re-scans the last target |
 | `Apex Call Graph: Show Entry Points` | View welcome link, command palette |

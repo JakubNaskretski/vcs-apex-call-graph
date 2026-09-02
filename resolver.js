@@ -271,24 +271,18 @@ function flowOpsForRecordTriggerType(rtRaw) {
 }
 
 // F1: 'List<Acme_Order__c>' / 'Acme_Order__c[]' / 'Acme_Order__c' -> the bare
-// (lowercased) SObject API name, stripping a List<>/Set<> wrapper or a
+// (case-preserved) SObject API name, stripping a List<>/Set<> wrapper or a
 // trailing array suffix first -- a DML statement's target can be either a
 // single record or a collection, and the object identity is the same either
 // way.
-function dmlObjectHead(rawType) {
-  const orig = dmlObjectHeadOriginal(rawType);
-  return orig ? lc(orig) : null;
-}
-
-// v0.8/N1(b)/N3: same wrapper-stripping as dmlObjectHead, but preserves the
-// object token's ORIGINAL case (dmlObjectHead's own lastSegmentLower() call
+//
+// v0.8/N1(b)/N3: the wrapper-stripping above, but preserving the
+// object token's ORIGINAL case (the sibling lastSegmentLower() helper
 // discards it). Needed so a managed-object external's `label`/`className`
 // (e.g. 'kwx__Ledger__c') renders with the exact source-text casing instead
 // of resolver.js's internal all-lowercase comparison keys -- see
 // resolveDmlTargetObject's own header note for how this feeds the N1(b)/N3
-// pipeline. `dmlObjectHead` above is now a thin lc() wrapper around this so
-// every pre-v0.8 caller's behavior (a lowercased objectLower string) is
-// completely unchanged.
+// pipeline.
 function dmlObjectHeadOriginal(rawType) {
   if (!rawType) return null;
   let s = String(rawType).trim();
@@ -2832,7 +2826,7 @@ function buildSemanticIndex(factsList, opts) {
   }
 
   // v0.7.1/R8: `objectLower` reduced to the literal generic `SObject`
-  // placeholder (dmlObjectHead's own "strip List<>/Set<>/[] wrapper, keep
+  // placeholder (dmlObjectHeadOriginal's "strip List<>/Set<>/[] wrapper, keep
   // the last dotted segment" logic applied to a declared type of
   // `List<SObject>`/`SObject`/`SObject[]`, never narrowed to a concrete
   // custom/standard object -- e.g. a fflib-style unit-of-work whose
@@ -4219,6 +4213,19 @@ function resolveClassLowerSimple(index, rawTypeName) {
   const norm = normalizeTypeName(rawTypeName);
   if (!norm) return null;
   if (index.classes.has(norm)) return norm;
+  // The miss path below is an O(index.classes) scan, and catchMatchesException
+  // reaches it on EVERY system-exception catch (DmlException/QueryException/
+  // CalloutException are never user classes) -- once per catch clause per
+  // ancestor node per trace, so unmemoized it made exception traces scale with
+  // total org class count instead of tree size. Memoized per normalized type
+  // name on the index: `norm` fully determines `simple` (both are
+  // lc(stripGenerics(raw)) derivatives), and index.classes is populated only
+  // inside buildSemanticIndex and never added to afterwards, so a cache
+  // carried on an already-built index cannot go stale.
+  const scanCache = index._classLowerSimpleCache instanceof Map
+    ? index._classLowerSimpleCache
+    : (index._classLowerSimpleCache = new Map());
+  if (scanCache.has(norm)) return scanCache.get(norm);
   const simple = lastSegmentLower(rawTypeName);
   let match = null;
   let count = 0;
@@ -4228,7 +4235,9 @@ function resolveClassLowerSimple(index, rawTypeName) {
       count++;
     }
   }
-  return count === 1 ? match : null;
+  const resolved = count === 1 ? match : null;
+  scanCache.set(norm, resolved);
+  return resolved;
 }
 
 // v0.10/A2: true when classLower's OWN class, or any ancestor reached via

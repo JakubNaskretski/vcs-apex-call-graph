@@ -1358,6 +1358,20 @@ function computeMetaRefs(files) {
 // hook layered on top of the (unchanged) FileFacts/MetaRef cache shape, and
 // is never itself persisted.
 //
+// ONE exception to "every call": a whole-index memo HIT (v0.2x/M2W, see
+// scanAndBuildIndexForEpoch) returns the prior index by reference without
+// reaching this call, carrying packageOf/defaultPackage/ownNamespace over.
+// The freshness promise survives that only because sfdx-project.json is
+// watched AND its `.json` extension passes scanMetaFiles' META_EXT_RE dirty
+// filter, so the scan after such an edit reports sweepKind != 'skipped' and
+// the memo cannot hit. Narrowing that filter to META_GLOBS (which matches no
+// sfdx-project.json) would make packageOf/ownNamespace stale -- and a user
+// apexCallGraph.excludeGlobs entry that matches sfdx-project.json (e.g.
+// `**/*.json`) already re-opens that window: the edit is dropped by the
+// dirty filter, the memo hits, and the package map stays stale until another
+// watched file changes or Clear Cache runs. Accepted; fold an
+// sfdx-project.json identity into indexMemoFingerprint if it ever bites.
+//
 // A workspace with no sfdx-project.json anywhere yields an empty prefix
 // list, so the returned packageOf() returns null for every path -- see the
 // module-header note on buildSemanticIndex's opts contract for why that
@@ -2272,6 +2286,18 @@ async function activate(context) {
           phaseMs.metascan += Date.now() - tMeta0;
         } catch (e) {
           // metadata indexing is additive -- never block the Apex-only trace on it.
+          // But do not let this degraded (metadata-less) build be MEMOIZED and
+          // then served forever: both sweeps would report 'skipped' next round,
+          // the fingerprint would match, and the memo hit below would keep
+          // returning the metadata-less index even once the I/O layer recovered.
+          // Latching the one-way full-sweep flag survives markSweepDone() (which
+          // is keyed on the Apex sweepKind and on _fullSweepGeneration), so the
+          // very next scan rebuilds with metadata instead of hitting the memo.
+          dirtyTracker.markFullSweepNeeded();
+          // Counts-only channel rule (see logRunStats): never log `e` itself.
+          scanStatsChannel.appendLine(
+            `[${new Date().toISOString()}] metadata scan failed; this trace omits metadata callers`
+          );
         }
 
         if (metaScan.cancelled || token.isCancellationRequested) {
@@ -2674,7 +2700,20 @@ async function activate(context) {
           const line = Math.max(0, (msg.line || 1) - 1);
           const col = Math.max(0, msg.col || 0);
           const resourceUri = resourceUriForSourcePath(msg.path);
-          if (!resourceUri) return;
+          // The map's HTML is a snapshot of the last trace, so a node whose
+          // file has since moved, been deleted, or dropped out of the open
+          // workspace folders still renders as clickable. Report the failed
+          // open instead of leaving the click silent and (for the rejected
+          // showTextDocument) the rejection unhandled in the extension host.
+          // Basename only: the unmappable case is exactly the out-of-workspace
+          // one, so the full path would put the user's home directory in a toast.
+          const reportOpenFailure = () => vscode.window.showWarningMessage(
+            `Apex Call Graph: could not open ${path.basename(msg.path)}; it may have moved since the last scan.`
+          );
+          if (!resourceUri) {
+            reportOpenFailure();
+            return;
+          }
           // Never navigate over the Path Map itself. If the map occupies
           // column one (including the one-group-only layout), `Beside`
           // reuses or creates another group. Otherwise column one is a
@@ -2686,7 +2725,7 @@ async function activate(context) {
           vscode.window.showTextDocument(resourceUri, {
             selection: new vscode.Range(line, col, line, col),
             viewColumn: sourceViewColumn,
-          });
+          }).then(undefined, reportOpenFailure);
           return;
         }
         // The map's own '+N' pill click posts

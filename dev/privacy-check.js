@@ -41,11 +41,16 @@ function isTextFile(relPath) {
 }
 
 function loadDenylist() {
-  const denylistPath = path.join(os.homedir(), '.Codex', 'anonymize-denylist.txt');
+  // Tool-neutral location; point a symlink here at the machine's real list.
+  const denylistPath = path.join(os.homedir(), '.config', 'anonymize-denylist.txt');
   let text;
   try {
     text = fs.readFileSync(denylistPath, 'utf8');
   } catch (_) {
+    // Never fail open silently: a fresh clone has no list (and still PASSes on
+    // the regex rules), but the maintainer's box must not mistake that for a
+    // real-name check having run.
+    console.log(`privacy-check: WARN denylist not found at ${denylistPath.replace(os.homedir(), '~')}; real-name terms NOT checked`);
     return [];
   }
   return text.split(/\r?\n/)

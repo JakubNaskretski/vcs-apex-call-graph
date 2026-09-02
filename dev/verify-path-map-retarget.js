@@ -49,6 +49,7 @@ let quickPickCalls = 0;
 let panelMessageHandler = null;
 let pathMapPanel = null;
 const openedDocuments = [];
+const warningMessages = [];
 
 const mockVscode = {
   EventEmitter: class {
@@ -119,7 +120,7 @@ const mockVscode = {
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }
     ),
     showQuickPick: async () => { quickPickCalls++; return null; },
-    showWarningMessage: () => {},
+    showWarningMessage: (text) => { warningMessages.push(text); },
     showInformationMessage: () => {},
     showErrorMessage: () => {},
     setStatusBarMessage: () => {},
@@ -236,6 +237,16 @@ async function main() {
     'a map in column two reuses the other editor group for source');
   check(finalHtml === mapHtmlBeforeNavigation,
     'source navigation from a two-column layout leaves the map HTML intact');
+
+  // A node whose file moved or was deleted after the trace still renders as
+  // clickable, and the host's open then rejects. The click must warn rather
+  // than fail silently (and leave an unhandled rejection behind).
+  mockVscode.window.showTextDocument = async () => { throw missing(); };
+  const warningsBeforeFailedOpen = warningMessages.length;
+  await panelMessageHandler({ type: 'open', path: firstPath, line: 1, col: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  check(warningMessages.length === warningsBeforeFailedOpen + 1,
+    'a source open the host rejects warns the user instead of failing silently');
 
   await extension.deactivate();
   console.log('\n=== Path Map retarget verify summary ===');

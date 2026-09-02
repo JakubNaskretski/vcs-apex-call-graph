@@ -1464,6 +1464,18 @@ function findChild(tree, label) {
       extSrc.indexOf('resolver.attachMetaCallers(index, strippedMetaRefs);'),
     'only a fully-built, fully-attached index is ever stored in the memo'
   );
+  // A swallowed metadata-scan failure must not be memoized: without the latch,
+  // the metadata-less index it produces is stored, both sweeps report 'skipped'
+  // next round, and the memo keeps serving it after the I/O layer recovers.
+  {
+    const catchStart = extSrc.indexOf('// metadata indexing is additive -- never block the Apex-only trace on it.');
+    assert(catchStart > 0, 'the additive-metadata catch block is still present');
+    const catchBody = extSrc.slice(catchStart, extSrc.indexOf('if (metaScan.cancelled', catchStart));
+    assert(
+      catchBody.includes('dirtyTracker.markFullSweepNeeded();'),
+      'a failed metadata scan latches a full sweep so the degraded build cannot be memoized and served after recovery'
+    );
+  }
 }
 
 // =========================================================================

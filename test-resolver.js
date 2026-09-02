@@ -2292,6 +2292,10 @@ const V5OrderTriggerHandler = ty('V5OrderTriggerHandler', 'V5OrderTriggerHandler
     mth('handle', {
       line: 1,
       calls: [cl('dot', 'processOrders', { receiver: 'V5OrderService', line: 2, lineText: 'V5OrderService.processOrders();' })],
+      // A catch of a SYSTEM exception: not a user class, so it misses the
+      // index.classes exact-key lookup and is the only fixture catch that
+      // reaches resolveClassLowerSimple's O(index.classes) fallback scan.
+      catches: [catchFact('DmlException', 'de', 3)],
     }),
   ],
 });
@@ -2608,7 +2612,7 @@ assert.ok(indexV5.publishSitesByObject instanceof Map, 'buildSemanticIndex must 
 
   const handleNode = findChild(processOrdersNode.children, 'V5OrderTriggerHandler.handle');
   assert.ok(handleNode, 'the uncaught intermediate frame, handle(), must still be reachable');
-  assert.strictEqual(handleNode.caughtHere, undefined, 'handle() has no catch of its own -- must not carry the badge');
+  assert.strictEqual(handleNode.caughtHere, undefined, "handle()'s only catch is a SYSTEM exception (DmlException), which resolves to no user class at all -- must not carry the badge");
   const trigNode = findChild(handleNode.children, 'V5OrderTrigger');
   assert.ok(trigNode, 'bare-Exception catch scenario: the trigger itself must be reachable one hop past the uncaught handle() frame');
   assert.strictEqual(trigNode.caughtHere, true, "catch (Exception ex) is a bare-Exception catch -- matches everything, caughtHere must be true");
@@ -2618,6 +2622,29 @@ assert.ok(indexV5.publishSitesByObject instanceof Map, 'buildSemanticIndex must 
   assert.ok(testNode, 'the negative (no-catch-anywhere) scenario must still be reachable');
   assert.strictEqual(testNode.caughtHere, undefined, 'no catch anywhere in this branch -- absence of the badge is itself the ground truth, not an omission');
   assert.ok(!testNode.entries.some((e) => e.startsWith('catches ')), 'no catches-badge of any kind on the uncaught branch');
+
+  // PERF PIN (resolveClassLowerSimple): handle()'s DmlException catch misses
+  // the index.classes exact-key lookup, so it falls through to the full-Map
+  // simple-name scan. That scan is memoized per type name for the life of the
+  // index, so a REPEAT trace of the same exception -- which re-walks every
+  // catch clause on every ancestor node -- must not iterate index.classes even
+  // once. Unmemoized this ran once per (node x catch clause x trace call),
+  // making trace time scale with total org class count instead of tree size.
+  // Pin the mechanism first so the counter below cannot pass vacuously: the
+  // earlier trace must already have cached the DmlException miss (null).
+  assert.ok(indexV5._classLowerSimpleCache instanceof Map && indexV5._classLowerSimpleCache.has('dmlexception'),
+    'the first exception trace must populate the per-index simple-name scan cache for the DmlException miss');
+  assert.strictEqual(indexV5._classLowerSimpleCache.get('dmlexception'), null,
+    'DmlException is a system exception, so its cached fallback resolution is null (no user class)');
+  let fullScans = 0;
+  const realIter = indexV5.classes[Symbol.iterator];
+  indexV5.classes[Symbol.iterator] = function () { fullScans++; return realIter.call(this); };
+  try {
+    buildCallerTree(indexV5, { classLower: 'v5validationexception', methodLower: null });
+  } finally {
+    delete indexV5.classes[Symbol.iterator];
+  }
+  assert.strictEqual(fullScans, 0, 'a repeat exception trace must never re-scan index.classes -- resolveClassLowerSimple memoizes its fallback simple-name scan per type name on the index');
 }
 
 // ---- fallback exception-target detection: name ends in 'Exception', no

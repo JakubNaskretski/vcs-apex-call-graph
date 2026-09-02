@@ -5,6 +5,7 @@
 // persistence; these functions never mutate the disk cache Maps.
 const APEX_EXT_RE = /\.(cls|trigger|apex)$/i;
 const META_EXT_RE = /\.(js|cmp|app|xml|json|page|component)$/i;
+const crypto = require('node:crypto');
 const workspacepaths = require('./workspacepaths');
 
 function pathKey(fsPath) {
@@ -74,22 +75,26 @@ function captureDirtyDocumentOverlays(documents) {
 }
 
 // v0.2x/M2W: cheap, deterministic fingerprint of a
-// captureDirtyDocumentOverlays() snapshot -- every overlay already carries
-// the document's own monotonically increasing `version` (vscode bumps it on
-// every edit, including an edit that is later undone back to the original
-// text -- this fingerprint is deliberately conservative: it may report
-// "changed" when the content actually round-tripped back to its previous
-// text, never the reverse, which is the safe direction to be wrong in), so
-// 'key@version' pairs are sufficient to detect an added, removed, or
-// re-edited dirty buffer without hashing full text on every scan. Sorted so
-// Map iteration order never affects the result. Consumed by extension.js's
-// whole-index memoization (see scanflow.indexMemoFingerprint) -- an
-// empty/absent overlay set fingerprints as ''.
+// captureDirtyDocumentOverlays() snapshot -- keyed by a digest of each
+// overlay's own text rather than the document's `version` counter. `version`
+// is scoped to a single TextDocument model and is not a stable proxy for
+// content: it can restart (e.g. a dirty buffer closed with "Don't Save" and
+// reopened begins again at its initial version), so two overlays for the
+// same resource key at the same version but with different text must still
+// fingerprint differently -- otherwise extension.js's whole-index memo could
+// serve a stale index built from an earlier buffer state. Hashing is cheap
+// next to the parse work applyApexOverlays already does on every 'skipped'
+// sweep. Sorted so Map iteration order never affects the result. Consumed by
+// extension.js's whole-index memoization (see scanflow.indexMemoFingerprint)
+// -- an empty/absent overlay set fingerprints as ''.
 function overlaySnapshotFingerprint(overlays) {
   if (!(overlays instanceof Map) || overlays.size === 0) return '';
   const parts = [];
   for (const overlay of overlays.values()) {
-    parts.push(`${overlay.key}@${overlay.version == null ? '?' : overlay.version}`);
+    const digest = typeof overlay.text === 'string'
+      ? crypto.createHash('sha1').update(overlay.text, 'utf8').digest('base64')
+      : '?';
+    parts.push(`${overlay.key}@${digest}`);
   }
   parts.sort();
   return parts.join('|');
