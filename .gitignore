@@ -12,3 +12,7 @@ CONTRACT.md
 # dev: keep probe/verify scripts, ignore scratch fixtures + generated output
 dev/*
 !dev/*.js
+
+# fixture ground-truth notes stay local
+test-fixtures/adv-org/MANIFEST.md
+test-fixtures/gauntlet-org/GROUND-TRUTH.md
