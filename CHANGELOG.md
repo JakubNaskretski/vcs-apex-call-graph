@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.21.0
+
+Faster repeat traces, and two more ways metadata reaches Apex are now visible.
+
+- Repeating a trace on an unchanged workspace — most visibly **Switch Trace
+  Direction** — now reuses the semantic index instead of rebuilding it, so the
+  second answer arrives without a re-index. Editing a file, changing exclusion
+  globs, or **Clear Cache** all invalidate the reuse.
+- Visualforce pages that reach Apex through JavaScript Remoting
+  (`{!$RemoteAction.Class.method}`, namespace-qualified form included) now appear
+  as callers of that method, alongside `controller`/`extensions` and
+  `action="{!method}"` bindings.
+- Flows that are not Active now say so: `Draft`, `Obsolete`, or `InvalidDraft`
+  shows as a badge in the tree and as a suffix in **Entry Points**, and
+  record-triggered Flows with Scheduled Paths are marked `async path`.
+- Also fixed: the Path Map's "unresolved sites elsewhere mention …" header line
+  was silently dropped; clicking a Path Map node whose file has moved did nothing;
+  a failed metadata scan stuck until reload; a reopened unsaved buffer could serve
+  a stale index; exception traces re-scanned every class at each node. README
+  refreshed to match, including the missing **Toggle Orientation** command.
+
 ## 0.20.0
 
 More accurate answers from metadata: this release fixes four cases where traces

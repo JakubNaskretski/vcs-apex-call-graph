@@ -2,7 +2,7 @@
   "name": "apex-call-graph",
   "displayName": "Apex Call Graph",
   "description": "Trace callers and callees of Apex methods, inspect arguments, and assess signature-change impact across Apex, Flow, LWC, Aura and Visualforce. Offline static analysis: real Apex parser, no org connection, no language server.",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "publisher": "Skrety",
   "license": "MIT",
   "icon": "plugin-icon.png",
@@ -233,7 +233,11 @@
         },
         "apexCallGraph.showUnconfirmed": {
           "type": "string",
-          "enum": ["rollup", "hide", "expand"],
+          "enum": [
+            "rollup",
+            "hide",
+            "expand"
+          ],
           "enumDescriptions": [
             "Group approximate (unconfirmed) callers/callees under one collapsed \"N possible callers/callees (unconfirmed)\" node.",
             "Hide approximate (unconfirmed) callers/callees entirely -- only confirmed edges are shown.",
